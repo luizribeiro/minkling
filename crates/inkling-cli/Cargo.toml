@@ -1,0 +1,16 @@
+[package]
+name = "inkling-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "inklingrs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+inkling-core.workspace = true
+inkling-metal.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "inkling-metal"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+inkling-core.workspace = true
