@@ -1,0 +1,8 @@
+/target
+/result
+/models
+/reference/.venv
+__pycache__/
+*.py[cod]
+.direnv/
+.DS_Store
