@@ -1,0 +1,21 @@
+--- a/mlx_vlm/models/inkling/__init__.py
++++ b/mlx_vlm/models/inkling/__init__.py
+@@ -1,5 +1,16 @@
+-from .config import ModelConfig
++from .audio import AudioModel
++from .config import AudioConfig, ModelConfig, TextConfig, VisionConfig
+ from .inkling import Model
+ from .language import LanguageModel
++from .vision import VisionModel
+ 
+-__all__ = ["Model", "ModelConfig", "LanguageModel"]
++__all__ = [
++    "AudioConfig",
++    "AudioModel",
++    "LanguageModel",
++    "Model",
++    "ModelConfig",
++    "TextConfig",
++    "VisionConfig",
++    "VisionModel",
++]

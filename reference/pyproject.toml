@@ -7,6 +7,11 @@ dependencies = [
     "mlx-vlm==0.6.8",
     "huggingface-hub>=1.26",
     "numpy",
+    # transformers gates InklingProcessor behind the torch backend and
+    # InklingImageProcessor behind torchvision, so the tokeniser and the
+    # image/audio front end need both. Inference is all MLX.
+    "torch",
+    "torchvision",
 ]
 
 [tool.uv]

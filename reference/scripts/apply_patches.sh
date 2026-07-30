@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# Patch the mlx-vlm installed in the reference venv. Idempotent: a patch that
-# reverse-applies cleanly is already in place.
+# Patch the mlx-vlm installed in the reference venv so it can load Inkling
+# checkpoints. Idempotent: a patch that reverse-applies cleanly is already in
+# place. Patches are rooted at site-packages and applied with -p1.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 venv="${1:-$here/../.venv}"
-pkg="$venv/lib/python3.12/site-packages/mlx_vlm/models/inkling"
+root="$venv/lib/python3.12/site-packages"
 
-[ -d "$pkg" ] || { echo "no mlx-vlm in $venv; run 'uv sync' first" >&2; exit 1; }
+[ -d "$root/mlx_vlm" ] || {
+  echo "no mlx-vlm in $venv; run 'uv sync' first" >&2
+  exit 1
+}
 
-for p in "$here"/../patches/inkling-*.patch; do
+for p in "$here"/../patches/*.patch; do
   name="$(basename "$p")"
-  target="$pkg/${name#inkling-}"
-  target="${target%.patch}"
-
-  if patch -s -R --dry-run -f "$target" "$p" >/dev/null 2>&1; then
+  if patch -s -p1 -R --dry-run -f -d "$root" <"$p" >/dev/null 2>&1; then
     echo "  already applied  $name"
-  elif patch -s "$target" "$p"; then
+  elif patch -s -p1 -d "$root" <"$p"; then
     echo "  applied          $name"
   else
     echo "  FAILED           $name" >&2

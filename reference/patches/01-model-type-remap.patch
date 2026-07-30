@@ -1,0 +1,12 @@
+--- a/mlx_vlm/utils.py
++++ b/mlx_vlm/utils.py
+@@ -49,6 +49,9 @@
+     "unlimited-ocr": "unlimited_ocr",
+     "mistral": "llama",
+     "nemotron-nas": "nemotron_nas",
++    # Every published Inkling checkpoint declares this, while the module that
++    # implements it is `models/inkling`.
++    "inkling_mm_model": "inkling",
+ }
+ 
+ MAX_FILE_SIZE_GB = 5

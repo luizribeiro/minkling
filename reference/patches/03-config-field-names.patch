@@ -1,0 +1,61 @@
+--- a/mlx_vlm/models/inkling/config.py
++++ b/mlx_vlm/models/inkling/config.py
+@@ -34,11 +34,21 @@
+     mlp_layer_types: Optional[List[str]] = None
+     intermediate_size: int = 24576
+     moe_intermediate_size: int = 3072
++    dense_intermediate_size: Optional[int] = None
+     n_routed_experts: int = 256
+     num_experts_per_tok: int = 6
+     n_shared_experts: int = 2
+     route_scale: float = 8.0
+ 
++    def __post_init__(self):
++        """Official Inkling checkpoints name the dense FFN width
++        ``dense_intermediate_size`` and the per-expert FFN width
++        ``intermediate_size``; this class calls those ``intermediate_size`` and
++        ``moe_intermediate_size``. Rebind when the checkpoint uses the former."""
++        if self.dense_intermediate_size is not None:
++            self.moe_intermediate_size = self.intermediate_size
++            self.intermediate_size = self.dense_intermediate_size
++
+     def layer_is_sliding(self, i: int) -> bool:
+         """Sliding-window (local) vs global full-attention layer. Real checkpoints set
+         either ``layer_types`` (0.6B) or ``local_layer_ids`` (975B); the modulo is the
+@@ -61,20 +71,36 @@
+     patch_size: int = 40
+     temporal_patch_size: int = 2
+     num_channels: int = 3
++    n_channels: Optional[int] = None
+     n_layers: int = 4  # HMLP encoder layers
+     text_hidden_size: int = 6144
++    decoder_dmodel: Optional[int] = None
+     rms_norm_eps: float = 1e-6
+ 
++    def __post_init__(self):
++        """The towers project into LM space, which the checkpoint spells
++        ``decoder_dmodel``. ``update_module_configs`` rebuilds this config from
++        its own dict, so the wiring in ``ModelConfig`` never reaches it."""
++        if self.decoder_dmodel is not None:
++            self.text_hidden_size = self.decoder_dmodel
++        if self.n_channels is not None:
++            self.num_channels = self.n_channels
+ 
++
+ @dataclass
+ class AudioConfig(BaseModelConfig):
+     model_type: str = "inkling_audio"
+     n_mel_bins: int = 80
+     mel_vocab_size: int = 16
+     text_hidden_size: int = 6144
++    decoder_dmodel: Optional[int] = None
+     rms_norm_eps: float = 1e-6
+ 
++    def __post_init__(self):
++        if self.decoder_dmodel is not None:
++            self.text_hidden_size = self.decoder_dmodel
+ 
++
+ @dataclass
+ class ModelConfig(BaseModelConfig):
+     text_config: Union[TextConfig, dict, None] = None
