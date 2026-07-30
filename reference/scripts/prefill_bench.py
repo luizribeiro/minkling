@@ -176,6 +176,7 @@ def main():
         if args.json:
             with open(args.json, "w") as f:
                 json.dump(rows, f, indent=2)
+                f.write("\n")
 
 
 if __name__ == "__main__":
