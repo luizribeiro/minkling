@@ -6,13 +6,9 @@ import argparse
 import time
 
 import mlx.core as mx
-from mlx_vlm import load
+from inkling_ref import gib, load_model
 from mlx_vlm.generate import generate
 from mlx_vlm.prompt_utils import apply_chat_template
-
-
-def gib(n_bytes):
-    return n_bytes / (1 << 30)
 
 
 def main():
@@ -25,22 +21,12 @@ def main():
     args = ap.parse_args()
 
     t0 = time.perf_counter()
-    model, processor = load(args.model)
-    mx.eval(model.parameters())
+    model, processor = load_model(args.model)
     load_s = time.perf_counter() - t0
 
     print(f"load            {load_s:.1f} s")
     print(f"resident        {gib(mx.get_active_memory()):.1f} GiB")
     print(f"peak            {gib(mx.get_peak_memory()):.1f} GiB")
-
-    # The checkpoint lists every special token under additional_special_tokens
-    # and names no eos, so mlx-vlm's `pad_token = eos_token` fallback assigns
-    # None and padding fails. Resolve eos from the model config instead.
-    tok = getattr(processor, "tokenizer", processor)
-    if tok.eos_token is None:
-        tok.eos_token = tok.convert_ids_to_tokens(model.config.eos_token_id)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
 
     formatted = apply_chat_template(processor, model.config, args.prompt)
 
