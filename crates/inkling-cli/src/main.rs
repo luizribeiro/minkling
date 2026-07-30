@@ -15,8 +15,14 @@ fn main() -> Result<()> {
     println!("global layers   {:?}", t.global_layers());
     println!("dense FFN       {}", t.dense_intermediate_size);
     println!("expert FFN      {}", t.moe_intermediate_size);
-    println!("experts         {} (top-{})", t.n_routed_experts, t.num_experts_per_tok);
+    println!(
+        "experts         {} (top-{})",
+        t.n_routed_experts, t.num_experts_per_tok
+    );
     println!("kv/token        {} B", kv.bytes_per_token);
-    println!("kv @ 1M ctx     {:.1} GiB", kv.bytes_at(1 << 20) as f64 / (1u64 << 30) as f64);
+    println!(
+        "kv @ 1M ctx     {:.1} GiB",
+        kv.bytes_at(1 << 20) as f64 / (1u64 << 30) as f64
+    );
     Ok(())
 }
