@@ -1,0 +1,28 @@
+--- a/mlx_vlm/models/inkling/inkling.py
++++ b/mlx_vlm/models/inkling/inkling.py
+@@ -158,11 +158,25 @@
+             out[base + sub] = v
+         return out
+ 
++    _IDENTITY_QUANT_SCALES = (".switch_mlp.gate_scale", ".switch_mlp.out_scale")
++
++    def _is_droppable_quant_scale(self, k, v):
++        """The MXFP4 quantizer emits per-expert scale tensors that have no
++        counterpart in this model. They are identity in published checkpoints;
++        anything else carries real information and must not be silently dropped."""
++        if not k.endswith(self._IDENTITY_QUANT_SCALES):
++            return False
++        if not mx.allclose(v.astype(mx.float32), mx.array(1.0), atol=1e-3):
++            raise ValueError(f"{k} is not identity; expert scaling is unsupported")
++        return True
++
+     def sanitize(self, weights):
+         out = {}
+         for k, v in weights.items():
+             if ".mtp" in k or k.startswith("model.mtp") or k.endswith("training_args"):
+                 continue
++            if self._is_droppable_quant_scale(k, v):
++                continue
+             if k == "model.llm.embed.weight":
+                 out["language_model.model.embed_tokens.weight"] = v
+             elif k == "model.llm.unembed.weight":

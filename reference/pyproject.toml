@@ -1,0 +1,13 @@
+[project]
+name = "inkling-ref"
+version = "0.1.0"
+description = "mlx-vlm reference implementation used as the numerical oracle for inklingrs"
+requires-python = "==3.12.*"
+dependencies = [
+    "mlx-vlm==0.6.8",
+    "huggingface-hub>=1.26",
+    "numpy",
+]
+
+[tool.uv]
+package = false
