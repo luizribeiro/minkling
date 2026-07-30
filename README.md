@@ -1,0 +1,73 @@
+# inklingrs
+
+An inference engine for [Inkling-Small](https://thinkingmachines.ai/news/inkling-small/)
+on Apple Silicon, in Rust + Metal. The two things it aims to do that existing
+runtimes do not: **multi-token prediction** and **continuous batching**.
+
+## Layout
+
+    crates/inkling-core     config, checkpoint loading, architecture
+    crates/inkling-metal    Metal backend; kernels compiled at runtime
+    crates/inkling-cli      binary
+    reference/              Python mlx-vlm oracle, kept out of the Rust tree
+    models/                 weights (gitignored)
+
+`inkling-serve` splits out of `inkling-cli` once the batching scheduler is more
+than a request loop.
+
+## Getting started
+
+    direnv allow          # or: nix develop
+    just sync             # reference venv + mlx-vlm patches
+    just test
+
+## Why the reference directory exists
+
+`sconv`, the banded relative-position bias, and sigmoid-gated top-6-of-256
+routing cannot be validated by reading generated text. `reference/` is a
+patched mlx-vlm used for layer-by-layer tensor comparison — an oracle, not a
+dependency of the engine.
+
+Two patches are needed before it loads Inkling-Small at all:
+
+- `inkling-config.py.patch` — mlx-vlm reads `intermediate_size` as the dense FFN
+  width, but Inkling calls the dense width `dense_intermediate_size` and uses
+  `intermediate_size` for the per-expert width. Unpatched, both are wrong for
+  Inkling-Small, and Inkling-975B's two dense layers load at 3072 instead of
+  24576.
+- `inkling-inkling.py.patch` — the MXFP4 quant carries identity
+  `switch_mlp.{gate,out}_scale` tensors with no counterpart in the model, which
+  abort a strict load. Dropped, with a guard that refuses any non-identity value.
+
+## Architecture notes
+
+42 layers, hidden 4096, 256 routed experts (top-6) plus 2 shared, 276B total /
+12B active. No RoPE — position comes from depthwise causal short convolutions
+(kernel 4, on q/k/v and on the attention/MLP inputs) plus a learned relative
+logit bias over a 1024-token extent.
+
+Three properties drive the design:
+
+**Attention is 5:1 local:global.** Layers 5, 11, 17, 23, 29, 35 and 41 are full
+attention; the other 35 are capped at a 512-token window. Only the 7 global
+layers grow with sequence length, so KV costs 28 KiB/token plus a fixed 73 MiB
+per sequence — a 1M-token context fits in under 30 GiB. This is what makes deep
+batching plausible on one machine.
+
+**Short-conv state cannot be trimmed.** It keeps only the last `K-1` inputs, so
+rejected speculative tokens need restore-and-replay rather than truncation.
+Reordering along the batch dimension is fine, so continuous batching works, but
+MTP rejection and batching meet here and this is the hard part of the engine.
+
+**The mask is materialised.** The reference builds a full `[B, H, LQ, S]`
+additive mask. Acceptable when decoding, quadratic when prefilling. Fusing the
+relative-position bias into a flash-attention kernel is where a custom engine
+wins outright.
+
+## Weights
+
+The MXFP4 quant (`mlx-community/Inkling-Small-mxfp4`, 140 GB) has **no MTP
+tensors** — they were stripped during quantisation. It is fine for text, vision,
+audio, batching and perf work, but MTP requires the BF16 original
+(`thinkingmachines/Inkling-Small`, 532 GB). The official NVFP4 keeps its MTP
+weights but is in ModelOpt format, which mlx-vlm cannot read.
