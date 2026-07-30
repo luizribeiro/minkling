@@ -17,5 +17,9 @@ fmt:
 inspect config:
     cargo run -q --bin inklingrs -- {{ config }}
 
+# Baseline load cost and decode throughput via the reference implementation
+smoke model="models/Inkling-Small-mxfp4":
+    reference/.venv/bin/python reference/scripts/smoke.py {{ model }}
+
 fetch repo="thinkingmachines/Inkling-Small":
     hf download {{ repo }}
