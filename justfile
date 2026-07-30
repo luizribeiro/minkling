@@ -21,5 +21,9 @@ inspect config:
 smoke model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/smoke.py {{ model }}
 
+# Prefill wall time, throughput and peak memory across a prompt-length sweep
+prefill-bench model="models/Inkling-Small-mxfp4" *args:
+    reference/.venv/bin/python reference/scripts/prefill_bench.py {{ model }} {{ args }}
+
 fetch repo="thinkingmachines/Inkling-Small":
     hf download {{ repo }}
