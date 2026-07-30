@@ -1,0 +1,39 @@
+[
+  {
+    "tokens": 1024,
+    "mask_bytes": 67108864,
+    "wall_s": 1.5343035420000888,
+    "resident_bytes": 140271289132,
+    "peak_bytes": 143062903730,
+    "tok_s": 667.4037906900307
+  },
+  {
+    "tokens": 4096,
+    "mask_bytes": 1073741824,
+    "wall_s": 5.641909542000008,
+    "resident_bytes": 140271313708,
+    "peak_bytes": 151635051412,
+    "tok_s": 725.9953335848777
+  },
+  {
+    "tokens": 8192,
+    "mask_bytes": 4294967296,
+    "wall_s": 13.03983616700009,
+    "resident_bytes": 140271346476,
+    "peak_bytes": 167229530950,
+    "tok_s": 628.2287518865837
+  },
+  {
+    "tokens": 16384,
+    "mask_bytes": 17179869184,
+    "wall_s": 37.71684499999992,
+    "resident_bytes": 140271412012,
+    "peak_bytes": 215573160772,
+    "tok_s": 434.3947644613444
+  },
+  {
+    "tokens": 32768,
+    "mask_bytes": 68719476736,
+    "error": "BudgetExceeded: projected peak 406 GiB over the 350 GiB budget"
+  }
+]
