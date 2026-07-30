@@ -33,6 +33,15 @@ def main():
     print(f"resident        {gib(mx.get_active_memory()):.1f} GiB")
     print(f"peak            {gib(mx.get_peak_memory()):.1f} GiB")
 
+    # The checkpoint lists every special token under additional_special_tokens
+    # and names no eos, so mlx-vlm's `pad_token = eos_token` fallback assigns
+    # None and padding fails. Resolve eos from the model config instead.
+    tok = getattr(processor, "tokenizer", processor)
+    if tok.eos_token is None:
+        tok.eos_token = tok.convert_ids_to_tokens(model.config.eos_token_id)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
     formatted = apply_chat_template(processor, model.config, args.prompt)
 
     t0 = time.perf_counter()
@@ -41,15 +50,16 @@ def main():
     )
     gen_s = time.perf_counter() - t0
 
-    text = getattr(result, "text", str(result))
-    n = getattr(result, "generation_tokens", None) or len(
-        processor.tokenizer.encode(text)
+    print(f"wall            {gen_s:.1f} s")
+    print(f"prompt          {result.prompt_tokens} tok @ {result.prompt_tps:.1f} tok/s")
+    print(
+        f"decode          {result.generation_tokens} tok @ "
+        f"{result.generation_tps:.1f} tok/s"
     )
-
-    print(f"generated       {n} tokens in {gen_s:.1f} s  ({n / gen_s:.1f} tok/s)")
+    print(f"finish          {result.finish_reason}")
     print(f"peak after gen  {gib(mx.get_peak_memory()):.1f} GiB")
     print("-" * 60)
-    print(text)
+    print(result.text)
 
 
 if __name__ == "__main__":
