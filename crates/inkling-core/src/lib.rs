@@ -1,6 +1,7 @@
 pub mod attention;
 pub mod checkpoint;
 pub mod config;
+pub mod detokenize;
 pub mod embed;
 pub mod generate;
 pub mod head;
@@ -22,6 +23,7 @@ pub use attention::{
 };
 pub use checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 pub use config::{Config, TextConfig};
+pub use detokenize::{Utf8Stream, char_byte, piece_bytes};
 pub use embed::Embed;
 pub use generate::{Generator, greedy};
 pub use head::LmHead;

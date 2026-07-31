@@ -6,7 +6,10 @@
 //! a `just dump-*` recipe and read back through [`Checkpoint`]'s single-file
 //! layout.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use serde::Deserialize;
 
 use crate::attention::{AttentionConfig, AttentionWeights};
 use crate::checkpoint::{Checkpoint, Dtype, TensorView};
@@ -425,6 +428,48 @@ impl ModelWeights for Stack {
         let tensors = &self.layers[self.order[index]];
         let config = AttentionConfig::for_layer(&self.config, index);
         DecoderLayer::new(config, tensors.view(), tensors.mlp()).forward(cache, x, tensors)
+    }
+}
+
+/// The text/id pairs `just dump-tokenizer-fixture` recorded, from
+/// [`TokenizerFixture::load`].
+pub const TOKENIZER_CASES: &str = "tokenizer_cases.json";
+
+/// What the checkpoint's tokenizer did with a handful of cases, so that the
+/// 27 MB `tokenizer.json` is needed only by the checkpoint-gated tests.
+#[derive(Debug, Deserialize)]
+pub struct TokenizerFixture {
+    /// The eos the *config* named, which is the only file that names one.
+    pub eos_token_id: u32,
+    pub eos_token: String,
+    pub cases: BTreeMap<String, TokenizerCase>,
+}
+
+/// One sequence of ids, and everything the reference made of it.
+#[derive(Debug, Deserialize)]
+pub struct TokenizerCase {
+    pub ids: Vec<u32>,
+    pub text: String,
+    /// The vocabulary pieces those ids name, which is what lets a test
+    /// reconstruct each token's bytes without the vocabulary itself.
+    pub pieces: Vec<String>,
+    /// What the reference's streaming detokenizer surfaced as each token
+    /// arrived, and then what its flush left over — one longer than `ids`.
+    pub segments: Vec<String>,
+    /// Whether `text` encodes back to `ids`. A case assembled from pieces
+    /// splits characters no encoder would split, and says so.
+    pub round_trips: bool,
+}
+
+impl TokenizerFixture {
+    pub fn load() -> Self {
+        serde_json::from_str(&read(TOKENIZER_CASES)).expect("the recorded cases parse")
+    }
+
+    pub fn case(&self, name: &str) -> &TokenizerCase {
+        self.cases
+            .get(name)
+            .unwrap_or_else(|| panic!("{TOKENIZER_CASES} holds a {name} case"))
     }
 }
 
