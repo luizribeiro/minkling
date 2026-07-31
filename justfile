@@ -33,5 +33,9 @@ dump-activations model="models/Inkling-Small-mxfp4":
 dump-quant-fixture model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_quant_fixture.py {{ model }}
 
+# Regenerate the committed synthetic tensors the Rust CPU ops are tested against
+dump-op-fixture:
+    reference/.venv/bin/python reference/scripts/dump_op_fixture.py
+
 fetch repo="thinkingmachines/Inkling-Small":
     hf download {{ repo }}

@@ -263,15 +263,13 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+    use crate::fixture;
 
     /// The committed oracle dump: a single file, no index.
-    const FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../reference/fixtures/layer_activations.safetensors"
-    );
+    const FIXTURE: &str = "layer_activations.safetensors";
 
     fn fixture() -> Checkpoint {
-        Checkpoint::open(Path::new(FIXTURE)).expect("fixture opens")
+        fixture::open(FIXTURE)
     }
 
     struct Blob {

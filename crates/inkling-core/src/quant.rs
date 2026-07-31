@@ -171,17 +171,13 @@ fn logical_shape(weights: &[usize], scales: &[usize]) -> Result<Vec<usize>, Quan
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
     use crate::checkpoint::Checkpoint;
+    use crate::fixture;
 
     /// Packed slices and MLX's dequantisation of them, from
     /// `just dump-quant-fixture`.
-    const FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../reference/fixtures/mxfp4_dequant.safetensors"
-    );
+    const FIXTURE: &str = "mxfp4_dequant.safetensors";
 
     /// One synthetic group per scale byte, each holding all 16 codes twice, so
     /// value `32 * byte + code` is that code under that scale.
@@ -189,7 +185,7 @@ mod tests {
     const SLICES: [&str; 4] = ["routed_expert", "dense_ffn", "vocab_padding", GRID];
 
     fn fixture() -> Checkpoint {
-        Checkpoint::open(Path::new(FIXTURE)).expect("fixture opens")
+        fixture::open(FIXTURE)
     }
 
     fn decode(ckpt: &Checkpoint, slice: &str) -> Dequantized {
@@ -199,16 +195,8 @@ mod tests {
     }
 
     fn expected(ckpt: &Checkpoint, slice: &str) -> (Vec<usize>, Vec<f32>) {
-        let view = ckpt
-            .tensor(&format!("{slice}.dequantized"))
-            .expect("dequantized");
-        assert_eq!(view.dtype(), Dtype::F32);
-        let values = view
-            .data()
-            .chunks_exact(size_of::<f32>())
-            .map(|b| f32::from_le_bytes(b.try_into().expect("chunked into floats")))
-            .collect();
-        (view.shape().to_vec(), values)
+        let view = fixture::tensor(ckpt, &format!("{slice}.dequantized"));
+        (view.shape().to_vec(), fixture::f32s(&view))
     }
 
     /// Compared as bit patterns, not as floats: dequantisation is a table
