@@ -7,9 +7,10 @@ use std::process::Command;
 use std::time::Instant;
 
 use inkling_core::attention::{Attention, AttentionConfig, AttentionWeights};
-use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation};
-use inkling_core::quant::dequantize;
-use inkling_core::{Checkpoint, Config, Dtype, TextConfig};
+use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation, indices};
+use inkling_core::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
+use inkling_core::quant::{dequantize, dequantize_blocks};
+use inkling_core::{Checkpoint, Config, Dtype, TensorView, TextConfig};
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
 
@@ -19,6 +20,12 @@ fn checkpoint_dir() -> Option<PathBuf> {
         eprintln!("skipping: {CHECKPOINT_VAR} is unset");
     }
     dir
+}
+
+/// A named tensor, still packed or still bfloat16 as the checkpoint stores it.
+fn checkpoint_tensor<'a>(ckpt: &'a Checkpoint, name: &str) -> TensorView<'a> {
+    ckpt.tensor(name)
+        .unwrap_or_else(|err| panic!("checkpoint holds {name}: {err}"))
 }
 
 fn resident_bytes() -> u64 {
@@ -135,9 +142,10 @@ struct Weights {
 impl Weights {
     fn load(ckpt: &Checkpoint, layer: usize) -> Self {
         let of = |name: &str| {
-            let name = format!("language_model.model.layers.{layer}.self_attn.{name}");
-            ckpt.tensor(&name)
-                .unwrap_or_else(|err| panic!("checkpoint holds {name}: {err}"))
+            checkpoint_tensor(
+                ckpt,
+                &format!("language_model.model.layers.{layer}.self_attn.{name}"),
+            )
         };
         let quantized = |name: &str| {
             dequantize(
@@ -219,5 +227,197 @@ fn attention_reproduces_the_reference_layers_against_real_weights() {
     assert!(
         worst > 0.0,
         "a run that matched exactly would mean the reference's bfloat16 vanished"
+    );
+}
+
+/// What the synthetic MoE fixture cannot settle. The committed gate makes the
+/// whole routing computation hermetic, but the experts it routes to are
+/// `[256, 2048, 4096]` and `[2, 2048, 4096]` of MXFP4 — 25 GB once decoded — so
+/// only a real checkpoint carries them, and with them the tensor names, the
+/// `[experts, out, in]` layout and the per-expert group boundaries.
+///
+/// The reference multiplies its 4-bit weights without decoding them, in
+/// bfloat16, through `mx.gather_qmm`; this decodes them and multiplies in
+/// float32, then sums a token's six experts in expert order rather than in
+/// selection order. The gap is a dtype's, so 6e-3 — three bfloat16 quanta at
+/// 2^-9 — is the same bound, for the same reason, as the recorded attention
+/// step and the trained masks.
+///
+/// It holds less of that in reserve than the attention layer does, and knowably
+/// so: the reference rounds *twice* here, once on each expert's output and
+/// again on the routing weight, which `InklingSparseMoE` casts to the input's
+/// dtype before multiplying. Worst observed when this landed: 4.2e-3 on the
+/// routed half, two quanta, against a shared pair exchanged at 6.6e-2 — an
+/// order of magnitude above the bound.
+const MOE_TOLERANCE: f32 = 6e-3;
+
+/// One `SwitchLinear` bank, left packed: `[experts, out, in/8]` codes beside
+/// `[experts, out, in/32]` scale bytes.
+struct PackedBank<'a> {
+    weight: TensorView<'a>,
+    scales: TensorView<'a>,
+}
+
+impl<'a> PackedBank<'a> {
+    fn load(ckpt: &'a Checkpoint, module: &str, projection: &str) -> Self {
+        let of = |suffix: &str| checkpoint_tensor(ckpt, &format!("{module}.{projection}.{suffix}"));
+        Self {
+            weight: of("weight"),
+            scales: of("scales"),
+        }
+    }
+
+    fn experts(&self) -> usize {
+        self.weight.shape()[0]
+    }
+
+    /// One expert's rows, decoded. Each is 33 MB in float32 at Inkling-Small's
+    /// shape, so they are decoded on demand and dropped rather than held.
+    fn expert(&self, index: usize) -> Vec<f32> {
+        let stride = |view: &TensorView<'_>| view.data().len() / self.experts();
+        let (codes, scales) = (stride(&self.weight), stride(&self.scales));
+        dequantize_blocks(
+            &self.weight.data()[index * codes..][..codes],
+            &self.scales.data()[index * scales..][..scales],
+        )
+        .unwrap_or_else(|err| panic!("expert {index} decodes: {err}"))
+    }
+}
+
+/// One `SwitchGLU`'s three banks.
+struct PackedExperts<'a> {
+    gate_proj: PackedBank<'a>,
+    up_proj: PackedBank<'a>,
+    down_proj: PackedBank<'a>,
+}
+
+impl<'a> PackedExperts<'a> {
+    fn load(ckpt: &'a Checkpoint, layer: usize, module: &str) -> Self {
+        let module = format!("language_model.model.layers.{layer}.mlp.{module}");
+        Self {
+            gate_proj: PackedBank::load(ckpt, &module, "gate_proj"),
+            up_proj: PackedBank::load(ckpt, &module, "up_proj"),
+            down_proj: PackedBank::load(ckpt, &module, "down_proj"),
+        }
+    }
+
+    /// `[rows, dim]` through one expert. A bank of one is the same bank.
+    fn forward(&self, expert: usize, dim: usize, rows: &[f32]) -> Vec<f32> {
+        let (gate, up, down) = (
+            self.gate_proj.expert(expert),
+            self.up_proj.expert(expert),
+            self.down_proj.expert(expert),
+        );
+        ExpertBank::new(1, dim, &gate, &up, &down)
+            .expert(0)
+            .forward(rows)
+    }
+}
+
+#[test]
+fn the_moe_layer_reproduces_the_reference_against_real_weights() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+
+    let layer = CAPTURED_LAYERS
+        .into_iter()
+        .find(|layer| !config.layer_is_dense(*layer))
+        .expect("the capture covers a MoE layer");
+    let recorded = |name: &str| fixture::f32s(&fixture::layer_tensor(&activations, layer, name));
+
+    let gate = |name: &str| {
+        checkpoint_tensor(
+            &ckpt,
+            &format!("language_model.model.layers.{layer}.mlp.{name}"),
+        )
+        .to_f32()
+        .expect("the gate is not packed")
+    };
+    let (gate_weight, correction_bias) = (gate("gate_weight"), gate("e_score_correction_bias"));
+    let global_scale = gate("global_scale")[0];
+
+    let moe = SparseMoe::new(
+        MoeConfig::for_layer(&config, layer).expect("a MoE layer has a router"),
+        GateWeights {
+            gate_weight: &gate_weight,
+            correction_bias: &correction_bias,
+            global_scale,
+        },
+    );
+    let (x, hidden) = (recorded("post_attention_ln_out"), moe.hidden());
+
+    // Which experts run is the one thing here that has to be exact rather than
+    // close: a single different expert changes the answer by far more than the
+    // bound below, and would fail as an arithmetic disagreement rather than as
+    // the wiring mistake it is. The order within a token is more than the
+    // reference promises — see `SparseMoe::route` — and a capture regenerated on
+    // a backend that partitions differently would fail here for that reason
+    // rather than for a routing one.
+    let routing = moe.route(&moe.gate(&x));
+    assert_eq!(
+        routing.experts(),
+        indices(&fixture::layer_tensor(&activations, layer, "topk_idx")),
+        "layer {layer}: selection"
+    );
+
+    let routed = PackedExperts::load(&ckpt, layer, "switch_mlp");
+    let shared = PackedExperts::load(&ckpt, layer, "shared_experts");
+    let got = moe.forward(
+        &x,
+        |expert, rows| routed.forward(expert, hidden, rows),
+        |expert, rows| shared.forward(expert, hidden, rows),
+    );
+
+    let mut worst = 0.0f32;
+    for (what, got, want) in [
+        ("routed_out", &got.routed, recorded("routed_out")),
+        ("shared_out", &got.shared, recorded("shared_out")),
+        ("mlp_out", &got.total(), recorded("mlp_out")),
+    ] {
+        let deviation = deviation(got, &want);
+        assert!(
+            deviation <= MOE_TOLERANCE,
+            "layer {layer}: {what} deviation {deviation:e}"
+        );
+        worst = worst.max(deviation);
+    }
+    assert!(
+        worst > 0.0,
+        "a run that matched exactly would mean the reference's bfloat16 vanished"
+    );
+
+    // The two shared experts are told apart by their index alone, and a port
+    // that paired `shared_gammas[0]` with the second of them would still add
+    // two always-on experts to every token. Cheap to state here because the
+    // shared bank is two experts rather than the routed bank's 256.
+    let exchanged = moe.forward(
+        &x,
+        |_, rows| vec![0.0; rows.len()],
+        |expert, rows| shared.forward(shared.gate_proj.experts() - 1 - expert, hidden, rows),
+    );
+    let deviation = deviation(&exchanged.shared, &recorded("shared_out"));
+    assert!(
+        deviation > MOE_TOLERANCE,
+        "layer {layer}: exchanging the shared experts deviates by only {deviation:e}"
+    );
+
+    // The correction bias is a weight like any other, and a port that never
+    // loaded it routes every token somewhere else. Stated on the routing rather
+    // than on the output, which would mean decoding a second set of experts.
+    let unbiased = vec![0.0; correction_bias.len()];
+    let flat = SparseMoe::new(
+        moe.config(),
+        GateWeights {
+            gate_weight: &gate_weight,
+            correction_bias: &unbiased,
+            global_scale,
+        },
+    );
+    assert_ne!(
+        flat.route(&flat.gate(&x)).experts(),
+        routing.experts(),
+        "layer {layer}: dropping the correction bias selects the same experts"
     );
 }
