@@ -22,9 +22,9 @@ is one sentence repeated.
 
 Beside the captured layers' intermediates, both ends of the model are recorded:
 the embedding at the front, and at the back the final hidden state — before the
-final norm and after it, because the reference distinguishes them. The forty-two
-layers' own intermediates are not, and could not be committed; the end-to-end
-comparison is what tests the stack.
+final norm and after it, because the reference distinguishes them — and the
+logits the head makes of it. The forty-two layers' own intermediates are not, and
+could not be committed; the end-to-end comparison is what tests the stack.
 
 Everything is captured by wrapping the reference's own modules and functions,
 never by recomputing: a recomputation that drifts from the reference would make
@@ -40,6 +40,12 @@ from mlx_vlm.models.inkling import language
 
 PROMPT = "The lighthouse keeper counted the ships that passed the headland."
 SEQ_LEN = 8
+
+# How deep the recorded ranking goes. Deeper than any assertion is expected to
+# hold — 32 ids and values per position is 2 KB — so that where the ordering
+# stops surviving forty-two layers of bfloat16 is something the fixture can be
+# asked rather than something the fixture has to be regenerated to answer.
+TOP_K = 32
 
 
 class Capture:
@@ -168,6 +174,56 @@ def record_final_hidden_state(capture, lm):
     capture.record("norm_out", lm.norm(capture.tensors["layers_out"]))
 
 
+def _untruncated_logits(language_model, h):
+    """`_logits_from_norm` with its last two lines disabled, which is where the
+    padding logits are.
+
+    `unpadded_vocab_size` is read off the config at call time, so clearing it is
+    the reference's own method answering what it would answer for a checkpoint
+    that stated no truncation. Nothing is reimplemented, which matters most for
+    the one tensor recorded so that a port can be caught skipping the cut."""
+    config = language_model.config
+    stated = config.unpadded_vocab_size
+    config.unpadded_vocab_size = None
+    try:
+        return language_model._logits_from_norm(h)
+    finally:
+        config.unpadded_vocab_size = stated
+
+
+def record_logits(capture, language_model, top_k):
+    """What `_logits_from_norm` makes of the normed state: the muP divide, the
+    projection through `lm_head`, and the cut at `unpadded_vocab_size`.
+
+    All 200058 logits of all eight positions is 6.4 MB, against a bundle that has
+    been kept to a few megabytes throughout, and most of it would pin nothing:
+    what survives forty-two layers of accumulated bfloat16 is the *ordering*, and
+    the ordering that decides anything is at the top. So two things are recorded
+    instead.
+
+    `logits_topk_ids` and `logits_topk_values` are the top `top_k` of every
+    position, which is what an argmax and a top-k comparison need, and what a
+    port that dropped the muP divide fails against on values.
+
+    `logits_untruncated` is every logit of the *last* position — the one that
+    decides the next token — and it is recorded before the cut rather than after.
+    That costs 966 float32 values over the truncated tensor and buys the only
+    committed evidence of what the padding rows produce, which is the question
+    truncation exists to answer."""
+    normed = capture.tensors["norm_out"]
+    logits = language_model._logits_from_norm(normed)
+    untruncated = _untruncated_logits(language_model, normed)
+
+    vocab = logits.shape[-1]
+    if not mx.array_equal(untruncated[..., :vocab], logits):
+        raise SystemExit("the untruncated logits do not extend the truncated ones")
+
+    order = mx.argsort(-logits, axis=-1)[..., :top_k]
+    capture.record("logits_topk_ids", order)
+    capture.record("logits_topk_values", mx.take_along_axis(logits, order, axis=-1))
+    capture.record("logits_untruncated", untruncated[0, -1])
+
+
 def instrument(capture, model):
     lm = model.language_model.model
     taps = [
@@ -274,6 +330,7 @@ def main():
     ap.add_argument("model", help="path to a local checkpoint directory")
     ap.add_argument("--seq-len", type=int, default=SEQ_LEN)
     ap.add_argument("--layers", type=int, nargs="+", default=CAPTURED_LAYERS)
+    ap.add_argument("--top-k", type=int, default=TOP_K)
     ap.add_argument("--name", default="layer_activations")
     ap.add_argument("--out-dir", default="reference/fixtures")
     args = ap.parse_args()
@@ -290,6 +347,7 @@ def main():
         inputs=inputs, cache=model.language_model.make_cache(), skip_logits=True
     )
     record_final_hidden_state(capture, model.language_model.model)
+    record_logits(capture, model.language_model, args.top_k)
 
     tensors = {
         name: as_fixture_dtype(value) for name, value in sorted(capture.tensors.items())

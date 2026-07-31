@@ -709,6 +709,31 @@
       "dtype": "float32"
     },
     {
+      "name": "logits_topk_ids",
+      "shape": [
+        1,
+        8,
+        32
+      ],
+      "dtype": "int32"
+    },
+    {
+      "name": "logits_topk_values",
+      "shape": [
+        1,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "logits_untruncated",
+      "shape": [
+        201024
+      ],
+      "dtype": "float32"
+    },
+    {
       "name": "norm_out",
       "shape": [
         1,
