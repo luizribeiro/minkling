@@ -10,6 +10,7 @@ use std::time::Instant;
 use inkling_core::attention::{Attention, AttentionConfig, AttentionWeights};
 use inkling_core::embed::Embed;
 use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation, indices};
+use inkling_core::generate::{Generator, greedy};
 use inkling_core::head::LmHead;
 use inkling_core::layer::{
     DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts,
@@ -1426,6 +1427,87 @@ fn the_heads_padding_rows_are_zero_and_would_outrank_most_of_the_vocabulary() {
         "no real logit beats zero, so the padding takes the argmax and the hermetic case is \
          reachable here too"
     );
+}
+
+/// The whole engine over this checkpoint: the stack, its final norm, and the
+/// head, which is what `LanguageModel` is.
+fn generator<'a>(weights: &'a CheckpointWeights<'a>) -> Generator<'a> {
+    Generator::new(weights.model(), weights.head())
+}
+
+/// One call of the engine, timed: `ids` through the model and the head, and the
+/// logits of the last of them.
+///
+/// The two regimes are one call apart — a prompt against fresh caches, or one
+/// token against caches carrying everything before it — and they are not the
+/// same price. Measured when this landed: 7 tokens prefilled in 54.7 s, the 8th
+/// decoded in 9.2 s.
+///
+/// The routed experts are why, and not the matmuls. A layer's five projections
+/// and the head are decoded whichever regime it is — 9.0 GB and 3.3 GB, fixed —
+/// but a MoE layer decodes the experts its tokens *chose*, and seven tokens
+/// choose up to seven times as many as one. That is what makes a decode step a
+/// sixth of a seven-token prefill rather than a seventh of it: the fixed part is
+/// what stops it from being cheaper still, and it is exactly the part a
+/// quantised Metal kernel deletes by never decoding at all.
+fn timed_logits(
+    what: &str,
+    weights: &CheckpointWeights<'_>,
+    cache: &mut ModelCache,
+    ids: &[usize],
+) -> Vec<f32> {
+    let started = Instant::now();
+    let logits = generator(weights).logits(cache, ids, weights, |id| weights.head_row(id));
+    eprintln!("{what}: {} token(s) in {:?}", ids.len(), started.elapsed());
+    logits
+}
+
+/// The invariant the whole engine rests on, against trained weights: prefilling
+/// N tokens and then decoding the (N+1)th gives the same logits as one prefill
+/// over all N+1.
+///
+/// **Exactly the same, and that is the assertion.** Every tolerance in this file
+/// exists because the reference computes in bfloat16 and this port in float32.
+/// Nothing of the sort is involved here — both sides of this comparison are this
+/// port, running the same scalar float32 arithmetic over the same weights, and
+/// the only thing a split changes is where a key comes from. A tolerance would
+/// absorb precisely what this exists to catch: a query offset off by one moves a
+/// mask entry by one distance along a band the checkpoint trained to be smooth,
+/// so the answer would only drift.
+///
+/// This is the same claim `generate::tests` makes on the synthetic stack, and
+/// what it adds is everything a five-layer model of width 32 cannot reach: the
+/// checkpoint's own 42 layers, its sliding and global attentions, the packed
+/// experts a router chooses per token, and a head over 200058 rows. The
+/// synthetic stack cannot say that a decode step routes to the same experts a
+/// prefill did, because its expert bank is sixteen held tensors rather than 256
+/// decoded on demand into a buffer the pass reuses.
+#[test]
+fn prefilling_then_decoding_matches_one_prefill_against_real_weights() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+    let (ids, _, _) = recorded_stack(&activations);
+
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+    let (prompt, last) = ids.split_at(ids.len() - 1);
+    assert_eq!(last.len(), 1, "one token is decoded");
+
+    let cache = &mut ModelCache::new(&config);
+    timed_logits("prefill", &weights, cache, prompt);
+    let decoded = timed_logits("decode", &weights, cache, last);
+    let whole = timed_logits("one prefill", &weights, &mut ModelCache::new(&config), &ids);
+
+    let deviation = deviation(&decoded, &whole);
+    eprintln!(
+        "prefill {} + decode 1 against one prefill of {}: deviation {deviation:e}, top-1 {} against {}",
+        prompt.len(),
+        ids.len(),
+        greedy(&decoded),
+        greedy(&whole),
+    );
+    assert_eq!(decoded, whole, "the two paths are the same arithmetic");
 }
 
 /// Whether this checkpoint ties its embeddings, which decides which tensor the
