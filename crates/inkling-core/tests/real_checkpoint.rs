@@ -1510,6 +1510,88 @@ fn prefilling_then_decoding_matches_one_prefill_against_real_weights() {
     assert_eq!(decoded, whole, "the two paths are the same arithmetic");
 }
 
+/// How many tokens the generation case decodes, which is the whole of what the
+/// fixture recorded.
+///
+/// A decoded token costs the CPU path 9.2 s, so eight of them and the prefill
+/// under them is about two minutes — spent deliberately, and the reason the
+/// fixture records exactly this many rather than a length a test would have to
+/// be trimmed to.
+const GENERATED: usize = 8;
+
+/// The milestone: this engine and mlx-vlm producing the same tokens.
+///
+/// Everything else in this file compares a tensor against a tensor. This
+/// compares a *sequence of decisions* — each token sampled from logits this port
+/// produced, fed back through this port's caches, and asked to agree with what
+/// the reference did from the same prompt. It is the first assertion that would
+/// fail for a cache mistake the equivalence test above cannot see, because that
+/// one feeds the recorded ids back and this one feeds back whatever it decided.
+///
+/// **Why token agreement is the right claim and tensor agreement is not.** Forty
+/// two layers of accumulated bfloat16 put this port's logits 0.13 to 0.56 away
+/// from the reference's over the ranked ids, where adjacent logits in the top 32
+/// are routinely 0.0625 apart. So the tail reorders — at six of eight recorded
+/// positions, on values that are distinct — and the argmax does not. Greedy
+/// decoding is what that leaves reproducible, which is why greedy is the only
+/// sampler the engine has.
+///
+/// **And it is not guaranteed to hold forever.** Every generated token is one
+/// argmax over a drifted distribution, so a step whose top two logits are closer
+/// together than the drift is a coin toss, and once one token differs the
+/// sequences are incomparable from there. All eight agreed when this landed —
+/// `[656, 13, 623, 180069, 86333, 60500, 220, 23]`, the whole of what the
+/// fixture recorded — but that is a measurement and not a proof, and the drift
+/// it survived is the same drift that reorders the tail at six of eight recorded
+/// positions. How many agree is therefore reported as well as asserted, and the
+/// assertion is on all of `GENERATED`: a test shrunk until it passed would
+/// report the opposite of what is true.
+#[test]
+fn the_generated_tokens_match_the_oracle_against_real_weights() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+    let (ids, _, _) = recorded_stack(&activations);
+
+    let oracle = indices(&fixture::tensor(&activations, "greedy_continuation"));
+    assert!(
+        oracle.len() >= GENERATED,
+        "the fixture records {} of {GENERATED} tokens",
+        oracle.len()
+    );
+    let want = &oracle[..GENERATED];
+
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+    let started = Instant::now();
+    let got = generator(&weights).generate(
+        &mut ModelCache::new(&config),
+        &ids,
+        GENERATED,
+        &weights,
+        |id| weights.head_row(id),
+    );
+    let elapsed = started.elapsed();
+
+    // No mean over these: one prefill of the prompt and `GENERATED - 1` decode
+    // steps produced them, and those are the two regimes at six times each
+    // other's price. `timed_logits` reports each on its own.
+    //
+    // A token that stops agreeing is a tie before it is a bug. Both sides break
+    // one towards the lower id — `mx.argmax` there and `top_k` here — so a step
+    // whose top two logits are equal in the reference's bfloat16 but ordered in
+    // this port's float32 disagrees without either being wrong. Check the
+    // recorded `logits_topk_values` at the position first.
+    let agreed = got.iter().zip(want).take_while(|(a, b)| a == b).count();
+    eprintln!(
+        "{GENERATED} tokens in {elapsed:?} — one prefill of {} and {} decode steps — \
+         {agreed} agreeing with the oracle\n  got  {got:?}\n  want {want:?}",
+        ids.len(),
+        GENERATED - 1,
+    );
+    assert_eq!(got, want, "{agreed} of {GENERATED} tokens agree");
+}
+
 /// Whether this checkpoint ties its embeddings, which decides which tensor the
 /// head's rows come out of.
 ///
