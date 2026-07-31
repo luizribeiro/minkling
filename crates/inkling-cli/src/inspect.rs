@@ -4,8 +4,10 @@ use std::path::Path;
 
 use anyhow::Result;
 
-pub fn run(config: &Path) -> Result<()> {
-    let cfg: inkling_core::Config = serde_json::from_str(&std::fs::read_to_string(config)?)?;
+use crate::config;
+
+pub fn run(path: &Path) -> Result<()> {
+    let cfg = config::read(path)?;
     let t = &cfg.text_config;
     let kv = t.kv_footprint(2);
 

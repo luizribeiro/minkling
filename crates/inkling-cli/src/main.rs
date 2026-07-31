@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use args::{Command, USAGE};
 
 mod args;
+mod config;
 mod inspect;
 
 /// What an invocation that was never understood exits with, apart from one that
