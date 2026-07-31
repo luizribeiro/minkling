@@ -17,6 +17,7 @@ pub mod config;
 pub mod generate;
 pub mod inspect;
 pub mod openai;
+pub mod serve;
 
 /// Reading a response the way a client does. Behind a feature so that the
 /// checkpoint-gated test in `tests/` — which links this crate from outside and

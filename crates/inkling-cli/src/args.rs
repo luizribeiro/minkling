@@ -16,6 +16,8 @@ pub enum Command {
     Inspect { config: PathBuf },
     /// Continue a prompt, a token at a time.
     Generate(Generate),
+    /// Answer chat completions over HTTP against a loaded checkpoint.
+    Serve(Serve),
 }
 
 /// A generation, as a command line describes one.
@@ -32,6 +34,17 @@ pub struct Generate {
     pub max_tokens: usize,
 }
 
+/// A server, as a command line describes one.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Serve {
+    /// The checkpoint directory, loaded once at startup and served against.
+    pub checkpoint: PathBuf,
+    /// What to listen on, as `tiny_http` takes it.
+    pub address: String,
+    /// The budget for a request that names none of its own.
+    pub max_tokens: usize,
+}
+
 /// How many tokens `generate` decodes when the caller names no budget.
 ///
 /// Eight, which is what the oracle's recorded continuation is. A short prompt
@@ -40,9 +53,24 @@ pub struct Generate {
 /// other words, because a paragraph is an hour.
 pub const DEFAULT_MAX_TOKENS: usize = 8;
 
+/// The budget a request that names none is served under.
+///
+/// Larger than `generate`'s, because a templated turn spends tokens on
+/// `<|content_thinking|>` before it says anything, and smaller than any chat
+/// server's would be, because 64 tokens is ten minutes at 9.2 s a step. A client
+/// that wants more asks for more.
+pub const DEFAULT_SERVE_MAX_TOKENS: usize = 64;
+
+/// Where the server listens when nobody says. Loopback: this is one process
+/// holding a 16.7 GiB model with no authentication of any kind in front of it,
+/// and putting that on every interface is not a default anyone should get by
+/// omission.
+pub const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
+
 pub const USAGE: &str = "usage:\n  \
     inklingrs inspect <config.json>\n  \
-    inklingrs generate <checkpoint-dir> --prompt <text> [--max-tokens <n>]";
+    inklingrs generate <checkpoint-dir> --prompt <text> [--max-tokens <n>]\n  \
+    inklingrs serve <checkpoint-dir> [--address <host:port>] [--max-tokens <n>]";
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ArgError {
@@ -76,6 +104,7 @@ impl Command {
         match command.as_str() {
             "inspect" => inspect(args),
             "generate" => generate(args),
+            "serve" => serve(args),
             _ => Err(ArgError::UnknownCommand(command)),
         }
     }
@@ -101,6 +130,17 @@ fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, 
         .ok_or_else(|| ArgError::MissingValue(flag.to_string()))
 }
 
+/// A budget, which is a count of at least one. Nothing at all is decoded under a
+/// budget of zero — not even the prompt's prefill, which only the first step
+/// runs — so it is a mistake rather than a request, in either command.
+fn count(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize, ArgError> {
+    let count = value(flag, args)?;
+    match count.parse() {
+        Ok(parsed) if parsed > 0 => Ok(parsed),
+        _ => Err(ArgError::NotACount(count)),
+    }
+}
+
 fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
     let mut args = args.into_iter();
     let mut checkpoint = None;
@@ -110,13 +150,7 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--prompt" | "-p" => prompt = Some(value(&arg, &mut args)?),
-            "--max-tokens" | "-n" => {
-                let count = value(&arg, &mut args)?;
-                max_tokens = match count.parse() {
-                    Ok(count) if count > 0 => count,
-                    _ => return Err(ArgError::NotACount(count)),
-                };
-            }
+            "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
             _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
             _ => return Err(ArgError::Unexpected(arg)),
@@ -137,6 +171,32 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
                 command: "generate",
                 what: "--prompt <text>",
             })?,
+        max_tokens,
+    }))
+}
+
+fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
+    let mut args = args.into_iter();
+    let mut checkpoint = None;
+    let mut address = DEFAULT_ADDRESS.to_string();
+    let mut max_tokens = DEFAULT_SERVE_MAX_TOKENS;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--address" | "-a" => address = value(&arg, &mut args)?,
+            "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
+            _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
+            _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
+            _ => return Err(ArgError::Unexpected(arg)),
+        }
+    }
+
+    Ok(Command::Serve(Serve {
+        checkpoint: checkpoint.ok_or(ArgError::Missing {
+            command: "serve",
+            what: "a path to a checkpoint directory",
+        })?,
+        address,
         max_tokens,
     }))
 }
@@ -339,6 +399,74 @@ mod tests {
         assert_eq!(
             parse(&["generate", "models/small", "models/other", "-p", "Once"]),
             Err(ArgError::Unexpected("models/other".to_string()))
+        );
+    }
+
+    fn serving(args: &[&str]) -> Result<Serve, ArgError> {
+        match parse(args)? {
+            Command::Serve(serve) => Ok(serve),
+            other => panic!("{args:?} parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_takes_a_checkpoint_an_address_and_a_budget() {
+        assert_eq!(
+            serving(&["serve", "models/small", "-a", "0.0.0.0:9000", "-n", "3"]),
+            Ok(Serve {
+                checkpoint: PathBuf::from("models/small"),
+                address: "0.0.0.0:9000".to_string(),
+                max_tokens: 3,
+            })
+        );
+    }
+
+    /// A server nobody gave an address is on loopback, not on every interface.
+    /// There is no authentication in front of it, so the difference is who can
+    /// reach a 16.7 GiB model, and it should not turn on an argument being
+    /// forgotten.
+    #[test]
+    fn a_server_that_names_no_address_listens_on_loopback() {
+        let serve = serving(&["serve", "models/small"]).expect("parses");
+        assert_eq!(serve.address, DEFAULT_ADDRESS);
+        assert!(serve.address.starts_with("127.0.0.1:"), "{}", serve.address);
+        assert_eq!(serve.max_tokens, DEFAULT_SERVE_MAX_TOKENS);
+    }
+
+    #[test]
+    fn serve_without_a_checkpoint_is_refused() {
+        assert!(matches!(
+            parse(&["serve"]),
+            Err(ArgError::Missing {
+                command: "serve",
+                ..
+            })
+        ));
+    }
+
+    /// The budget is a count of at least one wherever it is written, which is
+    /// the one rule both commands share rather than each having its own.
+    #[test]
+    fn a_budget_that_is_not_a_count_is_refused_by_either_command() {
+        for count in ["0", "-1", "many"] {
+            assert_eq!(
+                parse(&["serve", "models/small", "-n", count]),
+                Err(ArgError::NotACount(count.to_string())),
+                "{count:?}"
+            );
+            assert_eq!(
+                parse(&["generate", "models/small", "-p", "Once", "-n", count]),
+                Err(ArgError::NotACount(count.to_string())),
+                "{count:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_refuses_a_flag_it_does_not_have() {
+        assert_eq!(
+            parse(&["serve", "models/small", "--prompt", "Once"]),
+            Err(ArgError::Unexpected("--prompt".to_string()))
         );
     }
 }

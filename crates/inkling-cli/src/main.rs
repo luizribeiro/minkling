@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use inkling_cli::args::{Command, USAGE};
-use inkling_cli::{generate, inspect};
+use inkling_cli::{generate, inspect, serve};
 
 /// What an invocation that was never understood exits with, apart from one that
 /// ran and failed. A caller scripting this can tell a typo from a config that
@@ -20,6 +20,7 @@ fn main() -> ExitCode {
     let ran = match command {
         Command::Inspect { config } => inspect::run(&config),
         Command::Generate(args) => generate::run(&args),
+        Command::Serve(args) => serve::run(&args),
     };
     match ran {
         Ok(()) => ExitCode::SUCCESS,

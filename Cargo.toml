@@ -26,6 +26,14 @@ thiserror = "2"
 # bar or a trainer.
 tokenizers = { version = "0.23", default-features = false, features = [ "fancy-regex" ] }
 
+# The socket and the request parser under `serve`, and nothing else: a blocking
+# accept loop, which is what a server that holds one 16.7 GiB model and decodes
+# one request at a time actually is. Four transitive crates — `ascii`,
+# `chunked_transfer`, `httpdate`, `log` — against the ~100 an async stack brings,
+# and no executor to pretend a 9 s CPU decode step can be awaited. TLS is behind
+# a feature this does not turn on.
+tiny_http = { version = "0.12", default-features = false }
+
 # The CPU ops are scalar loops, and a test that drives the whole 42-layer stack
 # runs tens of gigabytes through them. Unoptimised that is half an hour; this
 # makes it minutes. `test` inherits from `dev`, and so does a dependency built
