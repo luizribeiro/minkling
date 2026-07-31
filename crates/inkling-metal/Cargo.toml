@@ -21,3 +21,7 @@ thiserror.workspace = true
 # tree is stated, and for the recorded activations the checkpoint-gated tests
 # drive the head with.
 inkling-core = { workspace = true, features = [ "test-support" ] }
+
+# The checkpoint's `config.json`, which the gated test that runs the whole
+# engine needs to know how wide the head is. The backend itself reads no json.
+serde_json.workspace = true

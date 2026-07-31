@@ -8,14 +8,23 @@
 //! carries a tensor whose group scales, code distribution and sheer reduction
 //! count are the ones the engine will actually run against, and only a real
 //! checkpoint asks whether one dispatch of that size survives the GPU watchdog.
+//!
+//! It is also the only place the two backends can be run against each other in
+//! anger. `inkling-core` cannot reach a Metal device — the dependency points the
+//! other way — so the engine driven from end to end with its head on the GPU is
+//! a case that has to live here, beside the kernel it is measuring.
 
-use std::path::PathBuf;
-use std::time::Instant;
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
-use inkling_core::fixture::{self, ACTIVATIONS, deviation};
+use inkling_core::fixture::{self, ACTIVATIONS, deviation, indices};
 use inkling_core::ops::linear;
 use inkling_core::quant::{BITS, dequantize_blocks_into};
-use inkling_core::{Checkpoint, Dtype, TensorView};
+use inkling_core::{
+    Checkpoint, CheckpointWeights, Config, Dtype, Ending, Generator, ModelCache, TensorView,
+};
 use inkling_metal::{Device, MetalError, PackedMatmul, PackedProjection};
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -59,6 +68,27 @@ const CODES_PER_WORD: usize = u32::BITS as usize / BITS;
 /// invert while still producing weights of the right magnitude — 3.2, seven
 /// decades above.
 const TOLERANCE: f32 = 1e-6;
+
+/// The checkpoint's own config, which is what says how wide the head is and
+/// where the vocabulary stops.
+fn config(dir: &Path) -> Config {
+    let text =
+        std::fs::read_to_string(dir.join("config.json")).expect("the checkpoint carries a config");
+    serde_json::from_str(&text).expect("config.json parses")
+}
+
+fn resident_bytes() -> u64 {
+    let pid = std::process::id().to_string();
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .expect("ps reports rss in KiB")
+        * 1024
+}
 
 fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var_os(CHECKPOINT_VAR).map(PathBuf::from);
@@ -369,6 +399,123 @@ fn one_dispatch_does_an_lm_head_shaped_multiply_without_meeting_the_watchdog() {
         on_the_cpu.as_secs_f64() / dispatched.as_secs_f64(),
     );
     assert!(dispatched < on_the_cpu, "the kernel bought nothing");
+}
+
+/// How many tokens the end-to-end case decodes, which is the whole of what the
+/// fixture recorded and what `inkling-core` asserts on the CPU path.
+const GENERATED: usize = 8;
+
+/// What the whole process may hold resident with the head on the device.
+///
+/// Two things are in the number this test reports and only one of them is the
+/// head's. The head adds 411 MB of codes and 26 MB of scales in shared storage,
+/// which on Apple silicon is the same physical memory the mapping is in rather
+/// than a second copy behind a bus — 0.44 GiB, and measured as such at the
+/// command line: 20.36 GiB on the CPU path against 20.79 GiB with the head on
+/// the device, over the same generation.
+///
+/// The rest is the generation. `inkling-core`'s
+/// `the_whole_stack_holds_its_resident_set_under_a_bound` peaks at 16.7 GiB over
+/// a single eight-token pass; eight decode steps route to eight tokens' worth of
+/// experts across 42 layers, so more of the checkpoint is touched and every page
+/// of it stays mapped. Observed here when this landed: 23.29 GiB.
+///
+/// The bound is therefore the same 32 GiB, and for the same reason: what it has
+/// to refuse is a residency that grew by a *tensor*, not by a fraction of one.
+const RESIDENT_BOUND: u64 = 32 << 30;
+
+/// The engine, with the largest projection in it running on the GPU, against the
+/// tokens mlx-vlm generated from the same prompt.
+///
+/// **This is the assertion with teeth, and it is the same one the CPU path
+/// makes.** `inkling-core`'s `the_generated_tokens_match_the_oracle` establishes
+/// that the eight recorded ids are what this engine decodes; what this says is
+/// that changing where `lm_head` multiplies does not change one of them. Every
+/// generated token is an argmax over a distribution 42 layers of accumulated
+/// bfloat16 have already moved, and two of the eight recorded positions carry a
+/// top-1/top-2 margin *narrower* than that accumulated deviation — so a head
+/// that is arithmetically better is not thereby guaranteed to agree, and this is
+/// where that would show.
+///
+/// A token that stops agreeing is a finding rather than a bound to widen. The
+/// kernel sums 128 products a lane and reduces 32 lanes in a tree where the CPU
+/// sums 4096 serially, and `the_packed_matmul_reproduces_the_cpu_over_the_real_head`
+/// measures the kernel as the *closer* of the two to an f64 accumulation — so a
+/// flipped token would mean a position where the reference's own bfloat16 logits
+/// are tied or all but tied, which the recorded `logits_topk_values` at that
+/// position settles.
+///
+/// The timings go to stderr rather than into an assertion. What one dispatch
+/// costs is already measured above; what this reports is what a decode step
+/// costs once the head is no longer most of it.
+#[test]
+fn the_generated_tokens_match_the_oracle_with_the_head_on_the_device() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
+
+    let config = config(&dir).text_config;
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let activations = fixture::open(ACTIVATIONS);
+    let ids = indices(&fixture::tensor(&activations, "input_ids"));
+    let oracle = indices(&fixture::tensor(&activations, "greedy_continuation"));
+    let want = &oracle[..GENERATED];
+
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+    let vocab = weights.head().vocab();
+    let started = Instant::now();
+    let head = PackedProjection::upload_packed(&device, &matmul, &weights.head_packed(), vocab)
+        .expect("the head uploads");
+    eprintln!(
+        "{vocab} rows of the head uploaded in {:?}",
+        started.elapsed()
+    );
+
+    // Once, before the loop rather than inside it. The head is 0.41 GiB and a
+    // decode step reads all of it, so an upload per token would move more bytes
+    // than the multiply it enables — see `PackedProjection`.
+    let weights = weights.with_head(Box::new(head));
+    let generator = Generator::new(weights.model(), weights.head(), weights.head_projection());
+
+    let mut steps: Vec<Duration> = Vec::new();
+    let mut got = Vec::new();
+    let mut step = Instant::now();
+    let mut peak = resident_bytes();
+    generator.stream(
+        &mut ModelCache::new(&config),
+        &ids,
+        Ending {
+            budget: GENERATED,
+            eos: None,
+        },
+        &weights,
+        |id| {
+            steps.push(step.elapsed());
+            peak = peak.max(resident_bytes());
+            got.push(id);
+            step = Instant::now();
+            ControlFlow::Continue(())
+        },
+    );
+
+    // The prompt's prefill is the first step and every later one is a single
+    // decode; a mean over the two describes neither.
+    let (prefill, decode) = steps.split_first().expect("a step per token");
+    let each = decode.iter().sum::<Duration>() / decode.len() as u32;
+    eprintln!(
+        "{} tokens prefilled in {prefill:.2?}, {} decoded at {each:.2?}/token, peak RSS {:.2} GiB\
+         \n  got  {got:?}\n  want {want:?}",
+        ids.len(),
+        decode.len(),
+        peak as f64 / (1u64 << 30) as f64,
+    );
+
+    let agreed = got.iter().zip(want).take_while(|(a, b)| a == b).count();
+    assert_eq!(got, want, "{agreed} of {GENERATED} tokens agree");
+    assert!(
+        peak < RESIDENT_BOUND,
+        "peak RSS {peak} bytes is over the bound of {RESIDENT_BOUND}"
+    );
 }
 
 /// The other shape in the model, which the head does not cover: one expert of a
