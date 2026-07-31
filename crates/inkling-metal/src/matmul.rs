@@ -93,6 +93,9 @@ pub enum MatmulError {
         expected: usize,
         got: usize,
     },
+
+    #[error("expert {expert} of a bank that holds {experts}")]
+    NoSuchExpert { expert: usize, experts: usize },
 }
 
 /// The compiled kernel, which every packed projection on a device shares.
@@ -119,24 +122,31 @@ impl PackedMatmul {
     }
 }
 
-/// One projection's weights, on the device exactly as the checkpoint stores
-/// them.
+/// An `[experts, out_dim, in_dim]` MXFP4 weight on the device, and the gathered
+/// multiply against it.
 ///
-/// Made resident once and multiplied against many times, which is the shape the
-/// model wants: `lm_head` is 411 MB of codes, and a decode step that re-uploaded
-/// them would be moving more bytes than the multiply reads. Wrapped it is not
-/// moving them at all.
+/// **The gather is what makes 137 GB of routed experts affordable to have
+/// resident.** A decode step's token picks 6 of 256, and every row of a call
+/// names the expert it goes through, so one dispatch reads the six banks that
+/// were chosen and never touches the other 250 — the win is precisely in not
+/// reading them, and a kernel that took the expert as a shape rather than as a
+/// per-row index could not express it in one dispatch.
+///
+/// Made resident once and multiplied against many times. Wrapped, "once" is 40
+/// microseconds a gibibyte and no copy, so what that phrase used to be defending
+/// against is gone.
 #[derive(Debug)]
-pub struct PackedProjection<'a> {
+pub struct PackedBank<'a> {
     device: &'a Device,
     matmul: &'a PackedMatmul,
+    experts: usize,
     in_dim: usize,
     out_dim: usize,
     resident: RefCell<Resident<'a>>,
 }
 
-/// What a projection holds on the device between calls: the two tensors the
-/// checkpoint pairs, and the shape the kernel reads its bounds out of.
+/// What a bank holds on the device between calls: the two tensors the checkpoint
+/// pairs, and the shape the kernel reads its bounds out of.
 #[derive(Debug)]
 struct Resident<'a> {
     shape: Buffer<u32>,
@@ -144,30 +154,12 @@ struct Resident<'a> {
     scales: Bytes<'a>,
 }
 
-/// The scalars in the order the kernel's `Shape` struct declares them.
-///
-/// The kernel reads them as `uint`, so this is where a shape too large to
-/// describe has to stop. Unreachable through any real weight — four billion rows
-/// of anything is decades past the 348 GiB one allocation can hold — and a
-/// truncation would not fail: it would dispatch a grid for the wrong shape over
-/// buffers of the right one.
-fn shape(rows: usize, in_dim: usize, out_dim: usize, resident: &Resident<'_>) -> [u32; 5] {
-    [
-        rows,
-        in_dim,
-        out_dim,
-        resident.codes.offset(),
-        resident.scales.offset(),
-    ]
-    .map(|extent| {
-        u32::try_from(extent).unwrap_or_else(|_| panic!("{extent} is wider than a kernel's uint"))
-    })
-}
-
-/// Whether `codes` and `scales` are an `[out_dim, in_dim]` MXFP4 weight, which
-/// has to be settled on the way in: the kernel takes its bounds from the shape
-/// it was told and would read off the end of whichever tensor was short.
-pub(crate) fn pairs(
+/// Whether `codes` and `scales` are an `[experts, out_dim, in_dim]` MXFP4
+/// weight, which has to be settled on the way in: the kernel takes its bounds
+/// from the shape it was told and would read off the end of whichever tensor was
+/// short.
+fn pairs(
+    experts: usize,
     in_dim: usize,
     out_dim: usize,
     codes: usize,
@@ -177,19 +169,19 @@ pub(crate) fn pairs(
         return Err(MatmulError::PartialGroup(in_dim));
     }
 
-    let expected = out_dim * in_dim / CODES_PER_BYTE;
+    let expected = experts * out_dim * in_dim / CODES_PER_BYTE;
     if codes != expected {
         return Err(MatmulError::WrongCodeLen {
-            rows: out_dim,
+            rows: experts * out_dim,
             in_dim,
             expected,
             got: codes,
         });
     }
-    let expected = out_dim * in_dim / GROUP_SIZE;
+    let expected = experts * out_dim * in_dim / GROUP_SIZE;
     if scales != expected {
         return Err(MatmulError::WrongScaleLen {
-            rows: out_dim,
+            rows: experts * out_dim,
             in_dim,
             expected,
             got: scales,
@@ -198,14 +190,225 @@ pub(crate) fn pairs(
     Ok(())
 }
 
-impl<'a> PackedProjection<'a> {
-    /// Copy an `[out_dim, in_dim]` MXFP4 weight onto the device, as the two
-    /// tensors the checkpoint pairs: `codes` is the bytes of the `U32` weight
-    /// and `scales` the bytes of the `U8` one.
+impl<'a> PackedBank<'a> {
+    /// Copy an `[experts, out_dim, in_dim]` MXFP4 weight onto the device, as the
+    /// two tensors the checkpoint pairs: `codes` is the bytes of the `U32`
+    /// weight and `scales` the bytes of the `U8` one.
     ///
     /// For weights that are not a mapping's — a test's synthetic bytes, and
-    /// anything a future path builds rather than reads.
-    /// [`PackedProjection::wrap_packed`] is what a checkpoint's own tensor takes.
+    /// anything a future path builds rather than reads. [`PackedBank::wrap`] is
+    /// what a checkpoint's own tensor takes.
+    pub fn upload(
+        device: &'a Device,
+        matmul: &'a PackedMatmul,
+        experts: usize,
+        in_dim: usize,
+        out_dim: usize,
+        codes: &[u8],
+        scales: &[u8],
+    ) -> Result<Self, MatmulError> {
+        pairs(experts, in_dim, out_dim, codes.len(), scales.len())?;
+        Self::over(
+            device,
+            matmul,
+            experts,
+            in_dim,
+            out_dim,
+            Bytes::Copied(device.buffer(codes)?),
+            Bytes::Copied(device.buffer(scales)?),
+        )
+    }
+
+    /// A checkpoint's own bank, read where it is mapped: every slice of its
+    /// leading axis is an expert, and `in_dim` says how each expert's remaining
+    /// values divide into rows.
+    ///
+    /// `in_dim` rather than `out_dim` because that is the axis the checkpoint's
+    /// shape does not give. A routed bank is `[256, 2048, 512]` `U32`, whose last
+    /// axis is packed words rather than either dimension of the multiply.
+    pub fn wrap(
+        device: &'a Device,
+        matmul: &'a PackedMatmul,
+        packed: &Packed<'a>,
+        in_dim: usize,
+    ) -> Result<Self, MatmulError> {
+        let experts = packed.slices();
+        Self::wrapping(
+            device,
+            matmul,
+            packed,
+            experts,
+            in_dim,
+            packed.slice_len() / in_dim,
+            experts,
+        )
+    }
+
+    fn wrapping(
+        device: &'a Device,
+        matmul: &'a PackedMatmul,
+        packed: &Packed<'a>,
+        slices: usize,
+        in_dim: usize,
+        out_dim: usize,
+        experts: usize,
+    ) -> Result<Self, MatmulError> {
+        let (codes, scales) = packed.prefix(slices);
+        pairs(experts, in_dim, out_dim, codes.len(), scales.len())?;
+        // SAFETY: the bytes are a `Checkpoint`'s mapping, which outlives this by
+        // the lifetime they carry and which nothing writes — the assumption that
+        // module already maps under.
+        let (codes, scales) = unsafe { (device.wrap(codes)?, device.wrap(scales)?) };
+        Self::over(
+            device,
+            matmul,
+            experts,
+            in_dim,
+            out_dim,
+            Bytes::Mapped(codes),
+            Bytes::Mapped(scales),
+        )
+    }
+
+    fn over(
+        device: &'a Device,
+        matmul: &'a PackedMatmul,
+        experts: usize,
+        in_dim: usize,
+        out_dim: usize,
+        codes: Bytes<'a>,
+        scales: Bytes<'a>,
+    ) -> Result<Self, MatmulError> {
+        let bank = Self {
+            resident: RefCell::new(Resident {
+                shape: device.zeroed(SHAPE_FIELDS)?,
+                codes,
+                scales,
+            }),
+            device,
+            matmul,
+            experts,
+            in_dim,
+            out_dim,
+        };
+        bank.write_shape(0);
+        Ok(bank)
+    }
+
+    pub fn experts(&self) -> usize {
+        self.experts
+    }
+
+    pub fn in_dim(&self) -> usize {
+        self.in_dim
+    }
+
+    pub fn out_dim(&self) -> usize {
+        self.out_dim
+    }
+
+    /// The scalars the kernel's `Shape` struct declares, in its order, written
+    /// where it reads them.
+    ///
+    /// The kernel reads them as `uint`, so this is where a shape too large to
+    /// describe has to stop. Unreachable through any real weight — four billion
+    /// rows of anything is decades past the 348 GiB one allocation can hold — and
+    /// a truncation would not fail: it would dispatch a grid for the wrong shape
+    /// over buffers of the right one.
+    fn write_shape(&self, rows: usize) {
+        let mut resident = self.resident.borrow_mut();
+        let stride = self.out_dim * self.in_dim;
+        let shape = [
+            rows,
+            self.in_dim,
+            self.out_dim,
+            resident.codes.offset(),
+            resident.scales.offset(),
+            stride / CODES_PER_BYTE,
+            stride / GROUP_SIZE,
+        ]
+        .map(|extent| {
+            u32::try_from(extent)
+                .unwrap_or_else(|_| panic!("{extent} is wider than a kernel's uint"))
+        });
+        resident.shape.as_mut_slice().copy_from_slice(&shape);
+    }
+
+    /// `[rows, in_dim]` in, `[rows, out_dim]` out, row `i` multiplied against
+    /// expert `experts[i]`.
+    ///
+    /// Fallible where [`Projection::forward`] is not, because a dispatch can
+    /// fail in ways no arithmetic can: the watchdog kills a command buffer that
+    /// runs too long, and a caller that wants to say so rather than die needs
+    /// the error.
+    pub fn multiply(&self, experts: &[u32], x: &[f32]) -> Result<Vec<f32>, MatmulError> {
+        assert_eq!(
+            x.len(),
+            experts.len() * self.in_dim,
+            "{} values are not {} rows of {}",
+            x.len(),
+            experts.len(),
+            self.in_dim
+        );
+        // Checked here because the kernel cannot: an index past the bank is an
+        // offset past the buffer, which a GPU read answers with whatever is
+        // there rather than with a fault.
+        if let Some(past) = experts
+            .iter()
+            .find(|expert| **expert as usize >= self.experts)
+        {
+            return Err(MatmulError::NoSuchExpert {
+                expert: *past as usize,
+                experts: self.experts,
+            });
+        }
+
+        let rows = experts.len();
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        self.write_shape(rows);
+
+        let mut resident = self.resident.borrow_mut();
+        let resident = &mut *resident;
+        let mut chosen = self.device.buffer(experts)?;
+        let mut x = self.device.buffer(x)?;
+        let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
+        let args = [
+            resident.shape.arg(),
+            chosen.arg(),
+            x.arg(),
+            resident.codes.arg(),
+            resident.scales.arg(),
+            out.arg(),
+        ];
+
+        let elements = rows * self.out_dim;
+        let kernel = &self.matmul.kernel;
+        let grid = Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP);
+        self.device.run(kernel, &args, grid)?;
+
+        Ok(out.to_vec())
+    }
+}
+
+/// One `[out_dim, in_dim]` weight, as the bank of one expert it is.
+///
+/// A projection and a bank are the same operation over the same format — the
+/// difference is only whether the leading axis has anything in it — so this is
+/// a [`PackedBank`] that names the one expert every row goes through rather
+/// than a second way of dispatching. `lm_head` is the caller.
+#[derive(Debug)]
+pub struct PackedProjection<'a> {
+    bank: PackedBank<'a>,
+    /// The expert each row goes through, which for a bank of one is row after
+    /// row of zero. Sized to the call and keeping its allocation, because a
+    /// decode step asks for one row and a prefill for eight.
+    chosen: RefCell<Vec<u32>>,
+}
+
+impl<'a> PackedProjection<'a> {
+    /// Copy an `[out_dim, in_dim]` MXFP4 weight onto the device.
     pub fn upload(
         device: &'a Device,
         matmul: &'a PackedMatmul,
@@ -214,15 +417,9 @@ impl<'a> PackedProjection<'a> {
         codes: &[u8],
         scales: &[u8],
     ) -> Result<Self, MatmulError> {
-        pairs(in_dim, out_dim, codes.len(), scales.len())?;
-        Self::over(
-            device,
-            matmul,
-            in_dim,
-            out_dim,
-            Bytes::Copied(device.buffer(codes)?),
-            Bytes::Copied(device.buffer(scales)?),
-        )
+        Ok(Self::of(PackedBank::upload(
+            device, matmul, 1, in_dim, out_dim, codes, scales,
+        )?))
     }
 
     /// A checkpoint's own tensor, cut to its first `out_dim` slices and read
@@ -239,87 +436,37 @@ impl<'a> PackedProjection<'a> {
         packed: &Packed<'a>,
         out_dim: usize,
     ) -> Result<Self, MatmulError> {
-        let (codes, scales) = packed.prefix(out_dim);
-        let in_dim = packed.slice_len();
-        pairs(in_dim, out_dim, codes.len(), scales.len())?;
-        // SAFETY: the bytes are a `Checkpoint`'s mapping, which outlives this by
-        // the lifetime they carry and which nothing writes — the assumption that
-        // module already maps under.
-        let (codes, scales) = unsafe { (device.wrap(codes)?, device.wrap(scales)?) };
-        Self::over(
+        Ok(Self::of(PackedBank::wrapping(
             device,
             matmul,
-            in_dim,
+            packed,
             out_dim,
-            Bytes::Mapped(codes),
-            Bytes::Mapped(scales),
-        )
+            packed.slice_len(),
+            out_dim,
+            1,
+        )?))
     }
 
-    fn over(
-        device: &'a Device,
-        matmul: &'a PackedMatmul,
-        in_dim: usize,
-        out_dim: usize,
-        codes: Bytes<'a>,
-        scales: Bytes<'a>,
-    ) -> Result<Self, MatmulError> {
-        let mut resident = Resident {
-            shape: device.zeroed(SHAPE_FIELDS)?,
-            codes,
-            scales,
-        };
-        let shape = shape(0, in_dim, out_dim, &resident);
-        resident.shape.as_mut_slice().copy_from_slice(&shape);
-        Ok(Self {
-            resident: RefCell::new(resident),
-            device,
-            matmul,
-            in_dim,
-            out_dim,
-        })
+    fn of(bank: PackedBank<'a>) -> Self {
+        Self {
+            bank,
+            chosen: RefCell::new(Vec::new()),
+        }
     }
 
     /// `[rows, in_dim]` in, `[rows, out_dim]` out.
-    ///
-    /// Fallible where [`Projection::forward`] is not, because a dispatch can
-    /// fail in ways no arithmetic can: the watchdog kills a command buffer that
-    /// runs too long, and a caller that wants to say so rather than die needs
-    /// the error.
     pub fn multiply(&self, x: &[f32]) -> Result<Vec<f32>, MatmulError> {
         assert_eq!(
-            x.len() % self.in_dim,
+            x.len() % self.bank.in_dim(),
             0,
             "{} values are not whole rows of {}",
             x.len(),
-            self.in_dim
+            self.bank.in_dim()
         );
-        let rows = x.len() / self.in_dim;
-        if rows == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut resident = self.resident.borrow_mut();
-        let resident = &mut *resident;
-        let shape = shape(rows, self.in_dim, self.out_dim, resident);
-        resident.shape.as_mut_slice().copy_from_slice(&shape);
-
-        let mut x = self.device.buffer(x)?;
-        let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
-        let args = [
-            resident.shape.arg(),
-            x.arg(),
-            resident.codes.arg(),
-            resident.scales.arg(),
-            out.arg(),
-        ];
-
-        let elements = rows * self.out_dim;
-        let kernel = &self.matmul.kernel;
-        let grid = Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP);
-        self.device.run(kernel, &args, grid)?;
-
-        Ok(out.to_vec())
+        let rows = x.len() / self.bank.in_dim();
+        let mut chosen = self.chosen.borrow_mut();
+        chosen.resize(rows, 0);
+        self.bank.multiply(&chosen, x)
     }
 }
 
@@ -333,11 +480,11 @@ impl<'a> PackedProjection<'a> {
 /// `inkling_core::weights`, that nothing above it can do anything about it.
 impl Projection for PackedProjection<'_> {
     fn in_dim(&self) -> usize {
-        self.in_dim
+        self.bank.in_dim()
     }
 
     fn out_dim(&self) -> usize {
-        self.out_dim
+        self.bank.out_dim()
     }
 
     fn forward(&self, x: &[f32]) -> Vec<f32> {
@@ -374,7 +521,7 @@ constant float ELEMENTS[] = {{ {} }};
 }
 
 /// How many `uint`s the kernel's `Shape` struct declares.
-const SHAPE_FIELDS: usize = 5;
+const SHAPE_FIELDS: usize = 7;
 
 /// Everything of the kernel that the format does not decide.
 ///
@@ -415,14 +562,22 @@ struct Shape {
     uint out_dim;
     uint code_base;
     uint scale_base;
+    uint code_stride;
+    uint scale_stride;
 };
 
+/// `out[i] = x[i] @ w[experts[i]]^T` over an `[experts, out_dim, in_dim]` bank.
+///
+/// The expert is per row and not per dispatch, which is the whole of what a
+/// gather is: the six of 256 a token chose are six strides into the same bank,
+/// and the 250 it did not choose are addresses no thread forms.
 kernel void packed_matmul(
     constant Shape &shape [[buffer(0)]],
-    device const float *x [[buffer(1)]],
-    device const uchar *codes [[buffer(2)]],
-    device const uchar *scales [[buffer(3)]],
-    device float *out [[buffer(4)]],
+    device const uint *experts [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device const uchar *codes [[buffer(3)]],
+    device const uchar *scales [[buffer(4)]],
+    device float *out [[buffer(5)]],
     uint position [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint width [[threads_per_simdgroup]]
@@ -434,11 +589,13 @@ kernel void packed_matmul(
 
     const uint row = element / shape.out_dim;
     const uint col = element % shape.out_dim;
+    const uint expert = experts[row];
     const uint bytes = shape.in_dim / CODES_PER_BYTE;
 
     float sum = weight_dot(
-        codes + shape.code_base + (ulong)col * bytes,
-        scales + shape.scale_base + (ulong)col * (bytes / BYTES_PER_GROUP),
+        codes + shape.code_base + (ulong)expert * shape.code_stride + (ulong)col * bytes,
+        scales + shape.scale_base + (ulong)expert * shape.scale_stride
+            + (ulong)col * (bytes / BYTES_PER_GROUP),
         x + (ulong)row * shape.in_dim,
         bytes,
         lane,
@@ -932,6 +1089,108 @@ mod tests {
             fixture::VOCAB_PADDING
         );
         assert!(deviation <= TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// The gather, against the projections it is a gather over.
+    ///
+    /// A `[3, OUT_DIM, IN_DIM]` bank is three `[OUT_DIM, IN_DIM]` weights laid
+    /// end to end, so what a gathered dispatch has to produce is exactly what
+    /// three separate projections produce over the rows that named them — and
+    /// that is the whole claim, because the arithmetic inside is the same kernel
+    /// either way and only the address it forms differs.
+    ///
+    /// The list repeats an expert and skips one, which is what a decode step's
+    /// routing does: three of the four rows here go through expert 2 and none
+    /// goes through expert 1.
+    ///
+    /// Its two axes are then separated, which is the mistake worth catching. A
+    /// kernel that read the expert off the dispatch, or the input row off the
+    /// expert, would still fill the buffer with plausible numbers — so three of
+    /// the rows carry the same input under different experts and the fourth
+    /// carries a different input under a repeated one, and each pair says which
+    /// index moved.
+    #[test]
+    fn a_gathered_dispatch_multiplies_each_row_against_the_expert_it_named() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        const EXPERTS: usize = 3;
+
+        let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, 2);
+        let bank = PackedBank::upload(
+            &device,
+            &matmul,
+            EXPERTS,
+            IN_DIM,
+            OUT_DIM,
+            &case.packed(),
+            &case.scales,
+        )
+        .expect("the bank's shapes pair");
+
+        let chosen = [2u32, 0, 2, 2];
+        let inputs = [0usize, 0, 0, 1];
+        let x: Vec<f32> = inputs
+            .iter()
+            .flat_map(|row| case.x[row * IN_DIM..][..IN_DIM].to_vec())
+            .collect();
+        let got = bank.multiply(&chosen, &x).expect("the dispatch completes");
+        assert_eq!(got.len(), chosen.len() * OUT_DIM);
+
+        let codes_per_expert = OUT_DIM * IN_DIM / CODES_PER_BYTE;
+        let scales_per_expert = OUT_DIM * IN_DIM / GROUP_SIZE;
+        let packed = case.packed();
+        for (row, (expert, input)) in chosen.iter().zip(inputs).enumerate() {
+            let at = *expert as usize;
+            let alone = PackedProjection::upload(
+                &device,
+                &matmul,
+                IN_DIM,
+                OUT_DIM,
+                &packed[at * codes_per_expert..][..codes_per_expert],
+                &case.scales[at * scales_per_expert..][..scales_per_expert],
+            )
+            .expect("one expert's shapes pair")
+            .multiply(&case.x[input * IN_DIM..][..IN_DIM])
+            .expect("the dispatch completes");
+            assert_eq!(got[row * OUT_DIM..][..OUT_DIM], alone[..], "row {row}");
+        }
+
+        let row = |i: usize| &got[i * OUT_DIM..][..OUT_DIM];
+        assert_eq!(row(0), row(2), "one expert, one input, twice");
+        assert_ne!(row(0), row(1), "the expert index is read off the row");
+        assert_ne!(row(0), row(3), "the input row is read off the row");
+    }
+
+    /// An index past the bank is an offset past the buffer, and a GPU read
+    /// answers that with whatever is there rather than with a fault — so it has
+    /// to be refused on this side, where the bank's length is known.
+    #[test]
+    fn a_row_that_names_an_expert_the_bank_does_not_hold_is_refused() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let case = Case::noisy(GROUP_SIZE, 2 * 4, 1);
+        let bank = PackedBank::upload(
+            &device,
+            &matmul,
+            2,
+            GROUP_SIZE,
+            4,
+            &case.packed(),
+            &case.scales,
+        )
+        .expect("the bank's shapes pair");
+
+        assert!(bank.multiply(&[1], &case.x).is_ok(), "the last expert");
+        assert!(
+            matches!(
+                bank.multiply(&[2], &case.x),
+                Err(MatmulError::NoSuchExpert {
+                    expert: 2,
+                    experts: 2
+                })
+            ),
+            "one past the last"
+        );
     }
 
     /// A batch that happens to be empty is the caller's business rather than an

@@ -259,7 +259,11 @@ pub fn softmax(row: &mut [f32]) {
 /// `SwiGLUMLP` computes `swiglu(gate_proj(x), up_proj(x))`, and mlx-vlm's
 /// `swiglu` is `silu(gate) * x`. The two are interchangeable to anyone reading
 /// generated text and not to the numbers.
-fn swiglu(gate: &mut [f32], up: &[f32]) {
+///
+/// Public because a backend that runs the two projections as dispatches still
+/// has to join them, and a second spelling of which operand the activation goes
+/// on is the one mistake this whole comment exists to prevent.
+pub fn swiglu(gate: &mut [f32], up: &[f32]) {
     for (gate, up) in gate.iter_mut().zip(up) {
         *gate = silu(*gate) * up;
     }

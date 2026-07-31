@@ -282,6 +282,20 @@ impl<'a> PackedExperts<'a> {
         self.gate_proj.slices()
     }
 
+    /// The three banks still packed, for a backend that takes the weight rather
+    /// than the values.
+    pub fn gate_proj(&self) -> Packed<'a> {
+        self.gate_proj
+    }
+
+    pub fn up_proj(&self) -> Packed<'a> {
+        self.up_proj
+    }
+
+    pub fn down_proj(&self) -> Packed<'a> {
+        self.down_proj
+    }
+
     /// How many values one expert's three projections decode to, which is what
     /// running a single expert costs.
     pub fn expert_floats(&self) -> usize {

@@ -17,6 +17,7 @@
 
 pub mod buffer;
 pub mod device;
+pub mod experts;
 pub mod kernel;
 pub mod matmul;
 
@@ -25,5 +26,6 @@ mod testing;
 
 pub use buffer::{Arg, Buffer, Bytes, Element, Mapped};
 pub use device::{Device, MetalError};
+pub use experts::{ExpertBanks, LayerExperts};
 pub use kernel::{Grid, Kernel};
-pub use matmul::{MatmulError, PackedMatmul, PackedProjection};
+pub use matmul::{MatmulError, PackedBank, PackedMatmul, PackedProjection};

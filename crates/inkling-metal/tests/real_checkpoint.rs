@@ -21,8 +21,10 @@ use std::time::{Duration, Instant};
 use inkling_core::fixture::{self, ACTIVATIONS, deviation, indices};
 use inkling_core::ops::linear;
 use inkling_core::quant::{BITS, dequantize_blocks_into};
-use inkling_core::{Checkpoint, CheckpointWeights, Dtype, Ending, ModelCache, TensorView};
-use inkling_metal::{Device, MetalError, PackedMatmul, PackedProjection};
+use inkling_core::{
+    Checkpoint, CheckpointWeights, Dtype, Ending, ModelCache, Packed as CorePacked, TensorView,
+};
+use inkling_metal::{Device, MetalError, PackedBank, PackedMatmul, PackedProjection};
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
 
@@ -497,18 +499,23 @@ fn the_generated_tokens_match_the_oracle_with_the_head_on_the_device() {
 /// The other shape in the model, which the head does not cover: one expert of a
 /// `[256, 2048, 4096]` routed bank, 2048 rows where the head has 201024.
 ///
-/// The kernel knows nothing about that leading axis. What it is handed is the
-/// byte range of one slice of it, told those bytes are an `[out, in]` weight,
-/// and that is exactly how a gather will reach an expert — so the claim worth
-/// making here is that a slice offset by an expert multiplies to what decoding
-/// the same slice gives. Cheap beside the head: 4 MB of codes against 411.
+/// The gather is what the kernel does with that leading axis, and it is the
+/// thing a synthetic bank cannot settle: a stride of 4 MB across 1.06 GiB of
+/// wrapped mapping, on the bytes the engine will actually index. So the rows
+/// here name experts that are far apart and repeat one of them, and each is
+/// checked against decoding that expert's own slice.
+///
+/// The bank is wrapped rather than copied, which is what makes it cheap enough
+/// to state on a real one at all: 1.06 GiB in 40 microseconds instead of 130
+/// milliseconds and a second copy.
 #[test]
-fn the_packed_matmul_reproduces_the_cpu_over_one_routed_expert() {
+fn the_gathered_matmul_reproduces_the_cpu_over_a_routed_bank() {
     let Some(dir) = checkpoint_dir() else { return };
     let Some(device) = device() else { return };
     let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
     let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
 
+    let packed = CorePacked::open(&ckpt, ROUTED_EXPERTS).expect("the checkpoint holds the bank");
     let bank = Packed::open(&ckpt, ROUTED_EXPERTS);
     let &[experts, out_dim, packed_width] = bank.codes.shape() else {
         panic!(
@@ -517,47 +524,81 @@ fn the_packed_matmul_reproduces_the_cpu_over_one_routed_expert() {
         )
     };
     assert_eq!(packed_width * CODES_PER_WORD, HIDDEN, "an expert's width");
-    assert!(experts > 1, "a bank of one would not need the slicing");
+    assert!(experts > 1, "a bank of one would not need the gather");
+
+    let started = Instant::now();
+    let resident = PackedBank::wrap(&device, &matmul, &packed, HIDDEN).expect("the bank wraps");
+    let bytes = bank.codes.data().len() + bank.scales.data().len();
+    eprintln!(
+        "{ROUTED_EXPERTS}: {experts} experts of [{out_dim}, {HIDDEN}], {:.2} GiB wrapped in {:.2?}",
+        bytes as f64 / (1u64 << 30) as f64,
+        started.elapsed()
+    );
+    assert_eq!(resident.experts(), experts);
+    assert_eq!(resident.out_dim(), out_dim);
+
+    // Far apart in the bank and one of them repeated, which is the shape a
+    // token's six-of-256 has. The last is the last expert with a neighbour to
+    // be told apart from, which is as far into the bank as this can reach and
+    // still check what it checks.
+    let chosen: Vec<u32> = vec![6, 200, 6, experts as u32 - 2];
+    let x: Vec<f32> = chosen.iter().flat_map(|_| x_row()).collect();
+
+    let started = Instant::now();
+    let got = resident
+        .multiply(&chosen, &x)
+        .expect("the dispatch completes");
+    eprintln!(
+        "{} rows gathered out of the bank in {:.2?}",
+        chosen.len(),
+        started.elapsed()
+    );
+    assert_eq!(got.len(), chosen.len() * out_dim);
 
     let slice = |view: &TensorView<'_>, index: usize| {
         let stride = view.data().len() / experts;
         view.data()[index * stride..][..stride].to_vec()
     };
-    let through = |index: usize| {
-        PackedProjection::upload(
-            &device,
-            &matmul,
-            HIDDEN,
-            out_dim,
-            &slice(&bank.codes, index),
-            &slice(&bank.scales, index),
-        )
-        .expect("the expert's two slices pair")
-        .multiply(&x_row())
-        .expect("the dispatch completes")
-    };
-
-    let expert = 6;
     let mut weight = vec![0.0; out_dim * HIDDEN];
-    dequantize_blocks_into(
-        &slice(&bank.codes, expert),
-        &slice(&bank.scales, expert),
-        &mut weight,
-    )
-    .expect("the expert decodes");
-    let want = linear(&x_row(), &weight, HIDDEN);
+    let mut worst = 0.0f32;
+    for (row, expert) in chosen.iter().enumerate() {
+        let expert = *expert as usize;
+        dequantize_blocks_into(
+            &slice(&bank.codes, expert),
+            &slice(&bank.scales, expert),
+            &mut weight,
+        )
+        .expect("the expert decodes");
+        let want = linear(&x_row(), &weight, HIDDEN);
+        let mine = deviation(&got[row * out_dim..][..out_dim], &want);
+        assert!(mine <= TOLERANCE, "expert {expert}: {mine:e}");
+        worst = worst.max(mine);
 
-    let got = through(expert);
-    assert_eq!(got.len(), out_dim, "one value per expert row");
-    let worst = deviation(&got, &want);
-    eprintln!("expert {expert} of {ROUTED_EXPERTS}: worst deviation {worst:e}");
-    assert!(worst <= TOLERANCE, "deviation {worst:e}");
-
-    // Its neighbour in the bank is the same shape and different weights, so a
-    // slice taken an expert out would run and be quietly wrong.
-    let neighbour = deviation(&through(expert + 1), &want);
-    assert!(
-        neighbour > TOLERANCE,
-        "two adjacent experts of a bank deviate by only {neighbour:e}"
+        // Its neighbour in the bank is the same shape and different weights, so
+        // a stride an expert out would run and be quietly wrong.
+        dequantize_blocks_into(
+            &slice(&bank.codes, expert + 1),
+            &slice(&bank.scales, expert + 1),
+            &mut weight,
+        )
+        .expect("the neighbour decodes");
+        let want = linear(&x_row(), &weight, HIDDEN);
+        let neighbour = deviation(&got[row * out_dim..][..out_dim], &want);
+        assert!(
+            neighbour > TOLERANCE,
+            "experts {expert} and {} deviate by only {neighbour:e}",
+            expert + 1
+        );
+    }
+    eprintln!(
+        "worst deviation over {} gathered rows: {worst:e}",
+        chosen.len()
     );
+
+    assert_eq!(
+        got[..out_dim],
+        got[2 * out_dim..3 * out_dim],
+        "one expert, one input, twice"
+    );
+    assert_ne!(got[..out_dim], got[out_dim..2 * out_dim]);
 }
