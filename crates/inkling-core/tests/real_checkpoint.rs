@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use inkling_core::attention::{Attention, AttentionConfig, AttentionWeights};
+use inkling_core::embed::Embed;
 use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation, indices};
 use inkling_core::layer::{DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use inkling_core::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
@@ -645,5 +646,161 @@ fn the_decoder_layer_reproduces_the_reference_against_real_weights() {
     assert!(
         worst > 0.0,
         "a run that matched exactly would mean the reference's bfloat16 vanished"
+    );
+}
+
+/// `embed_norm` over a real lookup, which is the bound `embed::tests` accounts
+/// for: MLX rounds this norm's intermediate to bfloat16 before applying the
+/// weight and rounds again after, and this port rounds nowhere, so one quantum
+/// of the tensor's peak — 2^-9 — is the floor. Two of them is the bound.
+/// Worst observed when this landed: 1.9e-3, the same as the hermetic case,
+/// because the lookup under it is exact.
+const EMBED_NORM_TOLERANCE: f32 = 4e-3;
+
+/// The embedding table, left packed. Decoded whole it is `[201024, 4096]` of
+/// float32 — 3.3 GB — so a row is decoded when a token asks for it, which is
+/// what [`PackedBank`] already does for an expert of a bank.
+fn embedding_table(ckpt: &Checkpoint) -> PackedBank<'_> {
+    PackedBank::load(ckpt, "language_model.model", "embed_tokens")
+}
+
+fn embed_norm_weight(ckpt: &Checkpoint) -> Vec<f32> {
+    checkpoint_tensor(ckpt, "language_model.model.embed_norm.weight")
+        .to_f32()
+        .expect("a bfloat16 tensor")
+}
+
+fn root_mean_square(values: &[f32]) -> f64 {
+    let sum: f64 = values.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
+    (sum / values.len() as f64).sqrt()
+}
+
+/// What no committed fixture can settle about the lookup: that `embed_tokens`
+/// is named what this port thinks, that it is MXFP4 like every projection
+/// rather than the float array a lookup usually slices, and that decoding one
+/// of its rows is what the reference's embedding returns. The table is 3.3 GB
+/// decoded, so only a real checkpoint carries it.
+///
+/// Exact rather than bounded, and that is the assertion rather than a
+/// convenience: every MXFP4 element is a magnitude of at most three significant
+/// bits times a power of two, so a decoded row is representable in bfloat16 and
+/// the reference's dequantisation into it loses nothing. A lookup that
+/// disagreed at all would be reading the wrong row or the wrong bytes, which is
+/// not a difference a tolerance should absorb.
+#[test]
+fn the_embedding_lookup_reproduces_the_reference_against_real_weights() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let activations = fixture::open(ACTIVATIONS);
+
+    let ids = indices(&fixture::tensor(&activations, "input_ids"));
+    let want = fixture::f32s(&fixture::tensor(&activations, "embed_out"));
+
+    let table = embedding_table(&ckpt);
+    let got = Embed::new(None, 0.0).forward(&ids, |id| table.expert(id));
+
+    assert_eq!(got.len(), want.len(), "length");
+    for (i, (got, want)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "value {i}: {got:e} is not {want:e}"
+        );
+    }
+}
+
+/// The whole of `InklingModel.embed`: ids in, the tensor layer 0 consumes out.
+/// The hermetic case drives the norm from a recorded `embed_out`, so only this
+/// one runs the two steps against each other.
+#[test]
+fn the_embedding_reproduces_the_reference_from_ids_against_real_weights() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+    assert!(
+        config.use_embed_norm,
+        "the recorded pass normalised; a checkpoint that does not is a different capture"
+    );
+
+    let ids = indices(&fixture::tensor(&activations, "input_ids"));
+    let want = fixture::f32s(&fixture::tensor(&activations, "embed_norm_out"));
+
+    let table = embedding_table(&ckpt);
+    let weight = embed_norm_weight(&ckpt);
+    let embed = Embed::new(Some(&weight), config.rms_norm_eps);
+
+    let deviation = deviation(&embed.forward(&ids, |id| table.expert(id)), &want);
+    assert!(deviation <= EMBED_NORM_TOLERANCE, "deviation {deviation:e}");
+}
+
+/// What the table's padding rows hold, which is the question that decides
+/// whether the lookup needs a guard at all.
+///
+/// `lm_head`'s padding is all-zero codes under all-zero scales — the MXFP4
+/// fixture's `vocab_padding` slice pins that — and the natural assumption is
+/// that the embedding table at the other end of the model matches. It does not.
+/// Every one of its 966 padding rows carries small nonzero values, so an id
+/// past `unpadded_vocab_size` returns noise rather than nothing.
+///
+/// How much noise is the second half of the answer, and it is not the
+/// thousandfold attenuation the table suggests. `embed_norm` divides by the
+/// row's own RMS, which would erase the difference outright; what stops it is
+/// that a padding row's mean square lands 46 times below `rms_norm_eps`, so the
+/// epsilon dominates the divide. The gap survives, compressed by two orders of
+/// magnitude: measured when this landed, 1228x in the table and 7.8x after the
+/// norm. Both halves of that are asserted, because either one alone would leave
+/// the wrong impression.
+///
+/// Nothing is guarded on the strength of this: the reference does not guard,
+/// and a tokenizer cannot emit such an id. It is stated so that the assumption
+/// is on the record rather than inherited from `lm_head`.
+#[test]
+fn the_embedding_tables_padding_rows_are_small_but_neither_zero_nor_normalised_away() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+
+    let unpadded = config
+        .unpadded_vocab_size
+        .expect("the checkpoint states an unpadded vocabulary");
+    let table = embedding_table(&ckpt);
+    assert_eq!(table.experts(), config.vocab_size, "table rows");
+    assert!(unpadded < config.vocab_size, "the table is padded at all");
+
+    let weight = embed_norm_weight(&ckpt);
+    let padding: Vec<usize> = (unpadded..config.vocab_size).collect();
+    let vocabulary = indices(&fixture::tensor(&activations, "input_ids"));
+    let looked_up = |ids: &[usize]| Embed::new(None, 0.0).forward(ids, |id| table.expert(id));
+    let normalised = |ids: &[usize]| {
+        Embed::new(Some(&weight), config.rms_norm_eps).forward(ids, |id| table.expert(id))
+    };
+
+    let rows = looked_up(&padding);
+    for (row, values) in rows.chunks_exact(config.hidden_size).enumerate() {
+        assert!(
+            values.iter().any(|x| *x != 0.0),
+            "row {} is all zeros",
+            unpadded + row
+        );
+    }
+
+    let in_the_table = root_mean_square(&looked_up(&vocabulary)) / root_mean_square(&rows);
+    assert!(
+        in_the_table > 100.0,
+        "padding is only {in_the_table:.1}x below a real row in the table"
+    );
+
+    let after_the_norm =
+        root_mean_square(&normalised(&vocabulary)) / root_mean_square(&normalised(&padding));
+    assert!(
+        after_the_norm > 2.0,
+        "the norm erased the gap entirely, at {after_the_norm:.1}x"
+    );
+    assert!(
+        in_the_table / after_the_norm > 100.0,
+        "the norm compressed the gap by only {:.0}x, from {in_the_table:.1} to {after_the_norm:.1}",
+        in_the_table / after_the_norm
     );
 }
