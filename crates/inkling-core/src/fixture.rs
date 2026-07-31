@@ -45,6 +45,16 @@ pub fn f32s(view: &TensorView<'_>) -> Vec<f32> {
     view.to_f32().expect("float32 widens")
 }
 
+/// An index tensor's values. Every dump casts integers to int32 before saving,
+/// for the same reason it casts floats to float32.
+pub fn indices(view: &TensorView<'_>) -> Vec<usize> {
+    assert_eq!(view.dtype(), Dtype::I32);
+    view.data()
+        .chunks_exact(size_of::<i32>())
+        .map(|b| i32::from_le_bytes(b.try_into().expect("chunked into ints")) as usize)
+        .collect()
+}
+
 /// The worst absolute disagreement with a reference tensor, as a fraction of
 /// that tensor's largest value.
 ///

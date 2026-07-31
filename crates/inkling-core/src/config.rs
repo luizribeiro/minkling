@@ -117,6 +117,7 @@ impl TextConfig {
 mod tests {
     use super::*;
     use crate::attention::AttentionConfig;
+    use crate::moe::MoeConfig;
 
     /// Trimmed from `thinkingmachines/Inkling-Small`, values verbatim.
     const INKLING_SMALL: &str = r#"{
@@ -207,6 +208,23 @@ mod tests {
             .filter(|&i| t.layer_is_dense(i))
             .collect();
         assert_eq!(dense, vec![0, 1]);
+    }
+
+    /// A dense layer has an `InklingDenseMLP` and no router at all, so it has no
+    /// MoE config either.
+    #[test]
+    fn only_the_layers_past_the_dense_ones_carry_a_router() {
+        let t = cfg().text_config;
+        assert_eq!(MoeConfig::for_layer(&t, 1), None);
+        assert_eq!(
+            MoeConfig::for_layer(&t, 2),
+            Some(MoeConfig {
+                n_routed: 256,
+                n_shared: 2,
+                top_k: 6,
+                route_scale: 8.0,
+            })
+        );
     }
 
     #[test]
