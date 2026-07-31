@@ -1,0 +1,486 @@
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use memmap2::Mmap;
+use safetensors::{SafeTensorError, SafeTensors, tensor::Metadata};
+use serde::Deserialize;
+
+pub use safetensors::Dtype;
+
+const INDEX_FILE: &str = "model.safetensors.index.json";
+const SHARD_EXTENSION: &str = "safetensors";
+const HEADER_LEN_FIELD: usize = size_of::<u64>();
+
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointError {
+    #[error("no checkpoint at {}", .0.display())]
+    NotFound(PathBuf),
+
+    #[error("{} holds neither {INDEX_FILE} nor any *.{SHARD_EXTENSION}", .0.display())]
+    NoTensorFiles(PathBuf),
+
+    #[error("{} is not a readable shard index: {source}", .path.display())]
+    MalformedIndex {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[error("{} lists shard {}, which is not on disk", .index.display(), .shard.display())]
+    MissingShard { index: PathBuf, shard: PathBuf },
+
+    #[error("{} is not a readable safetensors file: {source}", .path.display())]
+    MalformedShard {
+        path: PathBuf,
+        source: SafeTensorError,
+    },
+
+    #[error("{name} appears in both {} and {}", .first.display(), .second.display())]
+    DuplicateTensor {
+        name: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
+
+    #[error("no tensor named {0} in this checkpoint")]
+    NoSuchTensor(String),
+
+    #[error("cannot read {}: {source}", .path.display())]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+/// A checkpoint opened for reading, either a directory of index-listed shards
+/// or a single `*.safetensors` file.
+///
+/// Opening maps every shard and reads its header — a few KiB each — but no
+/// tensor bytes. The slice handed out by [`Checkpoint::tensor`] faults its
+/// pages in on first touch, so a 140 GB checkpoint costs nothing to open.
+pub struct Checkpoint {
+    shards: Vec<Shard>,
+    owners: BTreeMap<String, usize>,
+}
+
+/// The dtype, shape and undecoded bytes of one tensor.
+///
+/// The bytes are exactly as they sit in the file: MXFP4 blocks stay packed and
+/// bf16 stays 16-bit. Decoding belongs to the layer that knows what it wants.
+#[derive(Debug, Clone, Copy)]
+pub struct TensorView<'a> {
+    dtype: Dtype,
+    shape: &'a [usize],
+    data: &'a [u8],
+}
+
+impl<'a> TensorView<'a> {
+    pub fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+
+    pub fn shape(&self) -> &'a [usize] {
+        self.shape
+    }
+
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+}
+
+impl Checkpoint {
+    /// Open a checkpoint directory or a single `*.safetensors` file.
+    ///
+    /// Tensor metadata comes from the shard headers rather than from the
+    /// index's `weight_map`: the headers are what the bytes are addressed
+    /// against, so a stale or truncated index cannot silently misplace a
+    /// tensor. The index is read only to learn which files to map.
+    pub fn open(path: &Path) -> Result<Self, CheckpointError> {
+        let mut shards: Vec<Shard> = Vec::new();
+        let mut owners: BTreeMap<String, usize> = BTreeMap::new();
+
+        for shard_path in shard_paths(path)? {
+            let shard = Shard::open(&shard_path)?;
+            let index = shards.len();
+            for name in shard.metadata.offset_keys() {
+                if let Some(&first) = owners.get(&name) {
+                    return Err(CheckpointError::DuplicateTensor {
+                        name,
+                        first: shards[first].path.clone(),
+                        second: shard.path,
+                    });
+                }
+                owners.insert(name, index);
+            }
+            shards.push(shard);
+        }
+
+        Ok(Self { shards, owners })
+    }
+
+    /// Every tensor in the checkpoint, in name order.
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.owners.keys().map(String::as_str)
+    }
+
+    pub fn num_shards(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub fn tensor(&self, name: &str) -> Result<TensorView<'_>, CheckpointError> {
+        self.owners
+            .get(name)
+            .and_then(|&shard| self.shards[shard].view(name))
+            .ok_or_else(|| CheckpointError::NoSuchTensor(name.to_owned()))
+    }
+}
+
+impl std::fmt::Debug for Checkpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Checkpoint")
+            .field("shards", &self.shards.len())
+            .field("tensors", &self.owners.len())
+            .finish()
+    }
+}
+
+struct Shard {
+    path: PathBuf,
+    map: Mmap,
+    data_start: usize,
+    metadata: Metadata,
+}
+
+impl Shard {
+    fn open(path: &Path) -> Result<Self, CheckpointError> {
+        let io = io_error(path);
+        let file = File::open(path).map_err(&io)?;
+        // SAFETY: the mapping aliases the file's pages, so a concurrent writer
+        // truncating or rewriting the checkpoint would be undefined behaviour.
+        // Checkpoints are read-only artefacts for the lifetime of a process.
+        let map = unsafe { Mmap::map(&file) }.map_err(&io)?;
+
+        let (header_len, metadata) =
+            SafeTensors::read_metadata(&map).map_err(|source| CheckpointError::MalformedShard {
+                path: path.to_owned(),
+                source,
+            })?;
+
+        Ok(Self {
+            path: path.to_owned(),
+            map,
+            data_start: HEADER_LEN_FIELD + header_len,
+            metadata,
+        })
+    }
+
+    fn view(&self, name: &str) -> Option<TensorView<'_>> {
+        let info = self.metadata.info(name)?;
+        let (start, end) = info.data_offsets;
+        Some(TensorView {
+            dtype: info.dtype,
+            shape: &info.shape,
+            // `read_metadata` rejects offsets that overrun the file.
+            data: &self.map[self.data_start + start..self.data_start + end],
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ShardIndex {
+    weight_map: BTreeMap<String, String>,
+}
+
+fn io_error(path: &Path) -> impl Fn(std::io::Error) -> CheckpointError + '_ {
+    move |source| CheckpointError::Io {
+        path: path.to_owned(),
+        source,
+    }
+}
+
+fn shard_paths(path: &Path) -> Result<Vec<PathBuf>, CheckpointError> {
+    if path.is_file() {
+        return Ok(vec![path.to_owned()]);
+    }
+    if !path.is_dir() {
+        return Err(CheckpointError::NotFound(path.to_owned()));
+    }
+
+    let index = path.join(INDEX_FILE);
+    let shards = if index.is_file() {
+        indexed_shard_paths(&index, path)?
+    } else {
+        loose_shard_paths(path)?
+    };
+
+    if shards.is_empty() {
+        return Err(CheckpointError::NoTensorFiles(path.to_owned()));
+    }
+    Ok(shards)
+}
+
+fn loose_shard_paths(dir: &Path) -> Result<Vec<PathBuf>, CheckpointError> {
+    let entries = std::fs::read_dir(dir).map_err(io_error(dir))?;
+    let mut loose: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == SHARD_EXTENSION))
+        .collect();
+    loose.sort();
+    Ok(loose)
+}
+
+fn indexed_shard_paths(index: &Path, dir: &Path) -> Result<Vec<PathBuf>, CheckpointError> {
+    let text = std::fs::read_to_string(index).map_err(io_error(index))?;
+    let parsed: ShardIndex =
+        serde_json::from_str(&text).map_err(|source| CheckpointError::MalformedIndex {
+            path: index.to_owned(),
+            source,
+        })?;
+
+    let mut names: Vec<&str> = parsed.weight_map.values().map(String::as_str).collect();
+    names.sort_unstable();
+    names.dedup();
+
+    names
+        .into_iter()
+        .map(|name| {
+            let shard = dir.join(name);
+            if shard.is_file() {
+                Ok(shard)
+            } else {
+                Err(CheckpointError::MissingShard {
+                    index: index.to_owned(),
+                    shard,
+                })
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::*;
+
+    /// The committed oracle dump: a single file, no index.
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../reference/fixtures/layer_activations.safetensors"
+    );
+
+    fn fixture() -> Checkpoint {
+        Checkpoint::open(Path::new(FIXTURE)).expect("fixture opens")
+    }
+
+    struct Blob {
+        dtype: Dtype,
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    impl safetensors::View for &Blob {
+        fn dtype(&self) -> Dtype {
+            self.dtype
+        }
+        fn shape(&self) -> &[usize] {
+            &self.shape
+        }
+        fn data(&self) -> Cow<'_, [u8]> {
+            Cow::Borrowed(&self.data)
+        }
+        fn data_len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    fn write_shard(path: &Path, name: &str, byte: u8) {
+        let blob = Blob {
+            dtype: Dtype::U32,
+            shape: vec![2, 2],
+            data: vec![byte; 16],
+        };
+        safetensors::serialize_to_file([(name, &blob)], None, path).expect("shard is written");
+    }
+
+    /// Two shards, one tensor each, wired together by an index.
+    fn sharded_checkpoint(dir: &Path) {
+        write_shard(&dir.join("model-00001-of-00002.safetensors"), "first", 0xaa);
+        write_shard(
+            &dir.join("model-00002-of-00002.safetensors"),
+            "second",
+            0xbb,
+        );
+        std::fs::write(
+            dir.join(INDEX_FILE),
+            r#"{"metadata": {"total_size": 32}, "weight_map": {
+                 "first":  "model-00001-of-00002.safetensors",
+                 "second": "model-00002-of-00002.safetensors"
+               }}"#,
+        )
+        .expect("index is written");
+    }
+
+    #[test]
+    fn single_file_layout_needs_no_index() {
+        let ckpt = fixture();
+        assert_eq!(ckpt.num_shards(), 1);
+        assert_eq!(ckpt.tensor_names().count(), 46);
+    }
+
+    #[test]
+    fn views_carry_dtype_shape_and_undecoded_bytes() {
+        let ckpt = fixture();
+
+        let embed = ckpt.tensor("embed_out").expect("embed_out");
+        assert_eq!(embed.dtype(), Dtype::F32);
+        assert_eq!(embed.shape(), [1, 8, 4096]);
+        assert_eq!(embed.data().len(), 8 * 4096 * 4);
+
+        let ids = ckpt.tensor("input_ids").expect("input_ids");
+        assert_eq!(ids.dtype(), Dtype::I32);
+        assert_eq!(ids.shape(), [1, 8]);
+        assert_eq!(ids.data().len(), 8 * 4);
+    }
+
+    #[test]
+    fn absent_tensor_is_a_typed_error() {
+        let err = fixture().tensor("layer0.nonesuch").unwrap_err();
+        assert!(
+            matches!(&err, CheckpointError::NoSuchTensor(name) if name == "layer0.nonesuch"),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("layer0.nonesuch"));
+    }
+
+    #[test]
+    fn sharded_layout_resolves_tensors_to_their_own_shard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        sharded_checkpoint(dir.path());
+
+        let ckpt = Checkpoint::open(dir.path()).expect("sharded checkpoint opens");
+        assert_eq!(ckpt.num_shards(), 2);
+        assert_eq!(ckpt.tensor_names().collect::<Vec<_>>(), ["first", "second"]);
+        assert_eq!(ckpt.tensor("first").expect("first").data(), [0xaa; 16]);
+        assert_eq!(ckpt.tensor("second").expect("second").data(), [0xbb; 16]);
+    }
+
+    #[test]
+    fn loose_shards_are_discovered_without_an_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shard(
+            &dir.path().join("model-00002-of-00002.safetensors"),
+            "second",
+            0xbb,
+        );
+        write_shard(
+            &dir.path().join("model-00001-of-00002.safetensors"),
+            "first",
+            0xaa,
+        );
+        std::fs::write(dir.path().join("config.json"), "{}").expect("non-shard file is written");
+
+        let ckpt = Checkpoint::open(dir.path()).expect("loose checkpoint opens");
+        assert_eq!(ckpt.num_shards(), 2);
+        assert_eq!(ckpt.tensor_names().collect::<Vec<_>>(), ["first", "second"]);
+        assert_eq!(ckpt.tensor("second").expect("second").data(), [0xbb; 16]);
+    }
+
+    #[test]
+    fn a_tensor_claimed_by_two_shards_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shard(
+            &dir.path().join("model-00001-of-00002.safetensors"),
+            "first",
+            0xaa,
+        );
+        write_shard(
+            &dir.path().join("model-00002-of-00002.safetensors"),
+            "first",
+            0xbb,
+        );
+
+        let err = Checkpoint::open(dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, CheckpointError::DuplicateTensor { name, .. } if name == "first"),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("model-00002-of-00002.safetensors"));
+    }
+
+    #[test]
+    fn an_index_listing_no_shards_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(INDEX_FILE), r#"{"weight_map": {}}"#)
+            .expect("index is written");
+
+        let err = Checkpoint::open(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::NoTensorFiles(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn shard_listed_but_absent_names_the_shard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        sharded_checkpoint(dir.path());
+        std::fs::remove_file(dir.path().join("model-00002-of-00002.safetensors")).expect("removed");
+
+        let err = Checkpoint::open(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::MissingShard { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("model-00002-of-00002.safetensors"));
+    }
+
+    #[test]
+    fn malformed_index_names_the_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        sharded_checkpoint(dir.path());
+        std::fs::write(dir.path().join(INDEX_FILE), "{\"weight_map\": [")
+            .expect("index is written");
+
+        let err = Checkpoint::open(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::MalformedIndex { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains(INDEX_FILE));
+    }
+
+    #[test]
+    fn truncated_shard_names_the_shard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shard = dir.path().join("model.safetensors");
+        write_shard(&shard, "first", 0xaa);
+        let full = std::fs::read(&shard).expect("read back");
+        std::fs::write(&shard, &full[..full.len() - 4]).expect("truncated");
+
+        let err = Checkpoint::open(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::MalformedShard { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("model.safetensors"));
+    }
+
+    #[test]
+    fn directory_without_tensors_is_distinct_from_a_missing_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = Checkpoint::open(dir.path()).unwrap_err();
+        assert!(
+            matches!(empty, CheckpointError::NoTensorFiles(_)),
+            "got {empty:?}"
+        );
+
+        let absent = Checkpoint::open(&dir.path().join("nowhere")).unwrap_err();
+        assert!(
+            matches!(absent, CheckpointError::NotFound(_)),
+            "got {absent:?}"
+        );
+        assert!(absent.to_string().contains("nowhere"));
+    }
+}
