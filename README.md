@@ -25,20 +25,34 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-Keep the budget small: a decode step is about 8.4 s against mlx-vlm's 32 ms, and
+Keep the budget small: a decode step is about 3.2 s against mlx-vlm's 32 ms, and
 the timings go to stderr so stdout stays pipeable. The prompt reaches the
 tokenizer as it stands, so the model *continues* it rather
 than answering it. A chat turn is written out in full —
 `<|message_user|><|content_text|>…<|end_message|><|message_model|>` — rather than
 applied by a template this does not implement.
 
-`lm_head` runs on the GPU — one dispatch against MXFP4 codes it never decodes,
-1.4 ms where the same multiply costs the CPU 687 ms — and `--backend cpu` puts
-it back. That is worth 0.6 s of a 9.0 s token and not the several seconds the
-ratio suggests: a decode step is dequantisation, at about 4.9 GB/s of it, and
-the head is 3.3 GB of the 44 GB it decodes while the 42 layers below are the
-other 41. Both backends generate the same tokens, and the CPU one stays the
-oracle every kernel here is validated against.
+The routed experts and `lm_head` run on the GPU, against MXFP4 codes they never
+decode, and `--backend cpu` puts them back: 3.2 s a token against the CPU's 8.9.
+The experts are where that comes from. A token reads 6 of each MoE layer's 256
+experts and both of its shared ones, which is 32 GB of float32 the CPU path
+decodes to multiply against and 4.3 GB of packed bytes the GPU path indexes into
+and never decodes at all — 73% of a decode step, gone in one dispatch per
+projection per layer.
+
+**Nothing is copied onto the device.** The forty layers' banks are 137 GB, which
+is the whole checkpoint but for its two ends, and they are handed to the GPU
+where the checkpoint mapped them — `newBufferWithBytesNoCopy` over all of it in
+6 ms. So the resident set goes *down*, 20.8 GiB to 2.4 GiB, and a bank nobody
+routes to costs nothing to have wrapped. Note what that number stops meaning:
+those pages are still in the unified buffer cache, they are simply no longer
+this process's.
+
+What is left is the 9 GB of attention and dense-FFN projections the CPU still
+decodes, which is 78% of a step — and of that, two thirds is the *multiply*
+rather than the decode, a serial f32 dot product no compiler may vectorise. Both
+backends generate the same tokens, and the CPU one stays the oracle every kernel
+here is validated against.
 
 Or the same model behind an OpenAI-compatible endpoint, loaded once:
 
