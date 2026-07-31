@@ -276,6 +276,7 @@ dependencies = [
  "inkling-core",
  "inkling-metal",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
