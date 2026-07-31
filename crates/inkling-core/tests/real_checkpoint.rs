@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use inkling_core::attention::{Attention, AttentionConfig, AttentionWeights};
 use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation, indices};
+use inkling_core::layer::{DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use inkling_core::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
+use inkling_core::ops::DenseMlp;
 use inkling_core::quant::{dequantize, dequantize_blocks};
 use inkling_core::{Checkpoint, Config, Dtype, TensorView, TextConfig};
 
@@ -139,13 +141,15 @@ struct Weights {
     rel_proj: Vec<f32>,
 }
 
+/// Where one decoder layer's tensors live.
+fn layer_module(layer: usize) -> String {
+    format!("language_model.model.layers.{layer}")
+}
+
 impl Weights {
     fn load(ckpt: &Checkpoint, layer: usize) -> Self {
         let of = |name: &str| {
-            checkpoint_tensor(
-                ckpt,
-                &format!("language_model.model.layers.{layer}.self_attn.{name}"),
-            )
+            checkpoint_tensor(ckpt, &format!("{}.self_attn.{name}", layer_module(layer)))
         };
         let quantized = |name: &str| {
             dequantize(
@@ -293,7 +297,7 @@ struct PackedExperts<'a> {
 
 impl<'a> PackedExperts<'a> {
     fn load(ckpt: &'a Checkpoint, layer: usize, module: &str) -> Self {
-        let module = format!("language_model.model.layers.{layer}.mlp.{module}");
+        let module = format!("{}.mlp.{module}", layer_module(layer));
         Self {
             gate_proj: PackedBank::load(ckpt, &module, "gate_proj"),
             up_proj: PackedBank::load(ckpt, &module, "up_proj"),
@@ -328,12 +332,9 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     let recorded = |name: &str| fixture::f32s(&fixture::layer_tensor(&activations, layer, name));
 
     let gate = |name: &str| {
-        checkpoint_tensor(
-            &ckpt,
-            &format!("language_model.model.layers.{layer}.mlp.{name}"),
-        )
-        .to_f32()
-        .expect("the gate is not packed")
+        checkpoint_tensor(&ckpt, &format!("{}.mlp.{name}", layer_module(layer)))
+            .to_f32()
+            .expect("the gate is not packed")
     };
     let (gate_weight, correction_bias) = (gate("gate_weight"), gate("e_score_correction_bias"));
     let global_scale = gate("global_scale")[0];
@@ -419,5 +420,219 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
         flat.route(&flat.gate(&x)).experts(),
         routing.experts(),
         "layer {layer}: dropping the correction bias selects the same experts"
+    );
+}
+
+/// What no committed fixture can settle about the assembled layer: that the
+/// tensor names outside attention and the MLP are the ones this port assumes,
+/// and that a whole trained layer — quantised projections, banded mask, trained
+/// convolutions, router and 256-expert bank — reproduces the reference from its
+/// input to its output.
+///
+/// Error accumulates across the whole layer, so this is legitimately looser than
+/// the 6e-3 each of its halves is held to, and the reason is `mlp_sconv` rather
+/// than the length of the chain. The trained convolutions amplify: on layer 0 the
+/// MLP's output peaks at 10.75 and what the convolution makes of it peaks at 192,
+/// so the bfloat16 quantum the reference rounded `mlp_out` to arrives at the
+/// residual multiplied by about eighteen. That is why the short convolution's own
+/// trained pairs are held to 2e-2 and not to 6e-3, and the layer inherits that
+/// regime: its output is `h + mlp_sconv(...)`, of which the convolution is about
+/// three quarters, so 2e-2 scaled by that share is 1.5e-2.
+///
+/// Written out, the observed error is exactly that sum. On layer 0, `h` deviates
+/// by 4.7e-3 of its own peak and `mlp_sconv_out` by 8.3e-3 of its own, which at
+/// their shares of the output's peak — 65 and 192 against 254 — come to 1.2e-3
+/// and 6.2e-3, against 7.0e-3 measured end to end.
+///
+/// Worst observed when this landed: 7.0e-3 on layer 0 and 6.6e-3 on layer 2, a
+/// factor of two in hand. Against the weakest mutation this bound has to catch,
+/// layer 0's two residual-path convolutions exchanged, at 4.9e-1 — a factor of
+/// thirty above it.
+const LAYER_TOLERANCE: f32 = 1.5e-2;
+
+/// One decoder layer's tensors outside its attention and its MLP: a weight for
+/// each of the two RMSNorms and a kernel for each of the two short convolutions
+/// on the residual path, all bfloat16.
+struct LayerWeights {
+    attention: Weights,
+    input_layernorm: Vec<f32>,
+    post_attention_layernorm: Vec<f32>,
+    attn_sconv: Vec<f32>,
+    mlp_sconv: Vec<f32>,
+}
+
+impl LayerWeights {
+    fn load(ckpt: &Checkpoint, layer: usize) -> Self {
+        let widened = |name: &str| {
+            checkpoint_tensor(ckpt, &format!("{}.{name}", layer_module(layer)))
+                .to_f32()
+                .expect("a bfloat16 tensor")
+        };
+        Self {
+            attention: Weights::load(ckpt, layer),
+            input_layernorm: widened("input_layernorm.weight"),
+            post_attention_layernorm: widened("post_attention_layernorm.weight"),
+            attn_sconv: widened("attn_sconv.conv.weight"),
+            mlp_sconv: widened("mlp_sconv.conv.weight"),
+        }
+    }
+
+    fn view(&self) -> DecoderWeights<'_> {
+        DecoderWeights {
+            attention: self.attention.view(),
+            input_layernorm: &self.input_layernorm,
+            post_attention_layernorm: &self.post_attention_layernorm,
+            attn_sconv: &self.attn_sconv,
+            mlp_sconv: &self.mlp_sconv,
+        }
+    }
+}
+
+/// Whichever MLP a layer index called for, out of the checkpoint.
+///
+/// A dense layer's three `[16384, 4096]` projections are decoded once and held —
+/// 800 MB, which a test can afford. A MoE layer's 256 experts are 25 GB and are
+/// decoded per expert per call instead, which is what [`Experts`] exists for.
+enum Mlp<'a> {
+    Dense(Dense),
+    Sparse(Box<Sparse<'a>>),
+}
+
+/// `InklingDenseMLP`'s three decoded projections and its learned output scale.
+struct Dense {
+    gate_proj: Vec<f32>,
+    up_proj: Vec<f32>,
+    down_proj: Vec<f32>,
+    global_scale: f32,
+}
+
+/// `InklingSparseMoE`'s gate, and the two banks it routes to left packed.
+struct Sparse<'a> {
+    config: MoeConfig,
+    hidden: usize,
+    gate_weight: Vec<f32>,
+    correction_bias: Vec<f32>,
+    global_scale: f32,
+    routed: PackedExperts<'a>,
+    shared: PackedExperts<'a>,
+}
+
+impl<'a> Mlp<'a> {
+    fn load(ckpt: &'a Checkpoint, config: &TextConfig, layer: usize) -> Self {
+        let of =
+            |name: &str| checkpoint_tensor(ckpt, &format!("{}.mlp.{name}", layer_module(layer)));
+        let widened = |name: &str| of(name).to_f32().expect("an unpacked tensor");
+        let global_scale = widened("global_scale")[0];
+
+        let Some(moe) = MoeConfig::for_layer(config, layer) else {
+            let quantized = |name: &str| {
+                dequantize(
+                    &of(&format!("{name}.weight")),
+                    &of(&format!("{name}.scales")),
+                )
+                .unwrap_or_else(|err| panic!("layer {layer} {name} decodes: {err}"))
+                .values
+            };
+            return Self::Dense(Dense {
+                gate_proj: quantized("gate_proj"),
+                up_proj: quantized("up_proj"),
+                down_proj: quantized("down_proj"),
+                global_scale,
+            });
+        };
+
+        Self::Sparse(Box::new(Sparse {
+            hidden: config.hidden_size,
+            config: moe,
+            gate_weight: widened("gate_weight"),
+            correction_bias: widened("e_score_correction_bias"),
+            global_scale,
+            routed: PackedExperts::load(ckpt, layer, "switch_mlp"),
+            shared: PackedExperts::load(ckpt, layer, "shared_experts"),
+        }))
+    }
+
+    fn view(&self, hidden: usize) -> LayerMlp<'_> {
+        match self {
+            Self::Dense(dense) => LayerMlp::Dense(DenseMlp::new(
+                hidden,
+                &dense.gate_proj,
+                &dense.up_proj,
+                &dense.down_proj,
+                dense.global_scale,
+            )),
+            Self::Sparse(sparse) => LayerMlp::Sparse(SparseMoe::new(
+                sparse.config,
+                GateWeights {
+                    gate_weight: &sparse.gate_weight,
+                    correction_bias: &sparse.correction_bias,
+                    global_scale: sparse.global_scale,
+                },
+            )),
+        }
+    }
+}
+
+impl Experts for Mlp<'_> {
+    fn routed(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
+        match self {
+            Self::Dense(_) => NoExperts.routed(expert, rows),
+            Self::Sparse(moe) => moe.routed.forward(expert, moe.hidden, rows),
+        }
+    }
+
+    fn shared(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
+        match self {
+            Self::Dense(_) => NoExperts.shared(expert, rows),
+            Self::Sparse(moe) => moe.shared.forward(expert, moe.hidden, rows),
+        }
+    }
+}
+
+#[test]
+fn the_decoder_layer_reproduces_the_reference_against_real_weights() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+
+    let mut worst = 0.0f32;
+    for layer in CAPTURED_LAYERS {
+        let recorded =
+            |name: &str| fixture::f32s(&fixture::layer_tensor(&activations, layer, name));
+        let (x, want) = (recorded("input"), recorded("out"));
+
+        let weights = LayerWeights::load(&ckpt, layer);
+        let mlp = Mlp::load(&ckpt, &config, layer);
+        let attention = AttentionConfig::for_layer(&config, layer);
+        let decoder = DecoderLayer::new(attention, weights.view(), mlp.view(config.hidden_size));
+
+        let against_reference = deviation(&decoder.forward(&mut decoder.cache(), &x, &mlp), &want);
+        assert!(
+            against_reference <= LAYER_TOLERANCE,
+            "layer {layer}: deviation {against_reference:e}"
+        );
+        worst = worst.max(against_reference);
+
+        // The two convolutions on the residual path are the same width, so a
+        // port that exchanged their kernels runs. Stated on the dense layer
+        // alone: its projections are already decoded and held, where a second
+        // MoE pass would decode a fresh 25 GB bank of experts to say the same
+        // thing about the same two tensors.
+        if !config.layer_is_dense(layer) {
+            continue;
+        }
+        let mut exchanged = weights.view();
+        std::mem::swap(&mut exchanged.attn_sconv, &mut exchanged.mlp_sconv);
+        let exchanged = DecoderLayer::new(attention, exchanged, mlp.view(config.hidden_size));
+        let swapped = deviation(&exchanged.forward(&mut exchanged.cache(), &x, &mlp), &want);
+        assert!(
+            swapped > LAYER_TOLERANCE,
+            "layer {layer}: exchanging the two convolutions deviates by only {swapped:e}"
+        );
+    }
+    assert!(
+        worst > 0.0,
+        "a run that matched exactly would mean the reference's bfloat16 vanished"
     );
 }
