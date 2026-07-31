@@ -25,5 +25,9 @@ smoke model="models/Inkling-Small-mxfp4":
 prefill-bench model="models/Inkling-Small-mxfp4" *args:
     reference/.venv/bin/python reference/scripts/prefill_bench.py {{ model }} {{ args }}
 
+# Regenerate the committed reference activations the Rust layers are tested against
+dump-activations model="models/Inkling-Small-mxfp4":
+    reference/.venv/bin/python reference/scripts/dump_activations.py {{ model }}
+
 fetch repo="thinkingmachines/Inkling-Small":
     hf download {{ repo }}

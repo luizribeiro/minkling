@@ -1,0 +1,35 @@
+--- a/mlx_vlm/models/inkling/language.py
++++ b/mlx_vlm/models/inkling/language.py
+@@ -242,6 +242,12 @@
+         return super().__call__(x) * self.global_scale
+ 
+ 
++# Observation point for the numerical oracle: the router's intermediates are all
++# locals, and every one of them is a place a reimplementation can silently
++# disagree. Left None in normal use, when it costs a single identity check.
++moe_tap = None
++
++
+ class InklingSparseMoE(nn.Module):
+     """Sigmoid-gated fine-grained MoE: top-k routed experts (+ correction-bias selection)
+     plus always-on shared experts, weighted by a logsigmoid/logsumexp softmax."""
+@@ -291,6 +297,19 @@
+         ys = (
+             self.shared_experts(xf, sh_idx) * shared_gammas[..., None].astype(x.dtype)
+         ).sum(axis=-2)
++        if moe_tap is not None:
++            moe_tap(
++                self,
++                {
++                    "gate_logits": logits,
++                    "gate_scores_biased": sfc,
++                    "topk_idx": idx,
++                    "topk_w": topk_w,
++                    "shared_gammas": shared_gammas,
++                    "routed_out": yr,
++                    "shared_out": ys,
++                },
++            )
+         return (yr + ys).reshape(B, L, D).astype(x.dtype)
+ 
+ 

@@ -1,0 +1,447 @@
+{
+  "prompt": "The lighthouse keeper counted the ships that passed the headland.",
+  "input_ids": [
+    976,
+    180069,
+    86333,
+    60500,
+    290,
+    33610,
+    484,
+    10292
+  ],
+  "checkpoint": {
+    "path": "models/Inkling-Small-mxfp4",
+    "total_size": 140271331492
+  },
+  "layers": [
+    {
+      "index": 0,
+      "attention": "sliding",
+      "mlp": "dense"
+    },
+    {
+      "index": 2,
+      "attention": "sliding",
+      "mlp": "moe"
+    }
+  ],
+  "tensors": [
+    {
+      "name": "embed_norm_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "embed_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "input_ids",
+      "shape": [
+        1,
+        8
+      ],
+      "dtype": "int32"
+    },
+    {
+      "name": "layer0.attn_sconv_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.h",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.input_layernorm_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.k_norm_out",
+      "shape": [
+        1,
+        8,
+        8,
+        128
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.k_proj_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.k_sconv_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.mask",
+      "shape": [
+        1,
+        32,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.mlp_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.mlp_sconv_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.o_proj_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.post_attention_ln_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.q_norm_out",
+      "shape": [
+        1,
+        32,
+        8,
+        128
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.q_proj_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.r_proj_out",
+      "shape": [
+        1,
+        8,
+        32,
+        16
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.sdpa_out",
+      "shape": [
+        1,
+        32,
+        8,
+        128
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.v_proj_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer0.v_sconv_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.attn_sconv_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.gate_logits",
+      "shape": [
+        8,
+        258
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.gate_scores_biased",
+      "shape": [
+        8,
+        256
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.h",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.input_layernorm_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.k_norm_out",
+      "shape": [
+        1,
+        8,
+        8,
+        128
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.k_proj_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.k_sconv_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.mask",
+      "shape": [
+        1,
+        32,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.mlp_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.mlp_sconv_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.o_proj_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.post_attention_ln_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.q_norm_out",
+      "shape": [
+        1,
+        32,
+        8,
+        128
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.q_proj_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.r_proj_out",
+      "shape": [
+        1,
+        8,
+        32,
+        16
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.routed_out",
+      "shape": [
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.sdpa_out",
+      "shape": [
+        1,
+        32,
+        8,
+        128
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.shared_gammas",
+      "shape": [
+        8,
+        2
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.shared_out",
+      "shape": [
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.topk_idx",
+      "shape": [
+        8,
+        6
+      ],
+      "dtype": "int32"
+    },
+    {
+      "name": "layer2.topk_w",
+      "shape": [
+        8,
+        6
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.v_proj_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.v_sconv_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    }
+  ]
+}
