@@ -32,6 +32,24 @@ than answering it. A chat turn is written out in full —
 `<|message_user|><|content_text|>…<|end_message|><|message_model|>` — rather than
 applied by a template this does not implement.
 
+Or the same model behind an OpenAI-compatible endpoint, loaded once:
+
+    inklingrs serve models/Inkling-Small-mxfp4
+
+    curl -sN http://127.0.0.1:8080/v1/chat/completions \
+      -H 'Content-Type: application/json' \
+      -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":4,"stream":true}'
+
+`POST /v1/chat/completions`, streaming and collected, plus `GET /v1/models`.
+Here the turn structure *is* applied — hard-coded rather than interpreted from
+`chat_template.jinja`, and checked against what that template renders — because
+without it nothing puts the model in a turn it could end and every request runs
+to `max_tokens`. The model's thinking channel arrives in `reasoning_content` and
+its answer in `content`, with the markers themselves in neither.
+
+One request at a time; a second client waits. Batching is the scheduler's job
+and the scheduler is the reason this engine exists.
+
 ## Why the reference directory exists
 
 `sconv`, the banded relative-position bias, and sigmoid-gated top-6-of-256
