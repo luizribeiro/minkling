@@ -48,7 +48,7 @@ use crate::generate::Generator;
 use crate::head::LmHead;
 use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use crate::model::{Model, ModelWeights};
-use crate::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
+use crate::moe::{ExpertBank, GateWeights, Gathered, MoeConfig, SparseMoe};
 use crate::ops::{DenseMlp, Projection, linear};
 use crate::quant::{BITS, QuantError, Scratch, dequantize_blocks_into};
 
@@ -155,10 +155,10 @@ impl<'a> Packed<'a> {
     /// The first `slices` slices as the checkpoint stores them: the packed
     /// bytes, and the scale bytes that go with them.
     ///
-    /// For a backend that takes the weight rather than the values. The codes are
-    /// handed over as the bytes of the `U32` tensor because that is what they
-    /// are — little-endian words a kernel reads as words — so this is a range of
-    /// the mapping and not a transcoding of 411 MB.
+    /// For a backend that takes the weight rather than the values. What it gets
+    /// is a range of the mapping and not a transcoding of 411 MB: the codes are
+    /// the bytes of the `U32` tensor, which a kernel reading MXFP4 two codes to
+    /// a byte needs nothing more of.
     ///
     /// A leading run rather than an arbitrary slice because that is the shape
     /// the truncation has: the vocabulary is the first `unpadded_vocab_size`
@@ -487,7 +487,6 @@ impl<'a> CheckpointWeights<'a> {
         };
         Mlp::Sparse(Box::new(Sparse {
             config,
-            hidden: self.config.hidden_size,
             gate_weight: widened("gate_weight"),
             correction_bias: widened("e_score_correction_bias"),
             global_scale,
@@ -581,7 +580,6 @@ enum Mlp<'a> {
 /// `InklingSparseMoE`'s gate, and the two banks it routes to left packed.
 struct Sparse<'a> {
     config: MoeConfig,
-    hidden: usize,
     gate_weight: Vec<f32>,
     correction_bias: Vec<f32>,
     global_scale: f32,
@@ -619,34 +617,36 @@ impl Mlp<'_> {
 /// routes to it and dropped again, into a buffer that outlives neither. A dense
 /// layer never asks, and asking anyway is the panic [`NoExperts`] raises.
 impl Experts for Mlp<'_> {
-    fn routed(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
+    fn routed(&self, gathered: Gathered<'_>) -> Vec<f32> {
         match self {
-            Self::Dense { .. } => NoExperts.routed(expert, rows),
-            Self::Sparse(moe) => through(&moe.routed, moe.hidden, expert, rows, moe.scratch),
+            Self::Dense { .. } => NoExperts.routed(gathered),
+            Self::Sparse(moe) => through(&moe.routed, gathered, moe.scratch),
         }
     }
 
-    fn shared(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
+    fn shared(&self, gathered: Gathered<'_>) -> Vec<f32> {
         match self {
-            Self::Dense { .. } => NoExperts.shared(expert, rows),
-            Self::Sparse(moe) => through(&moe.shared, moe.hidden, expert, rows, moe.scratch),
+            Self::Dense { .. } => NoExperts.shared(gathered),
+            Self::Sparse(moe) => through(&moe.shared, gathered, moe.scratch),
         }
     }
 }
 
-/// One expert of one bank, over the rows that chose it. The expert's three
-/// projections are decoded into the pass's expert buffer, which the next expert
-/// overwrites — so a layer whose eight experts ran costs one expert's float32,
-/// not eight.
+/// One bank, an expert at a time. Each expert's three projections are decoded
+/// into the pass's expert buffer, which the next expert overwrites — so a layer
+/// whose eight experts ran costs one expert's float32, not eight, and the runs
+/// [`Gathered::batches`] hands out are what says no expert is decoded twice.
 fn through(
     bank: &PackedExperts<'_>,
-    hidden: usize,
-    expert: usize,
-    rows: &[f32],
+    gathered: Gathered<'_>,
     scratch: &RefCell<Vec<f32>>,
 ) -> Vec<f32> {
     let mut buffer = scratch.borrow_mut();
-    bank.forward_into(expert, hidden, rows, &mut Scratch::new(&mut buffer))
+    let mut out = Vec::with_capacity(gathered.rows().len());
+    for (expert, rows) in gathered.batches() {
+        out.extend(bank.forward_into(expert, gathered.dim(), rows, &mut Scratch::new(&mut buffer)));
+    }
+    out
 }
 
 /// A `BF16` or `F32` tensor's values.

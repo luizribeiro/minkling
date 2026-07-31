@@ -32,7 +32,7 @@
 //! checkpoint-sized and are left to `tests/real_checkpoint.rs`.
 
 use crate::attention::{Attention, AttentionCache, AttentionConfig, AttentionWeights};
-use crate::moe::SparseMoe;
+use crate::moe::{Gathered, SparseMoe};
 use crate::ops::{DenseMlp, rms_norm};
 use crate::sconv::{ConvState, ShortConv};
 
@@ -41,13 +41,17 @@ use crate::sconv::{ConvState, ShortConv};
 /// Asked for rather than held, for the reason [`SparseMoe::forward`] asks:
 /// Inkling's routed bank is 25 GB per layer in float32, so an expert is decoded
 /// when a token routes to it and dropped again. A dense layer never asks.
+///
+/// A whole bank's work at a time rather than an expert's, because what the two
+/// backends want is not the same shape. The CPU wants an expert to decode and
+/// [`Gathered::batches`] hands it one; a Metal dispatch wants every row it will
+/// index and could not be handed that by a call per expert.
 pub trait Experts {
-    /// Expert `expert` of the routed bank, over the `[rows, hidden]` of the
-    /// tokens that chose it.
-    fn routed(&self, expert: usize, rows: &[f32]) -> Vec<f32>;
+    /// The routed bank, over every row that chose one of its experts.
+    fn routed(&self, gathered: Gathered<'_>) -> Vec<f32>;
 
-    /// Expert `expert` of the always-on shared bank, over every token.
-    fn shared(&self, expert: usize, rows: &[f32]) -> Vec<f32>;
+    /// The always-on shared bank, over every token, once per shared expert.
+    fn shared(&self, gathered: Gathered<'_>) -> Vec<f32>;
 }
 
 /// The [`Experts`] a dense layer needs, which is none.
@@ -58,12 +62,12 @@ pub trait Experts {
 pub struct NoExperts;
 
 impl Experts for NoExperts {
-    fn routed(&self, expert: usize, _rows: &[f32]) -> Vec<f32> {
-        panic!("a dense layer routed to expert {expert}")
+    fn routed(&self, gathered: Gathered<'_>) -> Vec<f32> {
+        panic!("a dense layer routed to {:?}", gathered.experts())
     }
 
-    fn shared(&self, expert: usize, _rows: &[f32]) -> Vec<f32> {
-        panic!("a dense layer routed to shared expert {expert}")
+    fn shared(&self, gathered: Gathered<'_>) -> Vec<f32> {
+        panic!("a dense layer routed to shared {:?}", gathered.experts())
     }
 }
 
@@ -91,8 +95,8 @@ impl LayerMlp<'_> {
             Self::Sparse(moe) => moe
                 .forward(
                     x,
-                    |expert, rows| experts.routed(expert, rows),
-                    |expert, rows| experts.shared(expert, rows),
+                    |gathered| experts.routed(gathered),
+                    |gathered| experts.shared(gathered),
                 )
                 .total(),
         }

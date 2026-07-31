@@ -18,7 +18,7 @@ use inkling_core::layer::{
     DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts,
 };
 use inkling_core::model::{ModelCache, ModelWeights};
-use inkling_core::moe::{GateWeights, MoeConfig, SparseMoe};
+use inkling_core::moe::{GateWeights, Gathered, MoeConfig, SparseMoe};
 use inkling_core::ops::{DenseMlp, DenseProjection, top_k};
 use inkling_core::quant::{Scratch, dequantize};
 use inkling_core::tokenizer::{Tokenizer, TokenizerError};
@@ -269,6 +269,26 @@ fn through_expert(bank: &PackedExperts<'_>, expert: usize, dim: usize, rows: &[f
     bank.forward_into(expert, dim, rows, &mut Scratch::new(&mut buffer))
 }
 
+/// Every row a routing gathered, each through the expert it named.
+fn through_bank(bank: &PackedExperts<'_>, gathered: Gathered<'_>) -> Vec<f32> {
+    gathered
+        .batches()
+        .flat_map(|(expert, rows)| through_expert(bank, expert, gathered.dim(), rows))
+        .collect()
+}
+
+/// [`through_bank`] with the bank read back to front, which for the two shared
+/// experts is the one way of confusing them that still adds two always-on
+/// experts to every token.
+fn through_bank_reversed(bank: &PackedExperts<'_>, gathered: Gathered<'_>) -> Vec<f32> {
+    gathered
+        .batches()
+        .flat_map(|(expert, rows)| {
+            through_expert(bank, bank.experts() - 1 - expert, gathered.dim(), rows)
+        })
+        .collect()
+}
+
 #[test]
 fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     let Some(dir) = checkpoint_dir() else { return };
@@ -298,7 +318,7 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
             global_scale,
         },
     );
-    let (x, hidden) = (recorded("post_attention_ln_out"), moe.hidden());
+    let x = recorded("post_attention_ln_out");
 
     // Which experts run is the one thing here that has to be exact rather than
     // close: a single different expert changes the answer by far more than the
@@ -318,8 +338,8 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     let shared = packed_experts(&ckpt, layer, "shared_experts");
     let got = moe.forward(
         &x,
-        |expert, rows| through_expert(&routed, expert, hidden, rows),
-        |expert, rows| through_expert(&shared, expert, hidden, rows),
+        |gathered| through_bank(&routed, gathered),
+        |gathered| through_bank(&shared, gathered),
     );
 
     let mut worst = 0.0f32;
@@ -346,8 +366,8 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     // shared bank is two experts rather than the routed bank's 256.
     let exchanged = moe.forward(
         &x,
-        |_, rows| vec![0.0; rows.len()],
-        |expert, rows| through_expert(&shared, shared.experts() - 1 - expert, hidden, rows),
+        |gathered| vec![0.0; gathered.rows().len()],
+        |gathered| through_bank_reversed(&shared, gathered),
     );
     let deviation = deviation(&exchanged.shared, &recorded("shared_out"));
     assert!(
@@ -467,7 +487,6 @@ struct Dense {
 /// `InklingSparseMoE`'s gate, and the two banks it routes to left packed.
 struct Sparse<'a> {
     config: MoeConfig,
-    hidden: usize,
     gate_weight: Vec<f32>,
     correction_bias: Vec<f32>,
     global_scale: f32,
@@ -500,7 +519,6 @@ impl<'a> Mlp<'a> {
         };
 
         Self::Sparse(Box::new(Sparse {
-            hidden: config.hidden_size,
             config: moe,
             gate_weight: widened("gate_weight"),
             correction_bias: widened("e_score_correction_bias"),
@@ -532,17 +550,17 @@ impl<'a> Mlp<'a> {
 }
 
 impl Experts for Mlp<'_> {
-    fn routed(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
+    fn routed(&self, gathered: Gathered<'_>) -> Vec<f32> {
         match self {
-            Self::Dense(_) => NoExperts.routed(expert, rows),
-            Self::Sparse(moe) => through_expert(&moe.routed, expert, moe.hidden, rows),
+            Self::Dense(_) => NoExperts.routed(gathered),
+            Self::Sparse(moe) => through_bank(&moe.routed, gathered),
         }
     }
 
-    fn shared(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
+    fn shared(&self, gathered: Gathered<'_>) -> Vec<f32> {
         match self {
-            Self::Dense(_) => NoExperts.shared(expert, rows),
-            Self::Sparse(moe) => through_expert(&moe.shared, expert, moe.hidden, rows),
+            Self::Dense(_) => NoExperts.shared(gathered),
+            Self::Sparse(moe) => through_bank(&moe.shared, gathered),
         }
     }
 }

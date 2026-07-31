@@ -31,7 +31,9 @@ pub use head::LmHead;
 pub use layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 pub use mask::{BandedMask, MASKED, is_masked};
 pub use model::{Model, ModelCache, ModelWeights};
-pub use moe::{ExpertBank, ExpertBatch, GateWeights, MoeConfig, MoeOutput, Routing, SparseMoe};
+pub use moe::{
+    ExpertBank, ExpertBatch, GateWeights, Gathered, MoeConfig, MoeOutput, Routing, SparseMoe,
+};
 pub use ops::{DenseMlp, DenseProjection, Projection, linear, rms_norm, softmax};
 pub use quant::{Dequantized, QuantError, Scratch};
 pub use sconv::{ConvState, ShortConv};

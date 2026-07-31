@@ -21,7 +21,7 @@ use crate::checkpoint::{Checkpoint, Dtype, TensorView};
 use crate::config::{Config, TextConfig};
 use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use crate::model::{Model, ModelWeights};
-use crate::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
+use crate::moe::{ExpertBank, GateWeights, Gathered, MoeConfig, SparseMoe};
 use crate::ops::{DenseMlp, DenseProjection};
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../reference/fixtures");
@@ -199,6 +199,14 @@ impl Bank {
         )
         .expert(index)
         .forward(rows)
+    }
+
+    /// Every row a routing sent here, each through the expert it named.
+    pub fn gathered(&self, gathered: Gathered<'_>) -> Vec<f32> {
+        gathered
+            .batches()
+            .flat_map(|(expert, rows)| self.expert(expert, rows))
+            .collect()
     }
 }
 
@@ -382,17 +390,17 @@ impl Mlp {
 /// dense layer asks for nothing, and asking anyway is the panic [`NoExperts`]
 /// raises.
 impl Experts for LayerTensors {
-    fn routed(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
+    fn routed(&self, gathered: Gathered<'_>) -> Vec<f32> {
         match &self.mlp {
-            Mlp::Dense { .. } => NoExperts.routed(expert, rows),
-            Mlp::Sparse { routed, .. } => routed.expert(expert, rows),
+            Mlp::Dense { .. } => NoExperts.routed(gathered),
+            Mlp::Sparse { routed, .. } => routed.gathered(gathered),
         }
     }
 
-    fn shared(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
+    fn shared(&self, gathered: Gathered<'_>) -> Vec<f32> {
         match &self.mlp {
-            Mlp::Dense { .. } => NoExperts.shared(expert, rows),
-            Mlp::Sparse { shared, .. } => shared.expert(expert, rows),
+            Mlp::Dense { .. } => NoExperts.shared(gathered),
+            Mlp::Sparse { shared, .. } => shared.gathered(gathered),
         }
     }
 }

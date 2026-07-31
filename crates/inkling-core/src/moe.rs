@@ -93,6 +93,83 @@ pub struct ExpertBatch {
     pub tokens: Vec<(usize, f32)>,
 }
 
+/// Every row one bank has to run, and the expert each row goes through:
+/// `[rows, dim]` gathered out of the hidden state beside `[rows]` expert
+/// indices.
+///
+/// **The whole bank's work in one value, which is what a gathered dispatch
+/// needs.** A backend that decodes an expert wants them one at a time and
+/// [`Gathered::batches`] is that; a backend that indexes 137 GB of packed banks
+/// from a list wants them all at once and cannot get there from a call per
+/// expert — 40 layers times 8 experts times 3 projections is 960 dispatches a
+/// decode step, and at the 170 microseconds a dispatch costs to encode, commit
+/// and wait for, that is 0.2 s of a step doing nothing.
+///
+/// Expert-ascending and grouped, which is what makes the second reading
+/// possible without giving up the first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gathered<'a> {
+    dim: usize,
+    experts: &'a [usize],
+    rows: &'a [f32],
+}
+
+impl<'a> Gathered<'a> {
+    pub fn new(dim: usize, experts: &'a [usize], rows: &'a [f32]) -> Self {
+        assert!(dim > 0, "a bank maps from some width");
+        assert_eq!(
+            rows.len(),
+            experts.len() * dim,
+            "{} values are not {} rows of {dim}",
+            rows.len(),
+            experts.len()
+        );
+        Self { dim, experts, rows }
+    }
+
+    /// The width a row is, which for every bank in the model is the hidden size.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub fn len(&self) -> usize {
+        self.experts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.experts.is_empty()
+    }
+
+    /// `[rows]`, the expert each row goes through.
+    pub fn experts(&self) -> &'a [usize] {
+        self.experts
+    }
+
+    /// `[rows, dim]`, the rows themselves.
+    pub fn rows(&self) -> &'a [f32] {
+        self.rows
+    }
+
+    /// The runs of one expert, for a backend that decodes an expert before it
+    /// can multiply against it and cannot afford to decode one twice.
+    ///
+    /// A run and not a scan, because the rows arrive expert-ascending — so what
+    /// this promises is that no expert appears in two of them.
+    pub fn batches(&self) -> impl Iterator<Item = (usize, &'a [f32])> {
+        let mut at = 0;
+        std::iter::from_fn(move || {
+            let expert = *self.experts.get(at)?;
+            let run = self.experts[at..]
+                .iter()
+                .take_while(|next| **next == expert)
+                .count();
+            let rows = &self.rows[at * self.dim..][..run * self.dim];
+            at += run;
+            Some((expert, rows))
+        })
+    }
+}
+
 /// The two halves `InklingSparseMoE` adds together on the way out. They are
 /// separate because the reference records them separately, and because only the
 /// routed half needs the 256-expert bank.
@@ -246,16 +323,17 @@ impl<'a> SparseMoe<'a> {
     /// out.
     ///
     /// The experts are asked for rather than held: `routed` and `shared` are
-    /// each called once per expert with work to do, with that expert's index
-    /// and the `[rows, hidden]` the tokens which chose it, and return its
-    /// `[rows, hidden]` output. Calling once per expert rather than once per
-    /// token is what lets a caller decode a 33 MB MXFP4 expert a single time
-    /// however many tokens routed to it.
+    /// each called once, with every row their bank has to run and the expert
+    /// each goes through, and return the `[rows, hidden]` those rows came out
+    /// as. The gathering is here so that a bank of 256 experts is asked about
+    /// only the six a token chose, and the grouping is here — see
+    /// [`Gathered`] — so that a caller which decodes a 33 MB MXFP4 expert still
+    /// decodes it a single time however many tokens routed to it.
     pub fn forward(
         &self,
         x: &[f32],
-        routed: impl FnMut(usize, &[f32]) -> Vec<f32>,
-        shared: impl FnMut(usize, &[f32]) -> Vec<f32>,
+        routed: impl FnOnce(Gathered<'_>) -> Vec<f32>,
+        shared: impl FnOnce(Gathered<'_>) -> Vec<f32>,
     ) -> MoeOutput {
         let routing = self.route(&self.gate(x));
         MoeOutput {
@@ -334,7 +412,7 @@ impl<'a> SparseMoe<'a> {
         &self,
         x: &[f32],
         batches: &[ExpertBatch],
-        mut apply: impl FnMut(usize, &[f32]) -> Vec<f32>,
+        apply: impl FnOnce(Gathered<'_>) -> Vec<f32>,
     ) -> Vec<f32> {
         assert_eq!(
             x.len() % self.hidden,
@@ -344,25 +422,29 @@ impl<'a> SparseMoe<'a> {
             self.hidden
         );
 
-        let mut out = vec![0.0; x.len()];
-        let mut rows = Vec::new();
+        let assignments = batches.iter().map(|batch| batch.tokens.len()).sum();
+        let mut experts = Vec::with_capacity(assignments);
+        let mut rows = Vec::with_capacity(assignments * self.hidden);
         for batch in batches {
-            rows.clear();
             for (token, _) in &batch.tokens {
+                experts.push(batch.expert);
                 rows.extend_from_slice(&x[token * self.hidden..][..self.hidden]);
             }
+        }
 
-            let got = apply(batch.expert, &rows);
-            assert_eq!(
-                got.len(),
-                rows.len(),
-                "expert {} answered {} values for {} rows",
-                batch.expert,
-                got.len(),
-                batch.tokens.len()
-            );
+        let got = apply(Gathered::new(self.hidden, &experts, &rows));
+        assert_eq!(
+            got.len(),
+            rows.len(),
+            "the bank answered {} values for {assignments} rows",
+            got.len(),
+        );
 
-            for ((token, weight), y) in batch.tokens.iter().zip(got.chunks_exact(self.hidden)) {
+        let mut out = vec![0.0; x.len()];
+        let mut answered = got.chunks_exact(self.hidden);
+        for batch in batches {
+            for (token, weight) in &batch.tokens {
+                let y = answered.next().expect("a row per assignment");
                 for (out, y) in out[token * self.hidden..][..self.hidden].iter_mut().zip(y) {
                     *out += weight * y;
                 }
@@ -659,8 +741,8 @@ mod tests {
         fn forward(&self) -> MoeOutput {
             self.moe().forward(
                 &self.x,
-                |expert, rows| self.routed.expert(expert, rows),
-                |expert, rows| self.shared.expert(expert, rows),
+                |gathered| self.routed.gathered(gathered),
+                |gathered| self.shared.gathered(gathered),
             )
         }
 
@@ -887,35 +969,90 @@ mod tests {
         assert_eq!(reversed.routed_batches(), routing.routed_batches());
     }
 
-    /// Every expert with work is asked for exactly once, whatever number of
-    /// tokens routed to it. A caller that decodes a 33 MB MXFP4 expert per
-    /// call cannot afford otherwise, and the 256-expert bank cannot be
-    /// materialised to avoid the question.
+    /// Every expert with work appears in exactly one run of the gathered rows,
+    /// whatever number of tokens routed to it. A caller that decodes a 33 MB
+    /// MXFP4 expert per run cannot afford otherwise, and the 256-expert bank
+    /// cannot be materialised to avoid the question.
+    ///
+    /// The runs are the whole of what a gathered call promises beyond the flat
+    /// list, so this is where that promise is stated: expert-ascending, once
+    /// each, and every assignment inside one of them.
     #[test]
-    fn each_expert_is_asked_for_once_with_all_of_its_tokens() {
+    fn every_expert_appears_in_one_run_with_all_of_its_tokens() {
         let case = Case::load("main");
         let (mut asked, mut rows) = (Vec::new(), 0);
 
         let out = case.moe().forward(
             &case.x,
-            |expert, batch| {
-                asked.push(expert);
-                rows += batch.len() / case.hidden;
-                case.routed.expert(expert, batch)
+            |gathered| {
+                for (expert, batch) in gathered.batches() {
+                    asked.push(expert);
+                    rows += batch.len() / case.hidden;
+                }
+                case.routed.gathered(gathered)
             },
-            |expert, batch| case.shared.expert(expert, batch),
+            |gathered| case.shared.gathered(gathered),
         );
 
         let mut distinct = case.topk_idx.clone();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(asked, distinct, "asked in expert order, once each");
+        assert_eq!(asked, distinct, "in expert order, once each");
         assert_eq!(rows, case.topk_idx.len(), "every assignment was served");
         assert!(
             asked.len() < rows,
             "a case where no expert repeats would prove nothing"
         );
         assert!(out.routed.iter().any(|y| *y != 0.0));
+    }
+
+    /// The flat list beside the runs: a backend that indexes a bank rather than
+    /// decoding it reads `experts()` and `rows()` and never asks for a batch, so
+    /// the two readings have to describe the same work.
+    #[test]
+    fn the_gathered_rows_are_the_runs_laid_end_to_end() {
+        let case = Case::load("main");
+        let mut seen = None;
+        case.moe().forward(
+            &case.x,
+            |gathered| {
+                let runs: Vec<usize> = gathered
+                    .batches()
+                    .flat_map(|(expert, rows)| {
+                        std::iter::repeat_n(expert, rows.len() / gathered.dim())
+                    })
+                    .collect();
+                assert_eq!(runs, gathered.experts(), "the runs against the flat list");
+
+                let concatenated: Vec<f32> = gathered
+                    .batches()
+                    .flat_map(|(_, rows)| rows.iter().copied())
+                    .collect();
+                assert_eq!(concatenated, gathered.rows(), "the runs against the rows");
+
+                seen = Some(gathered.len());
+                case.routed.gathered(gathered)
+            },
+            |gathered| case.shared.gathered(gathered),
+        );
+
+        assert_eq!(seen, Some(case.topk_idx.len()), "one row per assignment");
+    }
+
+    /// The two ways a gather can be malformed, which are the two things
+    /// [`Gathered`] promises a backend: that a row is `dim` wide, and that there
+    /// is one of them per expert index. A backend indexes the pair against each
+    /// other and would read whichever ran out first.
+    #[test]
+    #[should_panic(expected = "12 values are not 2 rows of 4")]
+    fn a_gather_whose_rows_do_not_pair_with_its_experts_is_refused() {
+        Gathered::new(4, &[0, 1], &[0.0; 12]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a bank maps from some width")]
+    fn a_gather_of_no_width_is_refused() {
+        Gathered::new(0, &[], &[]);
     }
 
     /// The trained gate of the captured MoE layer, and the routing mlx-vlm
