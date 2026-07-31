@@ -10,9 +10,10 @@ use inkling_core::attention::{Attention, AttentionConfig, AttentionWeights};
 use inkling_core::embed::Embed;
 use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation, indices};
 use inkling_core::layer::{DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
-use inkling_core::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
+use inkling_core::moe::{GateWeights, MoeConfig, SparseMoe};
 use inkling_core::ops::DenseMlp;
-use inkling_core::quant::{dequantize, dequantize_blocks};
+use inkling_core::quant::{Scratch, dequantize};
+use inkling_core::weights::{Packed, PackedExperts};
 use inkling_core::{Checkpoint, Config, Dtype, TensorView, TextConfig};
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -260,67 +261,18 @@ fn attention_reproduces_the_reference_layers_against_real_weights() {
 /// order of magnitude above the bound.
 const MOE_TOLERANCE: f32 = 6e-3;
 
-/// One `SwitchLinear` bank, left packed: `[experts, out, in/8]` codes beside
-/// `[experts, out, in/32]` scale bytes.
-struct PackedBank<'a> {
-    weight: TensorView<'a>,
-    scales: TensorView<'a>,
+/// One layer's `SwitchGLU`, left packed.
+fn packed_experts<'a>(ckpt: &'a Checkpoint, layer: usize, module: &str) -> PackedExperts<'a> {
+    PackedExperts::open(ckpt, &format!("{}.mlp.{module}", layer_module(layer)))
+        .unwrap_or_else(|err| panic!("layer {layer} holds {module}: {err}"))
 }
 
-impl<'a> PackedBank<'a> {
-    fn load(ckpt: &'a Checkpoint, module: &str, projection: &str) -> Self {
-        let of = |suffix: &str| checkpoint_tensor(ckpt, &format!("{module}.{projection}.{suffix}"));
-        Self {
-            weight: of("weight"),
-            scales: of("scales"),
-        }
-    }
-
-    fn experts(&self) -> usize {
-        self.weight.shape()[0]
-    }
-
-    /// One expert's rows, decoded. Each is 33 MB in float32 at Inkling-Small's
-    /// shape, so they are decoded on demand and dropped rather than held.
-    fn expert(&self, index: usize) -> Vec<f32> {
-        let stride = |view: &TensorView<'_>| view.data().len() / self.experts();
-        let (codes, scales) = (stride(&self.weight), stride(&self.scales));
-        dequantize_blocks(
-            &self.weight.data()[index * codes..][..codes],
-            &self.scales.data()[index * scales..][..scales],
-        )
-        .unwrap_or_else(|err| panic!("expert {index} decodes: {err}"))
-    }
-}
-
-/// One `SwitchGLU`'s three banks.
-struct PackedExperts<'a> {
-    gate_proj: PackedBank<'a>,
-    up_proj: PackedBank<'a>,
-    down_proj: PackedBank<'a>,
-}
-
-impl<'a> PackedExperts<'a> {
-    fn load(ckpt: &'a Checkpoint, layer: usize, module: &str) -> Self {
-        let module = format!("{}.mlp.{module}", layer_module(layer));
-        Self {
-            gate_proj: PackedBank::load(ckpt, &module, "gate_proj"),
-            up_proj: PackedBank::load(ckpt, &module, "up_proj"),
-            down_proj: PackedBank::load(ckpt, &module, "down_proj"),
-        }
-    }
-
-    /// `[rows, dim]` through one expert. A bank of one is the same bank.
-    fn forward(&self, expert: usize, dim: usize, rows: &[f32]) -> Vec<f32> {
-        let (gate, up, down) = (
-            self.gate_proj.expert(expert),
-            self.up_proj.expert(expert),
-            self.down_proj.expert(expert),
-        );
-        ExpertBank::new(1, dim, &gate, &up, &down)
-            .expert(0)
-            .forward(rows)
-    }
+/// `[rows, dim]` through one expert of a packed bank, decoded into a buffer of
+/// its own. The stack decodes into one it reuses; here each call is on its own,
+/// which a test can afford.
+fn through_expert(bank: &PackedExperts<'_>, expert: usize, dim: usize, rows: &[f32]) -> Vec<f32> {
+    let mut buffer = vec![0.0; bank.expert_floats()];
+    bank.forward_into(expert, dim, rows, &mut Scratch::new(&mut buffer))
 }
 
 #[test]
@@ -368,12 +320,12 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
         "layer {layer}: selection"
     );
 
-    let routed = PackedExperts::load(&ckpt, layer, "switch_mlp");
-    let shared = PackedExperts::load(&ckpt, layer, "shared_experts");
+    let routed = packed_experts(&ckpt, layer, "switch_mlp");
+    let shared = packed_experts(&ckpt, layer, "shared_experts");
     let got = moe.forward(
         &x,
-        |expert, rows| routed.forward(expert, hidden, rows),
-        |expert, rows| shared.forward(expert, hidden, rows),
+        |expert, rows| through_expert(&routed, expert, hidden, rows),
+        |expert, rows| through_expert(&shared, expert, hidden, rows),
     );
 
     let mut worst = 0.0f32;
@@ -401,7 +353,7 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     let exchanged = moe.forward(
         &x,
         |_, rows| vec![0.0; rows.len()],
-        |expert, rows| shared.forward(shared.gate_proj.experts() - 1 - expert, hidden, rows),
+        |expert, rows| through_expert(&shared, shared.experts() - 1 - expert, hidden, rows),
     );
     let deviation = deviation(&exchanged.shared, &recorded("shared_out"));
     assert!(
@@ -559,8 +511,8 @@ impl<'a> Mlp<'a> {
             gate_weight: widened("gate_weight"),
             correction_bias: widened("e_score_correction_bias"),
             global_scale,
-            routed: PackedExperts::load(ckpt, layer, "switch_mlp"),
-            shared: PackedExperts::load(ckpt, layer, "shared_experts"),
+            routed: packed_experts(ckpt, layer, "switch_mlp"),
+            shared: packed_experts(ckpt, layer, "shared_experts"),
         }))
     }
 
@@ -589,14 +541,14 @@ impl Experts for Mlp<'_> {
     fn routed(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
         match self {
             Self::Dense(_) => NoExperts.routed(expert, rows),
-            Self::Sparse(moe) => moe.routed.forward(expert, moe.hidden, rows),
+            Self::Sparse(moe) => through_expert(&moe.routed, expert, moe.hidden, rows),
         }
     }
 
     fn shared(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
         match self {
             Self::Dense(_) => NoExperts.shared(expert, rows),
-            Self::Sparse(moe) => moe.shared.forward(expert, moe.hidden, rows),
+            Self::Sparse(moe) => through_expert(&moe.shared, expert, moe.hidden, rows),
         }
     }
 }
@@ -659,9 +611,16 @@ const EMBED_NORM_TOLERANCE: f32 = 4e-3;
 
 /// The embedding table, left packed. Decoded whole it is `[201024, 4096]` of
 /// float32 — 3.3 GB — so a row is decoded when a token asks for it, which is
-/// what [`PackedBank`] already does for an expert of a bank.
-fn embedding_table(ckpt: &Checkpoint) -> PackedBank<'_> {
-    PackedBank::load(ckpt, "language_model.model", "embed_tokens")
+/// the same slice of a leading axis an expert of a bank is.
+fn embedding_table(ckpt: &Checkpoint) -> Packed<'_> {
+    Packed::open(ckpt, "language_model.model.embed_tokens").expect("the table is packed")
+}
+
+/// One row of the embedding table.
+fn embedding_row(table: &Packed<'_>, id: usize) -> Vec<f32> {
+    table
+        .decode_slice(id)
+        .unwrap_or_else(|err| panic!("row {id} decodes: {err}"))
 }
 
 fn embed_norm_weight(ckpt: &Checkpoint) -> Vec<f32> {
@@ -697,7 +656,7 @@ fn the_embedding_lookup_reproduces_the_reference_against_real_weights() {
     let want = fixture::f32s(&fixture::tensor(&activations, "embed_out"));
 
     let table = embedding_table(&ckpt);
-    let got = Embed::new(None, 0.0).forward(&ids, |id| table.expert(id));
+    let got = Embed::new(None, 0.0).forward(&ids, |id| embedding_row(&table, id));
 
     assert_eq!(got.len(), want.len(), "length");
     for (i, (got, want)) in got.iter().zip(&want).enumerate() {
@@ -730,7 +689,7 @@ fn the_embedding_reproduces_the_reference_from_ids_against_real_weights() {
     let weight = embed_norm_weight(&ckpt);
     let embed = Embed::new(Some(&weight), config.rms_norm_eps);
 
-    let deviation = deviation(&embed.forward(&ids, |id| table.expert(id)), &want);
+    let deviation = deviation(&embed.forward(&ids, |id| embedding_row(&table, id)), &want);
     assert!(deviation <= EMBED_NORM_TOLERANCE, "deviation {deviation:e}");
 }
 
@@ -766,15 +725,16 @@ fn the_embedding_tables_padding_rows_are_small_but_neither_zero_nor_normalised_a
         .unpadded_vocab_size
         .expect("the checkpoint states an unpadded vocabulary");
     let table = embedding_table(&ckpt);
-    assert_eq!(table.experts(), config.vocab_size, "table rows");
+    assert_eq!(table.slices(), config.vocab_size, "table rows");
     assert!(unpadded < config.vocab_size, "the table is padded at all");
 
     let weight = embed_norm_weight(&ckpt);
     let padding: Vec<usize> = (unpadded..config.vocab_size).collect();
     let vocabulary = indices(&fixture::tensor(&activations, "input_ids"));
-    let looked_up = |ids: &[usize]| Embed::new(None, 0.0).forward(ids, |id| table.expert(id));
+    let looked_up =
+        |ids: &[usize]| Embed::new(None, 0.0).forward(ids, |id| embedding_row(&table, id));
     let normalised = |ids: &[usize]| {
-        Embed::new(Some(&weight), config.rms_norm_eps).forward(ids, |id| table.expert(id))
+        Embed::new(Some(&weight), config.rms_norm_eps).forward(ids, |id| embedding_row(&table, id))
     };
 
     let rows = looked_up(&padding);
