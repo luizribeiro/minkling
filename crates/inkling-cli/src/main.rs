@@ -1,11 +1,7 @@
 use std::process::ExitCode;
 
-use args::{Command, USAGE};
-
-mod args;
-mod config;
-mod generate;
-mod inspect;
+use inkling_cli::args::{Command, USAGE};
+use inkling_cli::{generate, inspect};
 
 /// What an invocation that was never understood exits with, apart from one that
 /// ran and failed. A caller scripting this can tell a typo from a config that
