@@ -26,6 +26,39 @@ thiserror = "2"
 # bar or a trainer.
 tokenizers = { version = "0.23", default-features = false, features = [ "fancy-regex" ] }
 
+# The Metal bindings. `objc2` generates them from Apple's own headers and is the
+# ecosystem `metal-rs` itself now redirects to — that crate's README calls
+# itself deprecated because the `objc` runtime under it is unmaintained, and
+# `objc` has had no release since 2019. Zlib OR Apache-2.0 OR MIT, and eight
+# crates against `metal-rs`'s fifteen once its three proc-macro dependencies are
+# counted.
+#
+# The bindings are one Rust module per Metal header, gated by a feature of the
+# same name, and the default turns on all hundred of them. Naming the eleven
+# this backend calls into keeps the compiled surface to what it uses; a kernel
+# that reaches for a header not listed here fails to resolve rather than
+# silently widening the build.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSError",
+  "NSString",
+] }
+objc2-metal = { version = "0.3", default-features = false, features = [
+  "std",
+  "MTLAllocation",
+  "MTLBuffer",
+  "MTLCommandBuffer",
+  "MTLCommandEncoder",
+  "MTLCommandQueue",
+  "MTLComputeCommandEncoder",
+  "MTLComputePipeline",
+  "MTLDevice",
+  "MTLLibrary",
+  "MTLResource",
+  "MTLTypes",
+] }
+
 # The socket and the request parser under `serve`, and nothing else: a blocking
 # accept loop, which is what a server that holds one 16.7 GiB model and decodes
 # one request at a time actually is. Four transitive crates — `ascii`,
