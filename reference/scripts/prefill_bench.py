@@ -15,6 +15,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 from inkling_ref import gib, load_model, tokenizer
+from mlx_vlm.generate import wired_limit
 
 GIB = 1 << 30
 
@@ -144,6 +145,17 @@ def main():
     print(f"load            {time.perf_counter() - t0:.1f} s")
     print(f"resident        {gib(mx.get_active_memory()):.1f} GiB")
 
+    # Held across the whole sweep, the way `generate` holds it: at the default
+    # limit of 0 nothing is guaranteed GPU-resident, and a prefill's own
+    # transients are then free to evict the weights being read underneath them.
+    # The cost grows with peak memory rather than with token count — 0.07 s at
+    # 1024 against 2.2 s at 16384 — so it lands hardest on the longest rows,
+    # which are the ones the scaling fit is anchored on. See results/prefill.md.
+    with wired_limit(model):
+        run_sweep(args, model, processor, budget_bytes)
+
+
+def run_sweep(args, model, processor, budget_bytes):
     measure_prefill(model, build_prompt(processor, args.warmup_tokens))
 
     header = f"{'tokens':>8}  {'wall s':>9}  {'tok/s':>9}  {'peak GiB':>9}  {'Δ GiB':>9}  {'mask GiB':>9}"
