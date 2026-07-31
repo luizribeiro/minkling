@@ -33,6 +33,7 @@ use std::cell::RefCell;
 
 use inkling_core::ops::Projection;
 use inkling_core::quant::{BITS, ELEMENTS, GROUP_SIZE};
+use inkling_core::weights::Packed;
 
 use crate::buffer::Buffer;
 use crate::device::{Device, MetalError};
@@ -198,6 +199,25 @@ impl<'a> PackedProjection<'a> {
         })
     }
 
+    /// [`PackedProjection::upload`] over a checkpoint's own tensor, cut to its
+    /// first `out_dim` slices.
+    ///
+    /// The cut is what the head's truncation is: `lm_head` is `[201024, 4096]`
+    /// and 200058 of those rows are vocabulary, so a projection built to the
+    /// vocabulary leaves 966 rows of padding in the mapping rather than putting
+    /// 2 MB of guaranteed zeros on the device and dispatching over them. A bank
+    /// of experts is the other caller this shape has — one slice of a leading
+    /// axis, offset rather than cut — and it is not this method.
+    pub fn upload_packed(
+        device: &'a Device,
+        matmul: &'a PackedMatmul,
+        packed: &Packed<'_>,
+        out_dim: usize,
+    ) -> Result<Self, MatmulError> {
+        let (codes, scales) = packed.prefix(out_dim);
+        Self::upload(device, matmul, packed.slice_len(), out_dim, codes, scales)
+    }
+
     /// `[rows, in_dim]` in, `[rows, out_dim]` out.
     ///
     /// Fallible where [`Projection::forward`] is not, because a dispatch can
@@ -350,9 +370,10 @@ kernel void packed_matmul(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inkling_core::fixture::deviation;
+    use inkling_core::fixture::{self, deviation};
     use inkling_core::ops::DenseProjection;
     use inkling_core::quant::dequantize_blocks;
+    use inkling_core::weights::PackedRows;
 
     use crate::testing::device;
 
@@ -760,6 +781,51 @@ mod tests {
             let alone = projection.multiply(x).expect("the dispatch completes");
             assert_eq!(both[row * OUT_DIM..][..OUT_DIM], alone[..], "row {row}");
         }
+    }
+
+    /// A checkpoint's packed tensor onto the device, cut where the vocabulary
+    /// ends — and answering what the CPU makes of the same rows.
+    ///
+    /// [`PackedRows`] is the oracle rather than a decoded tensor here on
+    /// purpose: it is the projection the engine runs today, so what this states
+    /// is that exchanging one for the other is a change of backend and not a
+    /// change of answer.
+    ///
+    /// The rows past the cut are the assertion's other half. They decode to
+    /// exactly 0.0 — [`inkling_core::head`] is where that matters — so a
+    /// dispatch that quietly uploaded the whole tensor would still agree on the
+    /// 32 rows it was asked about, and only the length says otherwise.
+    #[test]
+    fn a_checkpoints_packed_tensor_uploads_the_rows_it_was_cut_to() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let ckpt = fixture::open(fixture::MXFP4);
+        let packed =
+            Packed::open(&ckpt, fixture::VOCAB_PADDING).expect("the fixture holds the slice");
+
+        let mut noise = Noise(0x0f1e_2d3c);
+        let x: Vec<f32> = (0..2 * packed.slice_len())
+            .map(|_| noise.signed())
+            .collect();
+        let got =
+            PackedProjection::upload_packed(&device, &matmul, &packed, fixture::VOCAB_PADDING_ROWS)
+                .expect("the cut tensor uploads")
+                .multiply(&x)
+                .expect("the dispatch completes");
+        assert_eq!(
+            got.len(),
+            2 * fixture::VOCAB_PADDING_ROWS,
+            "the padding rows were uploaded"
+        );
+
+        let want = PackedRows::new(packed, fixture::VOCAB_PADDING_ROWS).forward(&x);
+        let deviation = deviation(&got, &want);
+        eprintln!(
+            "{} rows of {}: deviation {deviation:e}",
+            fixture::VOCAB_PADDING_ROWS,
+            fixture::VOCAB_PADDING
+        );
+        assert!(deviation <= TOLERANCE, "deviation {deviation:e}");
     }
 
     /// A batch that happens to be empty is the caller's business rather than an

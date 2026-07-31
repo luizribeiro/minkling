@@ -151,6 +151,31 @@ impl<'a> Packed<'a> {
         )
     }
 
+    /// The first `slices` slices as the checkpoint stores them: the packed
+    /// bytes, and the scale bytes that go with them.
+    ///
+    /// For a backend that takes the weight rather than the values. The codes are
+    /// handed over as the bytes of the `U32` tensor because that is what they
+    /// are — little-endian words a kernel reads as words — so this is a range of
+    /// the mapping and not a transcoding of 411 MB.
+    ///
+    /// A leading run rather than an arbitrary slice because that is the shape
+    /// the truncation has: the vocabulary is the first `unpadded_vocab_size`
+    /// rows of the head, so a backend cut to it is handed bytes that stop where
+    /// the padding starts.
+    pub fn prefix(&self, slices: usize) -> (&'a [u8], &'a [u8]) {
+        assert!(
+            slices <= self.slices(),
+            "{slices} slices of a tensor that holds {}",
+            self.slices()
+        );
+        let stride = |view: &TensorView<'a>| view.data().len() / self.slices();
+        (
+            &self.weight.data()[..slices * stride(&self.weight)],
+            &self.scales.data()[..slices * stride(&self.scales)],
+        )
+    }
+
     /// Slice `index`, into a fresh vector, for a caller that wants one row and
     /// keeps it — which the embedding lookup does and no matmul does.
     pub fn decode_slice(&self, index: usize) -> Result<Vec<f32>, QuantError> {
@@ -682,6 +707,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::fixture;
+    use crate::quant::GROUP_SIZE;
 
     /// The synthetic stack's config, read for its shape rather than its
     /// contents: any real `TextConfig` settles the question below.
@@ -750,6 +776,40 @@ mod tests {
             projection.forward(&x),
             linear(&x, &weight, projection.in_dim())
         );
+    }
+
+    /// What a backend that uploads a weight is handed: the bytes themselves, as
+    /// many of them as the rows asked for, and the ones the mapping already
+    /// holds rather than a copy.
+    ///
+    /// The lengths are the claim. A cut that produced the whole tensor would
+    /// still decode correctly wherever it was indexed, so nothing about the
+    /// values would say the padding had been moved onto a device — only the
+    /// count of bytes does.
+    #[test]
+    fn a_prefix_is_the_leading_slices_bytes_and_no_more() {
+        let ckpt = fixture::open(fixture::MXFP4);
+        let packed = packed(&ckpt, fixture::VOCAB_PADDING);
+        let rows = fixture::VOCAB_PADDING_ROWS;
+        assert!(rows < packed.slices(), "a cut that cuts nothing");
+
+        let (codes, scales) = packed.prefix(packed.slices());
+        assert_eq!(codes.len(), packed.len() * BITS / u8::BITS as usize);
+        assert_eq!(scales.len(), packed.len() / GROUP_SIZE);
+
+        let (cut_codes, cut_scales) = packed.prefix(rows);
+        assert_eq!(cut_codes.len(), rows * codes.len() / packed.slices());
+        assert_eq!(cut_scales.len(), rows * scales.len() / packed.slices());
+        assert_eq!(cut_codes, &codes[..cut_codes.len()]);
+        assert_eq!(cut_scales, &scales[..cut_scales.len()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "65 slices of a tensor that holds 64")]
+    fn a_prefix_longer_than_the_tensor_is_refused() {
+        let ckpt = fixture::open(fixture::MXFP4);
+        let packed = packed(&ckpt, PROJECTION);
+        packed.prefix(packed.slices() + 1);
     }
 
     /// The truncation, on the checkpoint's own bytes: a projection cut at the
