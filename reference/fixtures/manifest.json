@@ -72,6 +72,15 @@
       "dtype": "float32"
     },
     {
+      "name": "layer0.input",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
       "name": "layer0.input_layernorm_out",
       "shape": [
         1,
@@ -247,6 +256,15 @@
     },
     {
       "name": "layer2.h",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer2.input",
       "shape": [
         1,
         8,

@@ -78,12 +78,20 @@ def _instrument_modules(taps):
 
 
 def _instrument_layers(capture, layers):
-    """Track which decoder layer is executing, and record its return value."""
+    """Track which decoder layer is executing, and record what it consumed and
+    what it returned.
+
+    The input is recorded even though the first captured layer's is
+    ``embed_norm_out``, because the layers between two captures record nothing
+    and the second one's input appears nowhere else. It can be recovered as
+    ``h - attn_sconv_out``, but only by assuming the residual wiring that is
+    itself under test."""
     inner = type(layers[0]).__call__
     index = {id(layer): i for i, layer in enumerate(layers)}
 
     def wrapped(self, *args, **kwargs):
         capture.layer = index[id(self)]
+        capture.record("input", args[0])
         out = inner(self, *args, **kwargs)
         capture.record("out", out)
         capture.layer = None
