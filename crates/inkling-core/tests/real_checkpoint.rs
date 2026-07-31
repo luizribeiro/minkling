@@ -2,6 +2,7 @@
 //! to commit. Set `INKLINGRS_CHECKPOINT` to a checkpoint directory to run them;
 //! unset, each test reports a skip and passes.
 
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -9,11 +10,16 @@ use std::time::Instant;
 use inkling_core::attention::{Attention, AttentionConfig, AttentionWeights};
 use inkling_core::embed::Embed;
 use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation, indices};
-use inkling_core::layer::{DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
+use inkling_core::layer::{
+    DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts,
+};
+use inkling_core::model::{ModelCache, ModelWeights};
 use inkling_core::moe::{GateWeights, MoeConfig, SparseMoe};
 use inkling_core::ops::DenseMlp;
 use inkling_core::quant::{Scratch, dequantize};
-use inkling_core::weights::{Packed, PackedExperts};
+use inkling_core::weights::{
+    CheckpointWeights, Packed, PackedExperts, expert_scratch_floats, layer_scratch_floats,
+};
 use inkling_core::{Checkpoint, Config, Dtype, TensorView, TextConfig};
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -763,4 +769,266 @@ fn the_embedding_tables_padding_rows_are_small_but_neither_zero_nor_normalised_a
         "the norm compressed the gap by only {:.0}x, from {in_the_table:.1} to {after_the_norm:.1}",
         in_the_table / after_the_norm
     );
+}
+
+/// What only the whole model can settle: that forty-two layers run in order,
+/// each built with the attention config and the MLP its index calls for, each
+/// against its own cache, and that the tensor names outside a layer are the ones
+/// this port assumes.
+///
+/// This is legitimately looser than any single layer's 1.5e-2, and by more than
+/// the length of the chain would suggest, because what it measures is different.
+/// Every intermediate of the recorded pass was rounded to bfloat16 and none of
+/// this port's are, so each layer contributes about one quantum — 2^-9 = 2.0e-3
+/// — of its own output. Forty-two of those added in quadrature is 1.3e-2, and
+/// the measurement is twice that: worst observed when this landed, 2.8e-2.
+/// Accumulation, not compounding; a port with an arithmetic mistake in it would
+/// not land within a factor of two of the rounding it inherited.
+///
+/// A factor of two in hand. Against the weakest mutation this bound has to catch
+/// — the normed state returned where the pre-norm one belongs, which is the one
+/// wiring mistake `LanguageModel.__call__`'s two last lines invite — 1.0, a
+/// decade above.
+///
+/// What this bound is *not* is a description of the tensor, and forty-two layers
+/// deep that stops being a quibble. The worst element disagrees by 2.8e-2 of the
+/// peak and the root mean square of the disagreements by 6.5e-4 — a factor of
+/// forty-four — over a tensor whose own peak is sixty-six times its RMS. So the
+/// number is set by a handful of elements at the top of a very long tail, and
+/// widening it to admit them admits far more everywhere else.
+///
+/// B3 should not define "matches the oracle" for logits this way. A tensor-wide
+/// epsilon over 201024 logits would be pinned by the same few outliers while
+/// saying nothing about the 200000 that decide nothing; what survives 42 layers
+/// of accumulated bfloat16 is the *ordering*, so the assertion with teeth is
+/// argmax agreement and top-k identity, with an epsilon kept only as a coarse
+/// guard beside it.
+const STACK_TOLERANCE: f32 = 6e-2;
+
+/// The same pass through the final norm, which is looser again for a reason
+/// worth writing down: the norm divides each row by its own RMS and so
+/// *compresses* the tensor it is measured against. `layers_out` peaks at 794624
+/// against an RMS of 11983 — one element sixty-six times the typical one — and
+/// `norm_out` peaks at 27.6 against 3.1. The same disagreement measured against
+/// a peak that dropped by a factor of nearly thirty relative to the bulk is a
+/// larger fraction of it.
+///
+/// On top of that this norm rounds where MLX rounds twice, which is the 2e-3
+/// `EMBED_NORM_TOLERANCE` accounts for and is not what dominates here. Worst
+/// observed when this landed: 4.9e-2, again a factor of two in hand.
+const FINAL_NORM_TOLERANCE: f32 = 1e-1;
+
+/// What a forward pass may hold resident, mapped pages included.
+///
+/// Observed when this landed: 16.7 GiB, of which 1.01 GiB is the scratch every
+/// weight is decoded into and the rest is packed bytes the pass touched and the
+/// kernel therefore kept — every layer's five projections, the two dense FFNs,
+/// and the experts eight tokens routed to. If no two of those tokens had ever
+/// agreed on an expert, all 48 selections a layer could make would be distinct
+/// and the same pass would touch about 28 GiB, so this sits above the arithmetic
+/// ceiling for eight tokens rather than above one measurement of one prompt.
+///
+/// What it has to catch is decades away and not a matter of margin: one layer's
+/// routed bank decoded eagerly is 25 GB on top of this, and the whole model
+/// decoded eagerly is 1.1 TB — against a 512 GiB host, and against the 130.6 GiB
+/// the checkpoint occupies packed.
+const RESIDENT_BOUND: u64 = 32 << 30;
+
+/// A [`ModelWeights`] that watches a pass go by.
+///
+/// It reports two things about the pass it wraps and changes nothing about it:
+/// the resident set, sampled per layer, and how far the layers the fixture
+/// captured have drifted from what the reference recorded for them.
+///
+/// The resident set is sampled per layer rather than once at the end because the
+/// scratch is faulted in as it is first written and the packed pages a layer
+/// reads join the resident set as it reads them, so a single reading afterwards
+/// would find whatever the last layer left rather than the worst any layer
+/// reached.
+///
+/// The drift is what a layer-at-a-time comparison cannot see. Each captured
+/// layer is measured here against the reference's output for it while being fed
+/// *this port's* input, where `the_decoder_layer_reproduces_the_reference` feeds
+/// it the reference's own — so what these numbers carry, and those do not, is
+/// everything the layers below contributed.
+struct Watched<'a> {
+    inner: &'a CheckpointWeights<'a>,
+    recorded: Vec<(usize, Vec<f32>)>,
+    peak: Cell<u64>,
+    drift: RefCell<Vec<(usize, f32)>>,
+}
+
+impl<'a> Watched<'a> {
+    fn new(inner: &'a CheckpointWeights<'a>, activations: &Checkpoint) -> Self {
+        Self {
+            inner,
+            recorded: CAPTURED_LAYERS
+                .into_iter()
+                .map(|layer| {
+                    (
+                        layer,
+                        fixture::f32s(&fixture::layer_tensor(activations, layer, "out")),
+                    )
+                })
+                .collect(),
+            peak: Cell::new(resident_bytes()),
+            drift: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// How far each captured layer had drifted by the time the pass reached it,
+    /// shallowest first.
+    fn drift(&self) -> Vec<(usize, f32)> {
+        self.drift.borrow().clone()
+    }
+}
+
+impl ModelWeights for Watched<'_> {
+    fn embedding_row(&self, id: usize) -> Vec<f32> {
+        self.inner.embedding_row(id)
+    }
+
+    fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: &[f32]) -> Vec<f32> {
+        let out = self.inner.run_layer(index, cache, x);
+        self.peak.set(self.peak.get().max(resident_bytes()));
+        if let Some((_, want)) = self.recorded.iter().find(|(layer, _)| *layer == index) {
+            self.drift.borrow_mut().push((index, deviation(&out, want)));
+        }
+        out
+    }
+}
+
+/// The typical disagreement beside [`deviation`]'s worst one: the root mean
+/// square of the differences, over the same tensor peak.
+///
+/// Reported and never asserted. What it answers is whether a bound of 2.8e-2 is
+/// describing the tensor or one element of it — and at 42 layers deep the answer
+/// decides how B3 can compare logits at all.
+fn typical_deviation(got: &[f32], want: &[f32]) -> f32 {
+    let scale = want.iter().fold(0.0f32, |worst, w| worst.max(w.abs()));
+    let squares: f64 = got
+        .iter()
+        .zip(want)
+        .map(|(got, want)| f64::from(got - want).powi(2))
+        .sum();
+    (squares / got.len() as f64).sqrt() as f32 / scale
+}
+
+/// The recorded ids, and the two answers the reference ended its forward pass
+/// with.
+fn recorded_stack(activations: &Checkpoint) -> (Vec<usize>, Vec<f32>, Vec<f32>) {
+    let of = |name: &str| fixture::f32s(&fixture::tensor(activations, name));
+    (
+        indices(&fixture::tensor(activations, "input_ids")),
+        of("layers_out"),
+        of("norm_out"),
+    )
+}
+
+#[test]
+fn the_whole_stack_reproduces_the_reference_against_real_weights() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+    let (ids, layers_out, norm_out) = recorded_stack(&activations);
+
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+    let model = weights.model();
+    assert_eq!(model.layers(), 42, "Inkling-Small is forty-two layers");
+
+    let watched = Watched::new(&weights, &activations);
+    let started = Instant::now();
+    let got = model.forward(&mut ModelCache::new(&config), &ids, &watched);
+    let normed = model.final_norm(&got);
+    eprintln!(
+        "42 layers over {} tokens in {:?}",
+        ids.len(),
+        started.elapsed()
+    );
+
+    // How the error grew on the way down, which is the question a fixture of
+    // three layers cannot answer on its own. Reported rather than bounded: the
+    // captured layers are 0, 2 and 5, and three points inside the first six of
+    // forty-two do not make a curve worth asserting a shape for.
+    for (layer, drift) in watched.drift() {
+        eprintln!("layer {layer}: drift {drift:e}");
+    }
+
+    let mut worst = 0.0f32;
+    for (what, got, want, bound) in [
+        ("layers_out", &got, &layers_out, STACK_TOLERANCE),
+        ("norm_out", &normed, &norm_out, FINAL_NORM_TOLERANCE),
+    ] {
+        let deviation = deviation(got, want);
+        eprintln!(
+            "{what}: worst {deviation:e}, typical {:e}",
+            typical_deviation(got, want)
+        );
+        assert!(deviation <= bound, "{what}: deviation {deviation:e}");
+        worst = worst.max(deviation);
+    }
+    assert!(
+        worst > 0.0,
+        "a run that matched exactly would mean the reference's bfloat16 vanished"
+    );
+
+    // The two ends of `LanguageModel.__call__`'s last two lines are four decades
+    // apart in magnitude, so returning either where the other belongs is a
+    // mistake the numbers catch outright. Free, because both are already here.
+    let swapped = deviation(&normed, &layers_out);
+    assert!(
+        swapped > STACK_TOLERANCE,
+        "the normed state stands in for the pre-norm one at only {swapped:e}"
+    );
+}
+
+#[test]
+fn the_whole_stack_holds_its_resident_set_under_a_bound() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+    let (ids, _, _) = recorded_stack(&activations);
+
+    let before = resident_bytes();
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+    let watched = Watched::new(&weights, &activations);
+    weights
+        .model()
+        .forward(&mut ModelCache::new(&config), &ids, &watched);
+
+    // The structural half of the bound, and the one with teeth. What the pass
+    // decodes into is one buffer, sized from the config before it starts, and
+    // `Scratch` panics rather than growing — so the pass having completed at all
+    // says nothing was decoded that this did not allow for. What remains to say
+    // is how much that is, and 2 GiB is chosen against the thing it must refuse:
+    // a MoE layer's routed bank decoded whole, which at 256 experts of 100.66 MB
+    // is 25 GB and would land a decade above.
+    let scratch = weights.scratch_floats() * size_of::<f32>();
+    assert!(
+        scratch < (2 << 30),
+        "the pass decodes into {scratch} bytes at once"
+    );
+    assert!(
+        expert_scratch_floats(&config) * config.n_routed_experts
+            > 8 * layer_scratch_floats(&config),
+        "a bank decoded whole would fit in the layer buffer, so this bounds nothing"
+    );
+
+    let (peak, gib) = (watched.peak.get(), (1u64 << 30) as f64);
+    eprintln!(
+        "scratch {:.2} GiB, RSS {:.2} -> peak {:.2} GiB",
+        scratch as f64 / gib,
+        before as f64 / gib,
+        peak as f64 / gib,
+    );
+    assert!(
+        peak < RESIDENT_BOUND,
+        "peak RSS {peak} bytes is over the bound of {RESIDENT_BOUND}"
+    );
+    // A pass that never faulted a weight in would mean the checkpoint was
+    // already resident, and the reading would be measuring the machine rather
+    // than this.
+    assert!(peak > before, "the pass grew the resident set by nothing");
 }
