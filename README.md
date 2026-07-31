@@ -25,15 +25,15 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 160 ms against mlx-vlm's 32 ms, and the timings go to
+A decode step is about 114 ms against mlx-vlm's 32 ms, and the timings go to
 stderr so stdout stays pipeable. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
 rather than applied by a template this does not implement.
 
 Every weight the model multiplies against runs on the GPU, against MXFP4 codes
-it never decodes, and `--backend cpu` puts them all back: 0.16 s a token against
-the CPU's 8.9. The experts were the first two thirds of that. A token reads 6 of
+it never decodes, and `--backend cpu` puts them all back: 0.114 s a token
+against the CPU's 8.9. The experts were the first two thirds of that. A token reads 6 of
 each MoE layer's 256 experts and both of its shared ones, which is 32 GB of
 float32 the CPU path decodes to multiply against and 4.3 GB of packed bytes the
 GPU path indexes into and never decodes at all. The rest is every layer's own
@@ -43,16 +43,26 @@ which are 9 GB of float32 that *every* token reads all of.
 **Nothing is copied onto the device.** The forty layers' banks are 137 GB, which
 is the whole checkpoint but for its two ends, and they are handed to the GPU
 where the checkpoint mapped them — `newBufferWithBytesNoCopy` over all of it in
-6 ms. So the resident set goes *down*, 20.8 GiB to 0.18 GiB, and a bank nobody
-routes to costs nothing to have wrapped. Note what that number stops meaning:
-those pages are still in the unified buffer cache, they are simply no longer
-this process's.
+6 ms. So the resident set goes *down* — 20.8 GiB with only the head there, 2.4
+GiB once the banks are, and 0.18 GiB once the layers' own projections are too —
+and a bank nobody routes to costs nothing to have wrapped. Note what those
+numbers stop meaning: the pages are still in the unified buffer cache, they are
+simply no longer this process's.
+
+**What a step costs is now mostly the asking.** A command buffer submitted and
+waited for is 206 µs whatever is in it, against the 105 µs a decode-shaped
+`[1, 4096] @ [4096, 4096]` projection takes to run — so the 457 dispatches a
+step makes are worth batching by what they depend on rather than issuing one at
+a time. Multiplies that share an input share a command buffer: the four
+projections a layer's normed hidden state feeds, and each expert bank's gate and
+up. That is 249 submissions rather than 457, and 51 ms of the 114.
 
 What is left on the CPU is the attention step itself — whose scores and softmax
 multiply activations against activations and have no weight to hand over — plus
 the two norms and four short convolutions of each layer, and the routers' own
-`[256, 4096]` gate. No weight above four megabytes among them. Both backends generate the same tokens, and the CPU one stays the
-oracle every kernel here is validated against.
+`[256, 4096]` gate. No weight above four megabytes among them. Both backends
+generate the same tokens, and the CPU one stays the oracle every kernel here is
+validated against.
 
 Or the same model behind an OpenAI-compatible endpoint, loaded once:
 
