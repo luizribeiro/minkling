@@ -126,6 +126,22 @@ pub struct DecoderCache {
     mlp_sconv: ConvState,
 }
 
+impl DecoderCache {
+    /// The state a sequence starts from: no keys, and four empty convolution
+    /// windows.
+    ///
+    /// Built from the config and the two widths rather than from a
+    /// [`DecoderLayer`], because the stack allocates all forty-two of these
+    /// before it decodes any layer's weights.
+    pub fn new(config: AttentionConfig, hidden: usize, kernel_size: usize) -> Self {
+        Self {
+            attention: AttentionCache::new(config, kernel_size),
+            attn_sconv: ConvState::new(hidden, kernel_size),
+            mlp_sconv: ConvState::new(hidden, kernel_size),
+        }
+    }
+}
+
 /// One decoder layer, from the hidden state it is handed to the one it passes
 /// on.
 #[derive(Debug, Clone, Copy)]
@@ -169,14 +185,13 @@ impl<'a> DecoderLayer<'a> {
         self.hidden
     }
 
-    /// The state a sequence starts from: no keys, and four empty convolution
-    /// windows.
+    /// The state a sequence starts from, for this layer's own shape.
     pub fn cache(&self) -> DecoderCache {
-        DecoderCache {
-            attention: self.attention.cache(),
-            attn_sconv: self.attn_sconv.state(),
-            mlp_sconv: self.mlp_sconv.state(),
-        }
+        DecoderCache::new(
+            self.attention.config(),
+            self.hidden,
+            self.attn_sconv.kernel_size(),
+        )
     }
 
     /// `[tokens, hidden]` in and out, continuing from `cache` and leaving this
@@ -454,6 +469,22 @@ mod tests {
             let mut split = prefill;
             split.extend(rest);
             assert_eq!(split, at_once, "{}", layer.name);
+        }
+    }
+
+    /// A stack allocates a cache for every layer before it decodes any layer's
+    /// weights, so a cache has to come from the shapes alone. It has to be the
+    /// same cache: a window of the wrong width or keys of the wrong stride
+    /// would show only on the second call, which is why both are driven.
+    #[test]
+    fn a_cache_built_from_the_shapes_alone_drives_the_same_two_calls() {
+        for layer in Layer::all() {
+            let decoder = layer.layer();
+            let kernel_size = layer.weights.kernel_size();
+            let mut cache = DecoderCache::new(layer.config, layer.hidden(), kernel_size);
+            let prefill = decoder.forward(&mut cache, &layer.x, &layer.weights);
+            let rest = decoder.forward(&mut cache, &layer.continue_x, &layer.weights);
+            assert_eq!((prefill, rest), layer.forward(), "{}", layer.name);
         }
     }
 

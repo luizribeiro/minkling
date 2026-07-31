@@ -202,6 +202,12 @@ impl AttentionConfig {
                 .map(|floor| LogScaling::new(floor, config.log_scaling_alpha)),
         }
     }
+
+    /// The width the key and value projections produce, which is the width of
+    /// their convolutions and of every key the cache holds.
+    pub fn kv_channels(&self) -> usize {
+        self.kv_heads * self.head_dim
+    }
 }
 
 /// One attention layer's tensors, as the checkpoint stores them: the five
@@ -237,17 +243,34 @@ pub struct AttentionCache {
     values: Vec<f32>,
 }
 
+impl AttentionCache {
+    /// The state a sequence starts from: empty convolution windows and no keys.
+    ///
+    /// Built from the config rather than from an [`Attention`], because a stack
+    /// of forty-two layers allocates its caches before it has decoded a single
+    /// weight — and at Inkling-Small's size, standing a layer up to ask it for
+    /// one would mean decoding 176 MB of projections to learn two integers.
+    pub fn new(config: AttentionConfig, kernel_size: usize) -> Self {
+        let channels = config.kv_channels();
+        Self {
+            k_sconv: ConvState::new(channels, kernel_size),
+            v_sconv: ConvState::new(channels, kernel_size),
+            keys: Vec::new(),
+            values: Vec::new(),
+        }
+    }
+}
+
 /// One attention layer, from the hidden state its input layernorm produced to
 /// the one `o_proj` returns.
 #[derive(Debug, Clone, Copy)]
 pub struct Attention<'a> {
+    config: AttentionConfig,
     sdpa: Sdpa,
     mask: BandedMask<'a>,
     k_sconv: ShortConv<'a>,
     v_sconv: ShortConv<'a>,
     hidden: usize,
-    rms_norm_eps: f32,
-    log_scaling: Option<LogScaling>,
     weights: AttentionWeights<'a>,
 }
 
@@ -274,31 +297,31 @@ impl<'a> Attention<'a> {
         assert_eq!(weights.k_norm.len(), head_dim, "k_norm");
 
         Self {
+            config,
             sdpa,
             mask: BandedMask::new(config.d_rel, weights.rel_proj, config.sliding),
             k_sconv: ShortConv::new(kv_heads * head_dim, weights.k_sconv),
             v_sconv: ShortConv::new(kv_heads * head_dim, weights.v_sconv),
             hidden,
-            rms_norm_eps: config.rms_norm_eps,
-            log_scaling: config.log_scaling,
             weights,
         }
     }
 
-    /// The state a sequence starts from: empty convolution windows and no keys.
+    /// What `InklingAttention.__init__` derived for this layer.
+    pub fn config(&self) -> AttentionConfig {
+        self.config
+    }
+
+    /// The state a sequence starts from, for this layer's own shape.
     pub fn cache(&self) -> AttentionCache {
-        AttentionCache {
-            k_sconv: self.k_sconv.state(),
-            v_sconv: self.v_sconv.state(),
-            keys: Vec::new(),
-            values: Vec::new(),
-        }
+        AttentionCache::new(self.config, self.k_sconv.kernel_size())
     }
 
     /// `[queries, hidden]` in and out, continuing from `cache` and leaving this
     /// call's keys, values and convolution windows behind in it.
     pub fn forward(&self, cache: &mut AttentionCache, x: &[f32]) -> Vec<f32> {
-        self.attend(cache, x, self.log_scaling, self.log_scaling)
+        let log_scaling = self.config.log_scaling;
+        self.attend(cache, x, log_scaling, log_scaling)
     }
 
     /// [`Attention::forward`], with log scaling's two multiplications named
@@ -327,7 +350,7 @@ impl<'a> Attention<'a> {
         let offset = cache.keys.len() / (self.sdpa.kv_heads * head_dim);
 
         let project = |weight| linear(x, weight, self.hidden);
-        let norm = |x: &[f32], weight| rms_norm(x, weight, self.rms_norm_eps);
+        let norm = |x: &[f32], weight| rms_norm(x, weight, self.config.rms_norm_eps);
 
         // The key is normed after its convolution, not before, and the value is
         // convolved and never normed.

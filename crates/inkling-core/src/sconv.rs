@@ -32,6 +32,20 @@ pub struct ConvState {
 }
 
 impl ConvState {
+    /// The state a sequence starts from: `kernel_size - 1` zeroed timesteps,
+    /// which is what makes the first output causal.
+    ///
+    /// Built from the two shapes rather than from a [`ShortConv`], because a
+    /// stack of forty-two layers allocates every cache it will need before it
+    /// has decoded a single weight.
+    pub fn new(channels: usize, kernel_size: usize) -> Self {
+        assert!(kernel_size > 0, "a kernel needs at least one tap");
+        Self {
+            channels,
+            history: vec![0.0; (kernel_size - 1) * channels],
+        }
+    }
+
     /// The `kernel_size - 1` timesteps preceding the next input, oldest first.
     pub fn history(&self) -> &[f32] {
         &self.history
@@ -71,13 +85,9 @@ impl<'a> ShortConv<'a> {
         self.kernel_size
     }
 
-    /// The state a sequence starts from: `kernel_size - 1` zeroed timesteps,
-    /// which is what makes the first output causal.
+    /// The state a sequence starts from, for this convolution's own shape.
     pub fn state(&self) -> ConvState {
-        ConvState {
-            channels: self.channels,
-            history: vec![0.0; (self.kernel_size - 1) * self.channels],
-        }
+        ConvState::new(self.channels, self.kernel_size)
     }
 
     /// `[rows, channels]` in and out, continuing from `state` and leaving the
