@@ -136,7 +136,7 @@ fn silu(x: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::checkpoint::Checkpoint;
-    use crate::fixture;
+    use crate::fixture::{self, deviation};
 
     /// Synthetic inputs and mlx-vlm's answers to them, from
     /// `just dump-op-fixture`.
@@ -150,10 +150,6 @@ mod tests {
         "norm_large",
     ];
 
-    /// Deviation is measured against the largest value in the reference tensor
-    /// rather than element by element, because a `down_proj` output that lands
-    /// near zero by cancellation has no meaningful relative error of its own.
-    ///
     /// 1e-6 is a few tens of f32 ulps at that scale. Both ops reduce over their
     /// feature axis, so their summation order and MLX's part company in the
     /// last bits and no tighter bound is honest; much looser would stop telling
@@ -162,18 +158,6 @@ mod tests {
     /// bound has a factor of five in hand. Needing more than that is a bug
     /// signal, not a reason to widen it.
     const TOLERANCE: f32 = 1e-6;
-
-    /// The worst absolute error, as a fraction of the reference tensor's
-    /// largest value.
-    fn deviation(got: &[f32], want: &[f32]) -> f32 {
-        assert_eq!(got.len(), want.len(), "length");
-        let scale = want.iter().fold(0.0f32, |worst, w| worst.max(w.abs()));
-        assert!(scale > 0.0, "reference tensor is all zeros");
-        got.iter()
-            .zip(want)
-            .fold(0.0f32, |worst, (got, want)| worst.max((got - want).abs()))
-            / scale
-    }
 
     fn eps(ckpt: &Checkpoint) -> f32 {
         fixture::f32s(&fixture::tensor(ckpt, "rms_norm_eps"))[0]
