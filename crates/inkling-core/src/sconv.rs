@@ -147,17 +147,11 @@ impl<'a> ShortConv<'a> {
 mod tests {
     use super::*;
     use crate::checkpoint::Checkpoint;
-    use crate::fixture::{self, deviation};
+    use crate::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation};
 
     /// Synthetic float32 cases and the trained kernels, from
     /// `just dump-sconv-fixture`.
     const FIXTURE: &str = "sconv.safetensors";
-
-    /// The forward pass `just dump-activations` recorded, which carries the
-    /// input and the output of every short convolution in the captured layers.
-    const ACTIVATIONS: &str = "layer_activations.safetensors";
-
-    const CAPTURED_LAYERS: [usize; 2] = [0, 2];
 
     /// Each conv's kernel in `FIXTURE`, and the activation pair in
     /// `ACTIVATIONS` it maps between.
@@ -244,12 +238,9 @@ mod tests {
                 .iter()
                 .flat_map(|layer| TRAINED.map(|conv| (*layer, conv)))
                 .map(|(layer, (conv, input, output))| {
-                    let kernel = fixture::tensor(&fixture, &format!("layer{layer}.{conv}.weight"));
+                    let kernel = fixture::layer_tensor(&fixture, layer, &format!("{conv}.weight"));
                     let of = |name: &str| {
-                        fixture::f32s(&fixture::tensor(
-                            &activations,
-                            &format!("layer{layer}.{name}"),
-                        ))
+                        fixture::f32s(&fixture::layer_tensor(&activations, layer, name))
                     };
                     Self {
                         name: format!("layer{layer}.{conv}"),

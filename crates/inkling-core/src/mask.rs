@@ -131,18 +131,11 @@ impl<'a> BandedMask<'a> {
 mod tests {
     use super::*;
     use crate::checkpoint::TensorView;
-    use crate::fixture::{self, deviation};
+    use crate::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation};
 
     /// Synthetic cases and the trained projections, from
     /// `just dump-mask-fixture`.
     const FIXTURE: &str = "mask.safetensors";
-
-    /// The forward pass `just dump-activations` recorded, which carries the
-    /// mask attention consumed in each captured layer and the `r_proj` output
-    /// it was built from.
-    const ACTIVATIONS: &str = "layer_activations.safetensors";
-
-    const CAPTURED_LAYERS: [usize; 2] = [0, 2];
 
     /// The synthetic cases, and the branches each was placed to reach. Named
     /// here as well as in the dump script so a case that is retuned until it
@@ -270,17 +263,15 @@ mod tests {
             let activations = fixture::open(ACTIVATIONS);
             CAPTURED_LAYERS
                 .iter()
-                .map(|layer| {
-                    let of = |name: &str| fixture::tensor(&ckpt, &format!("layer{layer}.{name}"));
+                .map(|&layer| {
+                    let of = |name: &str| fixture::layer_tensor(&ckpt, layer, name);
+                    let recorded = |name: &str| fixture::layer_tensor(&activations, layer, name);
                     Self::new(
                         &format!("layer{layer}"),
-                        &fixture::tensor(&activations, &format!("layer{layer}.r_proj_out")),
+                        &recorded("r_proj_out"),
                         &of("rel_proj"),
                         &fixture::f32s(&of("config")),
-                        fixture::f32s(&fixture::tensor(
-                            &activations,
-                            &format!("layer{layer}.mask"),
-                        )),
+                        fixture::f32s(&recorded("mask")),
                     )
                 })
                 .collect()

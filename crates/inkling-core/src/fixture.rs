@@ -10,6 +10,15 @@ use crate::checkpoint::{Checkpoint, Dtype, TensorView};
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../reference/fixtures");
 
+/// The forward pass `just dump-activations` recorded: eight tokens through the
+/// whole model, keeping every intermediate of the layers it captured.
+pub const ACTIVATIONS: &str = "layer_activations.safetensors";
+
+/// The decoder layers that pass kept, and so the layers every trained case is
+/// cut from. Which two comes from the checkpoint — the dump script refuses a
+/// pair that does not cover both a dense and a MoE MLP.
+pub const CAPTURED_LAYERS: [usize; 2] = [0, 2];
+
 pub fn open(file: &str) -> Checkpoint {
     let path = PathBuf::from(DIR).join(file);
     Checkpoint::open(&path).unwrap_or_else(|err| panic!("{file} opens: {err}"))
@@ -18,6 +27,12 @@ pub fn open(file: &str) -> Checkpoint {
 pub fn tensor<'a>(ckpt: &'a Checkpoint, name: &str) -> TensorView<'a> {
     ckpt.tensor(name)
         .unwrap_or_else(|err| panic!("fixture holds {name}: {err}"))
+}
+
+/// A tensor a dump recorded per decoder layer, which every bundle names
+/// `layer{layer}.{name}`.
+pub fn layer_tensor<'a>(ckpt: &'a Checkpoint, layer: usize, name: &str) -> TensorView<'a> {
+    tensor(ckpt, &format!("layer{layer}.{name}"))
 }
 
 /// A fixture tensor's values. Every dump casts to float32 before saving, so a

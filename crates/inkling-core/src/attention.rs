@@ -164,13 +164,8 @@ fn softmax(row: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{self, deviation};
+    use crate::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation};
     use crate::mask::{MASKED, is_masked};
-
-    /// The forward pass `just dump-activations` recorded.
-    const ACTIVATIONS: &str = "layer_activations.safetensors";
-
-    const CAPTURED_LAYERS: [usize; 2] = [0, 2];
 
     /// The recorded step ran in bfloat16 on trained numbers, so its output is
     /// this computation rounded once on the way out, and the tolerance is that
@@ -205,7 +200,7 @@ mod tests {
         /// taken one step earlier.
         fn load(layer: usize) -> Self {
             let activations = fixture::open(ACTIVATIONS);
-            let of = |name: &str| fixture::tensor(&activations, &format!("layer{layer}.{name}"));
+            let of = |name: &str| fixture::layer_tensor(&activations, layer, name);
 
             let q = of("q_norm_out");
             let k = of("k_norm_out");
