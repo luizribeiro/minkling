@@ -33,6 +33,10 @@ dump-activations model="models/Inkling-Small-mxfp4":
 dump-quant-fixture model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_quant_fixture.py {{ model }}
 
+# Regenerate the committed sconv kernels and cases the Rust short conv is tested against
+dump-sconv-fixture model="models/Inkling-Small-mxfp4":
+    reference/.venv/bin/python reference/scripts/dump_sconv_fixture.py {{ model }}
+
 # Regenerate the committed synthetic tensors the Rust CPU ops are tested against
 dump-op-fixture:
     reference/.venv/bin/python reference/scripts/dump_op_fixture.py
