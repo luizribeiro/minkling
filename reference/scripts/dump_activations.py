@@ -26,6 +26,12 @@ final norm and after it, because the reference distinguishes them — and the
 logits the head makes of it. The forty-two layers' own intermediates are not, and
 could not be committed; the end-to-end comparison is what tests the stack.
 
+The oracle's greedy continuation of the same ids is recorded too, which is the
+one thing here that is not a tensor of a single forward pass. It costs one
+argmax and one cached decode step per token, and it buys a comparison the Rust
+tests cannot make for themselves: the reference and this port producing the same
+tokens, without a Python round trip in `cargo test`.
+
 Everything is captured by wrapping the reference's own modules and functions,
 never by recomputing: a recomputation that drifts from the reference would make
 the fixture agree with the bug it is supposed to catch."""
@@ -46,6 +52,13 @@ SEQ_LEN = 8
 # stops surviving forty-two layers of bfloat16 is something the fixture can be
 # asked rather than something the fixture has to be regenerated to answer.
 TOP_K = 32
+
+# How many tokens of greedy continuation are recorded. Longer than any test is
+# expected to run, for the same reason `TOP_K` is deeper than any assertion:
+# decoding a token costs the Rust engine 41 GB of dequantisation and a minute
+# and a half, so how far the two agree is a number a test spends deliberately,
+# and lengthening the fixture to find out should not mean loading 131 GB again.
+CONTINUATION = 8
 
 
 class Capture:
@@ -224,6 +237,34 @@ def record_logits(capture, language_model, top_k):
     capture.record("logits_untruncated", untruncated[0, -1])
 
 
+def greedy_continuation(language_model, inputs, count):
+    """The ids the reference generates from `inputs` by taking the argmax, one
+    token at a time, against the caches `make_cache` allocates.
+
+    This is the milestone the Rust engine's decode loop is measured against, so
+    every step of it is the reference's own: `LanguageModel.__call__` produces
+    the logits, `_logits_from_norm` truncates them at `unpadded_vocab_size`, and
+    `mx.argmax` breaks a tie towards the lower id — which is the rule the Rust
+    ranking uses too, and one that matters, because three significant digits of
+    bfloat16 over 200058 logits leaves ties everywhere.
+
+    Only the sampled token is fed back. The prompt enters the caches on the first
+    call and every step after it is one token against everything before it, which
+    is the decode regime rather than a prefill repeated.
+
+    Run before the capture is instrumented, because the taps are installed on
+    module *classes* and would otherwise overwrite every recorded tensor with the
+    last decode step's."""
+    cache = language_model.make_cache()
+    ids, generated = inputs, []
+    for _ in range(count):
+        logits = language_model(inputs=ids, cache=cache).logits
+        ids = mx.argmax(logits[:, -1:, :], axis=-1)
+        mx.eval(ids)
+        generated.append(int(ids[0, 0]))
+    return mx.array([generated], dtype=mx.int32)
+
+
 def instrument(capture, model):
     lm = model.language_model.model
     taps = [
@@ -299,13 +340,16 @@ def dtype_name(value):
     return str(value.dtype).rsplit(".", 1)[-1]
 
 
-def build_manifest(model, model_path, input_ids, repeats, layer_indices, tensors):
+def build_manifest(
+    model, model_path, input_ids, repeats, layer_indices, tensors, continuation
+):
     index = json.loads((Path(model_path) / "model.safetensors.index.json").read_text())
     config = model.config.text_config
     return {
         "prompt": PROMPT,
         "prompt_repeats": repeats,
         "input_ids": input_ids,
+        "greedy_continuation": continuation,
         "checkpoint": {
             "path": str(model_path),
             "total_size": index["metadata"]["total_size"],
@@ -331,6 +375,7 @@ def main():
     ap.add_argument("--seq-len", type=int, default=SEQ_LEN)
     ap.add_argument("--layers", type=int, nargs="+", default=CAPTURED_LAYERS)
     ap.add_argument("--top-k", type=int, default=TOP_K)
+    ap.add_argument("--continuation", type=int, default=CONTINUATION)
     ap.add_argument("--name", default="layer_activations")
     ap.add_argument("--out-dir", default="reference/fixtures")
     args = ap.parse_args()
@@ -339,10 +384,12 @@ def main():
     check_layer_coverage(model.config.text_config, args.layers)
     ids, repeats = token_ids(processor, args.seq_len)
     inputs = mx.array(ids, dtype=mx.int32)[None, :]
+    continuation = greedy_continuation(model.language_model, inputs, args.continuation)
 
     capture = Capture(args.layers)
     instrument(capture, model)
     capture.record("input_ids", inputs)
+    capture.record("greedy_continuation", continuation)
     model.language_model(
         inputs=inputs, cache=model.language_model.make_cache(), skip_logits=True
     )
@@ -358,7 +405,15 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     bundle = out_dir / f"{args.name}.safetensors"
     mx.save_safetensors(str(bundle), tensors)
-    manifest = build_manifest(model, args.model, ids, repeats, args.layers, tensors)
+    manifest = build_manifest(
+        model,
+        args.model,
+        ids,
+        repeats,
+        args.layers,
+        tensors,
+        continuation.tolist()[0],
+    )
     with open(out_dir / f"{args.name}.json", "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")

@@ -11,6 +11,16 @@
     484,
     10292
   ],
+  "greedy_continuation": [
+    656,
+    13,
+    623,
+    180069,
+    86333,
+    60500,
+    220,
+    23
+  ],
   "checkpoint": {
     "path": "models/Inkling-Small-mxfp4",
     "total_size": 140271331492
@@ -50,6 +60,14 @@
         4096
       ],
       "dtype": "float32"
+    },
+    {
+      "name": "greedy_continuation",
+      "shape": [
+        1,
+        8
+      ],
+      "dtype": "int32"
     },
     {
       "name": "input_ids",
