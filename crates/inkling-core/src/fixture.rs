@@ -8,8 +8,11 @@
 
 use std::path::PathBuf;
 
+use crate::attention::AttentionWeights;
 use crate::checkpoint::{Checkpoint, Dtype, TensorView};
-use crate::moe::ExpertBank;
+use crate::layer::{DecoderWeights, Experts, LayerMlp, NoExperts};
+use crate::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
+use crate::ops::DenseMlp;
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../reference/fixtures");
 
@@ -127,6 +130,201 @@ impl Bank {
         )
         .expert(index)
         .forward(rows)
+    }
+}
+
+/// One synthetic decoder layer's tensors, owned so the borrowed
+/// [`DecoderWeights`] and [`LayerMlp`] can be handed out repeatedly.
+///
+/// Every dump names a layer's tensors `{prefix}.{module}` after the module that
+/// holds them, so one reader serves a bundle of standalone layers and a bundle
+/// of a whole stack. The expert banks are held whole, which sixteen experts of
+/// width sixteen allow and Inkling's 25 GB do not.
+pub struct LayerTensors {
+    q_proj: Vec<f32>,
+    k_proj: Vec<f32>,
+    v_proj: Vec<f32>,
+    r_proj: Vec<f32>,
+    o_proj: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    k_sconv: Vec<f32>,
+    v_sconv: Vec<f32>,
+    rel_proj: Vec<f32>,
+    input_layernorm: Vec<f32>,
+    post_attention_layernorm: Vec<f32>,
+    attn_sconv: Vec<f32>,
+    mlp_sconv: Vec<f32>,
+    mlp: Mlp,
+}
+
+/// Whichever MLP a layer index called for, owned the same way.
+enum Mlp {
+    Dense {
+        gate_proj: Vec<f32>,
+        up_proj: Vec<f32>,
+        down_proj: Vec<f32>,
+        global_scale: f32,
+    },
+    Sparse {
+        config: MoeConfig,
+        gate_weight: Vec<f32>,
+        correction_bias: Vec<f32>,
+        global_scale: f32,
+        routed: Bank,
+        shared: Bank,
+    },
+}
+
+impl LayerTensors {
+    pub fn load(ckpt: &Checkpoint, prefix: &str) -> Self {
+        let of = |name: &str| f32s(&tensor(ckpt, &format!("{prefix}.{name}")));
+        let input_layernorm = of("input_layernorm.weight");
+        Self {
+            q_proj: of("self_attn.q_proj.weight"),
+            k_proj: of("self_attn.k_proj.weight"),
+            v_proj: of("self_attn.v_proj.weight"),
+            r_proj: of("self_attn.r_proj.weight"),
+            o_proj: of("self_attn.o_proj.weight"),
+            q_norm: of("self_attn.q_norm.weight"),
+            k_norm: of("self_attn.k_norm.weight"),
+            k_sconv: of("self_attn.k_sconv.conv.weight"),
+            v_sconv: of("self_attn.v_sconv.conv.weight"),
+            rel_proj: of("self_attn.rel_proj"),
+            post_attention_layernorm: of("post_attention_layernorm.weight"),
+            attn_sconv: of("attn_sconv.conv.weight"),
+            mlp_sconv: of("mlp_sconv.conv.weight"),
+            mlp: Mlp::load(ckpt, prefix, input_layernorm.len()),
+            input_layernorm,
+        }
+    }
+
+    pub fn view(&self) -> DecoderWeights<'_> {
+        DecoderWeights {
+            attention: AttentionWeights {
+                q_proj: &self.q_proj,
+                k_proj: &self.k_proj,
+                v_proj: &self.v_proj,
+                r_proj: &self.r_proj,
+                o_proj: &self.o_proj,
+                q_norm: &self.q_norm,
+                k_norm: &self.k_norm,
+                k_sconv: &self.k_sconv,
+                v_sconv: &self.v_sconv,
+                rel_proj: &self.rel_proj,
+            },
+            input_layernorm: &self.input_layernorm,
+            post_attention_layernorm: &self.post_attention_layernorm,
+            attn_sconv: &self.attn_sconv,
+            mlp_sconv: &self.mlp_sconv,
+        }
+    }
+
+    pub fn hidden(&self) -> usize {
+        self.input_layernorm.len()
+    }
+
+    /// `sconv_kernel_size`, which every one of the layer's four convolutions
+    /// shares and which the residual-path pair's kernels state directly.
+    pub fn kernel_size(&self) -> usize {
+        self.attn_sconv.len() / self.hidden()
+    }
+
+    pub fn is_dense(&self) -> bool {
+        matches!(self.mlp, Mlp::Dense { .. })
+    }
+
+    pub fn mlp(&self) -> LayerMlp<'_> {
+        let hidden = self.hidden();
+        match &self.mlp {
+            Mlp::Dense {
+                gate_proj,
+                up_proj,
+                down_proj,
+                global_scale,
+            } => LayerMlp::Dense(DenseMlp::new(
+                hidden,
+                gate_proj,
+                up_proj,
+                down_proj,
+                *global_scale,
+            )),
+            Mlp::Sparse {
+                config,
+                gate_weight,
+                correction_bias,
+                global_scale,
+                ..
+            } => LayerMlp::Sparse(SparseMoe::new(
+                *config,
+                GateWeights {
+                    gate_weight,
+                    correction_bias,
+                    global_scale: *global_scale,
+                },
+            )),
+        }
+    }
+}
+
+impl Mlp {
+    /// A layer with a router records its `[n_routed, n_shared, top_k,
+    /// route_scale]` and a dense layer records none, which is the dump saying
+    /// what `MoeConfig::for_layer` says by returning `None`.
+    fn load(ckpt: &Checkpoint, prefix: &str, hidden: usize) -> Self {
+        let of = |name: &str| f32s(&tensor(ckpt, &format!("{prefix}.mlp.{name}")));
+        let global_scale = of("global_scale")[0];
+
+        let moe_config = format!("{prefix}.moe_config");
+        if !ckpt.tensor_names().any(|name| name == moe_config) {
+            return Self::Dense {
+                gate_proj: of("gate_proj.weight"),
+                up_proj: of("up_proj.weight"),
+                down_proj: of("down_proj.weight"),
+                global_scale,
+            };
+        }
+
+        let recorded = f32s(&tensor(ckpt, &moe_config));
+        let &[n_routed, n_shared, top_k, route_scale] = recorded.as_slice() else {
+            panic!("{prefix}: moe_config carries four scalars, got {recorded:?}")
+        };
+        let config = MoeConfig {
+            n_routed: n_routed as usize,
+            n_shared: n_shared as usize,
+            top_k: top_k as usize,
+            route_scale,
+        };
+        let bank = |module: &str, experts| {
+            Bank::load(ckpt, &format!("{prefix}.mlp.{module}"), experts, hidden)
+        };
+        Self::Sparse {
+            gate_weight: of("gate_weight"),
+            correction_bias: of("e_score_correction_bias"),
+            global_scale,
+            routed: bank("switch_mlp", config.n_routed),
+            shared: bank("shared_experts", config.n_shared),
+            config,
+        }
+    }
+}
+
+/// The banks a layer carries, which is what makes one reader serve both MLPs: a
+/// dense layer asks for nothing, and asking anyway is the panic [`NoExperts`]
+/// raises.
+impl Experts for LayerTensors {
+    fn routed(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
+        match &self.mlp {
+            Mlp::Dense { .. } => NoExperts.routed(expert, rows),
+            Mlp::Sparse { routed, .. } => routed.expert(expert, rows),
+        }
+    }
+
+    fn shared(&self, expert: usize, rows: &[f32]) -> Vec<f32> {
+        match &self.mlp {
+            Mlp::Dense { .. } => NoExperts.shared(expert, rows),
+            Mlp::Sparse { shared, .. } => shared.expert(expert, rows),
+        }
     }
 }
 
