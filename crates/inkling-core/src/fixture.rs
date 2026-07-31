@@ -17,6 +17,22 @@ const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../reference/fixtures
 /// whole model, keeping every intermediate of the layers it captured.
 pub const ACTIVATIONS: &str = "layer_activations.safetensors";
 
+/// The same capture over a sequence long enough to reach past the relative-
+/// position band, from `just dump-long-activations`.
+///
+/// Not committed. Its masks alone are `[1, 32, L, L]` — 210 MB a layer at the
+/// 1280 tokens the recipe captures, against a bundle of a gibibyte — so
+/// reproducing it matters more than holding it, and every test that reads it
+/// skips when it is absent the way the `INKLINGRS_CHECKPOINT` tests do.
+///
+/// 1280 is the band plus a quarter of it. That puts 32896 query-key pairs per
+/// head outside the band on a global layer, spread over 256 rows and 256
+/// distances rather than heaped in one corner, and 295296 pairs past the window
+/// on a sliding one. Everything about the capture is quadratic in that length,
+/// so a longer one costs a fixture nobody can hold and buys margin no test
+/// spends.
+pub const LONG_ACTIVATIONS: &str = "long_activations.safetensors";
+
 /// The decoder layers that pass kept, and so the layers every trained case is
 /// cut from. Which three comes from the checkpoint — the dump script refuses a
 /// set that does not cover both a dense and a MoE MLP, and both a sliding and a
@@ -26,6 +42,23 @@ pub const CAPTURED_LAYERS: [usize; 3] = [0, 2, 5];
 pub fn open(file: &str) -> Checkpoint {
     let path = PathBuf::from(DIR).join(file);
     Checkpoint::open(&path).unwrap_or_else(|err| panic!("{file} opens: {err}"))
+}
+
+/// [`open`], for a bundle too large to commit: absent, it reports a skip and
+/// the caller returns rather than failing.
+pub fn try_open(file: &str) -> Option<Checkpoint> {
+    if !PathBuf::from(DIR).join(file).exists() {
+        eprintln!("skipping: {file} has not been generated");
+        return None;
+    }
+    Some(open(file))
+}
+
+/// Whether a bundle recorded a given decoder layer, which the long capture
+/// answers differently from the committed one.
+pub fn holds_layer(ckpt: &Checkpoint, layer: usize) -> bool {
+    let prefix = format!("layer{layer}.");
+    ckpt.tensor_names().any(|name| name.starts_with(&prefix))
 }
 
 pub fn tensor<'a>(ckpt: &'a Checkpoint, name: &str) -> TensorView<'a> {

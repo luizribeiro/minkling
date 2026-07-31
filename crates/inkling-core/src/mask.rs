@@ -8,7 +8,10 @@
 //!
 //! Pinned to mlx-vlm by `reference/fixtures/mask.safetensors`, whose synthetic
 //! cases are float32 throughout, and by the trained `rel_proj` in that bundle
-//! against the masks recorded in `layer_activations.safetensors`.
+//! against the masks recorded in `layer_activations.safetensors`. Those cover
+//! eight tokens, where the window and the far side of the band are both out of
+//! reach; the trained cases that reach them read `long_activations.safetensors`
+//! and skip when it has not been generated.
 
 /// The additive constant a masked position carries.
 ///
@@ -130,8 +133,8 @@ impl<'a> BandedMask<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::TensorView;
-    use crate::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation};
+    use crate::checkpoint::{Checkpoint, TensorView};
+    use crate::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, LONG_ACTIVATIONS, deviation};
 
     /// Synthetic cases and the trained projections, from
     /// `just dump-mask-fixture`.
@@ -256,30 +259,78 @@ mod tests {
                 .collect()
         }
 
-        /// The captured layers' own masks, rebuilt from the `r_proj` output
-        /// attention fed the kernel and the checkpoint's `rel_proj`.
+        /// One captured layer's own mask out of `activations`, rebuilt from the
+        /// `r_proj` output attention fed the kernel and the checkpoint's
+        /// `rel_proj`.
+        ///
+        /// The projection, the layer's window and its extent come from the
+        /// committed mask bundle, which records them per layer and cannot depend
+        /// on how long a sequence was run through it. The key span is the
+        /// recorded mask's own rather than that bundle's, which is what lets one
+        /// loader read a capture the config tensor was not written for.
+        fn captured(
+            ckpt: &Checkpoint,
+            activations: &Checkpoint,
+            layer: usize,
+            suffix: &str,
+        ) -> Self {
+            let of = |name: &str| fixture::layer_tensor(ckpt, layer, name);
+            let recorded = |name: &str| fixture::layer_tensor(activations, layer, name);
+
+            let mask = recorded("mask");
+            let &[_, _, _, keys] = mask.shape() else {
+                panic!("layer{layer}.mask is [batch, heads, queries, keys]")
+            };
+            let config = fixture::f32s(&of("config"));
+            Self::new(
+                &format!("layer{layer}{suffix}"),
+                &recorded("r_proj_out"),
+                &of("rel_proj"),
+                &[config[0], keys as f32, config[2], config[3]],
+                fixture::f32s(&mask),
+            )
+        }
+
+        /// The captured layers' masks over the committed eight tokens.
         fn trained() -> Vec<Self> {
             let ckpt = fixture::open(FIXTURE);
             let activations = fixture::open(ACTIVATIONS);
             CAPTURED_LAYERS
                 .iter()
-                .map(|&layer| {
-                    let of = |name: &str| fixture::layer_tensor(&ckpt, layer, name);
-                    let recorded = |name: &str| fixture::layer_tensor(&activations, layer, name);
-                    Self::new(
-                        &format!("layer{layer}"),
-                        &recorded("r_proj_out"),
-                        &of("rel_proj"),
-                        &fixture::f32s(&of("config")),
-                        fixture::f32s(&recorded("mask")),
-                    )
-                })
+                .map(|&layer| Self::captured(&ckpt, &activations, layer, ""))
                 .collect()
+        }
+
+        /// The same layers over the long capture, which is the only place the
+        /// window cap and the far side of the band are live on trained numbers.
+        /// `None` when it has not been generated.
+        fn long() -> Option<Vec<Self>> {
+            let ckpt = fixture::open(FIXTURE);
+            let activations = fixture::try_open(LONG_ACTIVATIONS)?;
+            Some(
+                CAPTURED_LAYERS
+                    .iter()
+                    .filter(|&&layer| fixture::holds_layer(&activations, layer))
+                    .map(|&layer| Self::captured(&ckpt, &activations, layer, ".long"))
+                    .collect(),
+            )
         }
 
         fn with(&self, proj: &[f32], rel: &[f32], q_offset: usize) -> Vec<f32> {
             BandedMask::new(self.d_rel, proj, self.sliding)
                 .forward(rel, self.batch, self.heads, q_offset, self.keys)
+        }
+
+        /// The same case under a different window, which is the one scalar
+        /// [`Case::with`] holds fixed.
+        fn windowed(&self, sliding: usize) -> Vec<f32> {
+            BandedMask::new(self.d_rel, &self.proj, sliding).forward(
+                &self.rel,
+                self.batch,
+                self.heads,
+                self.q_offset,
+                self.keys,
+            )
         }
 
         fn forward(&self) -> Vec<f32> {
@@ -358,8 +409,31 @@ mod tests {
             .collect()
     }
 
+    /// `[d_rel, rel_extent]` cut down to `[d_rel, extent]` — the rows a port
+    /// that took a global layer's extent from `sliding_window_size` would read.
+    /// Shorter, so it indexes in bounds and produces a mask of the right shape.
+    fn truncated(values: &[f32], rows: usize, extent: usize) -> Vec<f32> {
+        let cols = values.len() / rows;
+        (0..rows)
+            .flat_map(|r| values[r * cols..][..extent].to_vec())
+            .collect()
+    }
+
     fn masked_pattern(mask: &[f32]) -> Vec<bool> {
         mask.iter().map(|entry| is_masked(*entry)).collect()
+    }
+
+    /// The widest window any captured layer configures, which is the
+    /// checkpoint's `sliding_window_size` and the window a global layer would
+    /// have been given had it read that field.
+    fn window(cases: &[Case]) -> usize {
+        let window = cases
+            .iter()
+            .map(|case| case.sliding)
+            .max()
+            .expect("a captured layer");
+        assert!(window > 0, "no captured layer is sliding");
+        window
     }
 
     #[test]
@@ -390,6 +464,136 @@ mod tests {
             worst > 0.0,
             "a run that matched exactly would mean bfloat16 rounding vanished"
         );
+    }
+
+    /// The same check over the long capture, where the two branches eight
+    /// tokens cannot reach are live on trained numbers rather than synthetic
+    /// ones: a sliding layer's window caps, and a global layer's band runs out
+    /// with keys still in context.
+    ///
+    /// Held to the same bound and for the same reason, and it holds as much in
+    /// reserve: 2.8e-3 on layer 0 and 2.1e-3 on layer 5 when this landed, beside
+    /// the committed capture's 2.9e-3. Length costs this nothing — every entry
+    /// of a mask is one `d_rel`-long product, however many entries there are.
+    #[test]
+    fn the_long_capture_reproduces_the_reference_masks() {
+        let Some(cases) = Case::long() else { return };
+        assert!(
+            !cases.is_empty(),
+            "the long capture holds none of the captured layers"
+        );
+
+        let mut worst = 0.0f32;
+        for case in &cases {
+            let deviation = case.deviation(&case.forward());
+            assert!(
+                deviation <= TRAINED_TOLERANCE,
+                "{}: deviation {deviation:e}",
+                case.name
+            );
+            worst = worst.max(deviation);
+        }
+        assert!(
+            worst > 0.0,
+            "a run that matched exactly would mean bfloat16 rounding vanished"
+        );
+    }
+
+    /// That the long capture is long enough to be worth having, asserted on the
+    /// reference's own recorded masks rather than on this port's.
+    ///
+    /// Both branches are counted as well as checked. A capture regenerated at a
+    /// length that no longer reached them would otherwise leave every claim here
+    /// true of an empty set — and leave the two tests below unable to fail,
+    /// since a window nothing is old enough to reach masks nothing either way.
+    #[test]
+    fn the_long_capture_reaches_the_window_cap_and_the_far_side_of_the_band() {
+        let Some(cases) = Case::long() else { return };
+        let (mut capped, mut outside) = (0, 0);
+        for case in &cases {
+            assert!(
+                case.keys > case.rel_extent,
+                "{}: {} keys do not outrun a band of {}",
+                case.name,
+                case.keys,
+                case.rel_extent
+            );
+
+            let past_the_window: Vec<f32> = case.branch_entries(&case.want, 2).collect();
+            assert!(
+                past_the_window.iter().all(|entry| is_masked(*entry)),
+                "{}: {:?}",
+                case.name,
+                past_the_window.iter().find(|entry| !is_masked(**entry))
+            );
+
+            let outside_the_band: Vec<f32> = case.branch_entries(&case.want, 4).collect();
+            assert!(
+                outside_the_band.iter().all(|entry| *entry == 0.0),
+                "{}: {:?}",
+                case.name,
+                outside_the_band.iter().find(|entry| **entry != 0.0)
+            );
+            assert!(
+                case.branch_entries(&case.want, 3).all(|entry| entry != 0.0),
+                "{}: a learned bias is indistinguishable from outside the band",
+                case.name
+            );
+
+            capped += past_the_window.len();
+            outside += outside_the_band.len();
+        }
+        assert!(capped > 0, "no captured layer's window caps anything");
+        assert!(outside > 0, "no captured layer reaches outside its band");
+    }
+
+    /// The window is a sliding layer's alone: `InklingAttention` reads
+    /// `sliding_window_size` on a sliding layer and hands a global layer a zero.
+    /// Both slips leave a mask of the right shape — a global layer that caps at
+    /// 512, a sliding layer that never does — and neither is visible at eight
+    /// tokens, where no key is 512 positions back to begin with.
+    ///
+    /// Stated on the masked pattern rather than on a deviation: what the window
+    /// decides is which keys exist at all, and an entry that changed from a
+    /// learned bias to `-1e30` is not a numerical disagreement.
+    #[test]
+    fn a_window_belongs_to_a_sliding_layer_alone() {
+        let Some(cases) = Case::long() else { return };
+        let window = window(&cases);
+        for case in &cases {
+            let swapped = if case.sliding > 0 { 0 } else { window };
+            assert_ne!(
+                masked_pattern(&case.windowed(swapped)),
+                masked_pattern(&case.want),
+                "{}: a window of {swapped} masks what {} does",
+                case.name,
+                case.sliding
+            );
+        }
+    }
+
+    /// A global layer's band is `rel_extent` and a sliding layer's is
+    /// `sliding_window_size`, and the checkpoint stores `rel_proj` at whichever
+    /// width the layer uses. A port that read a global layer's extent from the
+    /// wrong field indexes a shorter row per feature: in bounds, the right
+    /// shape, and every key past the shorter extent silently unbiased instead of
+    /// carrying what the model learned for it.
+    #[test]
+    fn narrowing_a_global_band_to_a_sliding_window_changes_the_long_answer() {
+        let Some(cases) = Case::long() else { return };
+        let window = window(&cases);
+        let mut checked = 0;
+        for case in cases.iter().filter(|case| case.sliding == 0) {
+            let narrowed = truncated(&case.proj, case.d_rel, window);
+            let deviation = case.deviation(&case.with(&narrowed, &case.rel, case.q_offset));
+            assert!(
+                deviation > TRAINED_TOLERANCE,
+                "{}: deviation {deviation:e}",
+                case.name
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "the long capture holds no global layer");
     }
 
     /// The cases between them have to reach all four branches, or the tests

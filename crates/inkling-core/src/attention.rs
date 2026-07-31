@@ -9,10 +9,12 @@
 //! The step is pinned to mlx-vlm by the `q_norm_out`, `k_norm_out`,
 //! `v_sconv_out`, `mask` and `sdpa_out` tensors of
 //! `reference/fixtures/layer_activations.safetensors`, which between them carry
-//! everything it consumes and produces and involve no weights at all. The layer
-//! around it is pinned by `reference/fixtures/attention.safetensors`, whose
-//! synthetic cases are float32 throughout and reach the one branch a recorded
-//! forward pass cannot: log scaling, which fires past position 128000.
+//! everything it consumes and produces and involve no weights at all, and by
+//! the same tensors of `long_activations.safetensors` for the widths a
+//! committed capture cannot hold. The layer around it is pinned by
+//! `reference/fixtures/attention.safetensors`, whose synthetic cases are
+//! float32 throughout and reach the one branch a recorded forward pass cannot:
+//! log scaling, which fires past position 128000.
 //!
 //! Everything here takes one sequence at a time: batching is the scheduler's,
 //! and a batch of sequences is a loop over these.
@@ -439,7 +441,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use crate::checkpoint::Checkpoint;
-    use crate::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation};
+    use crate::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, LONG_ACTIVATIONS, deviation};
     use crate::mask::MASKED;
 
     /// Synthetic layers and the sequences mlx-vlm ran through them, from
@@ -471,7 +473,10 @@ mod tests {
     /// magnitude, which puts it slightly above the ceiling. The same bound, for
     /// the same reason, as the trained masks.
     ///
-    /// Worst observed when this landed: 2.8e-3 on layer 5. The weakest mutation
+    /// Worst observed when this landed: 2.8e-3 on layer 5 of the committed
+    /// capture, and 2.9e-3 on layer 0 of the long one against 2.0e-3 on its
+    /// layer 5, whose rows reduce over a thousand keys rather than eight — the
+    /// width buys the bound no error worth naming. The weakest mutation
     /// these tests rely on catching, the conventional `1/sqrt(head_dim)` scale,
     /// moves the answer by 1.0 — over two decades above this bound.
     const TRAINED_TOLERANCE: f32 = 6e-3;
@@ -496,8 +501,11 @@ mod tests {
         /// them to the kernel, already split into heads, and `v_sconv_out` was
         /// taken one step earlier.
         fn load(layer: usize) -> Self {
-            let activations = fixture::open(ACTIVATIONS);
-            let of = |name: &str| fixture::layer_tensor(&activations, layer, name);
+            Self::from(&fixture::open(ACTIVATIONS), layer)
+        }
+
+        fn from(activations: &Checkpoint, layer: usize) -> Self {
+            let of = |name: &str| fixture::layer_tensor(activations, layer, name);
 
             let q = of("q_norm_out");
             let k = of("k_norm_out");
@@ -523,6 +531,48 @@ mod tests {
 
         fn all() -> Vec<Self> {
             CAPTURED_LAYERS.iter().copied().map(Self::load).collect()
+        }
+
+        /// The long capture's steps, one per layer it recorded, each cut down to
+        /// its last `queries` rows. `None` when it has not been generated.
+        ///
+        /// Cut because the step is quadratic and this one is not: 1280 queries
+        /// over 1280 keys is 13 GMAC of scalar float32, where the rows kept are
+        /// the ones whose oldest keys are the far side of the band. The keys and
+        /// values stay whole — what is under test is a query attending over all
+        /// of them.
+        fn long(queries: usize) -> Option<Vec<Self>> {
+            let activations = fixture::try_open(LONG_ACTIVATIONS)?;
+            Some(
+                CAPTURED_LAYERS
+                    .iter()
+                    .filter(|&&layer| fixture::holds_layer(&activations, layer))
+                    .map(|&layer| Self::from(&activations, layer).tail(queries))
+                    .collect(),
+            )
+        }
+
+        /// The last `queries` rows of the step. `q`, the mask and the recorded
+        /// output are all query-minor within a head, so each is cut per head.
+        fn tail(&self, queries: usize) -> Self {
+            assert!(queries <= self.queries, "{}: {queries} rows", self.name);
+            let cut = |values: &[f32], stride: usize| -> Vec<f32> {
+                values
+                    .chunks_exact(self.queries * stride)
+                    .flat_map(|head| head[(self.queries - queries) * stride..].to_vec())
+                    .collect()
+            };
+            Self {
+                name: format!("{}.tail{queries}", self.name),
+                sdpa: self.sdpa,
+                queries,
+                keys: self.keys,
+                q: cut(&self.q, self.sdpa.head_dim),
+                k: self.k.clone(),
+                v: self.v.clone(),
+                mask: cut(&self.mask, self.keys),
+                want: cut(&self.want, self.sdpa.head_dim),
+            }
         }
 
         fn forward(&self) -> Vec<f32> {
@@ -554,6 +604,60 @@ mod tests {
     fn the_captured_layers_reproduce_the_reference_attention() {
         let mut worst = 0.0f32;
         for case in Case::all() {
+            let deviation = case.deviation(&case.forward());
+            assert!(
+                deviation <= TRAINED_TOLERANCE,
+                "{}: deviation {deviation:e}",
+                case.name
+            );
+            worst = worst.max(deviation);
+        }
+        assert!(
+            worst > 0.0,
+            "a run that matched exactly would mean bfloat16 rounding vanished"
+        );
+    }
+
+    /// How many of the long capture's queries the step below runs. Enough that
+    /// the softmax widths span a range rather than sit at a point, and few
+    /// enough that a quadratic step stays a test rather than a benchmark.
+    const LONG_TAIL: usize = 64;
+
+    /// The widest band any captured layer's mask is built over, which is a
+    /// global layer's — a sliding layer's ends at its 512-token window. A number
+    /// here because the step never sees either: attention is handed a finished
+    /// mask, and all this has to know is that the long capture's key span
+    /// outruns both.
+    const REL_EXTENT: usize = 1024;
+
+    /// The attention step over a span past the band, where the mask it is handed
+    /// carries window caps on a sliding layer and exact zeros on a global one,
+    /// and every softmax runs over more than a thousand keys rather than eight.
+    /// Skips when the long capture has not been generated.
+    ///
+    /// What this adds to the eight-token cases is width. Which entries the mask
+    /// holds is `mask.rs`'s to settle; what is left here is whether a step still
+    /// reproduces the reference when the row it reduces over is two orders of
+    /// magnitude longer — a softmax that lost its shift, or a masked key that
+    /// stopped being negligible against a thousand others.
+    #[test]
+    fn the_long_capture_reproduces_the_reference_attention_past_the_band() {
+        let Some(cases) = Case::long(LONG_TAIL) else {
+            return;
+        };
+        assert!(
+            !cases.is_empty(),
+            "the long capture holds none of the captured layers"
+        );
+
+        let mut worst = 0.0f32;
+        for case in &cases {
+            assert!(
+                case.keys > REL_EXTENT,
+                "{}: {} keys do not outrun a band of {REL_EXTENT}",
+                case.name,
+                case.keys
+            );
             let deviation = case.deviation(&case.forward());
             assert!(
                 deviation <= TRAINED_TOLERANCE,
