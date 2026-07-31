@@ -83,6 +83,12 @@ impl<'a> DenseMlp<'a> {
         }
     }
 
+    /// The width this maps between, which for a layer's own MLP is the hidden
+    /// size and for one expert of a bank is the same.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
     /// `[rows, dim]` in, `[rows, dim]` out.
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
         assert_eq!(

@@ -45,6 +45,10 @@ dump-mask-fixture model="models/Inkling-Small-mxfp4":
 dump-attention-fixture:
     reference/.venv/bin/python reference/scripts/dump_attention_fixture.py
 
+# Regenerate the committed synthetic decoder layers the Rust layer is tested against
+dump-layer-fixture:
+    reference/.venv/bin/python reference/scripts/dump_layer_fixture.py
+
 # Regenerate the committed router gate and synthetic cases the Rust MoE is tested against
 dump-moe-fixture model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_moe_fixture.py {{ model }}
