@@ -21,19 +21,18 @@ subnormal products to zero. `survey` establishes that no such input exists in
 the checkpoint, so the backends agree on everything the engine will ever decode
 and the exact answer is the one worth pinning.
 
-Slices are read straight out of one shard rather than through `mlx_vlm.load`:
-the fixture needs a few hundred KiB, and materialising the 130 GiB model to get
-them has crashed this host before."""
+Slices are read straight out of one shard rather than through `mlx_vlm.load`,
+because the fixture needs a few hundred KiB."""
 
 import argparse
 import json
-from functools import lru_cache
 from itertools import groupby
 from operator import itemgetter
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+from inkling_ref import index_of, load_shard
 
 GROUP_SIZE = 32
 BITS = 4
@@ -54,11 +53,6 @@ PADDING_CONTEXT = 32
 
 def slice_repr(index):
     return "[" + ", ".join(f"{s.start}:{s.stop}" for s in index) + "]"
-
-
-@lru_cache(maxsize=1)
-def index_of(model_path):
-    return json.loads((model_path / "model.safetensors.index.json").read_text())
 
 
 def codes_in(packed):
@@ -111,11 +105,6 @@ def real_slices(model_path):
             (slice(vocab - PADDING_CONTEXT, vocab + PADDING_CONTEXT),),
         ),
     )
-
-
-def load_shard(model_path, shard):
-    """`mx.load` is lazy, so a shard costs only the tensors actually evaluated."""
-    return mx.load(str(model_path / shard))
 
 
 def quantized_tensors(model_path):
