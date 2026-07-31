@@ -4,6 +4,7 @@ use args::{Command, USAGE};
 
 mod args;
 mod config;
+mod generate;
 mod inspect;
 
 /// What an invocation that was never understood exits with, apart from one that
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
 
     let ran = match command {
         Command::Inspect { config } => inspect::run(&config),
+        Command::Generate(args) => generate::run(&args),
     };
     match ran {
         Ok(()) => ExitCode::SUCCESS,

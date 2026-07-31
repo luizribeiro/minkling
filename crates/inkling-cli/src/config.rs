@@ -16,3 +16,10 @@ pub fn read(path: &Path) -> Result<Config> {
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
+
+/// The config of a checkpoint directory, which is where a generation starts
+/// from — the weights, the tokenizer and the config are three things in one
+/// place and only the directory names all three.
+pub fn of_checkpoint(dir: &Path) -> Result<Config> {
+    read(&dir.join("config.json"))
+}
