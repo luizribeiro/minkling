@@ -96,6 +96,13 @@ pub enum MatmulError {
 
     #[error("expert {expert} of a bank that holds {experts}")]
     NoSuchExpert { expert: usize, experts: usize },
+
+    #[error("{what} is {got}, not the {expected} gate_proj states")]
+    MismatchedBanks {
+        what: &'static str,
+        expected: usize,
+        got: usize,
+    },
 }
 
 /// The compiled kernel, which every packed projection on a device shares.
@@ -132,9 +139,9 @@ impl PackedMatmul {
 /// reading them, and a kernel that took the expert as a shape rather than as a
 /// per-row index could not express it in one dispatch.
 ///
-/// Made resident once and multiplied against many times. Wrapped, "once" is 40
-/// microseconds a gibibyte and no copy, so what that phrase used to be defending
-/// against is gone.
+/// Made resident once and multiplied against many times. Wrapped, "once" is
+/// about 50 microseconds a gibibyte and no copy at all, so what that phrase used
+/// to be defending against is gone.
 #[derive(Debug)]
 pub struct PackedBank<'a> {
     device: &'a Device,
@@ -609,8 +616,113 @@ kernel void packed_matmul(
 }
 "#;
 
+/// The synthetic weights this module's tests are built from, reachable by
+/// [`crate::experts`]'s tests too: a bank is three of these, and a second copy
+/// of the packing would be a second reading of the format.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// Codes to a little-endian word, which is the shape [`pack`] writes.
+    const CODES_PER_WORD: usize = u32::BITS as usize / BITS;
+
+    /// Codes packed the way the checkpoint packs them: eight to a little-endian
+    /// word, code `i` of a word in bits `4i..4i+4`.
+    ///
+    /// Written as words where the kernel reads bytes, on purpose. That the two
+    /// framings describe the same bytes is the claim the byte-addressed decode
+    /// rests on, and a test that packed bytewise would assume it rather than
+    /// check it.
+    pub(crate) fn pack(codes: &[u8]) -> Vec<u8> {
+        codes
+            .chunks_exact(CODES_PER_WORD)
+            .flat_map(|word| {
+                word.iter()
+                    .enumerate()
+                    .fold(0u32, |packed, (i, code)| {
+                        packed | (u32::from(*code) << (BITS * i))
+                    })
+                    .to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// A deterministic stand-in for trained weights. Any bit pattern does, so
+    /// long as a rerun sees the same one.
+    ///
+    /// The low eight bits of a linear congruential state are the poorly mixed
+    /// ones, so they are shifted off and what is left is 24 bits.
+    pub(crate) struct Noise(pub(crate) u32);
+
+    impl Noise {
+        pub(crate) fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
+            self.0 >> 8
+        }
+
+        /// A value spread over `-1.0..1.0`.
+        ///
+        /// The spread is load-bearing rather than cosmetic: against a *constant*
+        /// input a row's dot product is its weights summed, which no permutation
+        /// of codes within a word can move — so a kernel reading its nibbles
+        /// backwards would agree to four digits and the mutation this file
+        /// measures would measure nothing.
+        pub(crate) fn signed(&mut self) -> f32 {
+            self.next() as f32 / (1u32 << 23) as f32 - 1.0
+        }
+    }
+
+    /// One multiply: an `[out_dim, in_dim]` weight held as one code per element
+    /// beside one scale byte per group, and the rows of `x` to put through it.
+    pub(crate) struct Case {
+        pub(crate) in_dim: usize,
+        pub(crate) out_dim: usize,
+        pub(crate) codes: Vec<u8>,
+        pub(crate) scales: Vec<u8>,
+        pub(crate) x: Vec<f32>,
+    }
+
+    impl Case {
+        /// Codes over the whole table and inputs of mixed sign, which is what
+        /// makes the reduction cancel the way a trained one does and so what
+        /// makes two summation orders part company at all.
+        ///
+        /// The scales are shaped after the checkpoint's rather than spread over
+        /// the byte: `lm_head`'s span `0x74..=0x7e` across the tensor while the
+        /// 128 groups *within* a row span a median of one byte and at most four.
+        /// That structure is what sets how ill-conditioned the reduction is, and
+        /// a synthetic weight whose groups spanned twenty-six powers of two
+        /// would be measuring a serial f32 loop falling apart on a case no
+        /// checkpoint contains. `0x00` is left out on purpose — it is the one
+        /// reading the two sides deliberately disagree about.
+        ///
+        /// `seed` is what lets a bank be three weights that differ. Against
+        /// three identical ones, exchanging two would change nothing.
+        pub(crate) fn seeded(seed: u32, in_dim: usize, out_dim: usize, rows: usize) -> Self {
+            let mut noise = Noise(seed);
+            let groups = in_dim / GROUP_SIZE;
+            let mut scales = Vec::with_capacity(out_dim * groups);
+            for _ in 0..out_dim {
+                let row = 0x74 + (noise.next() % 11) as u8;
+                scales.extend((0..groups).map(|_| row + (noise.next() % 5) as u8));
+            }
+
+            Self {
+                codes: (0..out_dim * in_dim)
+                    .map(|_| (noise.next() % 16) as u8)
+                    .collect(),
+                x: (0..rows * in_dim).map(|_| noise.signed()).collect(),
+                scales,
+                in_dim,
+                out_dim,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::{Case, Noise, pack};
     use super::*;
     use inkling_core::fixture::{self, deviation};
     use inkling_core::ops::DenseProjection;
@@ -658,9 +770,6 @@ mod tests {
     /// computed independently of what it checks.
     const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
-    /// Codes to a little-endian word, which is the shape [`pack`] writes.
-    const CODES_PER_WORD: usize = u32::BITS as usize / BITS;
-
     /// What a code under a scale byte stands for, from the format rather than
     /// from a decoder: bit 3 carries the sign, the three below it index the
     /// magnitudes, and the byte is an exponent biased by 127.
@@ -670,62 +779,8 @@ mod tests {
         signed * f32::from_bits(u32::from(scale) << EXPONENT_SHIFT)
     }
 
-    /// Codes packed the way the checkpoint packs them: eight to a little-endian
-    /// word, code `i` of a word in bits `4i..4i+4`.
-    ///
-    /// Written as words where the kernel reads bytes, on purpose. That the two
-    /// framings describe the same bytes is the claim the byte-addressed decode
-    /// rests on, and a test that packed bytewise would assume it rather than
-    /// check it.
-    fn pack(codes: &[u8]) -> Vec<u8> {
-        codes
-            .chunks_exact(CODES_PER_WORD)
-            .flat_map(|word| {
-                word.iter()
-                    .enumerate()
-                    .fold(0u32, |packed, (i, code)| {
-                        packed | (u32::from(*code) << (BITS * i))
-                    })
-                    .to_le_bytes()
-            })
-            .collect()
-    }
-
-    /// A deterministic stand-in for trained weights. Any bit pattern does, so
-    /// long as a rerun sees the same one.
-    ///
-    /// The low eight bits of a linear congruential state are the poorly mixed
-    /// ones, so they are shifted off and what is left is 24 bits.
-    struct Noise(u32);
-
-    impl Noise {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
-            self.0 >> 8
-        }
-
-        /// A value spread over `-1.0..1.0`.
-        ///
-        /// The spread is load-bearing rather than cosmetic: against a *constant*
-        /// input a row's dot product is its weights summed, which no permutation
-        /// of codes within a word can move — so a kernel reading its nibbles
-        /// backwards would agree to four digits and the mutation this file
-        /// measures would measure nothing.
-        fn signed(&mut self) -> f32 {
-            self.next() as f32 / (1u32 << 23) as f32 - 1.0
-        }
-    }
-
     /// One multiply: an `[out_dim, in_dim]` weight held as one code per element
     /// beside one scale byte per group, and the rows of `x` to put through it.
-    struct Case {
-        in_dim: usize,
-        out_dim: usize,
-        codes: Vec<u8>,
-        scales: Vec<u8>,
-        x: Vec<f32>,
-    }
-
     impl Case {
         /// Codes over the whole table and inputs of mixed sign, which is what
         /// makes the reduction cancel the way a trained one does and so what
@@ -742,23 +797,7 @@ mod tests {
         /// [`a_zero_scale_byte_multiplies_to_zero_where_the_cpu_gives_two_to_the_minus_127`]
         /// is where that is stated.
         fn noisy(in_dim: usize, out_dim: usize, rows: usize) -> Self {
-            let mut noise = Noise(0x1234_5678);
-            let groups = in_dim / GROUP_SIZE;
-            let mut scales = Vec::with_capacity(out_dim * groups);
-            for _ in 0..out_dim {
-                let row = 0x74 + (noise.next() % 11) as u8;
-                scales.extend((0..groups).map(|_| row + (noise.next() % 5) as u8));
-            }
-
-            Self {
-                codes: (0..out_dim * in_dim)
-                    .map(|_| (noise.next() % 16) as u8)
-                    .collect(),
-                x: (0..rows * in_dim).map(|_| noise.signed()).collect(),
-                scales,
-                in_dim,
-                out_dim,
-            }
+            Self::seeded(0x1234_5678, in_dim, out_dim, rows)
         }
 
         fn packed(&self) -> Vec<u8> {
