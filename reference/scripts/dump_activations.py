@@ -20,6 +20,12 @@ Past the band the mask alone is `[1, 32, L, L]` — 210 MB a layer at 1280 token
 gitignored rather than committed. It is reproducible from this file: the prompt
 is one sentence repeated.
 
+Beside the captured layers' intermediates, both ends of the model are recorded:
+the embedding at the front, and at the back the final hidden state — before the
+final norm and after it, because the reference distinguishes them. The forty-two
+layers' own intermediates are not, and could not be committed; the end-to-end
+comparison is what tests the stack.
+
 Everything is captured by wrapping the reference's own modules and functions,
 never by recomputing: a recomputation that drifts from the reference would make
 the fixture agree with the bug it is supposed to catch."""
@@ -145,9 +151,27 @@ def _instrument_moe(capture):
     language.moe_tap = tap
 
 
+def record_final_hidden_state(capture, lm):
+    """The last two lines of `LanguageModel.__call__`, which are the two ends of
+    the model and are not interchangeable.
+
+    `InklingModel.__call__` is called with `skip_final_norm=True` — its only
+    caller always sets it — so what `layers_out` records is the state *before*
+    the final norm: what `return_hidden` gives the MTP heads and what
+    `speculative_verify_hidden` returns. The norm is applied one line later, on
+    the way to the logits, and `norm_out` is that. A port that returned either
+    where the other belonged would still generate.
+
+    The norm is called here rather than tapped because `skip_logits=True` means
+    the reference never reaches it. It is the reference's own module, over the
+    reference's own tensor; nothing is recomputed."""
+    capture.record("norm_out", lm.norm(capture.tensors["layers_out"]))
+
+
 def instrument(capture, model):
     lm = model.language_model.model
     taps = [
+        (lm, _tap(capture, "layers_out")),
         (lm.embed_tokens, _tap(capture, "embed_out")),
         (lm.embed_norm, _tap(capture, "embed_norm_out")),
     ]
@@ -265,6 +289,7 @@ def main():
     model.language_model(
         inputs=inputs, cache=model.language_model.make_cache(), skip_logits=True
     )
+    record_final_hidden_state(capture, model.language_model.model)
 
     tensors = {
         name: as_fixture_dtype(value) for name, value in sorted(capture.tensors.items())

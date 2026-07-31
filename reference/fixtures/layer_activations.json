@@ -698,6 +698,24 @@
         1024
       ],
       "dtype": "float32"
+    },
+    {
+      "name": "layers_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "norm_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
     }
   ]
 }

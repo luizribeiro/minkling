@@ -353,7 +353,7 @@ mod tests {
     fn single_file_layout_needs_no_index() {
         let ckpt = fixture();
         assert_eq!(ckpt.num_shards(), 1);
-        assert_eq!(ckpt.tensor_names().count(), 74);
+        assert_eq!(ckpt.tensor_names().count(), 76);
     }
 
     #[test]
