@@ -47,6 +47,14 @@ pub fn open(file: &str) -> Checkpoint {
     Checkpoint::open(&path).unwrap_or_else(|err| panic!("{file} opens: {err}"))
 }
 
+/// A dump's text manifest, beside the bundle of the same name. The synthetic
+/// stack's is the config it was built from, spelled the way a checkpoint spells
+/// it, so that one file stands up both the reference and this port.
+pub fn read(file: &str) -> String {
+    let path = PathBuf::from(DIR).join(file);
+    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{file} reads: {err}"))
+}
+
 /// [`open`], for a bundle too large to commit: absent, it reports a skip and
 /// the caller returns rather than failing.
 pub fn try_open(file: &str) -> Option<Checkpoint> {
