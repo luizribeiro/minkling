@@ -408,6 +408,41 @@ const GENERATED: usize = 8;
 /// what changed is whose they are.
 const RESIDENT_BOUND: u64 = 1 << 30;
 
+/// What one decode step dispatches, and how many command buffers it submits
+/// them in, from the shape of the model rather than as two numbers to keep in
+/// step with it.
+///
+/// Both are asserted rather than printed, and the second is the one this
+/// milestone's last commit is about. **A step that stopped batching would
+/// dispatch exactly as much and submit twice as often**, so a bound on the
+/// dispatches alone would watch the number that cannot change while the one
+/// that pays for it doubled underneath.
+///
+/// Per layer: five attention projections in two submissions — the four that
+/// share the normed hidden state, then `o_proj` — and per MoE layer six expert
+/// dispatches in four, being each bank's gate and up together and then its
+/// down. A dense layer's feed-forward network is three in two. The head is one
+/// of each.
+fn per_step(layers: u64, dense: u64) -> (u64, u64) {
+    let moe = layers - dense;
+    (
+        5 * layers + 3 * dense + 6 * moe + 1,
+        2 * layers + 2 * dense + 4 * moe + 1,
+    )
+}
+
+/// The running `(dispatches, submissions)` of the last decode step, which is the
+/// difference between the two totals either side of it.
+///
+/// The prefill is skipped: it dispatches the same kernels over more rows, and
+/// what the count is being read for is the steady state.
+fn per_decode_step(submitted: &[(u64, u64)]) -> (u64, u64) {
+    let [.., before, after] = submitted else {
+        panic!("a step per token, and more than one of them")
+    };
+    (after.0 - before.0, after.1 - before.1)
+}
+
 /// The engine, with every weight it has a kernel for on the GPU, against the
 /// tokens mlx-vlm generated from the same prompt.
 ///
@@ -492,6 +527,10 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
         "a layer has a feed-forward network or banks, never both and never neither"
     );
 
+    // Read before the handover moves it, because what a decode step submits is
+    // decided by how many layers are dense and how many route.
+    let dense_layers = projections.dense_layers();
+
     // Once, before the loop rather than inside it — though "once" is now 6 ms
     // for 137 GB, so what that used to be defending against is gone.
     let weights = weights
@@ -501,6 +540,11 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
     let generator = weights.generator();
 
     let mut steps: Vec<Duration> = Vec::new();
+    // What each step submitted, as the running totals it was reached at. A
+    // decode step's dispatch count is what the model's shape decides and its
+    // submission count is what the batching decides, and the two are the whole
+    // of the granularity question.
+    let mut submitted: Vec<(u64, u64)> = Vec::new();
     let mut got = Vec::new();
     let mut step = Instant::now();
     let mut peak = fixture::resident_bytes();
@@ -514,6 +558,7 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
         &weights,
         |id| {
             steps.push(step.elapsed());
+            submitted.push((device.dispatches(), device.submissions()));
             peak = peak.max(fixture::resident_bytes());
             got.push(id);
             step = Instant::now();
@@ -525,12 +570,21 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
     // decode; a mean over the two describes neither.
     let (prefill, decode) = steps.split_first().expect("a step per token");
     let each = decode.iter().sum::<Duration>() / decode.len() as u32;
+    let (dispatches, submissions) = per_decode_step(&submitted);
     eprintln!(
         "{} tokens prefilled in {prefill:.2?}, {} decoded at {each:.2?}/token, peak RSS {:.2} GiB\
+         \n  {dispatches} dispatches a decode step in {submissions} submissions, which at 206 µs \
+         a submission is {:.1?} of round trip\
          \n  got  {got:?}\n  want {want:?}",
         ids.len(),
         decode.len(),
         peak as f64 / (1u64 << 30) as f64,
+        Duration::from_micros(206) * submissions as u32,
+    );
+    assert_eq!(
+        (dispatches, submissions),
+        per_step(config.num_hidden_layers as u64, dense_layers as u64),
+        "a decode step's dispatches, and the command buffers they went in"
     );
 
     let agreed = got.iter().zip(want).take_while(|(a, b)| a == b).count();

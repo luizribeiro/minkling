@@ -19,19 +19,24 @@
 //! one expert every row goes through, and the only thing that stays packed is
 //! the weight itself.
 //!
-//! **One dispatch a projection.** Five a layer for attention and three for each
-//! of the two dense layers, which is 216 dispatches a decode step against the
-//! MoE's 240. Whether that is the right granularity is a question about
-//! dispatching rather than about arithmetic, and it is asked and answered
-//! separately: the four projections that consume the same normed hidden state
-//! could be one submission, and so could a feed-forward network's gate and up.
+//! **One dispatch a projection, two submissions a layer.** Five dispatches a
+//! layer for attention and three for each of the two dense layers, which is 216
+//! of a decode step's 457 against the MoE's 240. What they cost, though, is set
+//! by how many command buffers they go in rather than by how many they are:
+//! `q`, `k`, `v` and `r` consume the same normed hidden state and nothing of
+//! each other, so they are one submission and `o_proj` — which multiplies what
+//! the attention step made of them — is the second. A feed-forward network is
+//! the same shape over gate, up and then down.
+//!
+//! That is worth 26 ms of a decode step at 206 µs a submission, and it is the
+//! whole of what [`Batch`](crate::Batch) is for.
 
-use inkling_core::attention::Projections;
+use inkling_core::attention::{Projections, Qkvr};
 use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::weights::{LayerPacked, Packed, PackedAttention, PackedMlp, ProjectionBackend};
 
 use crate::device::Device;
-use crate::matmul::{MatmulError, PackedMatmul, PackedProjection};
+use crate::matmul::{MatmulError, PackedMatmul, PackedProjection, together};
 
 /// One attention layer's five projections on the device.
 ///
@@ -79,6 +84,25 @@ impl<'a> LayerProjections<'a> {
 }
 
 impl Projections for LayerProjections<'_> {
+    /// The four that consume the normed hidden state, in one command buffer.
+    ///
+    /// Four submissions become one, which at 206 microseconds a submission is
+    /// 618 µs a layer and 26 ms of a decode step — against the 105 µs the
+    /// arithmetic of one of these projections takes. They are independent of
+    /// each other, so the only thing the batch orders is what they cost.
+    fn qkvr(&self, x: &[f32]) -> Qkvr {
+        let [q, k, v, r] = together(self.q_proj.device(), |batch| {
+            Ok([
+                self.q_proj.encode(batch, x)?,
+                self.k_proj.encode(batch, x)?,
+                self.v_proj.encode(batch, x)?,
+                self.r_proj.encode(batch, x)?,
+            ])
+        })
+        .unwrap_or_else(|err| panic!("the layer's projections did not run: {err}"));
+        Qkvr { q, k, v, r }
+    }
+
     fn q_proj(&self) -> &dyn Projection {
         &self.q_proj
     }
@@ -130,6 +154,19 @@ impl<'a> DenseFfn<'a> {
 }
 
 impl MlpProjections for DenseFfn<'_> {
+    /// The two that consume the same input, in one command buffer — the same
+    /// bargain [`LayerProjections::qkvr`] strikes, over a pair.
+    fn gate_up(&self, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let [gate, up] = together(self.gate_proj.device(), |batch| {
+            Ok([
+                self.gate_proj.encode(batch, x)?,
+                self.up_proj.encode(batch, x)?,
+            ])
+        })
+        .unwrap_or_else(|err| panic!("the feed-forward network did not run: {err}"));
+        (gate, up)
+    }
+
     fn gate_proj(&self) -> &dyn Projection {
         &self.gate_proj
     }

@@ -48,7 +48,7 @@ use inkling_core::weights::Packed;
 
 use crate::buffer::{Buffer, Bytes};
 use crate::device::{Device, MetalError};
-use crate::kernel::{Grid, Kernel};
+use crate::kernel::{Batch, Grid, Kernel};
 
 const ENTRY: &str = "packed_matmul";
 
@@ -153,12 +153,57 @@ pub struct PackedBank<'a> {
 }
 
 /// What a bank holds on the device between calls: the two tensors the checkpoint
-/// pairs, and the shape the kernel reads its bounds out of.
+/// pairs, and nothing else.
+///
+/// The shape is not here. It carries the row count of a *call*, so a bank that
+/// held one could not have two calls of different heights encoded into one
+/// command buffer — the second would overwrite what the first is waiting to be
+/// read with — and a batch that could not hold two multiplies against one bank
+/// would be a rule nothing states.
 #[derive(Debug)]
 struct Resident<'a> {
-    shape: Buffer<u32>,
     codes: Bytes<'a>,
     scales: Bytes<'a>,
+}
+
+/// The output of a multiply encoded into a [`Batch`] that has not run yet.
+///
+/// Only the output is held. Everything else a dispatch reads — the shape, the
+/// expert list, the input — is retained by the command buffer it was bound
+/// into, so it outlives this side of it whatever happens here; the output is
+/// held because somebody has to read it afterwards.
+#[derive(Debug)]
+pub struct Pending {
+    /// `None` for a call with no rows, which is not a dispatch at all: the
+    /// device refuses a zero-length buffer.
+    out: Option<Buffer<f32>>,
+}
+
+impl Pending {
+    /// The values, once the batch this was encoded into has been waited for.
+    pub fn take(self) -> Vec<f32> {
+        self.out.map(|out| out.to_vec()).unwrap_or_default()
+    }
+}
+
+/// Everything `encode` put in one command buffer, run and read back.
+///
+/// The shape a caller with several multiplies in hand wants, and the reason
+/// [`PackedBank::encode`] is public: encode them all, wait once, and the array
+/// that comes back is what each of them produced.
+///
+/// Fallible, like the multiplies it runs. A caller standing behind an
+/// infallible seam panics on the way past — which is what
+/// [`Projection::forward`] already does — and one that promised a `Result`
+/// keeps that promise for every dispatch rather than for the last of them.
+pub fn together<const N: usize>(
+    device: &Device,
+    encode: impl FnOnce(&mut Batch<'_>) -> Result<[Pending; N], MatmulError>,
+) -> Result<[Vec<f32>; N], MatmulError> {
+    let mut batch = device.batch()?;
+    let pending = encode(&mut batch)?;
+    batch.wait()?;
+    Ok(pending.map(Pending::take))
 }
 
 /// Whether `codes` and `scales` are an `[experts, out_dim, in_dim]` MXFP4
@@ -286,20 +331,18 @@ impl<'a> PackedBank<'a> {
         codes: Bytes<'a>,
         scales: Bytes<'a>,
     ) -> Result<Self, MatmulError> {
-        let bank = Self {
-            resident: RefCell::new(Resident {
-                shape: device.zeroed(SHAPE_FIELDS)?,
-                codes,
-                scales,
-            }),
+        Ok(Self {
+            resident: RefCell::new(Resident { codes, scales }),
             device,
             matmul,
             experts,
             in_dim,
             out_dim,
-        };
-        bank.write_shape(0);
-        Ok(bank)
+        })
+    }
+
+    pub(crate) fn device(&self) -> &'a Device {
+        self.device
     }
 
     pub fn experts(&self) -> usize {
@@ -314,18 +357,18 @@ impl<'a> PackedBank<'a> {
         self.out_dim
     }
 
-    /// The scalars the kernel's `Shape` struct declares, in its order, written
-    /// where it reads them.
+    /// The scalars the kernel's `Shape` struct declares, in its order, in a
+    /// buffer of this call's own.
     ///
     /// The kernel reads them as `uint`, so this is where a shape too large to
     /// describe has to stop. Unreachable through any real weight — four billion
     /// rows of anything is decades past the 348 GiB one allocation can hold — and
     /// a truncation would not fail: it would dispatch a grid for the wrong shape
     /// over buffers of the right one.
-    fn write_shape(&self, rows: usize) {
-        let mut resident = self.resident.borrow_mut();
+    fn shape(&self, rows: usize) -> Result<Buffer<u32>, MetalError> {
+        let resident = self.resident.borrow();
         let stride = self.out_dim * self.in_dim;
-        let shape = [
+        let shape: [u32; SHAPE_FIELDS] = [
             rows,
             self.in_dim,
             self.out_dim,
@@ -338,7 +381,7 @@ impl<'a> PackedBank<'a> {
             u32::try_from(extent)
                 .unwrap_or_else(|_| panic!("{extent} is wider than a kernel's uint"))
         });
-        resident.shape.as_mut_slice().copy_from_slice(&shape);
+        self.device.buffer(&shape)
     }
 
     /// `[rows, in_dim]` in, `[rows, out_dim]` out, row `i` multiplied against
@@ -349,6 +392,25 @@ impl<'a> PackedBank<'a> {
     /// runs too long, and a caller that wants to say so rather than die needs
     /// the error.
     pub fn multiply(&self, experts: &[u32], x: &[f32]) -> Result<Vec<f32>, MatmulError> {
+        let mut batch = self.device.batch()?;
+        let pending = self.encode(&mut batch, experts, x)?;
+        batch.wait()?;
+        Ok(pending.take())
+    }
+
+    /// The same multiply, encoded into `batch` rather than submitted on its own.
+    ///
+    /// What this buys is the whole of the granularity question: a submission
+    /// costs 206 microseconds whatever is in it, so a caller with several
+    /// multiplies whose inputs are all in hand — the four projections of an
+    /// attention layer, a feed-forward network's gate and up — encodes them
+    /// together and waits once.
+    pub fn encode(
+        &self,
+        batch: &mut Batch<'_>,
+        experts: &[u32],
+        x: &[f32],
+    ) -> Result<Pending, MatmulError> {
         assert_eq!(
             x.len(),
             experts.len() * self.in_dim,
@@ -372,30 +434,35 @@ impl<'a> PackedBank<'a> {
 
         let rows = experts.len();
         if rows == 0 {
-            return Ok(Vec::new());
+            return Ok(Pending { out: None });
         }
-        self.write_shape(rows);
 
+        // The shape is read out of `resident` and so is built before it is
+        // borrowed mutably for the binding below.
+        let mut shape = self.shape(rows)?;
         let mut resident = self.resident.borrow_mut();
         let resident = &mut *resident;
         let mut chosen = self.device.buffer(experts)?;
         let mut x = self.device.buffer(x)?;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
-        let args = [
-            resident.shape.arg(),
-            chosen.arg(),
-            x.arg(),
-            resident.codes.arg(),
-            resident.scales.arg(),
-            out.arg(),
-        ];
 
         let elements = rows * self.out_dim;
         let kernel = &self.matmul.kernel;
         let grid = Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP);
-        self.device.run(kernel, &args, grid)?;
+        batch.add(
+            kernel,
+            &[
+                shape.arg(),
+                chosen.arg(),
+                x.arg(),
+                resident.codes.arg(),
+                resident.scales.arg(),
+                out.arg(),
+            ],
+            grid,
+        )?;
 
-        Ok(out.to_vec())
+        Ok(Pending { out: Some(out) })
     }
 }
 
@@ -463,6 +530,14 @@ impl<'a> PackedProjection<'a> {
 
     /// `[rows, in_dim]` in, `[rows, out_dim]` out.
     pub fn multiply(&self, x: &[f32]) -> Result<Vec<f32>, MatmulError> {
+        let mut batch = self.bank.device().batch()?;
+        let pending = self.encode(&mut batch, x)?;
+        batch.wait()?;
+        Ok(pending.take())
+    }
+
+    /// The same multiply, encoded into `batch` rather than submitted on its own.
+    pub fn encode(&self, batch: &mut Batch<'_>, x: &[f32]) -> Result<Pending, MatmulError> {
         assert_eq!(
             x.len() % self.bank.in_dim(),
             0,
@@ -473,7 +548,11 @@ impl<'a> PackedProjection<'a> {
         let rows = x.len() / self.bank.in_dim();
         let mut chosen = self.chosen.borrow_mut();
         chosen.resize(rows, 0);
-        self.bank.multiply(&chosen, x)
+        self.bank.encode(batch, &chosen, x)
+    }
+
+    pub(crate) fn device(&self) -> &Device {
+        self.bank.device()
     }
 }
 
@@ -1229,6 +1308,48 @@ mod tests {
                 })
             ),
             "one past the last"
+        );
+    }
+
+    /// Two multiplies against *one* bank in one command buffer, of different
+    /// heights — which is what says a dispatch's shape belongs to the dispatch.
+    ///
+    /// This is the case the shape buffer was moved out of [`Resident`] for. Held
+    /// per bank, the second call's row count would overwrite the first's before
+    /// either had run, and both dispatches would read the second.
+    ///
+    /// The taller call is encoded first, which is what makes that visible: the
+    /// kernel's `element >= rows * out_dim` check would then cull two thirds of
+    /// its output against the shorter call's row count and leave it zeroed,
+    /// where a shorter call reading a taller one's shape agrees by accident —
+    /// the elements it was dispatched for are inside the larger bound either
+    /// way.
+    #[test]
+    fn two_multiplies_against_one_bank_in_one_batch_keep_their_own_shapes() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let case = Case::noisy(IN_DIM, OUT_DIM, 3);
+        let projection = case.upload(&device, &matmul);
+        let (one, three) = (&case.x[..IN_DIM], &case.x[..]);
+
+        let [batched_three, batched_one] = together(&device, |batch| {
+            Ok([
+                projection.encode(batch, three)?,
+                projection.encode(batch, one)?,
+            ])
+        })
+        .expect("both dispatches complete");
+
+        assert_eq!(batched_three.len(), 3 * OUT_DIM);
+        assert_eq!(batched_one.len(), OUT_DIM, "one row in, one row out");
+        assert_eq!(
+            batched_three,
+            projection.multiply(three).expect("the dispatch completes"),
+            "the shorter call's shape reached the taller one"
+        );
+        assert_eq!(
+            batched_one,
+            projection.multiply(one).expect("the dispatch completes")
         );
     }
 

@@ -50,7 +50,7 @@ use inkling_core::ops::swiglu;
 use inkling_core::weights::{ExpertBackend, LayerBanks, PackedExperts};
 
 use crate::device::Device;
-use crate::matmul::{MatmulError, PackedBank, PackedMatmul};
+use crate::matmul::{MatmulError, PackedBank, PackedMatmul, together};
 
 /// One `SwitchGLU`'s three banks on the device: `[experts, hidden_dim, dim]`
 /// gate and up projections beside `[experts, dim, hidden_dim]` down projections.
@@ -162,8 +162,10 @@ impl<'a> ExpertBanks<'a> {
     /// Every gathered row through the expert it named, as the SwiGLU MLP an
     /// expert is.
     ///
-    /// Three dispatches over the same expert list: `x @ gate^T` and `x @ up^T`
-    /// against the same rows, and `silu(gate) * up` through `down`.
+    /// Three dispatches over the same expert list, in two command buffers:
+    /// `x @ gate^T` and `x @ up^T` read the same rows and nothing of each other,
+    /// so they are submitted together, and `silu(gate) * up` through `down`
+    /// follows because it is what they produced.
     pub fn forward(&self, gathered: Gathered<'_>) -> Result<Vec<f32>, MatmulError> {
         let chosen: Vec<u32> = gathered
             .experts()
@@ -173,8 +175,13 @@ impl<'a> ExpertBanks<'a> {
             })
             .collect();
 
-        let mut gate = self.gate_proj.multiply(&chosen, gathered.rows())?;
-        swiglu(&mut gate, &self.up_proj.multiply(&chosen, gathered.rows())?);
+        let [mut gate, up] = together(self.gate_proj.device(), |batch| {
+            Ok([
+                self.gate_proj.encode(batch, &chosen, gathered.rows())?,
+                self.up_proj.encode(batch, &chosen, gathered.rows())?,
+            ])
+        })?;
+        swiglu(&mut gate, &up);
         self.down_proj.multiply(&chosen, &gate)
     }
 }
