@@ -8,9 +8,11 @@
 
 use std::path::PathBuf;
 
-use crate::attention::AttentionWeights;
+use crate::attention::{AttentionConfig, AttentionWeights};
 use crate::checkpoint::{Checkpoint, Dtype, TensorView};
-use crate::layer::{DecoderWeights, Experts, LayerMlp, NoExperts};
+use crate::config::{Config, TextConfig};
+use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
+use crate::model::{Model, ModelWeights};
 use crate::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
 use crate::ops::DenseMlp;
 
@@ -333,6 +335,96 @@ impl Experts for LayerTensors {
             Mlp::Dense { .. } => NoExperts.shared(expert, rows),
             Mlp::Sparse { shared, .. } => shared.expert(expert, rows),
         }
+    }
+}
+
+/// A five-layer synthetic model and the two calls mlx-vlm drove it with, from
+/// `just dump-stack-fixture`.
+pub const STACK: &str = "stack.safetensors";
+
+/// The config that model was built from, in the checkpoint's own spelling so
+/// that the same JSON stands the reference and this port up.
+pub const STACK_CONFIG: &str = "stack.json";
+
+/// The synthetic stack's weights, held whole, as the [`ModelWeights`] a model
+/// runs against — five layers of width 32, which is what makes a stack testable
+/// without the 131 GB checkpoint.
+///
+/// The layer this builds per call is built from the *config*, not from anything
+/// the fixture recorded per layer: which attention config and which MLP each
+/// index gets is exactly what a stack has to get right.
+///
+/// Shared rather than kept beside the stack's own tests because everything
+/// downstream of a stack — generation, and the caches it carries between steps —
+/// needs a whole model to have anything to say, and the only whole model that
+/// fits in a test is this one.
+pub struct Stack {
+    pub config: TextConfig,
+    /// The prompt the reference prefilled, and the continuation it fed through
+    /// the caches that prefill left behind.
+    pub ids: Vec<usize>,
+    pub continue_ids: Vec<usize>,
+    /// The two norms outside the layers, which [`Stack::model`] borrows and
+    /// which a test that refuses a malformed model hands in itself.
+    pub embed_norm: Vec<f32>,
+    pub norm: Vec<f32>,
+    table: Vec<f32>,
+    layers: Vec<LayerTensors>,
+    order: Vec<usize>,
+}
+
+impl Stack {
+    pub fn load() -> Self {
+        let ckpt = open(STACK);
+        let config = serde_json::from_str::<Config>(&read(STACK_CONFIG))
+            .expect("the recorded config parses")
+            .text_config;
+        Self {
+            layers: (0..config.num_hidden_layers)
+                .map(|layer| LayerTensors::load(&ckpt, &format!("layers.{layer}")))
+                .collect(),
+            order: (0..config.num_hidden_layers).collect(),
+            embed_norm: f32s(&tensor(&ckpt, "embed_norm.weight")),
+            norm: f32s(&tensor(&ckpt, "norm.weight")),
+            table: f32s(&tensor(&ckpt, "embed_tokens.weight")),
+            ids: indices(&tensor(&ckpt, "input_ids")),
+            continue_ids: indices(&tensor(&ckpt, "continue_ids")),
+            config,
+        }
+    }
+
+    pub fn model(&self) -> Model<'_> {
+        Model::new(&self.config, Some(&self.embed_norm), &self.norm)
+    }
+
+    pub fn layers(&self) -> &[LayerTensors] {
+        &self.layers
+    }
+
+    /// Everything the reference drove this stack with, in order: the prompt and
+    /// then the continuation.
+    pub fn sequence(&self) -> Vec<usize> {
+        [self.ids.clone(), self.continue_ids.clone()].concat()
+    }
+
+    /// The same weights with two layers' tensors exchanged, which is the
+    /// mutation a stack that ran its layers out of order would make.
+    pub fn exchanging(mut self, a: usize, b: usize) -> Self {
+        self.order.swap(a, b);
+        self
+    }
+}
+
+impl ModelWeights for Stack {
+    fn embedding_row(&self, id: usize) -> Vec<f32> {
+        let hidden = self.config.hidden_size;
+        self.table[id * hidden..][..hidden].to_vec()
+    }
+
+    fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: &[f32]) -> Vec<f32> {
+        let tensors = &self.layers[self.order[index]];
+        let config = AttentionConfig::for_layer(&self.config, index);
+        DecoderLayer::new(config, tensors.view(), tensors.mlp()).forward(cache, x, tensors)
     }
 }
 

@@ -198,17 +198,7 @@ impl<'a> Model<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::fixture::{self, LayerTensors, deviation, indices};
-    use crate::layer::DecoderLayer;
-
-    /// A four-layer synthetic model and the two calls mlx-vlm drove it with,
-    /// from `just dump-stack-fixture`.
-    const FIXTURE: &str = "stack.safetensors";
-
-    /// The config that model was built from, in the checkpoint's own spelling so
-    /// that the same JSON stands the reference and this port up.
-    const FIXTURE_CONFIG: &str = "stack.json";
+    use crate::fixture::{self, LayerTensors, Stack, deviation};
 
     /// The synthetic stack is float32 end to end, so only summation order
     /// separates it from MLX — the same bound, for the same reason, as the
@@ -227,17 +217,9 @@ mod tests {
     /// six decades above.
     const TOLERANCE: f32 = 1e-6;
 
-    /// The whole synthetic model: the config it was built from, its two
-    /// stack-level norms, its embedding table, its layers, and what the
-    /// reference produced.
-    struct Stack {
-        config: TextConfig,
-        embed_norm: Vec<f32>,
-        norm: Vec<f32>,
-        table: Vec<f32>,
-        layers: Vec<LayerTensors>,
-        ids: Vec<usize>,
-        continue_ids: Vec<usize>,
+    /// What the reference produced for each of the two calls it drove the
+    /// synthetic stack with, beside the weights [`Stack`] holds.
+    struct Recorded {
         calls: [Call; 2],
     }
 
@@ -249,54 +231,25 @@ mod tests {
         norm_out: Vec<f32>,
     }
 
-    impl Stack {
+    impl Recorded {
         fn load() -> Self {
-            let ckpt = fixture::open(FIXTURE);
-            let of = |name: &str| fixture::f32s(&fixture::tensor(&ckpt, name));
-            let config = serde_json::from_str::<Config>(&fixture::read(FIXTURE_CONFIG))
-                .expect("the recorded config parses")
-                .text_config;
+            let ckpt = fixture::open(fixture::STACK);
             let call = |what: &'static str| Call {
                 what,
-                layers_out: of(&format!("{what}.layers_out")),
-                norm_out: of(&format!("{what}.norm_out")),
+                layers_out: fixture::f32s(&fixture::tensor(&ckpt, &format!("{what}.layers_out"))),
+                norm_out: fixture::f32s(&fixture::tensor(&ckpt, &format!("{what}.norm_out"))),
             };
-
             Self {
-                layers: (0..config.num_hidden_layers)
-                    .map(|layer| LayerTensors::load(&ckpt, &format!("layers.{layer}")))
-                    .collect(),
-                embed_norm: of("embed_norm.weight"),
-                norm: of("norm.weight"),
-                table: of("embed_tokens.weight"),
-                ids: indices(&fixture::tensor(&ckpt, "input_ids")),
-                continue_ids: indices(&fixture::tensor(&ckpt, "continue_ids")),
                 calls: [call("prefill"), call("continue")],
-                config,
             }
-        }
-
-        fn model(&self) -> Model<'_> {
-            Model::new(&self.config, Some(&self.embed_norm), &self.norm)
-        }
-
-        /// The prefill and the continuation, against one cache, as the dump
-        /// script drove the reference.
-        fn forward(&self, weights: &impl ModelWeights) -> [Vec<f32>; 2] {
-            let model = self.model();
-            let cache = &mut ModelCache::new(&self.config);
-            [
-                model.forward(cache, &self.ids, weights),
-                model.forward(cache, &self.continue_ids, weights),
-            ]
         }
 
         /// The worst deviation of either call, over both the pre-norm and the
         /// normed answer. The continuation is where the cache enters, so a
         /// prefill that matched alone would say nothing about decoding.
-        fn deviation(&self, weights: &impl ModelWeights) -> f32 {
-            let model = self.model();
-            self.forward(weights)
+        fn deviation(&self, stack: &Stack) -> f32 {
+            let model = stack.model();
+            forward(stack)
                 .iter()
                 .zip(&self.calls)
                 .fold(0.0f32, |worst, (got, want)| {
@@ -307,62 +260,20 @@ mod tests {
         }
     }
 
-    /// The synthetic model's weights, held whole — four layers of width 32,
-    /// which is what makes a stack testable without the 131 GB checkpoint.
-    ///
-    /// The layer this builds per call is built from the *config*, not from
-    /// anything the fixture recorded per layer: which attention config and which
-    /// MLP each index gets is exactly what a stack has to get right.
-    struct Held<'a> {
-        config: &'a TextConfig,
-        layers: &'a [LayerTensors],
-        table: &'a [f32],
-        order: Vec<usize>,
-    }
-
-    impl<'a> Held<'a> {
-        fn new(stack: &'a Stack) -> Self {
-            Self {
-                config: &stack.config,
-                layers: &stack.layers,
-                table: &stack.table,
-                order: (0..stack.layers.len()).collect(),
-            }
-        }
-
-        /// The same weights with two layers' tensors exchanged, which is the
-        /// mutation a stack that ran its layers out of order would make.
-        fn exchanging(mut self, a: usize, b: usize) -> Self {
-            self.order.swap(a, b);
-            self
-        }
-
-        fn layer(&self, index: usize) -> (&'a LayerTensors, DecoderLayer<'_>) {
-            let tensors = &self.layers[self.order[index]];
-            let config = AttentionConfig::for_layer(self.config, index);
-            (
-                tensors,
-                DecoderLayer::new(config, tensors.view(), tensors.mlp()),
-            )
-        }
-    }
-
-    impl ModelWeights for Held<'_> {
-        fn embedding_row(&self, id: usize) -> Vec<f32> {
-            let hidden = self.config.hidden_size;
-            self.table[id * hidden..][..hidden].to_vec()
-        }
-
-        fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: &[f32]) -> Vec<f32> {
-            let (experts, layer) = self.layer(index);
-            layer.forward(cache, x, experts)
-        }
+    /// The prefill and the continuation, against one cache, as the dump script
+    /// drove the reference.
+    fn forward(stack: &Stack) -> [Vec<f32>; 2] {
+        let model = stack.model();
+        let cache = &mut ModelCache::new(&stack.config);
+        [
+            model.forward(cache, &stack.ids, stack),
+            model.forward(cache, &stack.continue_ids, stack),
+        ]
     }
 
     #[test]
     fn the_synthetic_stack_reproduces_mlx() {
-        let stack = Stack::load();
-        let deviation = stack.deviation(&Held::new(&stack));
+        let deviation = Recorded::load().deviation(&Stack::load());
         assert!(deviation <= TOLERANCE, "deviation {deviation:e}");
         assert!(
             deviation > 0.0,
@@ -404,9 +315,9 @@ mod tests {
     /// only the numbers say otherwise.
     #[test]
     fn running_two_layers_out_of_order_changes_the_answer() {
-        let stack = Stack::load();
-        for (a, b) in interchangeable(&stack.config) {
-            let deviation = stack.deviation(&Held::new(&stack).exchanging(a, b));
+        let recorded = Recorded::load();
+        for (a, b) in interchangeable(&Stack::load().config) {
+            let deviation = recorded.deviation(&Stack::load().exchanging(a, b));
             assert!(
                 deviation > TOLERANCE,
                 "exchanging layers {a} and {b} deviates by only {deviation:e}"
@@ -421,9 +332,9 @@ mod tests {
     fn the_synthetic_stack_covers_both_mlps_and_both_attentions() {
         let stack = Stack::load();
         let indices = 0..stack.config.num_hidden_layers;
-        assert_eq!(stack.layers.len(), indices.len(), "a layer per index");
+        assert_eq!(stack.layers().len(), indices.len(), "a layer per index");
 
-        let dense: Vec<bool> = stack.layers.iter().map(LayerTensors::is_dense).collect();
+        let dense: Vec<bool> = stack.layers().iter().map(LayerTensors::is_dense).collect();
         let sliding: Vec<bool> = indices.map(|i| stack.config.layer_is_sliding(i)).collect();
         for (what, kinds) in [("MLPs", dense), ("attentions", sliding)] {
             assert_eq!(
@@ -460,15 +371,14 @@ mod tests {
     #[test]
     fn the_continuation_reads_what_the_prefill_cached() {
         let stack = Stack::load();
-        let model = stack.model();
-        let weights = Held::new(&stack);
+        let recorded = Recorded::load();
 
-        let fresh = model.forward(
+        let fresh = stack.model().forward(
             &mut ModelCache::new(&stack.config),
             &stack.continue_ids,
-            &weights,
+            &stack,
         );
-        let deviation = deviation(&fresh, &stack.calls[1].layers_out);
+        let deviation = deviation(&fresh, &recorded.calls[1].layers_out);
         assert!(deviation > TOLERANCE, "deviation {deviation:e}");
     }
 
@@ -480,7 +390,7 @@ mod tests {
     fn the_stack_stops_before_the_final_norm() {
         let stack = Stack::load();
         let model = stack.model();
-        for got in stack.forward(&Held::new(&stack)).iter().zip(&stack.calls) {
+        for got in forward(&stack).iter().zip(&Recorded::load().calls) {
             let (got, want) = got;
             let normed = model.final_norm(got);
             let deviation = deviation(&normed, &want.layers_out);
@@ -519,10 +429,8 @@ mod tests {
         let stack = Stack::load();
         let mut shallow = stack.config.clone();
         shallow.num_hidden_layers -= 1;
-        stack.model().forward(
-            &mut ModelCache::new(&shallow),
-            &stack.ids,
-            &Held::new(&stack),
-        );
+        stack
+            .model()
+            .forward(&mut ModelCache::new(&shallow), &stack.ids, &stack);
     }
 }
