@@ -16,6 +16,6 @@ pub use attention::{
 pub use checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 pub use config::{Config, TextConfig};
 pub use mask::{BandedMask, MASKED, is_masked};
-pub use ops::{DenseMlp, linear, rms_norm};
+pub use ops::{DenseMlp, linear, rms_norm, softmax};
 pub use quant::{Dequantized, QuantError};
 pub use sconv::{ConvState, ShortConv};

@@ -19,7 +19,7 @@
 
 use crate::config::TextConfig;
 use crate::mask::{BandedMask, is_masked};
-use crate::ops::{linear, rms_norm};
+use crate::ops::{linear, rms_norm, softmax};
 use crate::sconv::{ConvState, ShortConv};
 
 /// The softmax attention step, over `[heads, queries, head_dim]` queries and
@@ -433,24 +433,6 @@ pub fn merge_heads(x: &[f32], heads: usize, head_dim: usize) -> Vec<f32> {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(a, b)| a * b).sum()
-}
-
-/// Softmax in place, over a row's largest entry.
-///
-/// The shift is what lets the mask carry a magnitude rather than an infinity: a
-/// row whose keys are all masked shifts to zeros and leaves a uniform
-/// distribution, where an unshifted `exp` would leave zeros and divide by their
-/// sum.
-fn softmax(row: &mut [f32]) {
-    let peak = row.iter().fold(f32::NEG_INFINITY, |peak, x| peak.max(*x));
-    let mut total = 0.0;
-    for x in row.iter_mut() {
-        *x = (*x - peak).exp();
-        total += *x;
-    }
-    for x in row.iter_mut() {
-        *x /= total;
-    }
 }
 
 #[cfg(test)]

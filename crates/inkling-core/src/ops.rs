@@ -134,6 +134,25 @@ pub fn linear(x: &[f32], weight: &[f32], in_dim: usize) -> Vec<f32> {
     out
 }
 
+/// Softmax in place, over a row's largest entry.
+///
+/// The shift is what lets attention's mask carry a magnitude rather than an
+/// infinity: a row whose keys are all masked shifts to zeros and leaves a
+/// uniform distribution, where an unshifted `exp` would leave zeros and divide
+/// by their sum. It is also what the router's `exp(x - logsumexp(x))` is, that
+/// form being the shift written out.
+pub fn softmax(row: &mut [f32]) {
+    let peak = row.iter().fold(f32::NEG_INFINITY, |peak, x| peak.max(*x));
+    let mut total = 0.0;
+    for x in row.iter_mut() {
+        *x = (*x - peak).exp();
+        total += *x;
+    }
+    for x in row.iter_mut() {
+        *x /= total;
+    }
+}
+
 /// `silu(gate) * up`, written over `gate`.
 ///
 /// The activation goes on the gate projection and not on the up projection:
@@ -280,6 +299,25 @@ mod tests {
             got.iter().all(|y| (y - 1.0).abs() <= TOLERANCE),
             "uniform row should normalise to its weight: {got:?}"
         );
+    }
+
+    /// The shift by the row's peak is invisible in the answer and is the whole
+    /// point of the implementation: a row of large entries has to normalise
+    /// rather than overflow, and one of equal entries has to come out uniform
+    /// however large they are.
+    #[test]
+    fn softmax_normalises_without_overflowing() {
+        let mut row = [90.0, 91.0, 92.0];
+        softmax(&mut row);
+        assert!(
+            (row.iter().sum::<f32>() - 1.0).abs() <= TOLERANCE,
+            "{row:?}"
+        );
+        assert!(row[0] < row[1] && row[1] < row[2], "{row:?}");
+
+        let mut flat = [1e30; 4];
+        softmax(&mut flat);
+        assert_eq!(flat, [0.25; 4]);
     }
 
     /// `[rows, in]` against a `[out, in]` weight, one output row per input row.
