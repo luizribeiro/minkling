@@ -87,6 +87,12 @@ dump-op-fixture:
 dump-tokenizer-fixture model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_tokenizer_fixture.py {{ model }}
 
+# Regenerate the committed prompts the Rust turn structure is tested against.
+# The server writes the structure out by hand rather than interpreting
+# chat_template.jinja, and this is what says the two agree.
+dump-chat-template-fixture model="models/Inkling-Small-mxfp4":
+    reference/.venv/bin/python reference/scripts/dump_chat_template_cases.py {{ model }}
+
 fetch repo="thinkingmachines/Inkling-Small":
     hf download {{ repo }}
 

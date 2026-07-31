@@ -12,6 +12,7 @@
 //! and moving a module is a smaller thing than lifting one out of a binary.
 
 pub mod args;
+pub mod chat;
 pub mod config;
 pub mod generate;
 pub mod inspect;
