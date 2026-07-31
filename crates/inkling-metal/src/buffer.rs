@@ -95,9 +95,12 @@ impl<T: Element> Buffer<T> {
     pub fn as_slice(&self) -> &[T] {
         // SAFETY: `contents` is the start of an allocation of `len` elements —
         // page-aligned, so aligned for any `T` — and `Element` says every byte
-        // pattern in it reads back as a `T`. Nothing else holds those bytes:
-        // the allocation is reached only through this `Buffer`, which owns it
-        // and hands it out under the ordinary borrow rules.
+        // pattern in it reads back as a `T`. No dispatch can be writing it: a
+        // kernel reaches a buffer only through `arg`, which borrows exclusively
+        // for as long as the binding lives, and `Device::run` does not return
+        // until the GPU is done with it. A dispatch that stopped waiting would
+        // invalidate this, which is why `run` is synchronous by decision rather
+        // than by omission.
         unsafe { std::slice::from_raw_parts(self.raw.contents().as_ptr().cast(), self.len) }
     }
 
@@ -110,6 +113,26 @@ impl<T: Element> Buffer<T> {
 
     pub fn to_vec(&self) -> Vec<T> {
         self.as_slice().to_vec()
+    }
+
+    /// The buffer bound to one of a kernel's argument slots.
+    ///
+    /// Exclusive, because a kernel may write through any slot it is handed and
+    /// nothing in the source string says which. The borrow is what keeps a CPU
+    /// slice of the same bytes from outliving the call that writes them, and
+    /// what keeps one buffer from being bound to two slots that write.
+    pub fn arg(&mut self) -> Arg<'_> {
+        Arg(&self.raw)
+    }
+}
+
+/// A buffer bound to a kernel argument slot, from [`Buffer::arg`].
+#[derive(Debug)]
+pub struct Arg<'a>(&'a ProtocolObject<dyn MTLBuffer>);
+
+impl Arg<'_> {
+    pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        self.0
     }
 }
 

@@ -2,12 +2,15 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetalError {
     #[error("this machine has no Metal device")]
     NoDevice,
+
+    #[error("the Metal device would not open a command queue")]
+    NoCommandQueue,
 
     #[error("{len} elements of {size} bytes is not a size that can be addressed")]
     Overflow { len: usize, size: usize },
@@ -23,12 +26,40 @@ pub enum MetalError {
 
     #[error("{entry} does not make a compute pipeline: {diagnostic}")]
     Pipeline { entry: String, diagnostic: String },
+
+    #[error("{entry} asks for {asked} threads a group, more than the {most} this pipeline allows")]
+    ThreadgroupTooLarge {
+        entry: String,
+        asked: usize,
+        most: usize,
+    },
+
+    #[error("{entry} is given {asked} buffers, more than the {most} a function can bind")]
+    TooManyArguments {
+        entry: String,
+        asked: usize,
+        most: usize,
+    },
+
+    #[error("the Metal device would not open a command buffer")]
+    NoCommandBuffer,
+
+    #[error("the command buffer would not open a compute encoder")]
+    NoCommandEncoder,
+
+    #[error("{entry} did not complete: {diagnostic}")]
+    Execution { entry: String, diagnostic: String },
 }
 
-/// The default Metal device.
+/// The default Metal device and one command queue onto it.
+///
+/// The queue is opened once and held, rather than per dispatch: a queue is the
+/// serial ordering the GPU executes command buffers in, so a fresh one per call
+/// would be both an allocation and a claim that the calls are unordered.
 #[derive(Debug)]
 pub struct Device {
     raw: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
 }
 
 impl Device {
@@ -36,7 +67,8 @@ impl Device {
     /// one there is.
     pub fn open() -> Result<Self, MetalError> {
         let raw = MTLCreateSystemDefaultDevice().ok_or(MetalError::NoDevice)?;
-        Ok(Self { raw })
+        let queue = raw.newCommandQueue().ok_or(MetalError::NoCommandQueue)?;
+        Ok(Self { raw, queue })
     }
 
     /// The largest single allocation the device will make. A hard ceiling and
@@ -48,6 +80,10 @@ impl Device {
 
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.raw
+    }
+
+    pub(crate) fn queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
+        &self.queue
     }
 }
 
