@@ -72,7 +72,7 @@ use std::ops::ControlFlow;
 
 use crate::head::LmHead;
 use crate::model::{Model, ModelCache, ModelWeights};
-use crate::ops::top_k;
+use crate::ops::{Projection, top_k};
 
 /// The id a greedy sampler takes.
 ///
@@ -118,15 +118,29 @@ pub enum Stop {
 ///
 /// `LanguageModel` is the two of them together — the stack, its final norm, and
 /// `lm_head` — and generation is the first caller that needs all of it at once.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Generator<'a> {
     model: Model<'a>,
     head: LmHead,
+    head_weights: &'a dyn Projection,
 }
 
 impl<'a> Generator<'a> {
-    pub fn new(model: Model<'a>, head: LmHead) -> Self {
-        Self { model, head }
+    /// `head_weights` is `lm_head` itself, as the projection the head
+    /// multiplies through — 200058 rows of 4096, held by whoever knows how they
+    /// are stored.
+    ///
+    /// Taken once, here, rather than per call, and taken as a
+    /// [`Projection`] rather than as weights: which backend runs the largest
+    /// operation in a decode step is settled when a generator is built, and
+    /// nothing below this line — not [`Generator::stream`], not a sink, not a
+    /// server — is told which it was.
+    pub fn new(model: Model<'a>, head: LmHead, head_weights: &'a dyn Projection) -> Self {
+        Self {
+            model,
+            head,
+            head_weights,
+        }
     }
 
     pub fn model(&self) -> Model<'a> {
@@ -148,23 +162,19 @@ impl<'a> Generator<'a> {
     /// The norm is applied to that one row rather than to the whole state, which
     /// is the same value: RMSNorm divides a row by its own RMS and reads no
     /// other.
-    ///
-    /// `head_row` is asked for row `id` of the final projection, `[hidden]`
-    /// long, the same way [`LmHead::forward`] asks — which is what keeps a
-    /// 3.3 GB table from having to be held to generate one token.
     pub fn logits(
         &self,
         cache: &mut ModelCache,
         ids: &[usize],
         weights: &impl ModelWeights,
-        head_row: impl Fn(usize) -> Vec<f32>,
     ) -> Vec<f32> {
         assert!(!ids.is_empty(), "a forward pass over no tokens");
 
         let h = self.model.forward(cache, ids, weights);
         let hidden = h.len() / ids.len();
         let last = &h[h.len() - hidden..];
-        self.head.forward(&self.model.final_norm(last), head_row)
+        self.head
+            .forward(&self.model.final_norm(last), self.head_weights)
     }
 
     /// `prompt` prefilled, then tokens decoded greedily until `ending` says to
@@ -199,12 +209,11 @@ impl<'a> Generator<'a> {
         prompt: &[usize],
         ending: Ending,
         weights: &impl ModelWeights,
-        head_row: impl Fn(usize) -> Vec<f32>,
         mut sink: impl FnMut(usize) -> ControlFlow<()>,
     ) -> Stop {
         let mut ids = prompt.to_vec();
         for _ in 0..ending.budget {
-            let id = greedy(&self.logits(cache, &ids, weights, &head_row));
+            let id = greedy(&self.logits(cache, &ids, weights));
             if sink(id).is_break() {
                 return Stop::Sink;
             }
@@ -224,14 +233,13 @@ impl<'a> Generator<'a> {
         prompt: &[usize],
         count: usize,
         weights: &impl ModelWeights,
-        head_row: impl Fn(usize) -> Vec<f32>,
     ) -> Vec<usize> {
         let mut generated = Vec::with_capacity(count);
         let ending = Ending {
             budget: count,
             eos: None,
         };
-        self.stream(cache, prompt, ending, weights, head_row, |id| {
+        self.stream(cache, prompt, ending, weights, |id| {
             generated.push(id);
             ControlFlow::Continue(())
         });
@@ -243,6 +251,7 @@ impl<'a> Generator<'a> {
 mod tests {
     use super::*;
     use crate::fixture::Stack;
+    use crate::ops::DenseProjection;
 
     /// The synthetic stack carries no `lm_head` — `InklingModel` does not hold
     /// one — so the head here reads the embedding table, which is exactly what
@@ -253,13 +262,15 @@ mod tests {
     ///
     /// Which table the rows come from decides nothing here. What is under test
     /// is the loop, and the loop needs a head that ranks 48 ids rather than a
-    /// particular one.
-    fn generator(stack: &Stack) -> Generator<'_> {
-        Generator::new(stack.model(), LmHead::for_config(&stack.config))
+    /// particular one. Held whole rather than reached a row at a time, which 48
+    /// rows of 32 allow and the checkpoint's 200058 do not.
+    fn generator<'a>(stack: &'a Stack, head: &'a DenseProjection<'a>) -> Generator<'a> {
+        Generator::new(stack.model(), LmHead::for_config(&stack.config), head)
     }
 
     fn logits(stack: &Stack, cache: &mut ModelCache, ids: &[usize]) -> Vec<f32> {
-        generator(stack).logits(cache, ids, stack, |id| stack.embedding_row(id))
+        let head = stack.head();
+        generator(stack, &head).logits(cache, ids, stack)
     }
 
     fn generate(
@@ -268,7 +279,8 @@ mod tests {
         prompt: &[usize],
         count: usize,
     ) -> Vec<usize> {
-        generator(stack).generate(cache, prompt, count, stack, |id| stack.embedding_row(id))
+        let head = stack.head();
+        generator(stack, &head).generate(cache, prompt, count, stack)
     }
 
     /// What a caller streaming a generation sees: the ids that reached the sink,
@@ -283,21 +295,15 @@ mod tests {
         ending: Ending,
         take: usize,
     ) -> (Vec<usize>, Stop) {
+        let head = stack.head();
         let mut streamed = Vec::new();
-        let stop = generator(stack).stream(
-            cache,
-            prompt,
-            ending,
-            stack,
-            |id| stack.embedding_row(id),
-            |id| {
-                streamed.push(id);
-                match streamed.len() < take {
-                    true => ControlFlow::Continue(()),
-                    false => ControlFlow::Break(()),
-                }
-            },
-        );
+        let stop = generator(stack, &head).stream(cache, prompt, ending, stack, |id| {
+            streamed.push(id);
+            match streamed.len() < take {
+                true => ControlFlow::Continue(()),
+                false => ControlFlow::Break(()),
+            }
+        });
         (streamed, stop)
     }
 

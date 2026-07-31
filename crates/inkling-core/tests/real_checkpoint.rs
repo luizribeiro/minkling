@@ -1241,10 +1241,20 @@ fn recorded_logits(activations: &Checkpoint) -> Vec<f32> {
     fixture::f32s(&fixture::tensor(activations, "logits_untruncated"))
 }
 
+/// One row of the head, decoded. The engine never asks for one — it multiplies
+/// through [`CheckpointWeights::head_projection`] — but which rows the head
+/// holds is a claim about the checkpoint that only reading them settles.
+fn head_row(weights: &CheckpointWeights<'_>, id: usize) -> Vec<f32> {
+    weights
+        .head_packed()
+        .decode_slice(id)
+        .unwrap_or_else(|err| panic!("head row {id} decodes: {err}"))
+}
+
 fn head_logits(weights: &CheckpointWeights<'_>, normed: &[f32]) -> Vec<f32> {
     let head = weights.head();
     let started = Instant::now();
-    let logits = head.forward(normed, |id| weights.head_row(id));
+    let logits = head.forward(normed, weights.head_projection());
     eprintln!(
         "{} rows of the head in {:?}",
         head.vocab(),
@@ -1337,7 +1347,7 @@ fn dropping_the_mup_divide_moves_the_logits_and_not_the_ranking() {
     let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
     let head = weights.head();
     let undivided = LmHead::new(config.hidden_size, head.vocab(), 1.0)
-        .forward(&norm_out, |id| weights.head_row(id));
+        .forward(&norm_out, weights.head_projection());
 
     let multiplier = config.logits_mup_width_multiplier;
     let ranking = Ranking::load(&activations);
@@ -1401,7 +1411,7 @@ fn the_heads_padding_rows_are_zero_and_would_outrank_most_of_the_vocabulary() {
 
     for id in unpadded..config.vocab_size {
         assert!(
-            weights.head_row(id).iter().all(|w| *w == 0.0),
+            head_row(&weights, id).iter().all(|w| *w == 0.0),
             "head row {id} is not all zeros"
         );
     }
@@ -1437,7 +1447,7 @@ fn the_heads_padding_rows_are_zero_and_would_outrank_most_of_the_vocabulary() {
 /// The whole engine over this checkpoint: the stack, its final norm, and the
 /// head, which is what `LanguageModel` is.
 fn generator<'a>(weights: &'a CheckpointWeights<'a>) -> Generator<'a> {
-    Generator::new(weights.model(), weights.head())
+    Generator::new(weights.model(), weights.head(), weights.head_projection())
 }
 
 /// One call of the engine, timed: `ids` through the model and the head, and the
@@ -1462,7 +1472,7 @@ fn timed_logits(
     ids: &[usize],
 ) -> Vec<f32> {
     let started = Instant::now();
-    let logits = generator(weights).logits(cache, ids, weights, |id| weights.head_row(id));
+    let logits = generator(weights).logits(cache, ids, weights);
     eprintln!("{what}: {} token(s) in {:?}", ids.len(), started.elapsed());
     logits
 }
@@ -1569,13 +1579,8 @@ fn the_generated_tokens_match_the_oracle_against_real_weights() {
 
     let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
     let started = Instant::now();
-    let got = generator(&weights).generate(
-        &mut ModelCache::new(&config),
-        &ids,
-        GENERATED,
-        &weights,
-        |id| weights.head_row(id),
-    );
+    let got =
+        generator(&weights).generate(&mut ModelCache::new(&config), &ids, GENERATED, &weights);
     let elapsed = started.elapsed();
 
     // No mean over these: one prefill of the prompt and `GENERATED - 1` decode
@@ -1620,11 +1625,11 @@ fn the_checkpoint_does_not_tie_its_embeddings() {
     let table = embedding_table(&ckpt);
     for id in [0, config.vocab_size / 2, config.vocab_size - 1] {
         assert_eq!(
-            weights.head_row(id),
+            head_row(&weights, id),
             head.decode_slice(id).expect("decodes")
         );
         assert_ne!(
-            weights.head_row(id),
+            head_row(&weights, id),
             embedding_row(&table, id),
             "row {id}: the two ends of the model hold the same weights, so this settles nothing"
         );

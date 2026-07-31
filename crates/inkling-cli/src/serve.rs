@@ -413,20 +413,17 @@ impl Engine<'_> {
         let mut channels = Channels::new(self.markers.iter().cloned());
 
         let mut cache = ModelCache::new(self.config);
-        let stop = self.generator.stream(
-            &mut cache,
-            ids,
-            ending,
-            self.weights,
-            |id| self.weights.head_row(id),
-            |id| match text.push(id as u32) {
-                Ok(decoded) => {
-                    let (channel, decoded) = channels.route(id as u32, &decoded);
-                    out.push(channel, &decoded)
+        let stop = self
+            .generator
+            .stream(&mut cache, ids, ending, self.weights, |id| {
+                match text.push(id as u32) {
+                    Ok(decoded) => {
+                        let (channel, decoded) = channels.route(id as u32, &decoded);
+                        out.push(channel, &decoded)
+                    }
+                    Err(err) => out.fail(err),
                 }
-                Err(err) => out.fail(err),
-            },
-        );
+            });
 
         // Bytes the last token left half a character with, which a budget that
         // cut the reply off mid-character has and holding back would lose.
@@ -455,7 +452,7 @@ pub fn run(args: &Serve) -> Result<()> {
     eprintln!("loading {}", args.checkpoint.display());
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let weights = CheckpointWeights::open(&checkpoint, &config.text_config)?;
-    let generator = Generator::new(weights.model(), weights.head());
+    let generator = Generator::new(weights.model(), weights.head(), weights.head_projection());
 
     let mut engine = Engine {
         tokenizer,

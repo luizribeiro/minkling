@@ -28,7 +28,10 @@
 //! tokens asked for and the head for the rows the vocabulary runs to. What
 //! separates them is how many: a pass over eight tokens decodes eight rows of
 //! the one and 200058 of the other, so the head is the only place where
-//! per-row decoding costs the whole tensor. It still never holds it.
+//! per-row decoding costs the whole tensor. It still never holds it — and being
+//! the one weight every token touches every row of is what makes it the first to
+//! hand to a backend that does not decode at all, which
+//! [`CheckpointWeights::with_head`] is.
 //!
 //! A malformed checkpoint is a panic here rather than an error. Every name and
 //! shape this reads is fixed by the architecture, so a tensor that is missing at
@@ -45,7 +48,7 @@ use crate::head::LmHead;
 use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use crate::model::{Model, ModelWeights};
 use crate::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
-use crate::ops::DenseMlp;
+use crate::ops::{DenseMlp, Projection, linear};
 use crate::quant::{BITS, QuantError, Scratch, dequantize_blocks_into};
 
 /// Where the language model's tensors live in a multimodal checkpoint.
@@ -157,6 +160,79 @@ impl<'a> Packed<'a> {
     }
 }
 
+/// The CPU's answer to a projection whose weights stay packed: an
+/// `[out_dim, in_dim]` MXFP4 tensor, one row of it decoded at a time into a
+/// buffer the next row overwrites.
+///
+/// This is what [`crate::model`]'s bargain costs where the weight is one every
+/// token touches all of. A decode step through the head decodes 200058 rows of
+/// 4096 — 3.3 GB — to produce one token's logits, and holds 16 KB of them at
+/// once. It is also the oracle: every kernel that multiplies the same bytes
+/// without decoding them is checked against this, so it stays selectable rather
+/// than becoming a fallback.
+///
+/// `out_dim` is how many of the leading axis' slices are rows of the weight,
+/// which for the head is where the vocabulary ends. It bounds the loop rather
+/// than cutting its answer, so honouring the truncation costs nothing: the rows
+/// past it are not decoded at all.
+#[derive(Debug)]
+pub struct PackedRows<'a> {
+    packed: Packed<'a>,
+    out_dim: usize,
+    decoded: RefCell<Vec<f32>>,
+}
+
+impl<'a> PackedRows<'a> {
+    pub fn new(packed: Packed<'a>, out_dim: usize) -> Self {
+        assert!(
+            out_dim <= packed.slices(),
+            "{out_dim} rows of a tensor that holds {}",
+            packed.slices()
+        );
+        Self {
+            decoded: RefCell::new(vec![0.0; packed.slice_len()]),
+            packed,
+            out_dim,
+        }
+    }
+}
+
+impl Projection for PackedRows<'_> {
+    fn in_dim(&self) -> usize {
+        self.packed.slice_len()
+    }
+
+    fn out_dim(&self) -> usize {
+        self.out_dim
+    }
+
+    /// `[rows, in_dim]` in, `[rows, out_dim]` out, a weight row at a time:
+    /// decoded, multiplied against every row of `x`, and overwritten by the
+    /// next one.
+    fn forward(&self, x: &[f32]) -> Vec<f32> {
+        let in_dim = self.in_dim();
+        assert_eq!(
+            x.len() % in_dim,
+            0,
+            "{} values are not whole rows of {in_dim}",
+            x.len()
+        );
+
+        let rows = x.len() / in_dim;
+        let mut weight = self.decoded.borrow_mut();
+        let mut out = vec![0.0; rows * self.out_dim];
+        for col in 0..self.out_dim {
+            self.packed
+                .decode_slice_into(col, &mut weight)
+                .unwrap_or_else(|err| panic!("row {col} of the projection decodes: {err}"));
+            for (row, value) in linear(x, &weight, in_dim).into_iter().enumerate() {
+                out[row * self.out_dim + col] = value;
+            }
+        }
+        out
+    }
+}
+
 /// One `SwitchGLU`'s three packed banks, which are a MoE layer's routed 256 or
 /// its shared 2.
 #[derive(Debug, Clone, Copy)]
@@ -225,6 +301,7 @@ pub struct CheckpointWeights<'a> {
     config: &'a TextConfig,
     embed_tokens: Packed<'a>,
     lm_head: Packed<'a>,
+    head: Box<dyn Projection + 'a>,
     embed_norm: Option<Vec<f32>>,
     norm: Vec<f32>,
     layer_scratch: RefCell<Vec<f32>>,
@@ -260,6 +337,7 @@ impl<'a> CheckpointWeights<'a> {
         Ok(Self {
             layer_scratch: RefCell::new(vec![0.0; layer_scratch_floats(config)]),
             expert_scratch: RefCell::new(vec![0.0; expert_scratch_floats(config)]),
+            head: Box::new(PackedRows::new(lm_head, LmHead::for_config(config).vocab())),
             embed_tokens,
             lm_head,
             embed_norm,
@@ -279,12 +357,36 @@ impl<'a> CheckpointWeights<'a> {
         LmHead::for_config(self.config)
     }
 
-    /// Row `id` of that projection, `[hidden]` long. Which tensor it comes out
-    /// of is settled once, by [`head_module`], at [`CheckpointWeights::open`].
-    pub fn head_row(&self, id: usize) -> Vec<f32> {
+    /// The tensor its rows come out of, still packed. Which tensor that is is
+    /// settled once, by [`head_module`], at [`CheckpointWeights::open`] — so a
+    /// backend that wants the bytes rather than the values asks here rather than
+    /// answering `tie_word_embeddings` a second time.
+    pub fn head_packed(&self) -> Packed<'a> {
         self.lm_head
-            .decode_slice(id)
-            .unwrap_or_else(|err| panic!("head row {id} decodes: {err}"))
+    }
+
+    /// What the head multiplies against, which is the backend this was opened
+    /// with or the one [`CheckpointWeights::with_head`] put in its place.
+    pub fn head_projection(&self) -> &dyn Projection {
+        self.head.as_ref()
+    }
+
+    /// The same weights with the head projected somewhere else — a Metal
+    /// dispatch against codes that are never decoded, in place of the CPU's
+    /// row-at-a-time decode.
+    ///
+    /// **This is where the backend is chosen, and it is the only place.** A
+    /// caller holding a [`CheckpointWeights`] cannot tell which one answered:
+    /// the head is a [`Projection`] either way, the stack above it is untouched,
+    /// and the CPU path is what this returns when nobody says otherwise.
+    ///
+    /// A projection that is not the head's shape is refused here rather than
+    /// discovered by [`LmHead::forward`], which is one prefill later — and it is
+    /// [`LmHead::expects`] that decides, so that the two answers cannot differ.
+    pub fn with_head(mut self, head: Box<dyn Projection + 'a>) -> Self {
+        self.head().expects(head.as_ref());
+        self.head = head;
+        self
     }
 
     /// How many float32 values the pass's scratch holds, which is the whole of
@@ -605,5 +707,108 @@ mod tests {
         config.tie_word_embeddings = true;
         assert_eq!(head_module(&config), EMBED_TOKENS);
         assert_ne!(LM_HEAD, EMBED_TOKENS);
+    }
+
+    /// 64 rows of `layers.0.mlp.gate_proj`, which is a projection the engine
+    /// runs in anger.
+    const PROJECTION: &str = "dense_ffn";
+
+    fn packed<'a>(ckpt: &'a Checkpoint, slice: &str) -> Packed<'a> {
+        Packed::open(ckpt, slice).expect("the fixture holds the slice packed")
+    }
+
+    /// The same slice as MLX decoded it, which is the oracle the packed rows are
+    /// multiplied against.
+    fn decoded(ckpt: &Checkpoint, slice: &str) -> Vec<f32> {
+        fixture::f32s(&fixture::tensor(ckpt, &format!("{slice}.dequantized")))
+    }
+
+    /// Two rows of input, spread over both signs so that a reduction cancels
+    /// the way a trained one does.
+    fn rows(in_dim: usize) -> Vec<f32> {
+        (0..2 * in_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) / 8.0)
+            .collect()
+    }
+
+    /// What the whole seam claims: a projection over packed rows is the same
+    /// multiply as one over the decoded weight, and *exactly* the same — both
+    /// sides decode identically and then run the same [`linear`], so the only
+    /// thing that could separate them is which bytes were read.
+    #[test]
+    fn a_packed_projection_multiplies_what_the_decoded_weight_does() {
+        let ckpt = fixture::open(fixture::MXFP4);
+        let packed = packed(&ckpt, PROJECTION);
+        let weight = decoded(&ckpt, PROJECTION);
+
+        let projection = PackedRows::new(packed, packed.slices());
+        assert_eq!(projection.in_dim(), packed.slice_len());
+        assert_eq!(projection.out_dim(), packed.slices());
+
+        let x = rows(projection.in_dim());
+        assert_eq!(
+            projection.forward(&x),
+            linear(&x, &weight, projection.in_dim())
+        );
+    }
+
+    /// The truncation, on the checkpoint's own bytes: a projection cut at the
+    /// vocabulary decodes the rows below the cut and no others.
+    ///
+    /// Stated on the values rather than on a spy, because a padding row is
+    /// all-zero codes under all-zero scales and so multiplies to exactly 0.0 —
+    /// which is what [`crate::head`] says the truncation exists to keep out of
+    /// the ranking. The untruncated projection here holds 32 of them and the
+    /// truncated one holds none.
+    #[test]
+    fn a_truncated_projection_stops_at_the_row_it_was_cut_to() {
+        let ckpt = fixture::open(fixture::MXFP4);
+        let packed = packed(&ckpt, fixture::VOCAB_PADDING);
+        let whole = PackedRows::new(packed, packed.slices());
+        let cut = PackedRows::new(packed, fixture::VOCAB_PADDING_ROWS);
+
+        let x = rows(whole.in_dim());
+        let untruncated = whole.forward(&x);
+        let truncated = cut.forward(&x);
+        assert_eq!(truncated.len(), 2 * fixture::VOCAB_PADDING_ROWS);
+
+        for row in 0..2 {
+            let (whole, cut) = (
+                &untruncated[row * whole.out_dim()..][..whole.out_dim()],
+                &truncated[row * fixture::VOCAB_PADDING_ROWS..][..fixture::VOCAB_PADDING_ROWS],
+            );
+            assert_eq!(
+                &whole[..fixture::VOCAB_PADDING_ROWS],
+                cut,
+                "row {row} up to the cut"
+            );
+            assert!(
+                whole[fixture::VOCAB_PADDING_ROWS..]
+                    .iter()
+                    .all(|logit| *logit == 0.0),
+                "row {row}: the padding this fixture holds is not all-zero, so the cut is not \
+                 what it keeps out"
+            );
+            assert!(
+                cut.iter().any(|logit| *logit != 0.0),
+                "row {row}: the real rows multiply to zero too"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "65 rows of a tensor that holds 64")]
+    fn a_projection_over_more_rows_than_the_tensor_holds_is_refused() {
+        let ckpt = fixture::open(fixture::MXFP4);
+        let packed = packed(&ckpt, PROJECTION);
+        PackedRows::new(packed, packed.slices() + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "are not whole rows of 4096")]
+    fn a_packed_projection_over_a_ragged_input_is_refused() {
+        let ckpt = fixture::open(fixture::MXFP4);
+        let packed = packed(&ckpt, PROJECTION);
+        PackedRows::new(packed, packed.slices()).forward(&rows(packed.slice_len())[1..]);
     }
 }

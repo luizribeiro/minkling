@@ -17,7 +17,7 @@ use crate::config::{Config, TextConfig};
 use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use crate::model::{Model, ModelWeights};
 use crate::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
-use crate::ops::DenseMlp;
+use crate::ops::{DenseMlp, DenseProjection};
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../reference/fixtures");
 
@@ -40,6 +40,24 @@ pub const ACTIVATIONS: &str = "layer_activations.safetensors";
 /// so a longer one costs a fixture nobody can hold and buys margin no test
 /// spends.
 pub const LONG_ACTIVATIONS: &str = "long_activations.safetensors";
+
+/// The MXFP4 slices `just dump-quant-fixture` cut out of the checkpoint, each
+/// held both packed and as `mx.dequantize` decoded it.
+///
+/// The only committed bytes in the tree that are a real quantised weight, which
+/// is why three crates' tests read them: the dequantiser is pinned against them,
+/// and so are both of the projections that multiply against a packed tensor
+/// without decoding it whole.
+pub const MXFP4: &str = "mxfp4_dequant.safetensors";
+
+/// The slice of that bundle which straddles the head's cut:
+/// `lm_head[200026:200090]` against an `unpadded_vocab_size` of 200058, so the
+/// first [`VOCAB_PADDING_ROWS`] rows are vocabulary and the rest are the
+/// all-zero padding.
+pub const VOCAB_PADDING: &str = "vocab_padding";
+
+/// How many of [`VOCAB_PADDING`]'s 64 rows a head cut to the vocabulary keeps.
+pub const VOCAB_PADDING_ROWS: usize = 32;
 
 /// The decoder layers that pass kept, and so the layers every trained case is
 /// cut from. Which three comes from the checkpoint — the dump script refuses a
@@ -398,6 +416,17 @@ impl Stack {
 
     pub fn model(&self) -> Model<'_> {
         Model::new(&self.config, Some(&self.embed_norm), &self.norm)
+    }
+
+    /// The head's weights, which for a stack that carries no `lm_head` are its
+    /// embedding table read as a linear — the tie `tie_word_embeddings`
+    /// describes, over the same `[vocab, hidden]` rows the lookup returns.
+    ///
+    /// Held decoded, which is what makes a fixture a fixture: the checkpoint's
+    /// own head is 3.3 GB and is reached through
+    /// [`PackedRows`](crate::weights::PackedRows) instead.
+    pub fn head(&self) -> DenseProjection<'_> {
+        DenseProjection::new(self.config.hidden_size, &self.table)
     }
 
     pub fn layers(&self) -> &[LayerTensors] {

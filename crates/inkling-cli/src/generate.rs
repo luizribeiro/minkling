@@ -75,7 +75,7 @@ pub fn run(args: &Generate) -> Result<()> {
 
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let weights = CheckpointWeights::open(&checkpoint, &config.text_config)?;
-    let generator = Generator::new(weights.model(), weights.head());
+    let generator = Generator::new(weights.model(), weights.head(), weights.head_projection());
     let ending = Ending {
         budget: args.max_tokens,
         eos: Some(tokenizer.eos() as usize),
@@ -87,14 +87,9 @@ pub fn run(args: &Generate) -> Result<()> {
     // mapping, the tokenizer, the cache — is setup nobody times a generation by.
     let mut text = tokenizer.stream();
     let mut out = Output::new(io::stdout().lock());
-    let stop = generator.stream(
-        cache,
-        &ids,
-        ending,
-        &weights,
-        |id| weights.head_row(id),
-        |id| out.push(text.push(id as u32).map_err(anyhow::Error::from)),
-    );
+    let stop = generator.stream(cache, &ids, ending, &weights, |id| {
+        out.push(text.push(id as u32).map_err(anyhow::Error::from))
+    });
     // Bytes the last token left half a character with. A generation the budget
     // cut off mid-character has them, and holding them back would lose them.
     out.finish(&text.finish(), stop, tokenizer.eos())

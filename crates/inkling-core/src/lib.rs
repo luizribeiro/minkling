@@ -36,4 +36,4 @@ pub use ops::{DenseMlp, DenseProjection, Projection, linear, rms_norm, softmax};
 pub use quant::{Dequantized, QuantError, Scratch};
 pub use sconv::{ConvState, ShortConv};
 pub use tokenizer::{Detokenizer, Tokenizer, TokenizerError};
-pub use weights::{CheckpointWeights, Packed, PackedExperts, WeightsError};
+pub use weights::{CheckpointWeights, Packed, PackedExperts, PackedRows, WeightsError};

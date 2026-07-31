@@ -24,11 +24,19 @@
 //! small but nonzero, which [`crate::embed`] states — so neither end can be read
 //! off the other.
 //!
-//! **A row is asked for, not handed over.** The head is `[201024, 4096]`, which
-//! is 3.3 GB decoded, and [`crate::model`] gives the argument for why a weight
-//! that size arrives through an index. It buys something specific here: the
-//! truncation costs nothing to honour, because a row past the vocabulary is
-//! never decoded at all.
+//! **The weights are named as a [`Projection`], not handed over.** The head is
+//! `[201024, 4096]`, which is 3.3 GB decoded, and [`crate::model`] gives the
+//! argument for why a weight that size is never a slice. What this asks for
+//! instead is the operation — `h @ Wᵀ` over a weight whose storage it cannot see
+//! — so the same three lines run against rows the CPU decodes one at a time
+//! ([`PackedRows`](crate::weights::PackedRows)) and against codes a Metal
+//! dispatch multiplies without decoding at all.
+//!
+//! The truncation is then a shape rather than a slice taken afterwards. The
+//! projection is built to `vocab` outputs and the head refuses one that is not,
+//! so a row past the vocabulary is never decoded, never uploaded and never
+//! multiplied — which is what makes honouring the cut cost nothing on either
+//! backend.
 //!
 //! `tie_word_embeddings` decides only *which* table those rows come from —
 //! `lm_head` when it is clear, `embed_tokens` read as a linear when it is set,
@@ -44,7 +52,7 @@
 //! `tests/real_checkpoint.rs`.
 
 use crate::config::TextConfig;
-use crate::ops::linear;
+use crate::ops::Projection;
 
 /// `_logits_from_norm`: the muP divide, the projection, and the cut at the
 /// unpadded vocabulary.
@@ -79,13 +87,31 @@ impl LmHead {
         self.vocab
     }
 
-    /// `[tokens, hidden]` in, `[tokens, vocab]` out.
+    /// Whether `weights` is this head's `[vocab, hidden]` projection, which the
+    /// two shapes it reports are the whole of the answer to: a projection to the
+    /// padded width is the truncation left undone, and one from a different
+    /// width is another tensor entirely.
     ///
-    /// `row` is asked for row `id` of the head, `[hidden]` long — the same shape
-    /// of question [`Embed::forward`](crate::embed::Embed::forward) asks of the
-    /// embedding table, and asked here only for the ids that survive the
-    /// truncation.
-    pub fn forward(&self, h: &[f32], row: impl Fn(usize) -> Vec<f32>) -> Vec<f32> {
+    /// Public because it is asked twice — once by [`LmHead::forward`], and once
+    /// by whoever chooses the backend, so that a projection built to the wrong
+    /// shape is refused when it is handed over rather than one prefill later.
+    pub fn expects(&self, weights: &dyn Projection) {
+        assert_eq!(
+            weights.in_dim(),
+            self.hidden,
+            "the head projects from {}",
+            self.hidden
+        );
+        assert_eq!(
+            weights.out_dim(),
+            self.vocab,
+            "the head projects to {} logits",
+            self.vocab
+        );
+    }
+
+    /// `[tokens, hidden]` in, `[tokens, vocab]` out.
+    pub fn forward(&self, h: &[f32], weights: &dyn Projection) -> Vec<f32> {
         assert_eq!(
             h.len() % self.hidden,
             0,
@@ -93,18 +119,10 @@ impl LmHead {
             h.len(),
             self.hidden
         );
-        let tokens = h.len() / self.hidden;
-        let scaled: Vec<f32> = h.iter().map(|x| x / self.mup).collect();
+        self.expects(weights);
 
-        let mut logits = vec![0.0; tokens * self.vocab];
-        for id in 0..self.vocab {
-            let column = linear(&scaled, &row(id), self.hidden);
-            assert_eq!(column.len(), tokens, "row {id} of the head");
-            for (token, logit) in column.into_iter().enumerate() {
-                logits[token * self.vocab + id] = logit;
-            }
-        }
-        logits
+        let scaled: Vec<f32> = h.iter().map(|x| x / self.mup).collect();
+        weights.forward(&scaled)
     }
 }
 
@@ -113,7 +131,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::fixture;
-    use std::cell::RefCell;
+    use crate::ops::{DenseProjection, linear};
 
     const HIDDEN: usize = 4;
     const VOCAB: usize = 3;
@@ -130,36 +148,27 @@ mod tests {
     /// Negative on purpose: a padding logit is exactly 0.0, so what decides
     /// whether truncation is load-bearing is whether anything real beats zero.
     /// This is the position where nothing does.
-    struct Head {
-        rows: Vec<f32>,
-        asked: RefCell<Vec<usize>>,
+    fn rows() -> Vec<f32> {
+        [
+            [-0.1, -0.2, -0.3, -0.4],
+            [-0.2, -0.1, -0.1, -0.1],
+            [-0.3, -0.3, -0.3, -0.3],
+        ]
+        .into_iter()
+        .flatten()
+        .chain(std::iter::repeat_n(0.0, PADDING * HIDDEN))
+        .collect()
     }
 
-    impl Head {
-        fn new() -> Self {
-            let real = [
-                [-0.1, -0.2, -0.3, -0.4],
-                [-0.2, -0.1, -0.1, -0.1],
-                [-0.3, -0.3, -0.3, -0.3],
-            ];
-            Self {
-                rows: real
-                    .into_iter()
-                    .flatten()
-                    .chain(std::iter::repeat_n(0.0, PADDING * HIDDEN))
-                    .collect(),
-                asked: RefCell::new(Vec::new()),
-            }
-        }
+    /// The head's weights cut where a vocabulary of `vocab` ends, which is what
+    /// a backend builds its projection to and what the head then checks.
+    fn projection(rows: &[f32], vocab: usize) -> DenseProjection<'_> {
+        DenseProjection::new(HIDDEN, &rows[..vocab * HIDDEN])
+    }
 
-        fn row(&self, id: usize) -> Vec<f32> {
-            self.asked.borrow_mut().push(id);
-            self.rows[id * HIDDEN..][..HIDDEN].to_vec()
-        }
-
-        fn logits(&self, head: &LmHead, h: &[f32]) -> Vec<f32> {
-            head.forward(h, |id| self.row(id))
-        }
+    /// One position through a head and the weights it was cut for.
+    fn logits(rows: &[f32], head: &LmHead) -> Vec<f32> {
+        head.forward(&hidden_state(), &projection(rows, head.vocab()))
     }
 
     fn hidden_state() -> Vec<f32> {
@@ -175,13 +184,13 @@ mod tests {
     /// apart, with the same argmax.
     #[test]
     fn the_head_divides_by_the_mup_multiplier_before_projecting() {
-        let (head, h) = (Head::new(), hidden_state());
-        let divided = head.logits(&LmHead::new(HIDDEN, VOCAB, MUP), &h);
-        let undivided = head.logits(&LmHead::new(HIDDEN, VOCAB, 1.0), &h);
+        let rows = rows();
+        let divided = logits(&rows, &LmHead::new(HIDDEN, VOCAB, MUP));
+        let undivided = logits(&rows, &LmHead::new(HIDDEN, VOCAB, 1.0));
 
         assert_eq!(
             divided,
-            linear(&h, &head.rows[..VOCAB * HIDDEN], HIDDEN)
+            linear(&hidden_state(), &rows[..VOCAB * HIDDEN], HIDDEN)
                 .iter()
                 .map(|logit| logit / MUP)
                 .collect::<Vec<f32>>()
@@ -200,9 +209,9 @@ mod tests {
     /// zero, and at a position whose real logits are all negative a zero wins.
     #[test]
     fn an_untruncated_head_takes_its_argmax_from_the_padding() {
-        let (head, h) = (Head::new(), hidden_state());
+        let rows = rows();
 
-        let truncated = head.logits(&LmHead::new(HIDDEN, VOCAB, MUP), &h);
+        let truncated = logits(&rows, &LmHead::new(HIDDEN, VOCAB, MUP));
         assert_eq!(truncated.len(), VOCAB);
         assert!(
             truncated.iter().all(|logit| *logit < 0.0),
@@ -210,32 +219,24 @@ mod tests {
         );
         assert_eq!(argmax(&truncated), 1);
 
-        let untruncated = head.logits(&LmHead::new(HIDDEN, VOCAB + PADDING, MUP), &h);
+        let untruncated = logits(&rows, &LmHead::new(HIDDEN, VOCAB + PADDING, MUP));
         assert_eq!(untruncated[VOCAB..], [0.0; PADDING]);
         assert_eq!(argmax(&untruncated), VOCAB, "the first padding id");
     }
 
-    /// Honouring the truncation by never decoding the row, which is what makes
-    /// it free rather than a slice taken afterwards.
-    #[test]
-    fn a_truncated_head_never_asks_for_a_padding_row() {
-        let (head, h) = (Head::new(), hidden_state());
-        head.logits(&LmHead::new(HIDDEN, VOCAB, MUP), &h);
-        assert_eq!(*head.asked.borrow(), (0..VOCAB).collect::<Vec<usize>>());
-    }
-
     #[test]
     fn every_token_gets_its_own_row_of_logits() {
-        let (head, h) = (Head::new(), hidden_state());
-        let two = [h.clone(), h.clone()].concat();
-        let logits = head.logits(&LmHead::new(HIDDEN, VOCAB, MUP), &two);
-
-        assert_eq!(logits.len(), 2 * VOCAB);
-        assert_eq!(logits[..VOCAB], logits[VOCAB..]);
-        assert_eq!(
-            logits[..VOCAB],
-            head.logits(&LmHead::new(HIDDEN, VOCAB, MUP), &h)[..]
+        let rows = rows();
+        let head = LmHead::new(HIDDEN, VOCAB, MUP);
+        let h = hidden_state();
+        let two = head.forward(
+            &[h.clone(), h.clone()].concat(),
+            &projection(&rows, head.vocab()),
         );
+
+        assert_eq!(two.len(), 2 * VOCAB);
+        assert_eq!(two[..VOCAB], two[VOCAB..]);
+        assert_eq!(two[..VOCAB], logits(&rows, &head)[..]);
     }
 
     /// A config that states no unpadded vocabulary projects to the whole head,
@@ -265,14 +266,27 @@ mod tests {
     #[test]
     #[should_panic(expected = "are not whole rows of")]
     fn a_hidden_state_that_is_not_whole_rows_is_refused() {
-        let (head, h) = (Head::new(), hidden_state());
-        head.logits(&LmHead::new(HIDDEN, VOCAB, MUP), &h[1..]);
+        let rows = rows();
+        let head = LmHead::new(HIDDEN, VOCAB, MUP);
+        head.forward(&hidden_state()[1..], &projection(&rows, head.vocab()));
+    }
+
+    /// The truncation, now that it is the projection's shape rather than a loop
+    /// bound: a head handed the whole padded table would produce the 966 logits
+    /// of exactly zero the case above ranks, and it is refused instead.
+    #[test]
+    #[should_panic(expected = "the head projects to 3 logits")]
+    fn a_projection_that_kept_the_padding_rows_is_refused() {
+        let rows = rows();
+        LmHead::new(HIDDEN, VOCAB, MUP)
+            .forward(&hidden_state(), &projection(&rows, VOCAB + PADDING));
     }
 
     #[test]
-    #[should_panic(expected = "row 0 of the head")]
-    fn a_head_row_of_the_wrong_width_is_refused() {
-        let head = LmHead::new(HIDDEN, VOCAB, MUP);
-        head.forward(&hidden_state(), |_| vec![0.0; 2 * HIDDEN]);
+    #[should_panic(expected = "the head projects from 4")]
+    fn a_projection_from_the_wrong_width_is_refused() {
+        let rows = rows();
+        let narrow = DenseProjection::new(HIDDEN / 2, &rows[..VOCAB * HIDDEN]);
+        LmHead::new(HIDDEN, VOCAB, MUP).forward(&hidden_state(), &narrow);
     }
 }

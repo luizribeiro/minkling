@@ -264,17 +264,13 @@ mod tests {
     use crate::checkpoint::Checkpoint;
     use crate::fixture;
 
-    /// Packed slices and MLX's dequantisation of them, from
-    /// `just dump-quant-fixture`.
-    const FIXTURE: &str = "mxfp4_dequant.safetensors";
-
     /// One synthetic group per scale byte, each holding all 16 codes twice, so
     /// value `32 * byte + code` is that code under that scale.
     const GRID: &str = "code_grid";
     const SLICES: [&str; 4] = ["routed_expert", "dense_ffn", "vocab_padding", GRID];
 
     fn fixture() -> Checkpoint {
-        fixture::open(FIXTURE)
+        fixture::open(fixture::MXFP4)
     }
 
     fn decode(ckpt: &Checkpoint, slice: &str) -> Dequantized {
