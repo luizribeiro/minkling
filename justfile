@@ -83,6 +83,10 @@ dump-moe-fixture model="models/Inkling-Small-mxfp4":
 dump-op-fixture:
     reference/.venv/bin/python reference/scripts/dump_op_fixture.py
 
+# Regenerate the committed text/id pairs the Rust tokenizer is tested against
+dump-tokenizer-fixture model="models/Inkling-Small-mxfp4":
+    reference/.venv/bin/python reference/scripts/dump_tokenizer_fixture.py {{ model }}
+
 fetch repo="thinkingmachines/Inkling-Small":
     hf download {{ repo }}
 

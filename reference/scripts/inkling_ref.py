@@ -212,6 +212,13 @@ def piece_bytes(piece):
     return bytes(CHAR_BYTES[c] for c in piece)
 
 
+def byte_pieces(text):
+    """The pieces that spell `text` one byte at a time — the vocabulary entries
+    a tokenizer would have to fall back to if no merge covered it, and the only
+    way to hand a decoder a character split across tokens."""
+    return [BYTE_CHARS[b] for b in text.encode()]
+
+
 def _resolve_eos_token(model, processor):
     # The checkpoint lists every special token under additional_special_tokens
     # and names no eos, so mlx-vlm's `pad_token = eos_token` fallback assigns

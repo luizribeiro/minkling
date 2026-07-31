@@ -1,0 +1,192 @@
+{
+  "checkpoint": "models/Inkling-Small-mxfp4",
+  "eos_token_id": 200006,
+  "eos_token": "<|content_model_end_sampling|>",
+  "cases": {
+    "prompt": {
+      "ids": [
+        976,
+        180069,
+        86333,
+        60500,
+        290,
+        33610,
+        484,
+        10292,
+        290,
+        3189,
+        2117,
+        13
+      ],
+      "text": "The lighthouse keeper counted the ships that passed the headland.",
+      "pieces": [
+        "The",
+        "Ġlighthouse",
+        "Ġkeeper",
+        "Ġcounted",
+        "Ġthe",
+        "Ġships",
+        "Ġthat",
+        "Ġpassed",
+        "Ġthe",
+        "Ġhead",
+        "land",
+        "."
+      ],
+      "segments": [
+        "The",
+        " lighthouse",
+        " keeper",
+        " counted",
+        " the",
+        " ships",
+        " that",
+        " passed",
+        " the",
+        " head",
+        "land",
+        ".",
+        ""
+      ],
+      "round_trips": true
+    },
+    "turn": {
+      "ids": [
+        200001,
+        200008,
+        2167,
+        1251,
+        480,
+        869,
+        13,
+        200004,
+        34,
+        103112,
+        11,
+        17428,
+        40909,
+        11,
+        26192,
+        13,
+        200010
+      ],
+      "text": "<|message_model|><|content_thinking|>Weigh it up.<|content_text|>Café, 日本語, 🙂.<|end_message|>",
+      "pieces": [
+        "<|message_model|>",
+        "<|content_thinking|>",
+        "We",
+        "igh",
+        "Ġit",
+        "Ġup",
+        ".",
+        "<|content_text|>",
+        "C",
+        "afÃ©",
+        ",",
+        "ĠæĹ¥æľ¬",
+        "èªŀ",
+        ",",
+        "ĠðŁĻĤ",
+        ".",
+        "<|end_message|>"
+      ],
+      "segments": [
+        "<|message_model|>",
+        "<|content_thinking|>",
+        "We",
+        "igh",
+        " it",
+        " up",
+        ".",
+        "<|content_text|>",
+        "C",
+        "afé",
+        ",",
+        " 日本",
+        "語",
+        ",",
+        " 🙂",
+        ".",
+        "<|end_message|>",
+        ""
+      ],
+      "round_trips": true
+    },
+    "split_characters": {
+      "ids": [
+        51,
+        71,
+        68,
+        162,
+        245,
+        98,
+        172,
+        253,
+        247,
+        224,
+        13
+      ],
+      "text": "The日🙂.",
+      "pieces": [
+        "T",
+        "h",
+        "e",
+        "æ",
+        "Ĺ",
+        "¥",
+        "ð",
+        "Ł",
+        "Ļ",
+        "Ĥ",
+        "."
+      ],
+      "segments": [
+        "T",
+        "h",
+        "e",
+        "",
+        "",
+        "日",
+        "",
+        "",
+        "",
+        "🙂",
+        ".",
+        ""
+      ],
+      "round_trips": false
+    },
+    "interrupted_character": {
+      "ids": [
+        51,
+        71,
+        68,
+        162,
+        245,
+        200010,
+        13
+      ],
+      "text": "The�<|end_message|>.",
+      "pieces": [
+        "T",
+        "h",
+        "e",
+        "æ",
+        "Ĺ",
+        "<|end_message|>",
+        "."
+      ],
+      "segments": [
+        "T",
+        "h",
+        "e",
+        "",
+        "",
+        "�<|end_message|>",
+        ".",
+        ""
+      ],
+      "round_trips": false
+    }
+  }
+}
