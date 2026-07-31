@@ -63,11 +63,77 @@ impl Device {
     /// Run `kernel` over `grid`, with `args` bound to buffer slots `0..`, and
     /// wait for it.
     ///
-    /// Synchronous because the alternative has to be built rather than chosen:
-    /// nothing here yet has a second thing to do while the GPU works, and a
-    /// caller holding a completed buffer is what makes
-    /// [`Buffer::as_slice`](crate::Buffer::as_slice) safe to read.
+    /// A [`Batch`] of one, which is what a caller with a single dispatch wants
+    /// and what everything here did before there was a second one to put beside
+    /// it.
     pub fn run(&self, kernel: &Kernel, args: &[Arg<'_>], grid: Grid) -> Result<(), MetalError> {
+        let mut batch = self.batch()?;
+        batch.add(kernel, args, grid)?;
+        batch.wait()
+    }
+
+    /// An open command buffer, to encode dispatches into and wait for once.
+    pub fn batch(&self) -> Result<Batch<'_>, MetalError> {
+        let commands = self
+            .queue()
+            .commandBuffer()
+            .ok_or(MetalError::NoCommandBuffer)?;
+        let encoder = commands
+            .computeCommandEncoder()
+            .ok_or(MetalError::NoCommandEncoder)?;
+        Ok(Batch {
+            device: self,
+            commands,
+            encoder,
+            entry: None,
+            dispatches: 0,
+            ended: false,
+        })
+    }
+}
+
+/// Dispatches encoded into one command buffer, submitted and waited for
+/// together.
+///
+/// **A submission costs 206 microseconds and the arithmetic inside one costs
+/// less.** Measured on this machine with a kernel that writes a single float:
+/// opening a command buffer, committing it and waiting for it is 206 µs
+/// whatever is in it, where a decode-shaped `[1, 4096] @ [4096, 4096]ᵀ`
+/// projection against packed weights adds 105 µs of its own. So a decode step's
+/// 457 dispatches, each submitted alone, are 94 ms of round trip — most of the
+/// 163 ms the step takes — and what shares an input should share a command
+/// buffer.
+///
+/// **The dispatches are ordered.** Metal's default dispatch type is serial, so
+/// each one here runs after the one before it and reads what it wrote. That is
+/// not what makes batching worth doing — the four projections that consume a
+/// layer's normed hidden state are independent — but it is what makes it safe
+/// to put a dependent pair in one buffer, which `gate` and `down` will want.
+///
+/// Waiting is still what makes [`Buffer::as_slice`](crate::Buffer::as_slice)
+/// safe to read afterwards. What a batch removes is the *number* of waits, not
+/// the wait: the alternative to that is a second thing for this process to do
+/// while the GPU works, and there is not one yet.
+pub struct Batch<'a> {
+    device: &'a Device,
+    commands: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    /// The first kernel encoded, for the error a failure comes back as. A
+    /// command buffer fails as a whole and Metal does not say which dispatch
+    /// inside it did, so naming the first is as precise as this can be.
+    entry: Option<String>,
+    dispatches: usize,
+    ended: bool,
+}
+
+impl Batch<'_> {
+    /// Encode `kernel` over `grid`, with `args` bound to buffer slots `0..`.
+    ///
+    /// The buffers have to outlive the [`Batch::wait`] and not only this call.
+    /// A command buffer retains what is bound into it, so nothing is freed
+    /// under a running dispatch — but a caller that wants to *read* an output
+    /// still holds the buffer it reads.
+    pub fn add(&mut self, kernel: &Kernel, args: &[Arg<'_>], grid: Grid) -> Result<(), MetalError> {
         if grid.threads_per_group > kernel.max_threads_per_group() {
             return Err(MetalError::ThreadgroupTooLarge {
                 entry: kernel.entry.clone(),
@@ -83,15 +149,7 @@ impl Device {
             });
         }
 
-        let commands = self
-            .queue()
-            .commandBuffer()
-            .ok_or(MetalError::NoCommandBuffer)?;
-        let encoder = commands
-            .computeCommandEncoder()
-            .ok_or(MetalError::NoCommandEncoder)?;
-
-        encoder.setComputePipelineState(&kernel.pipeline);
+        self.encoder.setComputePipelineState(&kernel.pipeline);
         for (slot, arg) in args.iter().enumerate() {
             // SAFETY: the buffer outlives the encoding through `Arg`'s borrow,
             // offset 0 is within every allocation, and `slot` is inside the
@@ -102,15 +160,25 @@ impl Device {
             // length it was given. Neither is knowable from here — the source
             // string is the only thing that says — and both stay the kernel
             // author's to get right, the way the body of any `unsafe fn` is.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(arg.raw()), 0, slot) };
+            unsafe {
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(arg.raw()), 0, slot)
+            };
         }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
             one_dimensional(grid.groups()),
             one_dimensional(grid.threads_per_group),
         );
-        encoder.endEncoding();
 
-        commands.commit();
+        self.entry.get_or_insert_with(|| kernel.entry.clone());
+        self.dispatches += 1;
+        Ok(())
+    }
+
+    /// Submit everything encoded and wait for all of it.
+    pub fn wait(mut self) -> Result<(), MetalError> {
+        self.end();
+        self.commands.commit();
 
         // The GPU watchdog kills a command buffer that runs too long, and this
         // project has already met it once: `mlx_lm` mapping tensors off NFS at
@@ -118,19 +186,39 @@ impl Device {
         // `kIOGPUCommandBufferCallbackErrorTimeout`. It arrives here, as an
         // error on the completed buffer, not as a hang.
         //
-        // The largest kernel to come is `lm_head`: 201024 x 4096 against packed
-        // weights. Tiling that into several command buffers is a correctness
-        // requirement and not only a throughput one, because one buffer that
-        // does the whole projection is exactly the shape the watchdog stops.
-        commands.waitUntilCompleted();
+        // Batching is what makes the limit worth watching again: it is a limit
+        // on the buffer and not on the dispatch, so a caller that put a whole
+        // layer in one is asking for the sum to finish in time. A decode step's
+        // largest is four projections at 105 µs each, four decades below it.
+        self.commands.waitUntilCompleted();
+        self.device.counted(self.dispatches);
 
-        match commands.error() {
+        match self.commands.error() {
             None => Ok(()),
             Some(err) => Err(MetalError::Execution {
-                entry: kernel.entry.clone(),
+                entry: self.entry.clone().unwrap_or_default(),
                 diagnostic: diagnostic(&err),
             }),
         }
+    }
+
+    /// The encoder closed, which has to happen before the buffer is committed
+    /// and exactly once.
+    fn end(&mut self) {
+        if !self.ended {
+            self.encoder.endEncoding();
+            self.ended = true;
+        }
+    }
+}
+
+/// A batch nobody waited for still has an encoder open, and Metal raises on a
+/// command buffer that is released holding one — an Objective-C exception,
+/// which unwinds through no Rust destructor. So dropping one closes it, which
+/// is what happens when [`Batch::add`] refuses halfway through.
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
@@ -212,6 +300,8 @@ fn diagnostic(err: &NSError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::buffer::Buffer;
     use crate::testing::{SAXPY, SAXPY_ENTRY, device};
@@ -428,6 +518,116 @@ mod tests {
             .expect_err("one buffer too many");
 
         assert!(matches!(err, MetalError::TooManyArguments { most, .. } if most == ARGUMENT_SLOTS));
+    }
+
+    /// Several dispatches in one command buffer are the same arithmetic as
+    /// several command buffers, and one wait rather than several.
+    #[test]
+    fn a_batch_runs_every_dispatch_it_was_given() {
+        let Some(device) = device() else { return };
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        let mut first = Saxpy::new(&device, LEN);
+        let mut second = Saxpy::new(&device, LEN);
+
+        let (dispatches, submissions) = (device.dispatches(), device.submissions());
+        let mut batch = device.batch().expect("a command buffer opens");
+        for saxpy in [&mut first, &mut second] {
+            batch
+                .add(&kernel, &saxpy.args(), Grid::new(LEN, THREADS_PER_GROUP))
+                .expect("the dispatch encodes");
+        }
+        batch.wait().expect("the batch completes");
+
+        assert_eq!(first.out.to_vec(), first.on_the_cpu());
+        assert_eq!(second.out.to_vec(), second.on_the_cpu());
+        assert_eq!(device.dispatches() - dispatches, 2);
+        assert_eq!(device.submissions() - submissions, 1, "one command buffer");
+    }
+
+    /// A batch is a sequence and not a race: Metal's default dispatch type is
+    /// serial, so a dispatch reads what the one before it wrote.
+    ///
+    /// Nothing batched today depends on that — the projections that share a
+    /// submission are independent of each other — but a dependent pair in one
+    /// command buffer is the next thing anyone will reach for, and whether that
+    /// is allowed is a property of Metal rather than of this crate.
+    #[test]
+    fn a_dispatch_reads_what_the_one_before_it_in_the_batch_wrote() {
+        let Some(device) = device() else { return };
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        let mut saxpy = Saxpy::new(&device, LEN);
+
+        // The second reads the first's output as its own `x`, so its answer is
+        // `alpha * (alpha * x + y) + y` and only an ordered batch produces it.
+        let mut chained = Saxpy::new(&device, LEN);
+        let mut batch = device.batch().expect("a command buffer opens");
+        batch
+            .add(&kernel, &saxpy.args(), Grid::new(LEN, THREADS_PER_GROUP))
+            .expect("the dispatch encodes");
+        let args = [
+            chained.alpha.arg(),
+            chained.count.arg(),
+            saxpy.out.arg(),
+            chained.y.arg(),
+            chained.out.arg(),
+        ];
+        batch
+            .add(&kernel, &args, Grid::new(LEN, THREADS_PER_GROUP))
+            .expect("the dispatch encodes");
+        batch.wait().expect("the batch completes");
+
+        let want: Vec<f32> = saxpy
+            .on_the_cpu()
+            .iter()
+            .zip(chained.y.as_slice())
+            .map(|(x, y)| ALPHA * x + y)
+            .collect();
+        assert_eq!(chained.out.to_vec(), want);
+    }
+
+    /// What the granularity question rests on: a submission costs the same
+    /// whatever is in it, so N dispatches in one command buffer cost what one
+    /// does and N command buffers cost N times that.
+    ///
+    /// The kernel here is deliberately trivial — a saxpy over 4099 elements —
+    /// so that what is being timed is the round trip and not the arithmetic.
+    /// Nothing asserts a ratio; what is asserted is the direction, and the
+    /// numbers go to stderr for the commit message to quote.
+    #[test]
+    fn a_batch_of_dispatches_costs_less_than_the_same_dispatches_apart() {
+        let Some(device) = device() else { return };
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        let mut saxpy = Saxpy::new(&device, LEN);
+        let grid = Grid::new(LEN, THREADS_PER_GROUP);
+        const DISPATCHES: usize = 8;
+
+        // Warm: the first dispatch of a fresh pipeline pays for the driver's
+        // first look at these buffers, which a decode loop pays once.
+        for _ in 0..2 {
+            device.run(&kernel, &saxpy.args(), grid).expect("it runs");
+        }
+
+        let started = Instant::now();
+        for _ in 0..DISPATCHES {
+            device.run(&kernel, &saxpy.args(), grid).expect("it runs");
+        }
+        let apart = started.elapsed();
+
+        let started = Instant::now();
+        let mut batch = device.batch().expect("a command buffer opens");
+        for _ in 0..DISPATCHES {
+            batch.add(&kernel, &saxpy.args(), grid).expect("it encodes");
+        }
+        batch.wait().expect("the batch completes");
+        let together = started.elapsed();
+
+        eprintln!(
+            "{DISPATCHES} dispatches: {apart:.2?} apart ({:.2?} each), {together:.2?} in one \
+             command buffer ({:.2?} each)",
+            apart / DISPATCHES as u32,
+            together / DISPATCHES as u32,
+        );
+        assert!(together < apart, "{together:?} against {apart:?}");
     }
 
     #[test]

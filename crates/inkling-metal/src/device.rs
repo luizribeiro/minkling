@@ -1,5 +1,7 @@
 //! The GPU this process runs against, and everything that can go wrong there.
 
+use std::cell::Cell;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
@@ -63,6 +65,8 @@ pub enum MetalError {
 pub struct Device {
     raw: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    dispatches: Cell<u64>,
+    submissions: Cell<u64>,
 }
 
 impl Device {
@@ -71,7 +75,36 @@ impl Device {
     pub fn open() -> Result<Self, MetalError> {
         let raw = MTLCreateSystemDefaultDevice().ok_or(MetalError::NoDevice)?;
         let queue = raw.newCommandQueue().ok_or(MetalError::NoCommandQueue)?;
-        Ok(Self { raw, queue })
+        Ok(Self {
+            raw,
+            queue,
+            dispatches: Cell::new(0),
+            submissions: Cell::new(0),
+        })
+    }
+
+    /// How many kernels this device has been asked to run.
+    ///
+    /// Counted because the granularity question cannot be settled without it: a
+    /// decode step's dispatches are a number the engine's shape decides — five
+    /// projections a layer, six an MoE layer, one head — and what they cost is
+    /// how many command buffers they were submitted in, which is a different
+    /// number. Both are measurements rather than arithmetic on paper, and the
+    /// gated tests print the pair.
+    pub fn dispatches(&self) -> u64 {
+        self.dispatches.get()
+    }
+
+    /// How many command buffers those dispatches were submitted and waited for
+    /// in, which is what the round trips cost.
+    pub fn submissions(&self) -> u64 {
+        self.submissions.get()
+    }
+
+    pub(crate) fn counted(&self, dispatches: usize) {
+        self.dispatches
+            .set(self.dispatches.get() + dispatches as u64);
+        self.submissions.set(self.submissions.get() + 1);
     }
 
     /// The largest single allocation the device will make. A hard ceiling and
