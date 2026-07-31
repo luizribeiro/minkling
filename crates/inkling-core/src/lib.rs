@@ -26,7 +26,7 @@ pub use checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 pub use config::{Config, TextConfig};
 pub use detokenize::{Utf8Stream, char_byte, piece_bytes};
 pub use embed::Embed;
-pub use generate::{Generator, greedy};
+pub use generate::{Ending, Generator, Stop, greedy};
 pub use head::LmHead;
 pub use layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 pub use mask::{BandedMask, MASKED, is_masked};

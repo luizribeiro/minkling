@@ -51,6 +51,24 @@
 //! reference's. A sampler belongs in a later commit with its own honest
 //! statement about where it diverges — not smuggled in beside a loop that can be
 //! checked token for token.
+//!
+//! # A token at a time, to whoever asked for it
+//!
+//! [`Generator::stream`] hands each id to a sink as it is decided rather than
+//! returning them all at the end, and that is a decision the price of a step
+//! forces: a decode step costs 9.2 s on the CPU path, so a caller that waits for
+//! the last one waits minutes for the first. Nothing here writes anything —
+//! whether a token becomes text, a line on a terminal or a chunk on a socket is
+//! the sink's, and [`crate::detokenize`] is what makes a token's worth of text
+//! well-defined at all.
+//!
+//! Three things end a generation, and [`Stop`] says which: the end-of-sequence
+//! id, the budget, or the sink declining the next one. The last exists because a
+//! sink can fail — a closed pipe, a client that hung up — and at 9.2 s a step,
+//! discovering that only after the budget runs out is minutes of arithmetic
+//! nobody will read.
+
+use std::ops::ControlFlow;
 
 use crate::head::LmHead;
 use crate::model::{Model, ModelCache, ModelWeights};
@@ -64,6 +82,36 @@ use crate::ops::top_k;
 /// does in a comparison against the oracle.
 pub fn greedy(logits: &[f32]) -> usize {
     *top_k(logits, 1).first().expect("logits to sample from")
+}
+
+/// What ends a generation, as the caller states it beforehand.
+///
+/// The end-of-sequence id is an `Option` because it is the *config's* answer and
+/// not the tokenizer's — see [`Tokenizer`](crate::tokenizer::Tokenizer), whose
+/// files name none — so a caller driving a checkpoint that declares one has it
+/// and a synthetic stack has nothing to put here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ending {
+    /// How many tokens may be decoded at most.
+    pub budget: usize,
+    /// The id that ends the generation as soon as it arrives.
+    pub eos: Option<usize>,
+}
+
+/// Why a generation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// The end-of-sequence id arrived.
+    ///
+    /// It reaches the sink like any other token. The vocabulary spells it, a
+    /// detokenizer renders it, and a caller that wanted it dropped can drop the
+    /// one id it named — where a loop that swallowed it would leave nothing able
+    /// to tell an ended message from a truncated one by reading the stream.
+    EndOfSequence,
+    /// The budget ran out with the model still going.
+    Budget,
+    /// The sink stopped taking tokens.
+    Sink,
 }
 
 /// The model and its head, as the thing that turns ids into ids.
@@ -119,17 +167,57 @@ impl<'a> Generator<'a> {
         self.head.forward(&self.model.final_norm(last), head_row)
     }
 
-    /// `prompt` prefilled, then `count` tokens decoded greedily, each fed back
-    /// through the caches the step before it left behind.
+    /// `prompt` prefilled, then tokens decoded greedily until `ending` says to
+    /// stop, each handed to `sink` as it is decided and then fed back through
+    /// the caches the step before it left behind.
     ///
-    /// The last token generated is returned without ever being fed back, so its
-    /// keys are not in `cache` when this returns — which is what a generator
-    /// that stopped on an end-of-sequence id would want, and what makes
-    /// generating `n` then `m` more the same sequence as generating `n + m`.
+    /// The prompt is prefilled by the first step rather than by a step of its
+    /// own, so that step's cost is a prefill's and every later one's is a
+    /// decode's. Against this checkpoint those are 54.7 s and 9.2 s — the two
+    /// regimes are worth telling apart in anything that reports timings, and a
+    /// mean over the steps of one call describes neither.
     ///
-    /// A `count` of zero prefills nothing and leaves `cache` untouched: the
+    /// The last token generated is never fed back, so its keys are not in
+    /// `cache` when this returns. That is what makes stopping on an
+    /// end-of-sequence id leave a cache holding the message and not its
+    /// terminator, and what makes generating `n` then `m` more the same sequence
+    /// as generating `n + m`.
+    ///
+    /// The sink is offered every token, the end-of-sequence id included, and is
+    /// asked before that id is checked for — so a sink that declines the token
+    /// which is *also* the eos ends the generation as [`Stop::Sink`]. A sink
+    /// that could not take a token did not take that one either, and reporting
+    /// a clean end for a message the caller never received would be a worse
+    /// answer than reporting the refusal.
+    ///
+    /// A budget of zero prefills nothing and leaves `cache` untouched: the
     /// prompt enters it on the first step, because a prompt whose next token is
     /// never asked for is a forward pass with no answer.
+    pub fn stream(
+        &self,
+        cache: &mut ModelCache,
+        prompt: &[usize],
+        ending: Ending,
+        weights: &impl ModelWeights,
+        head_row: impl Fn(usize) -> Vec<f32>,
+        mut sink: impl FnMut(usize) -> ControlFlow<()>,
+    ) -> Stop {
+        let mut ids = prompt.to_vec();
+        for _ in 0..ending.budget {
+            let id = greedy(&self.logits(cache, &ids, weights, &head_row));
+            if sink(id).is_break() {
+                return Stop::Sink;
+            }
+            if Some(id) == ending.eos {
+                return Stop::EndOfSequence;
+            }
+            ids = vec![id];
+        }
+        Stop::Budget
+    }
+
+    /// [`stream`](Self::stream) collected: `count` tokens decoded greedily, with
+    /// no id ending it early.
     pub fn generate(
         &self,
         cache: &mut ModelCache,
@@ -139,11 +227,14 @@ impl<'a> Generator<'a> {
         head_row: impl Fn(usize) -> Vec<f32>,
     ) -> Vec<usize> {
         let mut generated = Vec::with_capacity(count);
-        let mut ids = prompt.to_vec();
-        for _ in 0..count {
-            ids = vec![greedy(&self.logits(cache, &ids, weights, &head_row))];
-            generated.extend_from_slice(&ids);
-        }
+        let ending = Ending {
+            budget: count,
+            eos: None,
+        };
+        self.stream(cache, prompt, ending, weights, head_row, |id| {
+            generated.push(id);
+            ControlFlow::Continue(())
+        });
         generated
     }
 }
@@ -178,6 +269,53 @@ mod tests {
         count: usize,
     ) -> Vec<usize> {
         generator(stack).generate(cache, prompt, count, stack, |id| stack.embedding_row(id))
+    }
+
+    /// What a caller streaming a generation sees: the ids that reached the sink,
+    /// and why the loop ended.
+    ///
+    /// `take` is how many the sink accepts before declining the next, which is
+    /// the one of the three endings the model itself has no say in.
+    fn stream(
+        stack: &Stack,
+        cache: &mut ModelCache,
+        prompt: &[usize],
+        ending: Ending,
+        take: usize,
+    ) -> (Vec<usize>, Stop) {
+        let mut streamed = Vec::new();
+        let stop = generator(stack).stream(
+            cache,
+            prompt,
+            ending,
+            stack,
+            |id| stack.embedding_row(id),
+            |id| {
+                streamed.push(id);
+                match streamed.len() < take {
+                    true => ControlFlow::Continue(()),
+                    false => ControlFlow::Break(()),
+                }
+            },
+        );
+        (streamed, stop)
+    }
+
+    /// What the loop generates when nothing but the budget ends it, which is
+    /// what every case below states its own ending against.
+    fn baseline(stack: &Stack) -> Vec<usize> {
+        generate(
+            stack,
+            &mut ModelCache::new(&stack.config),
+            &stack.ids,
+            COUNT,
+        )
+    }
+
+    /// A sink that takes everything the budget allows.
+    fn streamed(stack: &Stack, ending: Ending) -> (Vec<usize>, Stop) {
+        let cache = &mut ModelCache::new(&stack.config);
+        stream(stack, cache, &stack.ids, ending, usize::MAX)
     }
 
     /// One prefill over the whole sequence, which is what every split below has
@@ -271,12 +409,7 @@ mod tests {
     #[test]
     fn generating_in_two_calls_matches_generating_in_one() {
         let stack = Stack::load();
-        let at_once = generate(
-            &stack,
-            &mut ModelCache::new(&stack.config),
-            &stack.ids,
-            COUNT,
-        );
+        let at_once = baseline(&stack);
 
         let cache = &mut ModelCache::new(&stack.config);
         let mut split = generate(&stack, cache, &stack.ids, 1);
@@ -310,23 +443,176 @@ mod tests {
     fn every_generated_id_is_in_the_vocabulary() {
         let stack = Stack::load();
         let head = LmHead::for_config(&stack.config);
-        let generated = generate(
-            &stack,
-            &mut ModelCache::new(&stack.config),
-            &stack.ids,
-            COUNT,
-        );
+        let generated = baseline(&stack);
         assert!(
             generated.iter().all(|id| *id < head.vocab()),
             "{generated:?}"
         );
     }
 
+    /// Streaming and collecting are the same generation. Everything below states
+    /// what a sink can see that a returned vector cannot; this is what says the
+    /// two are the same loop.
+    #[test]
+    fn streaming_surfaces_the_tokens_generating_returns() {
+        let stack = Stack::load();
+        let ending = Ending {
+            budget: COUNT,
+            eos: None,
+        };
+        let (streamed, stop) = streamed(&stack, ending);
+
+        assert_eq!(
+            streamed,
+            generate(
+                &stack,
+                &mut ModelCache::new(&stack.config),
+                &stack.ids,
+                COUNT
+            )
+        );
+        assert_eq!(stop, Stop::Budget);
+    }
+
+    /// How many tokens a generation that ends on `id` produces. The synthetic
+    /// stack repeats itself, so the id a case names may arrive earlier than the
+    /// position it was taken from, and every eos case below has to say where it
+    /// first arrives rather than assume.
+    fn ends_after(generated: &[usize], id: usize) -> usize {
+        generated
+            .iter()
+            .position(|got| *got == id)
+            .expect("an id this generation reaches")
+            + 1
+    }
+
+    /// The end-of-sequence id ends the generation and reaches the sink, which is
+    /// what lets a caller that renders special tokens render this one.
+    #[test]
+    fn a_generation_ends_on_the_end_of_sequence_id_and_surfaces_it() {
+        let stack = Stack::load();
+        let generated = baseline(&stack);
+        let eos = generated[COUNT - 2];
+        let ending = Ending {
+            budget: COUNT,
+            eos: Some(eos),
+        };
+
+        let (streamed, stop) = streamed(&stack, ending);
+        assert_eq!(stop, Stop::EndOfSequence);
+        assert_eq!(streamed, generated[..ends_after(&generated, eos)]);
+        assert!(streamed.len() < COUNT, "the budget would have ended it");
+    }
+
+    /// Which of the two ends a generation that meets both at once. The model
+    /// stopped, so a caller told it ran out of budget would resume a message the
+    /// model considers finished.
+    #[test]
+    fn an_end_of_sequence_id_on_the_last_token_the_budget_allows_still_ends_it() {
+        let stack = Stack::load();
+        let generated = baseline(&stack);
+        let eos = generated[COUNT - 1];
+        let ending = Ending {
+            budget: ends_after(&generated, eos),
+            eos: Some(eos),
+        };
+
+        let (streamed, stop) = streamed(&stack, ending);
+        assert_eq!(stop, Stop::EndOfSequence);
+        assert_eq!(streamed, generated[..ending.budget]);
+    }
+
+    /// An id this generation never reaches leaves the budget to end it, which is
+    /// the case a length cap exists for at all.
+    #[test]
+    fn an_end_of_sequence_id_the_generation_never_reaches_ends_nothing() {
+        let stack = Stack::load();
+        let generated = baseline(&stack);
+        let unreachable = (0..)
+            .find(|id| !generated.contains(id))
+            .expect("an unused id");
+
+        let (streamed, stop) = streamed(
+            &stack,
+            Ending {
+                budget: COUNT,
+                eos: Some(unreachable),
+            },
+        );
+        assert_eq!(stop, Stop::Budget);
+        assert_eq!(streamed, generated);
+    }
+
+    /// A sink that stops taking tokens stops the model too. At 9.2 s a decode
+    /// step, a closed pipe discovered only when the budget runs out is minutes
+    /// of arithmetic nobody will read — so what says this works is the count of
+    /// tokens the sink was offered, not the ones it kept.
+    #[test]
+    fn a_sink_that_declines_a_token_ends_the_generation() {
+        let stack = Stack::load();
+        const TAKE: usize = 2;
+
+        let (streamed, stop) = stream(
+            &stack,
+            &mut ModelCache::new(&stack.config),
+            &stack.ids,
+            Ending {
+                budget: COUNT,
+                eos: None,
+            },
+            TAKE,
+        );
+        assert_eq!(stop, Stop::Sink);
+        assert_eq!(streamed.len(), TAKE, "the model ran past the sink");
+    }
+
+    /// The token a generation ended on is not fed back, so the cache it leaves
+    /// holds the message and not its terminator. What that buys is a caller who
+    /// can carry the cache on — a served conversation appends to it rather than
+    /// prefilling the turn again.
+    #[test]
+    fn the_end_of_sequence_token_is_not_fed_back() {
+        let stack = Stack::load();
+        let generated = baseline(&stack);
+        let eos = generated[COUNT - 2];
+
+        let cache = &mut ModelCache::new(&stack.config);
+        stream(
+            &stack,
+            cache,
+            &stack.ids,
+            Ending {
+                budget: COUNT,
+                eos: Some(eos),
+            },
+            usize::MAX,
+        );
+
+        let so_far = [
+            stack.ids.clone(),
+            generated[..ends_after(&generated, eos)].to_vec(),
+        ]
+        .concat();
+        assert_eq!(logits(&stack, cache, &[eos]), whole(&stack, &so_far));
+    }
+
+    /// A budget of nothing is a prompt nobody asked a question about, so the
+    /// pass that would have prefilled it never runs.
+    ///
+    /// Stated on `stream` alone, for both entry points: `generate` is this loop
+    /// collected, and the case above says the two produce the same tokens.
     #[test]
     fn generating_nothing_leaves_the_cache_alone() {
         let stack = Stack::load();
         let cache = &mut ModelCache::new(&stack.config);
-        assert!(generate(&stack, cache, &stack.ids, 0).is_empty());
+        let ending = Ending {
+            budget: 0,
+            eos: None,
+        };
+
+        let (streamed, stop) = stream(&stack, cache, &stack.ids, ending, usize::MAX);
+        assert!(streamed.is_empty());
+        assert_eq!(stop, Stop::Budget);
         assert_eq!(logits(&stack, cache, &stack.ids), whole(&stack, &stack.ids));
     }
 
