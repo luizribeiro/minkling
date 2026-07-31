@@ -9,9 +9,11 @@
 
 pub mod buffer;
 pub mod device;
+pub mod kernel;
 
 #[cfg(test)]
 mod testing;
 
 pub use buffer::{Buffer, Element};
 pub use device::{Device, MetalError};
+pub use kernel::Kernel;

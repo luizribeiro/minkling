@@ -14,6 +14,15 @@ pub enum MetalError {
 
     #[error("the Metal device would not allocate a buffer of {bytes} bytes")]
     Allocation { bytes: usize },
+
+    #[error("kernel source does not compile:\n{0}")]
+    Compile(String),
+
+    #[error("the compiled source has no kernel named {0}")]
+    NoSuchKernel(String),
+
+    #[error("{entry} does not make a compute pipeline: {diagnostic}")]
+    Pipeline { entry: String, diagnostic: String },
 }
 
 /// The default Metal device.
