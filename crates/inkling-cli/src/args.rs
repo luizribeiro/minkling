@@ -20,7 +20,7 @@ pub enum Command {
     Serve(Serve),
 }
 
-/// Where the model's largest projection runs.
+/// Where the model's weights are multiplied against.
 ///
 /// A runtime flag rather than a Cargo feature, and the reason is what the CPU
 /// path is for. It is the oracle every kernel in this tree is validated against,
@@ -30,12 +30,11 @@ pub enum Command {
 /// and a flag can be printed back where a feature has to be remembered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    /// Every weight decoded on the way through, a row at a time — 8.98 s a
-    /// token, of which the head is 0.69 s. The path every fixture in the tree
-    /// pins.
+    /// Every weight decoded on the way through, a row at a time — 8.90 s a
+    /// token. The path every fixture in the tree pins.
     Cpu,
-    /// `lm_head` multiplied on the GPU against codes that are never decoded,
-    /// which is 8.40 s a token.
+    /// `lm_head`, the experts and every layer's own projections multiplied on
+    /// the GPU against codes that are never decoded, which is 0.16 s a token.
     ///
     /// The default, because the two produce the same tokens and this is the
     /// faster of them. Asking for it explicitly is still worth allowing: a
@@ -67,7 +66,7 @@ pub struct Generate {
     pub prompt: String,
     /// How many tokens may be decoded before the budget ends the generation.
     pub max_tokens: usize,
-    /// Where `lm_head` multiplies.
+    /// Where the weights are multiplied against.
     pub backend: Backend,
 }
 
@@ -80,7 +79,7 @@ pub struct Serve {
     pub address: String,
     /// The budget for a request that names none of its own.
     pub max_tokens: usize,
-    /// Where `lm_head` multiplies.
+    /// Where the weights are multiplied against.
     pub backend: Backend,
 }
 
@@ -96,8 +95,8 @@ pub const DEFAULT_MAX_TOKENS: usize = 8;
 ///
 /// Larger than `generate`'s, because a templated turn spends tokens on
 /// `<|content_thinking|>` before it says anything, and smaller than any chat
-/// server's would be, because 64 tokens is ten minutes at 9.2 s a step. A client
-/// that wants more asks for more.
+/// server's would be, because 64 tokens is ten seconds on the device path and
+/// ten minutes on the CPU's. A client that wants more asks for more.
 pub const DEFAULT_SERVE_MAX_TOKENS: usize = 64;
 
 /// Where the server listens when nobody says. Loopback: this is one process

@@ -1,12 +1,17 @@
-//! Where the model's largest projection runs, and what a run holds to get it
-//! there.
+//! Where the model's multiplies run, and what a run holds to get them there.
 //!
 //! The choice is made once, before a token is decoded, and it reaches the engine
-//! as one thing: the [`Projection`](inkling_core::Projection) `lm_head`
-//! multiplies through. Nothing downstream branches on it — not the generation
-//! loop, not the server, not the head's own arithmetic — which is what makes
-//! "the CPU path still works" a claim a caller can check by rerunning the same
-//! command with one word changed.
+//! as three handovers: the [`Projection`](inkling_core::Projection) `lm_head`
+//! multiplies through, the experts every MoE layer routes into, and the five
+//! attention projections every layer holds — along with the feed-forward network
+//! the two dense layers hold where the other forty hold experts. Between them
+//! they are every weight this engine has a kernel for; what is left on the CPU
+//! is the attention step itself, the norms, the convolutions and the routers.
+//!
+//! Nothing downstream branches on the choice — not the generation loop, not the
+//! server, not the head's own arithmetic — which is what makes "the CPU path
+//! still works" a claim a caller can check by rerunning the same command with
+//! one word changed.
 //!
 //! # The weight is not moved at all
 //!
@@ -25,7 +30,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
-use inkling_metal::{Device, ModelExperts, PackedMatmul, PackedProjection};
+use inkling_metal::{Device, ModelExperts, ModelProjections, PackedMatmul, PackedProjection};
 
 use crate::LABEL;
 use crate::args::Backend;
@@ -97,14 +102,22 @@ pub fn weights<'a>(
         config.hidden_size,
     )
     .context("giving the expert banks to the Metal device")?;
+
+    let packed = weights.layer_projections();
+    let projections =
+        ModelProjections::wrap(&gpu.device, &gpu.matmul, &packed, config.num_hidden_layers)
+            .context("giving the layers' projections to the Metal device")?;
     eprintln!(
-        "{:<LABEL$}metal, {rows} rows of lm_head and {} MoE layers' banks wrapped in {:.2?}",
+        "{:<LABEL$}metal, {rows} rows of lm_head, {} MoE layers' banks and all {} layers' \
+         projections wrapped in {:.2?}",
         "backend",
         experts.layers(),
+        projections.layers(),
         started.elapsed()
     );
 
     Ok(weights
         .with_head(Box::new(head))
-        .with_experts(Box::new(experts)))
+        .with_experts(Box::new(experts))
+        .with_projections(Box::new(projections)))
 }
