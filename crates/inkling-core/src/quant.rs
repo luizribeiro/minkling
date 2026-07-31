@@ -208,7 +208,13 @@ fn decoded_len(packed: &[u8], scales: &[u8]) -> Result<usize, QuantError> {
 ///   the byte into the exponent field and so makes this scale zero; the CPU
 ///   kernel does not. The checkpoint pairs `0x00` only with all-zero codes — in
 ///   `lm_head`'s rows past the unpadded vocabulary — so both readings decode it
-///   to zero there, and this follows the exact one.
+///   to zero there, and this follows the exact one. `just dump-quant-fixture`
+///   surveys all 458 quantised tensors on every regeneration and has never
+///   found a group where the two readings decode to different weights, so a
+///   Metal kernel is free to shift and take the zero. That divergence is the
+///   licensed one. Closing it by bringing this function over to the shift is
+///   the one repair to refuse: it would stop matching MLX's CPU kernel, which
+///   is what the whole module is pinned to.
 /// - `0xff` is `2^128`, which overflows to infinity. OCP reserves the byte for
 ///   NaN; MLX makes it infinity, and a NaN only where it meets the zero code.
 ///   No scale byte in the checkpoint exceeds `0x82`.
