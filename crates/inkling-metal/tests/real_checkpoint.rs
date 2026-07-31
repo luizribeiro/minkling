@@ -24,7 +24,9 @@ use inkling_core::quant::{BITS, dequantize_blocks_into};
 use inkling_core::{
     Checkpoint, CheckpointWeights, Dtype, Ending, ModelCache, Packed as CorePacked, TensorView,
 };
-use inkling_metal::{Device, MetalError, ModelExperts, PackedBank, PackedMatmul, PackedProjection};
+use inkling_metal::{
+    Device, MetalError, ModelExperts, ModelProjections, PackedBank, PackedMatmul, PackedProjection,
+};
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
 
@@ -383,43 +385,48 @@ fn one_dispatch_does_an_lm_head_shaped_multiply_without_meeting_the_watchdog() {
 /// fixture recorded and what `inkling-core` asserts on the CPU path.
 const GENERATED: usize = 8;
 
-/// What the whole process may hold resident with the head and the experts on the
-/// device.
+/// What the whole process may hold resident with the whole model on the device.
 ///
-/// The bound is unchanged at 32 GiB and it has become slack rather than tight,
-/// which is worth stating because it is the surprise of this commit. A wrapped
-/// bank is read by the GPU through the mapping, and those pages do not join
-/// *this process's* resident set the way a `dequantize_blocks_into` of the same
-/// bytes does — so moving 32 GB of per-step expert decoding onto the device
-/// takes the peak down rather than up. Measured at the command line over the
-/// same four-token generation: 20.77 GiB with only the head on the device
-/// against 2.44 GiB with the experts there too.
+/// A wrapped weight is read by the GPU through the mapping, and those pages do
+/// not join *this process's* resident set the way a `dequantize_blocks_into` of
+/// the same bytes does — so each handover has taken the peak down rather than
+/// up. Measured over the same eight-token generation: 20.77 GiB with only the
+/// head on the device, 2.44 GiB with the experts there too, and 0.18 GiB now
+/// that the layers' own projections are.
 ///
-/// What the number no longer measures is how much memory the machine is using.
-/// The pages are in the unified buffer cache either way; what changed is whose
-/// they are. A bound on the resident set is still the right thing to assert —
-/// what it refuses is a path that started decoding a bank into float32 — but it
-/// is no longer a bound on the model's footprint, and a future commit that wants
-/// one has to measure something else.
-const RESIDENT_BOUND: u64 = 32 << 30;
+/// **32 GiB was slack and 1 GiB is a claim.** What is left resident is what the
+/// CPU still reads: the embedding rows a prompt asked for, the norms, the
+/// convolution kernels and the routers' bfloat16 gates. Everything else is
+/// pages the GPU reads where the checkpoint mapped them. The 981 MB layer
+/// scratch is still allocated and is now never written, so it never faults in
+/// either — which is the sharpest way to say what this commit did.
+///
+/// A bound this tight is a regression test with a name: a path that went back
+/// to decoding a layer's projections into that scratch lands at 2.44 GiB and
+/// fails here. What the number still does not measure is how much memory the
+/// machine is using — the pages are in the unified buffer cache either way, and
+/// what changed is whose they are.
+const RESIDENT_BOUND: u64 = 1 << 30;
 
-/// The engine, with the head and all forty MoE layers' banks on the GPU, against
-/// the tokens mlx-vlm generated from the same prompt.
+/// The engine, with every weight it has a kernel for on the GPU, against the
+/// tokens mlx-vlm generated from the same prompt.
 ///
 /// **This is the assertion with teeth, and it is the same one the CPU path
 /// makes.** `inkling-core`'s `the_generated_tokens_match_the_oracle` establishes
 /// that the eight recorded ids are what this engine decodes; what this says is
-/// that moving where the experts and the head multiply does not change one of
-/// them. Every generated token is an argmax over a distribution 42 layers of
-/// accumulated bfloat16 have already moved, and two of the eight recorded
-/// positions carry a top-1/top-2 margin *narrower* than that accumulated
-/// deviation — so arithmetic that is better is not thereby guaranteed to agree,
-/// and this is where that would show.
+/// that moving where the head, the experts and now every layer's own
+/// projections multiply does not change one of them. Every generated token is an
+/// argmax over a distribution 42 layers of accumulated bfloat16 have already
+/// moved, and two of the eight recorded positions carry a top-1/top-2 margin
+/// *narrower* than that accumulated deviation — so arithmetic that is better is
+/// not thereby guaranteed to agree, and this is where that would show.
 ///
-/// The experts raise the stakes over the head alone. The head is one multiply at
+/// Each handover raises the stakes over the last. The head is one multiply at
 /// the end and a different summation order there moves a logit; an expert's
-/// output is added into a residual that forty more layers then read, so a
-/// disagreement has forty layers to grow in. That it does not is the finding.
+/// output is added into a residual that forty more layers then read; and a
+/// layer's projections are *every* layer's, on the path every token takes,
+/// including the queries and keys a softmax then amplifies the difference
+/// between. That the eight tokens do not move is the finding.
 ///
 /// A token that stops agreeing is a finding rather than a bound to widen. The
 /// kernel sums 128 products a lane and reduces 32 lanes in a tree where the CPU
@@ -431,7 +438,7 @@ const RESIDENT_BOUND: u64 = 32 << 30;
 ///
 /// The timings go to stderr rather than into an assertion.
 #[test]
-fn the_generated_tokens_match_the_oracle_with_the_experts_on_the_device() {
+fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
     let Some(dir) = checkpoint_dir() else { return };
     let Some(device) = device() else { return };
     let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
@@ -457,9 +464,16 @@ fn the_generated_tokens_match_the_oracle_with_the_experts_on_the_device() {
         config.hidden_size,
     )
     .expect("the banks wrap");
+
+    let packed = weights.layer_projections();
+    let projections = ModelProjections::wrap(&device, &matmul, &packed, config.num_hidden_layers)
+        .expect("the projections wrap");
     eprintln!(
-        "{vocab} rows of the head and {} MoE layers' banks wrapped in {:?}",
+        "{vocab} rows of the head, {} MoE layers' banks and {} layers' projections ({} of them \
+         dense) wrapped in {:?}",
         experts.layers(),
+        projections.layers(),
+        projections.dense_layers(),
         started.elapsed()
     );
     assert_eq!(
@@ -467,12 +481,23 @@ fn the_generated_tokens_match_the_oracle_with_the_experts_on_the_device() {
         config.num_hidden_layers - banks[0].layer,
         "every layer past the dense ones has banks here"
     );
+    assert_eq!(
+        projections.layers(),
+        config.num_hidden_layers,
+        "every layer has its projections here"
+    );
+    assert_eq!(
+        projections.dense_layers() + experts.layers(),
+        config.num_hidden_layers,
+        "a layer has a feed-forward network or banks, never both and never neither"
+    );
 
     // Once, before the loop rather than inside it — though "once" is now 6 ms
     // for 137 GB, so what that used to be defending against is gone.
     let weights = weights
         .with_head(Box::new(head))
-        .with_experts(Box::new(experts));
+        .with_experts(Box::new(experts))
+        .with_projections(Box::new(projections));
     let generator = weights.generator();
 
     let mut steps: Vec<Duration> = Vec::new();

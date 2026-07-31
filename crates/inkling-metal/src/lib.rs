@@ -20,6 +20,7 @@ pub mod device;
 pub mod experts;
 pub mod kernel;
 pub mod matmul;
+pub mod projections;
 
 #[cfg(test)]
 mod testing;
@@ -29,3 +30,4 @@ pub use device::{Device, MetalError};
 pub use experts::{ExpertBanks, LayerExperts, ModelExperts};
 pub use kernel::{Grid, Kernel};
 pub use matmul::{MatmulError, PackedBank, PackedMatmul, PackedProjection};
+pub use projections::{DenseFfn, LayerProjections, ModelProjections};
