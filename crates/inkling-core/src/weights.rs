@@ -22,6 +22,14 @@
 //! — 250 of every layer's 256 experts, on an eight-token pass — which is the
 //! difference between a bounded run and an unbounded one.
 //!
+//! The two tables at the ends of the model are the same bargain read twice.
+//! `embed_tokens` and `lm_head` are both `[201024, 4096]` — 3.3 GB of float32
+//! each — and both are reached a row at a time, the embedding for the rows its
+//! tokens asked for and the head for the rows the vocabulary runs to. What
+//! separates them is how many: a pass over eight tokens decodes eight rows of
+//! the one and 200058 of the other, so the head is the only place where
+//! per-row decoding costs the whole tensor. It still never holds it.
+//!
 //! A malformed checkpoint is a panic here rather than an error. Every name and
 //! shape this reads is fixed by the architecture, so a tensor that is missing at
 //! layer 17 is not a condition a caller can do anything about, and threading a
@@ -33,6 +41,7 @@ use std::cell::RefCell;
 use crate::attention::{AttentionConfig, AttentionWeights};
 use crate::checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 use crate::config::TextConfig;
+use crate::head::LmHead;
 use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use crate::model::{Model, ModelWeights};
 use crate::moe::{ExpertBank, GateWeights, MoeConfig, SparseMoe};
@@ -41,6 +50,27 @@ use crate::quant::{BITS, QuantError, Scratch, dequantize_blocks_into};
 
 /// Where the language model's tensors live in a multimodal checkpoint.
 const MODEL: &str = "language_model.model";
+
+/// The final projection, which sits beside `MODEL` rather than inside it —
+/// `LanguageModel` holds `lm_head` and `InklingModel` holds everything else.
+const LM_HEAD: &str = "language_model.lm_head";
+
+/// The embedding table, which a tied checkpoint reaches twice.
+const EMBED_TOKENS: &str = "language_model.model.embed_tokens";
+
+/// Which tensor the head's rows come out of, which is the whole of what
+/// `tie_word_embeddings` decides.
+///
+/// A tied checkpoint carries no `lm_head` at all and reads the embedding table
+/// instead: `nn.Embedding.as_linear` is `h @ Wᵀ` over the same `[vocab, hidden]`
+/// rows the lookup returns, so the two cases differ in the name and in nothing
+/// else. Inkling-Small is untied.
+fn head_module(config: &TextConfig) -> &'static str {
+    match config.tie_word_embeddings {
+        true => EMBED_TOKENS,
+        false => LM_HEAD,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum WeightsError {
@@ -194,6 +224,7 @@ pub struct CheckpointWeights<'a> {
     ckpt: &'a Checkpoint,
     config: &'a TextConfig,
     embed_tokens: Packed<'a>,
+    lm_head: Packed<'a>,
     embed_norm: Option<Vec<f32>>,
     norm: Vec<f32>,
     layer_scratch: RefCell<Vec<f32>>,
@@ -218,10 +249,19 @@ impl<'a> CheckpointWeights<'a> {
             expect_len(weight, config.hidden_size, "embed_norm")?;
         }
 
+        let table = |name: &str, what: &str| {
+            let packed = Packed::open(ckpt, name)?;
+            expect_packed(&packed, config.vocab_size, config.hidden_size, what)?;
+            Ok::<_, WeightsError>(packed)
+        };
+        let embed_tokens = table(EMBED_TOKENS, "the embedding table")?;
+        let lm_head = table(head_module(config), "the head")?;
+
         Ok(Self {
-            embed_tokens: Packed::open(ckpt, &format!("{MODEL}.embed_tokens"))?,
             layer_scratch: RefCell::new(vec![0.0; layer_scratch_floats(config)]),
             expert_scratch: RefCell::new(vec![0.0; expert_scratch_floats(config)]),
+            embed_tokens,
+            lm_head,
             embed_norm,
             norm,
             ckpt,
@@ -232,6 +272,19 @@ impl<'a> CheckpointWeights<'a> {
     /// The model around the layers, borrowing the two norms this holds.
     pub fn model(&self) -> Model<'_> {
         Model::new(self.config, self.embed_norm.as_deref(), &self.norm)
+    }
+
+    /// The final projection this config asks for.
+    pub fn head(&self) -> LmHead {
+        LmHead::for_config(self.config)
+    }
+
+    /// Row `id` of that projection, `[hidden]` long. Which tensor it comes out
+    /// of is settled once, by [`head_module`], at [`CheckpointWeights::open`].
+    pub fn head_row(&self, id: usize) -> Vec<f32> {
+        self.lm_head
+            .decode_slice(id)
+            .unwrap_or_else(|err| panic!("head row {id} decodes: {err}"))
     }
 
     /// How many float32 values the pass's scratch holds, which is the whole of
@@ -467,13 +520,29 @@ fn widened(ckpt: &Checkpoint, name: &str) -> Result<Vec<f32>, WeightsError> {
 }
 
 fn expect_len(values: &[f32], expected: usize, name: &str) -> Result<(), WeightsError> {
-    if values.len() == expected {
+    expect(values.len(), expected, name)
+}
+
+/// A packed tensor's two axes, which for a table of rows is how many rows it
+/// holds and how wide each is.
+fn expect_packed(
+    packed: &Packed<'_>,
+    slices: usize,
+    slice_len: usize,
+    name: &str,
+) -> Result<(), WeightsError> {
+    expect(packed.slices(), slices, &format!("{name}'s rows"))?;
+    expect(packed.slice_len(), slice_len, &format!("a row of {name}"))
+}
+
+fn expect(got: usize, expected: usize, name: &str) -> Result<(), WeightsError> {
+    if got == expected {
         return Ok(());
     }
     Err(WeightsError::WrongLength {
         name: name.to_string(),
         expected,
-        got: values.len(),
+        got,
     })
 }
 
@@ -504,4 +573,37 @@ pub fn layer_scratch_floats(config: &TextConfig) -> usize {
 /// How many float32 values one expert's three projections decode into.
 pub fn expert_scratch_floats(config: &TextConfig) -> usize {
     3 * config.moe_intermediate_size * config.hidden_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::fixture;
+
+    /// The synthetic stack's config, read for its shape rather than its
+    /// contents: any real `TextConfig` settles the question below.
+    const FIXTURE_CONFIG: &str = "stack.json";
+
+    fn config() -> TextConfig {
+        serde_json::from_str::<Config>(&fixture::read(FIXTURE_CONFIG))
+            .expect("the recorded config parses")
+            .text_config
+    }
+
+    /// The tie is a choice of tensor name and nothing else, so this is the whole
+    /// of it — and it is worth a test of its own because no Inkling checkpoint
+    /// ties, which leaves the branch unreachable everywhere else. Exchanged, the
+    /// two arms would read an untied checkpoint's embedding table as its head and
+    /// still produce a full set of plausible logits.
+    #[test]
+    fn tying_the_word_embeddings_moves_the_head_to_the_embedding_table() {
+        let mut config = config();
+        assert!(!config.tie_word_embeddings, "the fixture does not tie");
+        assert_eq!(head_module(&config), LM_HEAD);
+
+        config.tie_word_embeddings = true;
+        assert_eq!(head_module(&config), EMBED_TOKENS);
+        assert_ne!(LM_HEAD, EMBED_TOKENS);
+    }
 }

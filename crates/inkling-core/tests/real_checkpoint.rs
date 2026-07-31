@@ -10,12 +10,13 @@ use std::time::Instant;
 use inkling_core::attention::{Attention, AttentionConfig, AttentionWeights};
 use inkling_core::embed::Embed;
 use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation, indices};
+use inkling_core::head::LmHead;
 use inkling_core::layer::{
     DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts,
 };
 use inkling_core::model::{ModelCache, ModelWeights};
 use inkling_core::moe::{GateWeights, MoeConfig, SparseMoe};
-use inkling_core::ops::DenseMlp;
+use inkling_core::ops::{DenseMlp, top_k};
 use inkling_core::quant::{Scratch, dequantize};
 use inkling_core::weights::{
     CheckpointWeights, Packed, PackedExperts, expert_scratch_floats, layer_scratch_floats,
@@ -1031,4 +1032,510 @@ fn the_whole_stack_holds_its_resident_set_under_a_bound() {
     // already resident, and the reading would be measuring the machine rather
     // than this.
     assert!(peak > before, "the pass grew the resident set by nothing");
+}
+
+/// The coarse guard beside the ordering claims, for a head driven from the
+/// reference's own normed state.
+///
+/// A logit is one row of `nn.Linear` over a hidden state this port has in
+/// common with the reference, so what separates the two answers is the dtype
+/// and nothing else: `mx.quantized_matmul` multiplies the packed 4-bit weights
+/// in bfloat16 and rounds the result to bfloat16, and this decodes them and
+/// multiplies in float32. One quantum at 2^-9 is 2.0e-3 of the tensor's peak,
+/// and 6e-3 is the same three-quanta bound, for the same reason, as the recorded
+/// attention step and the MoE layer.
+///
+/// Worst observed when this landed: 3.5e-3 over the ranked logits and 2.7e-3
+/// over all 200058 of the last position, a factor of 1.7 in hand. Against the
+/// weakest mutation it has to catch — the muP divide dropped, which multiplies
+/// every logit by sixteen — fifteen, four decades above.
+const HEAD_TOLERANCE: f32 = 6e-3;
+
+/// The same guard for logits made from a hidden state this port produced itself,
+/// forty-two layers deep, where the drift the stack accumulated arrives on top
+/// of the head's own rounding.
+///
+/// An order of magnitude looser than [`HEAD_TOLERANCE`], and it is the stack's
+/// number rather than the head's: `layers_out` deviates by 2.8e-2 of its peak
+/// and `norm_out` by 4.9e-2, so 6e-2 is `STACK_TOLERANCE` inherited unchanged.
+/// The head adds nothing measurable to it — 3.5e-3 against 3.1e-2 — because one
+/// projection over a drifted input carries the drift and little else.
+///
+/// Worst observed when this landed: 3.2e-2 over the ranked logits and 3.1e-2
+/// over all 200058 of the last position, a factor of 1.9 in hand.
+const MODEL_LOGIT_TOLERANCE: f32 = 6e-2;
+
+/// The ranking the reference ended its forward pass with: the top ids of every
+/// position and the logits they carried.
+///
+/// The depth comes from the fixture rather than from a constant here, so a dump
+/// regenerated at a different `--top-k` needs nothing changed on this side.
+struct Ranking {
+    k: usize,
+    ids: Vec<usize>,
+    values: Vec<f32>,
+}
+
+impl Ranking {
+    fn load(activations: &Checkpoint) -> Self {
+        let recorded = fixture::tensor(activations, "logits_topk_ids");
+        Self {
+            k: *recorded.shape().last().expect("a ranking has a depth"),
+            ids: indices(&recorded),
+            values: fixture::f32s(&fixture::tensor(activations, "logits_topk_values")),
+        }
+    }
+
+    fn positions(&self) -> usize {
+        self.ids.len() / self.k
+    }
+
+    fn at(&self, position: usize) -> (&[usize], &[f32]) {
+        let row = position * self.k;
+        (&self.ids[row..][..self.k], &self.values[row..][..self.k])
+    }
+}
+
+/// One position's computed logits against the reference's recorded ranking of
+/// them.
+struct Agreement {
+    position: usize,
+    /// The id this port ranked first.
+    argmax: usize,
+    /// How many ids the two orders agree on, from the top down.
+    depth: usize,
+    /// Whether the rank they first differ at is one the reference's own values
+    /// leave undetermined. `true` when the two orders agree all the way down.
+    tied_at_the_break: bool,
+    /// The best logit the reference recorded here.
+    top: f32,
+    /// Its gap to the runner-up.
+    margin: f32,
+    /// The worst disagreement over the logits the ranking names.
+    ///
+    /// Over those rather than over the tensor, and that is the claim rather
+    /// than a convenience: what a ranking is about is the logits at the top,
+    /// and a bound taken over 200058 of them would be set by the outliers among
+    /// the 200000 that decide nothing.
+    deviation: f32,
+}
+
+impl Agreement {
+    /// The deviation as a fraction of the logit it was measured beside, which is
+    /// what the tolerances are stated in.
+    fn relative(&self) -> f32 {
+        self.deviation / self.top.abs()
+    }
+}
+
+fn agreement(position: usize, logits: &[f32], ids: &[usize], values: &[f32]) -> Agreement {
+    let mine = top_k(logits, ids.len());
+    let depth = mine.iter().zip(ids).take_while(|(a, b)| a == b).count();
+    Agreement {
+        position,
+        argmax: mine[0],
+        depth,
+        tied_at_the_break: depth >= values.len() || undetermined_at(values, depth),
+        top: values[0],
+        margin: values[0] - values[1],
+        deviation: ids.iter().zip(values).fold(0.0f32, |worst, (id, want)| {
+            worst.max((logits[*id] - want).abs())
+        }),
+    }
+}
+
+/// Whether the reference's own logits leave `rank` undetermined: sorted
+/// descending, a value tied with either neighbour is one bfloat16 cannot tell
+/// apart from it, and which id comes first is then a tie-break rather than an
+/// order.
+fn undetermined_at(values: &[f32], rank: usize) -> bool {
+    let neighbours = [rank.checked_sub(1), Some(rank + 1)];
+    neighbours
+        .into_iter()
+        .flatten()
+        .filter_map(|r| values.get(r))
+        .any(|value| *value == values[rank])
+}
+
+/// Every position's logits against what the reference recorded: reported in
+/// full, then asserted on the two claims both callers make, with the ordering
+/// claim beneath the argmax left to each of them.
+///
+/// **The argmax, on every position.** The one assertion no amount of accumulated
+/// bfloat16 is allowed to move.
+///
+/// **The values, over the logits the ranking names.** Ordering cannot see the
+/// muP divide, and this is where it is caught.
+///
+/// The margin is reported beside the deviation because their ratio is what says
+/// whether an argmax that agreed did so with room to spare or by luck. Nothing
+/// asserts it, and the reason is on the record rather than assumed: end to end
+/// the ratio falls to 0.5 at the first position, so the argmax there survives a
+/// deviation twice its own margin — it agrees, and it does not agree robustly. A
+/// bound on the ratio would be asserting the prompt rather than the port.
+fn check_logits(
+    what: &str,
+    logits: &[f32],
+    vocab: usize,
+    ranking: &Ranking,
+    bound: f32,
+) -> Vec<Agreement> {
+    assert_eq!(
+        logits.len(),
+        ranking.positions() * vocab,
+        "{what}: {} logits over {} positions of {vocab}",
+        logits.len(),
+        ranking.positions()
+    );
+
+    let agreements: Vec<Agreement> = (0..ranking.positions())
+        .map(|position| {
+            let (ids, values) = ranking.at(position);
+            agreement(position, &logits[position * vocab..][..vocab], ids, values)
+        })
+        .collect();
+
+    for agreement in &agreements {
+        let (ids, _) = ranking.at(agreement.position);
+        eprintln!(
+            "{what} {}: top-1 {}, depth {} of {}{}, margin {:.4} against deviation {:.4} ({:.1}x)",
+            agreement.position,
+            ids[0],
+            agreement.depth,
+            ranking.k,
+            if agreement.tied_at_the_break {
+                " (breaks on a tie)"
+            } else {
+                " (breaks on a reordering)"
+            },
+            agreement.margin,
+            agreement.deviation,
+            agreement.margin / agreement.deviation,
+        );
+
+        assert_eq!(
+            agreement.argmax, ids[0],
+            "{what} {}: argmax",
+            agreement.position
+        );
+        assert!(
+            agreement.relative() <= bound,
+            "{what} {}: deviation {:e} over the ranked logits",
+            agreement.position,
+            agreement.relative()
+        );
+    }
+    agreements
+}
+
+/// The recorded logits of the position the dump kept every logit of, which is
+/// the last one — the one that decides the next token — and which is recorded
+/// *before* the truncation so that the padding is in the fixture.
+fn recorded_logits(activations: &Checkpoint) -> Vec<f32> {
+    fixture::f32s(&fixture::tensor(activations, "logits_untruncated"))
+}
+
+fn head_logits(weights: &CheckpointWeights<'_>, normed: &[f32]) -> Vec<f32> {
+    let head = weights.head();
+    let started = Instant::now();
+    let logits = head.forward(normed, |id| weights.head_row(id));
+    eprintln!(
+        "{} rows of the head in {:?}",
+        head.vocab(),
+        started.elapsed()
+    );
+    logits
+}
+
+/// What no committed fixture can settle about the head: that
+/// `language_model.lm_head` is named what this port assumes, that it is MXFP4
+/// like every projection, and that the muP divide, the projection and the
+/// truncation reproduce `_logits_from_norm` from the reference's own normed
+/// state. Decoded it is `[201024, 4096]` of float32 — 3.3 GB — so only a real
+/// checkpoint carries it.
+///
+/// **The assertion is the ordering, and that is a decision.** A tensor-wide
+/// epsilon has stopped describing these tensors: at the stack's output the worst
+/// element disagrees by 2.8e-2 of the peak while the root mean square of the
+/// disagreements is 6.5e-4, a factor of forty-four, so the bound is pinned by a
+/// handful of outliers in a long tail. Over 200058 logits that gets worse — the
+/// same few outliers would set a bound that says nothing about the 200000 logits
+/// which decide nothing. What is worth asserting is the *ordering*, so
+/// [`check_logits`] asserts the argmax, with the tensor-wide comparison kept
+/// beside it as a coarse guard and nothing more.
+///
+/// **Below the argmax, the claim is stronger than top-k identity.** "Identical
+/// to depth k" is the claim that has to be tuned until it passes — at k = 5 it
+/// would not pass here, position 7 breaks at rank 4 — and tuning it would report
+/// the wrong thing. What is true instead is that wherever the reference's logits
+/// determine an order, this reproduces it: at every position the rank the two
+/// orders first differ at is one where the reference's own recorded logits are
+/// *equal*. Three significant digits of bfloat16 over 200058 values leaves ties
+/// everywhere — position 7's break is 15.75 against 15.75 — and a tie broken by
+/// index is not an order to reproduce. Measured depths: 8, 11, 14, 18, 17, 9, 19
+/// and 4 of a recorded 32, every one of them ending on a tie. A genuine
+/// reordering at any depth fails this, where a depth bound set to the shallowest
+/// observed would not.
+///
+/// The coarse guard is the last position's 200058 logits, which is the one
+/// position the fixture carries them all for. It answers a different question
+/// from the ranking — whether the arithmetic is right anywhere below the top —
+/// and 6.4 MB for the other seven positions would answer it seven more times.
+#[test]
+fn the_head_reproduces_the_reference_against_real_weights() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+    let (_, _, norm_out) = recorded_stack(&activations);
+
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+    let head = weights.head();
+    let logits = head_logits(&weights, &norm_out);
+    let ranking = Ranking::load(&activations);
+    for agreement in check_logits("head", &logits, head.vocab(), &ranking, HEAD_TOLERANCE) {
+        assert!(
+            agreement.tied_at_the_break,
+            "head {}: the two orders differ at rank {}, where the reference's own logits are \
+             distinct — so this is a reordering rather than a tie broken the other way",
+            agreement.position, agreement.depth,
+        );
+    }
+
+    let recorded = recorded_logits(&activations);
+    let last = (ranking.positions() - 1) * head.vocab();
+    let deviation = deviation(&logits[last..], &recorded[..head.vocab()]);
+    eprintln!("the last position's {} logits: {deviation:e}", head.vocab());
+    assert!(deviation <= HEAD_TOLERANCE, "deviation {deviation:e}");
+    assert!(
+        deviation > 0.0,
+        "a run that matched exactly would mean the reference's bfloat16 vanished"
+    );
+}
+
+/// The muP divide, which no ordering test can reach: it scales every logit by
+/// sixteen and moves no argmax at all. Asserted on the values the ranking names,
+/// against the same recorded values the agreement above is measured on.
+#[test]
+fn dropping_the_mup_divide_moves_the_logits_and_not_the_ranking() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+    let (_, _, norm_out) = recorded_stack(&activations);
+    assert!(
+        config.logits_mup_width_multiplier > 1.0,
+        "a checkpoint that did not scale its logits could not settle this"
+    );
+
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+    let head = weights.head();
+    let undivided = LmHead::new(config.hidden_size, head.vocab(), 1.0)
+        .forward(&norm_out, |id| weights.head_row(id));
+
+    let multiplier = config.logits_mup_width_multiplier;
+    let ranking = Ranking::load(&activations);
+    for position in 0..ranking.positions() {
+        let (ids, values) = ranking.at(position);
+        let mine = &undivided[position * head.vocab()..][..head.vocab()];
+        assert_eq!(
+            top_k(mine, 1)[0],
+            ids[0],
+            "position {position}: the multiplier moved the argmax, so an ordering \
+             test would have caught it and this one says nothing"
+        );
+
+        let scaled = mine[ids[0]] / values[0];
+        assert!(
+            (scaled / multiplier - 1.0).abs() <= HEAD_TOLERANCE,
+            "position {position}: the undivided top logit is {scaled:.4} times the recorded \
+             one, not {multiplier}",
+        );
+    }
+}
+
+/// What the head's padding rows hold, which is what decides whether the
+/// truncation is load-bearing.
+///
+/// They are all-zero MXFP4 codes under all-zero scales, so they decode to
+/// exactly 0.0 and produce a logit of exactly 0.0 — and a zero is not nothing.
+/// It outranks every logit that came out negative, which at the recorded
+/// position is 78.5% of the vocabulary, so an untruncated head inserts 966 ids
+/// that cannot be generated into the middle of every distribution a sampler
+/// would draw from.
+///
+/// What it does not do at this prompt is take the argmax, and that is worth
+/// stating precisely rather than leaving as a near miss: every recorded
+/// position's best real logit is positive — 11.8 at the weakest — so a zero
+/// lands about forty thousand ranks below it. The argmax-flipping case is the
+/// hermetic one in `head::tests`, where the head is built so that nothing real
+/// beats zero. Here the claim is the ranking, and it is a live one: nucleus and
+/// top-k sampling both read the order this would corrupt.
+///
+/// The other end of the model does not agree about any of this — `embed_tokens`'
+/// padding rows are small but nonzero — so neither end can be read off the
+/// other.
+#[test]
+fn the_heads_padding_rows_are_zero_and_would_outrank_most_of_the_vocabulary() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+
+    let unpadded = config
+        .unpadded_vocab_size
+        .expect("the checkpoint states an unpadded vocabulary");
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+    assert_eq!(
+        weights.head().vocab(),
+        unpadded,
+        "the head stops at the cut"
+    );
+    assert!(unpadded < config.vocab_size, "the head is padded at all");
+
+    for id in unpadded..config.vocab_size {
+        assert!(
+            weights.head_row(id).iter().all(|w| *w == 0.0),
+            "head row {id} is not all zeros"
+        );
+    }
+
+    // Restated on the reference's own logits, because a row of zeros decoding to
+    // zero is this port's arithmetic and a logit of zero is the reference's.
+    let recorded = recorded_logits(&activations);
+    assert_eq!(recorded.len(), config.vocab_size, "recorded untruncated");
+    let (vocabulary, padding) = recorded.split_at(unpadded);
+    assert!(padding.iter().all(|logit| *logit == 0.0), "padding logits");
+
+    let above = vocabulary.iter().filter(|logit| **logit > 0.0).count();
+    let below = vocabulary.len() - above;
+    eprintln!(
+        "a padding zero would rank {} of {}, ahead of {below} real ids ({:.1}% of the vocabulary)",
+        above + 1,
+        config.vocab_size,
+        100.0 * below as f32 / vocabulary.len() as f32,
+    );
+    assert!(
+        below > vocabulary.len() / 2,
+        "only {below} of {} real logits fall below zero, so the padding would sit in the tail \
+         and truncation would be a formality",
+        vocabulary.len()
+    );
+    assert!(
+        above > 0,
+        "no real logit beats zero, so the padding takes the argmax and the hermetic case is \
+         reachable here too"
+    );
+}
+
+/// Whether this checkpoint ties its embeddings, which decides which tensor the
+/// head's rows come out of.
+///
+/// It does not: `tie_word_embeddings` is absent from the config — so false, the
+/// reference's default — and the checkpoint carries a `language_model.lm_head`
+/// beside `embed_tokens`. Asserted on the rows rather than on the flag alone,
+/// because a port that read the wrong table would still produce a full set of
+/// plausible logits.
+#[test]
+fn the_checkpoint_does_not_tie_its_embeddings() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    assert!(!config.tie_word_embeddings);
+
+    let head = Packed::open(&ckpt, "language_model.lm_head").expect("an untied checkpoint");
+    assert_eq!(head.slices(), config.vocab_size);
+    assert_eq!(head.slice_len(), config.hidden_size);
+
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+    let table = embedding_table(&ckpt);
+    for id in [0, config.vocab_size / 2, config.vocab_size - 1] {
+        assert_eq!(
+            weights.head_row(id),
+            head.decode_slice(id).expect("decodes")
+        );
+        assert_ne!(
+            weights.head_row(id),
+            embedding_row(&table, id),
+            "row {id}: the two ends of the model hold the same weights, so this settles nothing"
+        );
+    }
+}
+
+/// The whole model, ids to logits: what only a pass that ran every layer itself
+/// can settle, which is how much of the ordering survives the drift the layers
+/// accumulate.
+///
+/// `the_head_reproduces_the_reference_against_real_weights` feeds the head the
+/// reference's own normed state, so what it measures is the head. This feeds it
+/// this port's, and the difference between the two sets of numbers is everything
+/// the stack contributed.
+///
+/// **The argmax survives and the ordering beneath it does not.** Every one of
+/// the eight positions agrees on its top-1. Below that, the depth the two orders
+/// agree to — 8, 7, 5, 3, 4, 1, 23 and 8 of a recorded 32 — is reordering rather
+/// than ties broken differently: the head alone breaks only where the
+/// reference's own bfloat16 logits are equal, and here six of the eight breaks
+/// land on values that are distinct. At position 5 the *runner-up* already
+/// reorders. So top-5 identity holds at three positions of eight, and reporting
+/// that is the point; shrinking k until it passed would have reported the
+/// opposite of what is true.
+///
+/// That is the same drift measured elsewhere and not a new one. The deviation
+/// over the ranked logits is 0.13 to 0.56 against the head's own 0.03 to 0.06 —
+/// two to nine bfloat16 quanta, where adjacent logits in the top 32 are
+/// routinely 0.0625 apart — so a tail that reorders is arithmetic, not a
+/// mistake. What it says about the engine is that greedy decoding is
+/// reproducible and a sampler's tail is not, position by position.
+///
+/// **And the argmax that survives is not always robust.** At positions 0 and 2
+/// the deviation is twice the reference's own top-1/top-2 margin (0.5x and 0.4x
+/// of it), so those two agree by luck rather than by margin. The other six carry
+/// 1.6x to 19x. Reported and not asserted: a bound on that ratio would be a
+/// bound on the prompt.
+#[test]
+fn the_argmax_survives_the_whole_model_against_real_weights() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+    let (ids, _, _) = recorded_stack(&activations);
+
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+    let model = weights.model();
+    let started = Instant::now();
+    let hidden = model.forward(&mut ModelCache::new(&config), &ids, &weights);
+    let logits = head_logits(&weights, &model.final_norm(&hidden));
+    eprintln!("{} tokens to logits in {:?}", ids.len(), started.elapsed());
+
+    let vocab = weights.head().vocab();
+    let agreements = check_logits(
+        "model",
+        &logits,
+        vocab,
+        &Ranking::load(&activations),
+        MODEL_LOGIT_TOLERANCE,
+    );
+
+    // Nothing asserts a depth here, and that is the finding rather than a gap:
+    // the shallowest is 1, so any bound that passed would say no more than the
+    // argmax assertion already does. The head's tie-only claim is where the
+    // ordering below the top is pinned; what the stack does to it is reported.
+    let reordered = agreements
+        .iter()
+        .filter(|agreement| !agreement.tied_at_the_break)
+        .count();
+    eprintln!(
+        "{reordered} of {} positions reorder below the argmax",
+        agreements.len()
+    );
+
+    let recorded = recorded_logits(&activations);
+    let last = (ids.len() - 1) * vocab;
+    let deviation = deviation(&logits[last..], &recorded[..vocab]);
+    eprintln!("the last position's {vocab} logits: {deviation:e}");
+    assert!(
+        deviation <= MODEL_LOGIT_TOLERANCE,
+        "deviation {deviation:e}"
+    );
 }

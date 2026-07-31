@@ -20,6 +20,18 @@ pub struct TextConfig {
     pub use_embed_norm: bool,
     pub logits_mup_width_multiplier: f32,
 
+    /// Whether the final projection reuses `embed_tokens` instead of carrying an
+    /// `lm_head` of its own.
+    ///
+    /// The only field here that needs `#[serde(default)]`, because it is the
+    /// only optional one that is not an `Option` — a missing key already leaves
+    /// those `None`, and leaves a `bool` with nothing at all. No published
+    /// Inkling config states this one, and mlx-vlm's dataclass defaults it to
+    /// false, so inheriting that default is what reads such a config the way the
+    /// reference reads it. A checkpoint that ties says so by writing the field.
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
