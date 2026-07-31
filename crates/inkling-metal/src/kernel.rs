@@ -145,6 +145,17 @@ impl Kernel {
     pub fn max_threads_per_group(&self) -> usize {
         self.pipeline.maxTotalThreadsPerThreadgroup()
     }
+
+    /// How many threads of this kernel execute in lockstep, which is what a
+    /// `simd_`-prefixed reduction inside it reduces over.
+    ///
+    /// Asked rather than assumed, because a kernel that gives one simdgroup to
+    /// each output has to divide its grid by the same number the hardware is
+    /// using. Every Apple GPU states 32 and Metal makes no promise that it
+    /// always will.
+    pub fn simd_width(&self) -> usize {
+        self.pipeline.threadExecutionWidth()
+    }
 }
 
 /// A one-dimensional dispatch: how many threads the work needs, and how many of
@@ -266,6 +277,23 @@ mod tests {
 
         assert_eq!(kernel.entry(), SAXPY_ENTRY);
         assert!(kernel.max_threads_per_group() >= THREADS_PER_GROUP);
+    }
+
+    /// A dispatch that gives one simdgroup to each unit of work sizes its grid
+    /// from this and takes its output index from `thread_position_in_grid`
+    /// divided by it, so what it needs is a width that divides the threadgroup
+    /// evenly — not the 32 every Apple GPU happens to report.
+    #[test]
+    fn a_kernel_reports_the_simdgroup_it_executes_in() {
+        let Some(device) = device() else { return };
+
+        let width = device
+            .compile(SAXPY, SAXPY_ENTRY)
+            .expect("saxpy compiles")
+            .simd_width();
+
+        assert!(width > 0 && width.is_power_of_two(), "{width}");
+        assert_eq!(THREADS_PER_GROUP % width, 0, "{width}");
     }
 
     /// The whole point of the crate: source in, dispatch, and the same
