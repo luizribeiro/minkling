@@ -15,7 +15,7 @@ fmt:
 
 # Summarise a checkpoint's architecture and KV cost
 inspect config:
-    cargo run -q --bin inklingrs -- {{ config }}
+    cargo run -q --bin inklingrs -- inspect {{ config }}
 
 # Baseline load cost and decode throughput via the reference implementation
 smoke model="models/Inkling-Small-mxfp4":
