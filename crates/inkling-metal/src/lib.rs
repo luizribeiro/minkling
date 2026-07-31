@@ -7,9 +7,11 @@
 //! MLX does the same at the layer this replaces — `mx.fast.metal_kernel` hands
 //! the driver a source string — so this is a cost the reference already pays.
 
+pub mod buffer;
 pub mod device;
 
 #[cfg(test)]
 mod testing;
 
+pub use buffer::{Buffer, Element};
 pub use device::{Device, MetalError};

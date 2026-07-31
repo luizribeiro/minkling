@@ -8,6 +8,12 @@ use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
 pub enum MetalError {
     #[error("this machine has no Metal device")]
     NoDevice,
+
+    #[error("{len} elements of {size} bytes is not a size that can be addressed")]
+    Overflow { len: usize, size: usize },
+
+    #[error("the Metal device would not allocate a buffer of {bytes} bytes")]
+    Allocation { bytes: usize },
 }
 
 /// The default Metal device.
@@ -29,6 +35,10 @@ impl Device {
     /// memory is free.
     pub fn max_buffer_bytes(&self) -> usize {
         self.raw.maxBufferLength()
+    }
+
+    pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
+        &self.raw
     }
 }
 

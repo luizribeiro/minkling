@@ -8,7 +8,7 @@ use crate::device::{Device, MetalError};
 /// rather than gated ones. The one thing they do need is hardware, and a
 /// machine without a Metal device should report and pass — the way the
 /// `INKLINGRS_CHECKPOINT` tests do — rather than fail on something the code
-/// under test has no say in.
+/// under test has no say in. Any other error is a real failure and panics.
 pub fn device() -> Option<Device> {
     match Device::open() {
         Ok(device) => Some(device),
@@ -16,5 +16,6 @@ pub fn device() -> Option<Device> {
             eprintln!("skipping: this machine has no Metal device");
             None
         }
+        Err(err) => panic!("the default device opens: {err}"),
     }
 }
