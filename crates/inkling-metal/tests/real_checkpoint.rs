@@ -316,6 +316,61 @@ fn the_packed_matmul_reproduces_the_cpu_over_the_real_head() {
     assert!(reversed > TOLERANCE, "deviation {reversed:e}");
 }
 
+/// What one dispatch of the largest projection in the model costs, which is the
+/// number M3 is buying.
+///
+/// `[1, 4096] @ [201024, 4096]ᵀ` is the decode-step shape: one token, every row
+/// of the head. It is also the shape `Device::run`'s watchdog note is about —
+/// one command buffer doing the whole projection is exactly what the GPU
+/// watchdog stops if it takes too long, and whether it does is a measurement
+/// rather than a thing to pre-emptively tile around. If it ever starts to, this
+/// fails with `kIOGPUCommandBufferCallbackErrorTimeout` rather than hanging.
+///
+/// Nothing here asserts a speed. What is asserted is that the dispatch completes
+/// and that it is not somehow slower than the loop it replaces; the numbers go
+/// to stderr for the commit message to quote.
+#[test]
+fn one_dispatch_does_an_lm_head_shaped_multiply_without_meeting_the_watchdog() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
+
+    let head = Packed::open(&ckpt, LM_HEAD);
+    let x = x_row();
+    let weight_bytes = head.codes.data().len() + head.scales.data().len();
+
+    let started = Instant::now();
+    let projection = head.upload(&device, &matmul);
+    let uploaded = started.elapsed();
+
+    // Twice, and the second is what is reported: the first dispatch of a fresh
+    // pipeline pays for the driver's first look at these buffers, which is a
+    // cost a decode loop pays once and not per token.
+    let mut dispatched = std::time::Duration::ZERO;
+    for _ in 0..2 {
+        let started = Instant::now();
+        projection.multiply(&x).expect("the dispatch completes");
+        dispatched = started.elapsed();
+    }
+
+    let started = Instant::now();
+    on_the_cpu(&head, &x, Reading::Documented);
+    let on_the_cpu = started.elapsed();
+
+    let gib = (1u64 << 30) as f64;
+    eprintln!(
+        "[1, {HIDDEN}] @ [{}, {HIDDEN}]^T: {:.2} GiB of packed weights uploaded in {uploaded:?}, \
+         dispatched in {dispatched:?} ({:.0} GB/s of weights consumed), against {on_the_cpu:?} on \
+         the CPU — {:.0}x",
+        head.out_dim(),
+        weight_bytes as f64 / gib,
+        weight_bytes as f64 / dispatched.as_secs_f64() / 1e9,
+        on_the_cpu.as_secs_f64() / dispatched.as_secs_f64(),
+    );
+    assert!(dispatched < on_the_cpu, "the kernel bought nothing");
+}
+
 /// The other shape in the model, which the head does not cover: one expert of a
 /// `[256, 2048, 4096]` routed bank, 2048 rows where the head has 201024.
 ///
