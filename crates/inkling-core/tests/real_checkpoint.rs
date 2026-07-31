@@ -7,7 +7,9 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use inkling_core::attention::{Attention, AttentionConfig, AttentionWeights};
+use inkling_core::attention::{
+    Attention, AttentionConfig, AttentionProjections, AttentionWeights, DecodedProjections,
+};
 use inkling_core::embed::Embed;
 use inkling_core::fixture::{
     self, ACTIVATIONS, CAPTURED_LAYERS, TokenizerFixture, deviation, indices,
@@ -175,13 +177,18 @@ impl Weights {
         }
     }
 
-    fn view(&self) -> AttentionWeights<'_> {
+    fn view(&self, hidden: usize) -> AttentionWeights<'_> {
         AttentionWeights {
-            q_proj: &self.q_proj,
-            k_proj: &self.k_proj,
-            v_proj: &self.v_proj,
-            r_proj: &self.r_proj,
-            o_proj: &self.o_proj,
+            projections: AttentionProjections::decoded(
+                hidden,
+                DecodedProjections {
+                    q_proj: &self.q_proj,
+                    k_proj: &self.k_proj,
+                    v_proj: &self.v_proj,
+                    r_proj: &self.r_proj,
+                    o_proj: &self.o_proj,
+                },
+            ),
             q_norm: &self.q_norm,
             k_norm: &self.k_norm,
             k_sconv: &self.k_sconv,
@@ -206,7 +213,7 @@ fn attention_reproduces_the_reference_layers_against_real_weights() {
         let weights = Weights::load(&ckpt, layer);
         let layer_config = AttentionConfig::for_layer(&config, layer);
 
-        let attention = Attention::new(layer_config, weights.view());
+        let attention = Attention::new(layer_config, weights.view(config.hidden_size));
         let against_reference = deviation(&attention.forward(&mut attention.cache(), &x), &want);
         assert!(
             against_reference <= ATTENTION_TOLERANCE,
@@ -219,7 +226,7 @@ fn attention_reproduces_the_reference_layers_against_real_weights() {
         // it is the only part of the mask that is not plain causality. Without
         // it the layer still attends, over a flat band.
         let flat = vec![0.0; weights.rel_proj.len()];
-        let mut unbiased = weights.view();
+        let mut unbiased = weights.view(config.hidden_size);
         unbiased.rel_proj = &flat;
         let unbiased = Attention::new(layer_config, unbiased);
         let flattened = deviation(&unbiased.forward(&mut unbiased.cache(), &x), &want);
@@ -455,9 +462,9 @@ impl LayerWeights {
         }
     }
 
-    fn view(&self) -> DecoderWeights<'_> {
+    fn view(&self, hidden: usize) -> DecoderWeights<'_> {
         DecoderWeights {
-            attention: self.attention.view(),
+            attention: self.attention.view(hidden),
             input_layernorm: &self.input_layernorm,
             post_attention_layernorm: &self.post_attention_layernorm,
             attn_sconv: &self.attn_sconv,
@@ -581,7 +588,11 @@ fn the_decoder_layer_reproduces_the_reference_against_real_weights() {
         let weights = LayerWeights::load(&ckpt, layer);
         let mlp = Mlp::load(&ckpt, &config, layer);
         let attention = AttentionConfig::for_layer(&config, layer);
-        let decoder = DecoderLayer::new(attention, weights.view(), mlp.view(config.hidden_size));
+        let decoder = DecoderLayer::new(
+            attention,
+            weights.view(config.hidden_size),
+            mlp.view(config.hidden_size),
+        );
 
         let against_reference = deviation(&decoder.forward(&mut decoder.cache(), &x, &mlp), &want);
         assert!(
@@ -598,7 +609,7 @@ fn the_decoder_layer_reproduces_the_reference_against_real_weights() {
         if !config.layer_is_dense(layer) {
             continue;
         }
-        let mut exchanged = weights.view();
+        let mut exchanged = weights.view(config.hidden_size);
         std::mem::swap(&mut exchanged.attn_sconv, &mut exchanged.mlp_sconv);
         let exchanged = DecoderLayer::new(attention, exchanged, mlp.view(config.hidden_size));
         let swapped = deviation(&exchanged.forward(&mut exchanged.cache(), &x, &mlp), &want);

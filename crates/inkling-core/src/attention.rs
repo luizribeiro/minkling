@@ -19,9 +19,11 @@
 //! Everything here takes one sequence at a time: batching is the scheduler's,
 //! and a batch of sequences is a loop over these.
 
+use std::fmt::Debug;
+
 use crate::config::TextConfig;
 use crate::mask::{BandedMask, is_masked};
-use crate::ops::{linear, rms_norm, softmax};
+use crate::ops::{DenseProjection, Projection, rms_norm, softmax};
 use crate::sconv::{ConvState, ShortConv};
 
 /// The softmax attention step, over `[heads, queries, head_dim]` queries and
@@ -163,6 +165,14 @@ impl LogScaling {
 /// them, so which set a layer got is not recoverable from the tensors.
 #[derive(Debug, Clone, Copy)]
 pub struct AttentionConfig {
+    /// The width the layer maps from and back to, which is the model's hidden
+    /// size.
+    ///
+    /// Here rather than read off `q_proj`, because it is what the five
+    /// projections are *checked* against: a backend answering for them reports
+    /// its own widths, and a width taken from one of the weights being checked
+    /// would agree with itself.
+    pub hidden: usize,
     pub heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
@@ -190,6 +200,7 @@ impl AttentionConfig {
         let either = |swa, global| if sliding { swa } else { global };
 
         Self {
+            hidden: config.hidden_size,
             heads: either(config.swa_num_attention_heads, config.num_attention_heads),
             kv_heads: either(config.swa_num_key_value_heads, config.num_key_value_heads),
             head_dim: either(config.swa_head_dim, config.head_dim),
@@ -210,17 +221,147 @@ impl AttentionConfig {
     }
 }
 
-/// One attention layer's tensors, as the checkpoint stores them: the five
-/// projections `[out, in]` row-major and without bias, a per-head-channel
-/// RMSNorm weight for the queries and one for the keys, a kernel per short
-/// convolution, and the mask's `[d_rel, rel_extent]` projection.
+/// The five projections one attention layer multiplies through, wherever their
+/// weights live.
+///
+/// The seam [`crate::ops::Projection`] is, said once for the five together
+/// rather than five times: they are the projections of one layer, they are
+/// handed over as a set, and a backend that holds one holds all of them.
+///
+/// `Debug` because [`AttentionWeights`] derives it.
+pub trait Projections: Debug {
+    fn q_proj(&self) -> &dyn Projection;
+    fn k_proj(&self) -> &dyn Projection;
+    fn v_proj(&self) -> &dyn Projection;
+    fn r_proj(&self) -> &dyn Projection;
+    fn o_proj(&self) -> &dyn Projection;
+}
+
+/// One attention layer's five projections as the checkpoint's weights decoded
+/// to float32, `[out, in]` row-major and without bias — the layout `nn.Linear`
+/// stores.
 #[derive(Debug, Clone, Copy)]
-pub struct AttentionWeights<'a> {
+pub struct DecodedProjections<'a> {
     pub q_proj: &'a [f32],
     pub k_proj: &'a [f32],
     pub v_proj: &'a [f32],
     pub r_proj: &'a [f32],
     pub o_proj: &'a [f32],
+}
+
+/// Where one attention layer's five projections multiply.
+///
+/// Held by value rather than borrowed, so that a caller holding the decoded
+/// weights can hand over a view of them without owning anything else.
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionProjections<'a>(Held<'a>);
+
+#[derive(Debug, Clone, Copy)]
+enum Held<'a> {
+    /// Weights decoded to float32 and multiplied here, which is the path every
+    /// other one is checked against.
+    Decoded(Decoded<'a>),
+    /// A backend holding the weights itself, which may never decode them.
+    Backend(&'a dyn Projections),
+}
+
+/// [`DecodedProjections`] with each weight's widths settled, which is what a
+/// [`Projections`] has to be able to answer.
+#[derive(Debug, Clone, Copy)]
+struct Decoded<'a> {
+    q_proj: DenseProjection<'a>,
+    k_proj: DenseProjection<'a>,
+    v_proj: DenseProjection<'a>,
+    r_proj: DenseProjection<'a>,
+    o_proj: DenseProjection<'a>,
+}
+
+impl<'a> AttentionProjections<'a> {
+    /// The five decoded, against a layer of `hidden` width.
+    ///
+    /// Four of them map from `hidden` and `o_proj` maps back to it, so its own
+    /// width — the heads' channels merged — is what its length divides into
+    /// rather than something the caller has to say again.
+    pub fn decoded(hidden: usize, weights: DecodedProjections<'a>) -> Self {
+        assert_eq!(
+            weights.o_proj.len() % hidden,
+            0,
+            "{} o_proj weights are not whole rows into {hidden}",
+            weights.o_proj.len()
+        );
+        Self(Held::Decoded(Decoded {
+            q_proj: DenseProjection::new(hidden, weights.q_proj),
+            k_proj: DenseProjection::new(hidden, weights.k_proj),
+            v_proj: DenseProjection::new(hidden, weights.v_proj),
+            r_proj: DenseProjection::new(hidden, weights.r_proj),
+            o_proj: DenseProjection::new(weights.o_proj.len() / hidden, weights.o_proj),
+        }))
+    }
+
+    /// The five wherever a backend holds them.
+    pub fn backend(projections: &'a dyn Projections) -> Self {
+        Self(Held::Backend(projections))
+    }
+
+    fn held(&self) -> &dyn Projections {
+        match &self.0 {
+            Held::Decoded(decoded) => decoded,
+            Held::Backend(projections) => *projections,
+        }
+    }
+}
+
+impl Projections for Decoded<'_> {
+    fn q_proj(&self) -> &dyn Projection {
+        &self.q_proj
+    }
+
+    fn k_proj(&self) -> &dyn Projection {
+        &self.k_proj
+    }
+
+    fn v_proj(&self) -> &dyn Projection {
+        &self.v_proj
+    }
+
+    fn r_proj(&self) -> &dyn Projection {
+        &self.r_proj
+    }
+
+    fn o_proj(&self) -> &dyn Projection {
+        &self.o_proj
+    }
+}
+
+impl Projections for AttentionProjections<'_> {
+    fn q_proj(&self) -> &dyn Projection {
+        self.held().q_proj()
+    }
+
+    fn k_proj(&self) -> &dyn Projection {
+        self.held().k_proj()
+    }
+
+    fn v_proj(&self) -> &dyn Projection {
+        self.held().v_proj()
+    }
+
+    fn r_proj(&self) -> &dyn Projection {
+        self.held().r_proj()
+    }
+
+    fn o_proj(&self) -> &dyn Projection {
+        self.held().o_proj()
+    }
+}
+
+/// One attention layer's tensors: the five projections wherever they multiply,
+/// a per-head-channel RMSNorm weight for the queries and one for the keys, a
+/// kernel per short convolution, and the mask's `[d_rel, rel_extent]`
+/// projection.
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionWeights<'a> {
+    pub projections: AttentionProjections<'a>,
     pub q_norm: &'a [f32],
     pub k_norm: &'a [f32],
     pub k_sconv: &'a [f32],
@@ -279,19 +420,17 @@ impl<'a> Attention<'a> {
         let (heads, kv_heads, head_dim) = (config.heads, config.kv_heads, config.head_dim);
         let sdpa = Sdpa::new(heads, kv_heads, head_dim);
 
-        let hidden = weights.q_proj.len() / (heads * head_dim);
-        for (name, weight, rows) in [
-            ("q_proj", weights.q_proj, heads * head_dim),
-            ("k_proj", weights.k_proj, kv_heads * head_dim),
-            ("v_proj", weights.v_proj, kv_heads * head_dim),
-            ("r_proj", weights.r_proj, heads * config.d_rel),
-            ("o_proj", weights.o_proj, hidden),
+        let projections = &weights.projections;
+        let hidden = config.hidden;
+        for (name, projection, from, to) in [
+            ("q_proj", projections.q_proj(), hidden, heads * head_dim),
+            ("k_proj", projections.k_proj(), hidden, kv_heads * head_dim),
+            ("v_proj", projections.v_proj(), hidden, kv_heads * head_dim),
+            ("r_proj", projections.r_proj(), hidden, heads * config.d_rel),
+            ("o_proj", projections.o_proj(), heads * head_dim, hidden),
         ] {
-            assert_eq!(
-                weight.len(),
-                rows * hidden,
-                "{name} against a hidden {hidden}"
-            );
+            assert_eq!(projection.in_dim(), from, "the width {name} maps from");
+            assert_eq!(projection.out_dim(), to, "the width {name} maps to");
         }
         assert_eq!(weights.q_norm.len(), head_dim, "q_norm");
         assert_eq!(weights.k_norm.len(), head_dim, "k_norm");
@@ -351,23 +490,24 @@ impl<'a> Attention<'a> {
         let cached = cache.keys.len() / (self.sdpa.kv_heads * head_dim);
         let offset = query_offset.of(cached);
 
-        let project = |weight| linear(x, weight, self.hidden);
+        let projections = &self.weights.projections;
+        let project = |projection: &dyn Projection| projection.forward(x);
         let norm = |x: &[f32], weight| rms_norm(x, weight, self.config.rms_norm_eps);
 
         // The key is normed after its convolution, not before, and the value is
         // convolved and never normed.
         let k = self
             .k_sconv
-            .forward(&mut cache.k_sconv, &project(self.weights.k_proj), None);
+            .forward(&mut cache.k_sconv, &project(projections.k_proj()), None);
         let v = self
             .v_sconv
-            .forward(&mut cache.v_sconv, &project(self.weights.v_proj), None);
+            .forward(&mut cache.v_sconv, &project(projections.v_proj()), None);
         let mut q = split_heads(
-            &norm(&project(self.weights.q_proj), self.weights.q_norm),
+            &norm(&project(projections.q_proj()), self.weights.q_norm),
             heads,
             head_dim,
         );
-        let rel = project(self.weights.r_proj);
+        let rel = project(projections.r_proj());
 
         cache.keys.extend(norm(&k, self.weights.k_norm));
         cache.values.extend(v);
@@ -398,11 +538,10 @@ impl<'a> Attention<'a> {
             &split_heads(&cache.values, self.sdpa.kv_heads, head_dim),
             &mask,
         );
-        linear(
-            &merge_heads(&out, heads, head_dim),
-            self.weights.o_proj,
-            heads * head_dim,
-        )
+        self.weights
+            .projections
+            .o_proj()
+            .forward(&merge_heads(&out, heads, head_dim))
     }
 }
 
@@ -889,13 +1028,19 @@ mod tests {
             }
         }
 
-        fn view(&self) -> AttentionWeights<'_> {
-            AttentionWeights {
+        fn decoded(&self) -> DecodedProjections<'_> {
+            DecodedProjections {
                 q_proj: &self.q_proj,
                 k_proj: &self.k_proj,
                 v_proj: &self.v_proj,
                 r_proj: &self.r_proj,
                 o_proj: &self.o_proj,
+            }
+        }
+
+        fn view(&self, hidden: usize) -> AttentionWeights<'_> {
+            AttentionWeights {
+                projections: AttentionProjections::decoded(hidden, self.decoded()),
                 q_norm: &self.q_norm,
                 k_norm: &self.k_norm,
                 k_sconv: &self.k_sconv,
@@ -952,6 +1097,10 @@ mod tests {
             Self {
                 name: case.to_string(),
                 config: AttentionConfig {
+                    // The dump script records what `__init__` derived, and the
+                    // hidden size is not among it: the synthetic case's weights
+                    // are what say how wide the layer is.
+                    hidden: weights.q_proj.len() / (heads * head_dim) as usize,
                     heads: heads as usize,
                     kv_heads: kv_heads as usize,
                     head_dim: head_dim as usize,
@@ -976,7 +1125,7 @@ mod tests {
         }
 
         fn attention(&self) -> Attention<'_> {
-            Attention::new(self.config, self.weights.view())
+            Attention::new(self.config, self.weights.view(self.hidden()))
         }
 
         /// The prefill alone, under weights this layer's own may have been
@@ -1027,7 +1176,7 @@ mod tests {
         }
 
         fn hidden(&self) -> usize {
-            self.weights.q_proj.len() / (self.config.heads * self.config.head_dim)
+            self.config.hidden
         }
     }
 
@@ -1036,6 +1185,124 @@ mod tests {
             .into_iter()
             .find(|layer| layer.name == case)
             .unwrap_or_else(|| panic!("no {case} case"))
+    }
+
+    /// A [`Projections`] that is not this module's — the five answered by
+    /// something the layer cannot see inside, which is the whole of what a
+    /// backend is from here.
+    #[derive(Debug)]
+    struct Handed<'a>(AttentionProjections<'a>);
+
+    impl Projections for Handed<'_> {
+        fn q_proj(&self) -> &dyn Projection {
+            self.0.q_proj()
+        }
+
+        fn k_proj(&self) -> &dyn Projection {
+            self.0.k_proj()
+        }
+
+        fn v_proj(&self) -> &dyn Projection {
+            self.0.v_proj()
+        }
+
+        fn r_proj(&self) -> &dyn Projection {
+            self.0.r_proj()
+        }
+
+        fn o_proj(&self) -> &dyn Projection {
+            self.0.o_proj()
+        }
+    }
+
+    /// The five in the order [`DecodedProjections`] names them.
+    const PROJECTIONS: [&str; 5] = ["q_proj", "k_proj", "v_proj", "r_proj", "o_proj"];
+
+    /// `five` with the projection at `index` replaced by as much of `zeroed` as
+    /// it was long, so that a layer run through it cannot be reading the
+    /// original.
+    fn without<'a>(
+        mut five: DecodedProjections<'a>,
+        index: usize,
+        zeroed: &'a [f32],
+    ) -> DecodedProjections<'a> {
+        let slot = match index {
+            0 => &mut five.q_proj,
+            1 => &mut five.k_proj,
+            2 => &mut five.v_proj,
+            3 => &mut five.r_proj,
+            _ => &mut five.o_proj,
+        };
+        *slot = &zeroed[..slot.len()];
+        five
+    }
+
+    /// The seam, stated where nothing else states it: a layer whose five
+    /// projections are answered by a backend is the same layer.
+    ///
+    /// Exact rather than bounded, because the backend here multiplies the same
+    /// weights through the same [`linear`](crate::ops::linear) — what changes is
+    /// only who was asked. A backend whose arithmetic differs is what
+    /// `inkling-metal`'s own tests bound.
+    #[test]
+    fn a_layer_whose_projections_come_from_a_backend_is_the_same_layer() {
+        for layer in Layer::all() {
+            let hidden = layer.hidden();
+            let handed = Handed(layer.weights.view(hidden).projections);
+            let mut weights = layer.weights.view(hidden);
+            weights.projections = AttentionProjections::backend(&handed);
+
+            assert_eq!(
+                layer.run(weights),
+                layer.run(layer.weights.view(hidden)),
+                "{}",
+                layer.name
+            );
+        }
+    }
+
+    /// And each of the five it answers with is one the layer multiplies through,
+    /// rather than one the layer went back to the weights for. Zeroed, each has
+    /// to move the answer — which is also what says none of the five is
+    /// unreachable.
+    #[test]
+    fn every_projection_a_backend_answers_with_is_one_the_layer_multiplies() {
+        for layer in Layer::all() {
+            let hidden = layer.hidden();
+            let whole = layer.run(layer.weights.view(hidden));
+            let zeroed = vec![0.0; layer.weights.o_proj.len().max(layer.weights.q_proj.len())];
+
+            for (index, name) in PROJECTIONS.iter().enumerate() {
+                let handed = Handed(AttentionProjections::decoded(
+                    hidden,
+                    without(layer.weights.decoded(), index, &zeroed),
+                ));
+                let mut weights = layer.weights.view(hidden);
+                weights.projections = AttentionProjections::backend(&handed);
+
+                assert_ne!(layer.run(weights), whole, "{}: {name}", layer.name);
+            }
+        }
+    }
+
+    /// A projection of the wrong width is refused where it is handed over, which
+    /// is one prefill before it would be discovered. Both of its widths are
+    /// checked against the config rather than against each other, because a
+    /// backend answering with another layer's `k_proj` reports widths that agree
+    /// with themselves.
+    #[test]
+    #[should_panic(expected = "the width k_proj maps to")]
+    fn a_projection_that_is_not_the_layers_shape_is_refused() {
+        let layer = synthetic("sliding");
+        let hidden = layer.hidden();
+        let narrow = vec![0.0; layer.weights.k_proj.len() - hidden];
+        let mut five = layer.weights.decoded();
+        five.k_proj = &narrow;
+
+        let handed = Handed(AttentionProjections::decoded(hidden, five));
+        let mut weights = layer.weights.view(hidden);
+        weights.projections = AttentionProjections::backend(&handed);
+        Attention::new(layer.config, weights);
     }
 
     #[test]
@@ -1176,7 +1443,7 @@ mod tests {
     #[test]
     fn exchanging_the_query_and_key_norms_is_a_no_op() {
         for layer in Layer::all() {
-            let mut weights = layer.weights.view();
+            let mut weights = layer.weights.view(layer.hidden());
             std::mem::swap(&mut weights.q_norm, &mut weights.k_norm);
 
             let deviation = deviation(&layer.run(weights), &layer.prefill_out);
@@ -1196,7 +1463,7 @@ mod tests {
         for layer in Layer::all() {
             let ones = vec![1.0; layer.config.head_dim];
             for (what, dropped) in [("q_norm", true), ("k_norm", false)] {
-                let mut weights = layer.weights.view();
+                let mut weights = layer.weights.view(layer.hidden());
                 *(if dropped {
                     &mut weights.q_norm
                 } else {
@@ -1218,7 +1485,7 @@ mod tests {
     #[test]
     fn exchanging_the_key_and_value_convolutions_changes_the_answer() {
         for layer in Layer::all() {
-            let mut weights = layer.weights.view();
+            let mut weights = layer.weights.view(layer.hidden());
             std::mem::swap(&mut weights.k_sconv, &mut weights.v_sconv);
 
             let deviation = deviation(&layer.run(weights), &layer.prefill_out);

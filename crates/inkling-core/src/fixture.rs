@@ -16,7 +16,9 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-use crate::attention::{AttentionConfig, AttentionWeights};
+use crate::attention::{
+    AttentionConfig, AttentionProjections, AttentionWeights, DecodedProjections,
+};
 use crate::checkpoint::{Checkpoint, Dtype, TensorView};
 use crate::config::{Config, TextConfig};
 use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
@@ -279,11 +281,16 @@ impl LayerTensors {
     pub fn view(&self) -> DecoderWeights<'_> {
         DecoderWeights {
             attention: AttentionWeights {
-                q_proj: &self.q_proj,
-                k_proj: &self.k_proj,
-                v_proj: &self.v_proj,
-                r_proj: &self.r_proj,
-                o_proj: &self.o_proj,
+                projections: AttentionProjections::decoded(
+                    self.hidden(),
+                    DecodedProjections {
+                        q_proj: &self.q_proj,
+                        k_proj: &self.k_proj,
+                        v_proj: &self.v_proj,
+                        r_proj: &self.r_proj,
+                        o_proj: &self.o_proj,
+                    },
+                ),
                 q_norm: &self.q_norm,
                 k_norm: &self.k_norm,
                 k_sconv: &self.k_sconv,

@@ -41,7 +41,9 @@
 
 use std::cell::RefCell;
 
-use crate::attention::{AttentionConfig, AttentionWeights};
+use crate::attention::{
+    AttentionConfig, AttentionProjections, AttentionWeights, DecodedProjections,
+};
 use crate::checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 use crate::config::TextConfig;
 use crate::generate::Generator;
@@ -524,6 +526,7 @@ impl<'a> CheckpointWeights<'a> {
     fn attention<'s>(&self, module: &str, scratch: &mut Scratch<'s>) -> Attention<'s> {
         let widened = |name: &str| self.widened(&format!("{module}.self_attn.{name}"));
         Attention {
+            hidden: self.config.hidden_size,
             q_norm: widened("q_norm.weight"),
             k_norm: widened("k_norm.weight"),
             k_sconv: widened("k_sconv.conv.weight"),
@@ -628,6 +631,7 @@ impl ModelWeights for CheckpointWeights<'_> {
 /// One layer's attention tensors: the five projections decoded into the pass's
 /// scratch, and the small bfloat16 ones widened into vectors of their own.
 struct Attention<'a> {
+    hidden: usize,
     projections: [&'a [f32]; 5],
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
@@ -640,11 +644,16 @@ impl Attention<'_> {
     fn view(&self) -> AttentionWeights<'_> {
         let [q_proj, k_proj, v_proj, r_proj, o_proj] = self.projections;
         AttentionWeights {
-            q_proj,
-            k_proj,
-            v_proj,
-            r_proj,
-            o_proj,
+            projections: AttentionProjections::decoded(
+                self.hidden,
+                DecodedProjections {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    r_proj,
+                    o_proj,
+                },
+            ),
             q_norm: &self.q_norm,
             k_norm: &self.k_norm,
             k_sconv: &self.k_sconv,

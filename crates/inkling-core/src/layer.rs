@@ -356,6 +356,7 @@ mod tests {
             Self {
                 name: case.to_string(),
                 config: AttentionConfig {
+                    hidden: weights.hidden(),
                     heads: heads as usize,
                     kv_heads: kv_heads as usize,
                     head_dim: head_dim as usize,

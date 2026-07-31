@@ -19,8 +19,8 @@ pub mod weights;
 pub mod fixture;
 
 pub use attention::{
-    Attention, AttentionCache, AttentionConfig, AttentionWeights, LogScaling, Sdpa, merge_heads,
-    split_heads,
+    Attention, AttentionCache, AttentionConfig, AttentionProjections, AttentionWeights,
+    DecodedProjections, LogScaling, Projections, Sdpa, merge_heads, split_heads,
 };
 pub use checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 pub use config::{Config, TextConfig};
