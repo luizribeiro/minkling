@@ -21,6 +21,17 @@ than a request loop.
     just sync             # reference venv + mlx-vlm patches
     just test
 
+Text in, text out, streamed to stdout as each token is decoded:
+
+    inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
+
+Keep the budget small: a decode step is about 9 s on the CPU path against
+mlx-vlm's 32 ms, and the timings go to stderr so stdout stays pipeable. The
+prompt reaches the tokenizer as it stands, so the model *continues* it rather
+than answering it. A chat turn is written out in full —
+`<|message_user|><|content_text|>…<|end_message|><|message_model|>` — rather than
+applied by a template this does not implement.
+
 ## Why the reference directory exists
 
 `sconv`, the banded relative-position bias, and sigmoid-gated top-6-of-256
