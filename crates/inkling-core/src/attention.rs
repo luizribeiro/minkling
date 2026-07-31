@@ -321,21 +321,22 @@ impl<'a> Attention<'a> {
     /// call's keys, values and convolution windows behind in it.
     pub fn forward(&self, cache: &mut AttentionCache, x: &[f32]) -> Vec<f32> {
         let log_scaling = self.config.log_scaling;
-        self.attend(cache, x, log_scaling, log_scaling)
+        self.attend(cache, x, QueryOffset::Cached, log_scaling, log_scaling)
     }
 
-    /// [`Attention::forward`], with log scaling's two multiplications named
-    /// apart.
+    /// [`Attention::forward`], with the query offset and log scaling's two
+    /// multiplications named apart.
     ///
     /// The reference applies the same `tau` to the queries and to the mask's
     /// unmasked entries: both or neither. They are separable, and either one
     /// alone is a plausible misreading that leaves a model which still
     /// generates, so the tests drive this to show that neither alone reproduces
-    /// mlx-vlm.
+    /// mlx-vlm. [`QueryOffset`] is there for the same reason.
     fn attend(
         &self,
         cache: &mut AttentionCache,
         x: &[f32],
+        query_offset: QueryOffset,
         on_queries: Option<LogScaling>,
         on_biases: Option<LogScaling>,
     ) -> Vec<f32> {
@@ -347,7 +348,8 @@ impl<'a> Attention<'a> {
             self.hidden
         );
         let (heads, head_dim) = (self.sdpa.heads, self.sdpa.head_dim);
-        let offset = cache.keys.len() / (self.sdpa.kv_heads * head_dim);
+        let cached = cache.keys.len() / (self.sdpa.kv_heads * head_dim);
+        let offset = query_offset.of(cached);
 
         let project = |weight| linear(x, weight, self.hidden);
         let norm = |x: &[f32], weight| rms_norm(x, weight, self.config.rms_norm_eps);
@@ -401,6 +403,35 @@ impl<'a> Attention<'a> {
             self.weights.o_proj,
             heads * head_dim,
         )
+    }
+}
+
+/// Where a call's queries sit in the sequence, which is `InklingAttention`'s
+/// `q_offset` and is read off the cache rather than passed in.
+///
+/// Two things index by it: the relative-position bias, whose entries are
+/// `(i + offset) - j`, and log scaling's `tau`. They are one decision — the
+/// reference derives both from one `cache.offset` — so a port that never
+/// threaded it gets both wrong, and this names that port rather than half of it.
+///
+/// A prefill starts from an empty cache, so the two arms agree on every call
+/// that has one. They part from the first token decoded after it.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+enum QueryOffset {
+    /// How many keys the cache already holds, which is how many tokens the
+    /// sequence has seen.
+    Cached,
+    /// Zero, whatever the cache holds.
+    Ignored,
+}
+
+impl QueryOffset {
+    fn of(&self, cached: usize) -> usize {
+        match self {
+            Self::Cached => cached,
+            Self::Ignored => 0,
+        }
     }
 }
 
@@ -966,11 +997,20 @@ mod tests {
             on_queries: Option<LogScaling>,
             on_biases: Option<LogScaling>,
         ) -> (Vec<f32>, Vec<f32>) {
+            self.at(QueryOffset::Cached, on_queries, on_biases)
+        }
+
+        fn at(
+            &self,
+            query_offset: QueryOffset,
+            on_queries: Option<LogScaling>,
+            on_biases: Option<LogScaling>,
+        ) -> (Vec<f32>, Vec<f32>) {
             let attention = self.attention();
             let cache = &mut attention.cache();
             (
-                attention.attend(cache, &self.x, on_queries, on_biases),
-                attention.attend(cache, &self.continue_x, on_queries, on_biases),
+                attention.attend(cache, &self.x, query_offset, on_queries, on_biases),
+                attention.attend(cache, &self.continue_x, query_offset, on_queries, on_biases),
             )
         }
 
@@ -1068,6 +1108,41 @@ mod tests {
         assert_eq!(inert.weights.q_proj, scaled.weights.q_proj);
         assert_eq!(inert.weights.rel_proj, scaled.weights.rel_proj);
         assert!(deviation(&inert.prefill_out, &scaled.prefill_out) > TOLERANCE);
+    }
+
+    /// `q_offset` is where a call's queries sit, and it is the one thing about a
+    /// cache that a prefill cannot expose: a prefill starts from an empty cache,
+    /// so a layer that never advanced the offset computes the same tensor as one
+    /// that does — to the bit, not within a tolerance. The first token attended
+    /// after it is where the two part, and this asserts both halves, because
+    /// either alone would leave the wrong impression of what the mistake costs.
+    ///
+    /// What it costs is not a small drift. A query at position `i + offset`
+    /// indexes the band at backward distances `i + offset - j`; pinned to zero,
+    /// every key but the very first sits at a negative distance, which the mask
+    /// reads as a position that has not happened yet and rules out. So the
+    /// continuation attends over almost nothing.
+    #[test]
+    fn ignoring_the_query_offset_shows_only_once_a_prefill_is_behind_it() {
+        for layer in Layer::all() {
+            let log = layer.config.log_scaling;
+            let (prefill, rest) = layer.at(QueryOffset::Ignored, log, log);
+
+            let agreed = deviation(&prefill, &layer.prefill_out);
+            assert!(
+                agreed <= TOLERANCE,
+                "{}: the prefill deviates by {agreed:e}",
+                layer.name
+            );
+            assert_eq!(prefill, layer.forward().0, "{}", layer.name);
+
+            let deviation = deviation(&rest, &layer.continue_out);
+            assert!(
+                deviation > TOLERANCE,
+                "{}: deviation {deviation:e}",
+                layer.name
+            );
+        }
     }
 
     /// The continuation reads the cache: the keys and values of the prefill, and
