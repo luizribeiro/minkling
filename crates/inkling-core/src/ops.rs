@@ -149,6 +149,64 @@ pub fn linear(x: &[f32], weight: &[f32], in_dim: usize) -> Vec<f32> {
     out
 }
 
+/// `y = x @ wᵀ`, for a weight held however its owner holds it.
+///
+/// [`linear`] above takes the weight as a `&[f32]`, and that signature is a
+/// claim as much as a convenience: it says the weight has been decoded into
+/// memory. Every projection in an Inkling checkpoint is MXFP4 — the whole model
+/// is 130.6 GiB packed and 1.1 TB decoded — so the claim is one the CPU path
+/// pays for a run at a time, through [`Scratch`](crate::quant::Scratch), and one
+/// a GPU kernel that decodes codes in registers should not have to pay at all.
+///
+/// This is the operation with that claim taken out. A caller written against it
+/// is handed weights it cannot see the storage of, which is what lets the same
+/// caller run against decoded floats or against packed codes.
+pub trait Projection {
+    /// The width a row of the input has to be.
+    fn in_dim(&self) -> usize;
+
+    /// The width a row of the output comes out.
+    fn out_dim(&self) -> usize;
+
+    /// `[rows, in_dim]` in, `[rows, out_dim]` out.
+    fn forward(&self, x: &[f32]) -> Vec<f32>;
+}
+
+/// A projection over weights already decoded to float32, `[out_dim, in_dim]`
+/// row-major — the layout `nn.Linear` stores and the one [`linear`] takes.
+#[derive(Debug, Clone, Copy)]
+pub struct DenseProjection<'a> {
+    in_dim: usize,
+    weight: &'a [f32],
+}
+
+impl<'a> DenseProjection<'a> {
+    pub fn new(in_dim: usize, weight: &'a [f32]) -> Self {
+        assert!(in_dim > 0, "a projection maps from some width");
+        assert_eq!(
+            weight.len() % in_dim,
+            0,
+            "{} weights are not whole rows of {in_dim}",
+            weight.len()
+        );
+        Self { in_dim, weight }
+    }
+}
+
+impl Projection for DenseProjection<'_> {
+    fn in_dim(&self) -> usize {
+        self.in_dim
+    }
+
+    fn out_dim(&self) -> usize {
+        self.weight.len() / self.in_dim
+    }
+
+    fn forward(&self, x: &[f32]) -> Vec<f32> {
+        linear(x, self.weight, self.in_dim)
+    }
+}
+
 /// The indices of the `k` largest values, largest first, ties going to the
 /// lower index.
 ///
@@ -362,14 +420,49 @@ mod tests {
         assert_eq!(flat, [0.25; 4]);
     }
 
+    /// Two rows of three against two weight rows of three, whose axes are
+    /// unequal so that a weight read transposed would not even fit.
+    const PROJECTION_IN_DIM: usize = 3;
+    const PROJECTION_X: [f32; 6] = [1.0, 2.0, 3.0, 10.0, 20.0, 30.0];
+    const PROJECTION_WEIGHT: [f32; 6] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
     /// `[rows, in]` against a `[out, in]` weight, one output row per input row.
-    /// The two axes are unequal here, so a projection that transposed the weight
-    /// would not even fit.
     #[test]
     fn a_projection_maps_each_row_against_every_weight_row() {
-        let x = [1.0, 2.0, 3.0, 10.0, 20.0, 30.0];
-        let weight = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
-        assert_eq!(linear(&x, &weight, 3), [1.0, 3.0, 10.0, 30.0]);
+        assert_eq!(
+            linear(&PROJECTION_X, &PROJECTION_WEIGHT, PROJECTION_IN_DIM),
+            [1.0, 3.0, 10.0, 30.0]
+        );
+    }
+
+    /// The seam over a decoded weight is [`linear`] and nothing else, and the
+    /// two shapes it reports are what a caller that cannot see the weight has to
+    /// go on. A projection that read them off the wrong axis would report 2 and
+    /// 3 the other way round.
+    #[test]
+    fn a_dense_projection_is_the_linear_it_reports_the_shape_of() {
+        let projection = DenseProjection::new(PROJECTION_IN_DIM, &PROJECTION_WEIGHT);
+
+        assert_eq!(projection.in_dim(), PROJECTION_IN_DIM);
+        assert_eq!(projection.out_dim(), 2);
+        assert_eq!(
+            projection.forward(&PROJECTION_X),
+            linear(&PROJECTION_X, &PROJECTION_WEIGHT, PROJECTION_IN_DIM)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "are not whole rows of 3")]
+    fn a_dense_projection_over_a_ragged_weight_is_refused() {
+        DenseProjection::new(PROJECTION_IN_DIM, &[1.0; 7]);
+    }
+
+    /// The width divides, so it has to be refused before it does — a projection
+    /// from nothing would panic on the remainder rather than on the shape.
+    #[test]
+    #[should_panic(expected = "a projection maps from some width")]
+    fn a_dense_projection_from_no_width_is_refused() {
+        DenseProjection::new(0, &[]);
     }
 
     #[test]

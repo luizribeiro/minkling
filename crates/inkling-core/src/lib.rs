@@ -32,7 +32,7 @@ pub use layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, N
 pub use mask::{BandedMask, MASKED, is_masked};
 pub use model::{Model, ModelCache, ModelWeights};
 pub use moe::{ExpertBank, ExpertBatch, GateWeights, MoeConfig, MoeOutput, Routing, SparseMoe};
-pub use ops::{DenseMlp, linear, rms_norm, softmax};
+pub use ops::{DenseMlp, DenseProjection, Projection, linear, rms_norm, softmax};
 pub use quant::{Dequantized, QuantError, Scratch};
 pub use sconv::{ConvState, ShortConv};
 pub use tokenizer::{Detokenizer, Tokenizer, TokenizerError};
