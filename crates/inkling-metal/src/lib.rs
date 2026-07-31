@@ -11,10 +11,14 @@
 //! each of them: a [`Device`] to compile and run against, a [`Kernel`] compiled
 //! from source, [`Buffer`]s the CPU and GPU both address, and a [`Grid`] saying
 //! how many threads to run.
+//!
+//! On top of those sits the one operation the whole engine is made of:
+//! [`matmul`], which multiplies against weights that stay MXFP4-packed.
 
 pub mod buffer;
 pub mod device;
 pub mod kernel;
+pub mod matmul;
 
 #[cfg(test)]
 mod testing;
@@ -22,3 +26,4 @@ mod testing;
 pub use buffer::{Arg, Buffer, Element};
 pub use device::{Device, MetalError};
 pub use kernel::{Grid, Kernel};
+pub use matmul::{MatmulError, PackedMatmul, PackedProjection};

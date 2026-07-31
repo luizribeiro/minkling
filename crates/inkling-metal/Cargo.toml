@@ -6,7 +6,18 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# The MXFP4 format, which the matmul kernel decodes in registers and which
+# `inkling_core::quant` is the authority on. A dependency the other way round
+# would be the model reaching into a backend; this way the backend is one
+# implementation of operations the model names.
+inkling-core.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-metal.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# `test-support` for `fixture::deviation`, which is how every tolerance in this
+# tree is stated, and for the recorded activations the checkpoint-gated tests
+# drive the head with.
+inkling-core = { workspace = true, features = [ "test-support" ] }
