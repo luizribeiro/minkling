@@ -140,6 +140,33 @@ pub fn linear(x: &[f32], weight: &[f32], in_dim: usize) -> Vec<f32> {
     out
 }
 
+/// The indices of the `k` largest values, largest first, ties going to the
+/// lower index.
+///
+/// The tie-break is not arbitrary at either end of the model that uses this. The
+/// router picks six of 256 gate scores, and mlx-vlm's `mx.argpartition` leaves a
+/// selection whose *order* is more than the reference promises — see
+/// [`SparseMoe::route`](crate::moe::SparseMoe::route). The tests compare a
+/// ranking of logits against `mx.argsort`, which is stable and ascending, so
+/// `argsort(-x)` leaves equal values in index order; agreeing with that matters
+/// because the reference's logits are bfloat16, three significant digits over
+/// 200058 values, and exact ties are ordinary.
+///
+/// Partitioned before it is sorted, so ranking the top six of 256 — or the top
+/// thirty-two of 200058 — costs a linear pass and a sort of `k`.
+pub fn top_k(values: &[f32], k: usize) -> Vec<usize> {
+    let k = k.min(values.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    let rank = |a: &usize, b: &usize| values[*b].total_cmp(&values[*a]).then(a.cmp(b));
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.select_nth_unstable_by(k - 1, rank);
+    order.truncate(k);
+    order.sort_unstable_by(rank);
+    order
+}
+
 /// Softmax in place, over a row's largest entry.
 ///
 /// The shift is what lets attention's mask carry a magnitude rather than an

@@ -30,7 +30,7 @@
 use std::collections::BTreeMap;
 
 use crate::config::TextConfig;
-use crate::ops::{DenseMlp, linear, softmax};
+use crate::ops::{self, DenseMlp, linear, softmax};
 
 /// The shapes and scalars `InklingSparseMoE.__init__` reads.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -301,7 +301,7 @@ impl<'a> SparseMoe<'a> {
                 .zip(self.weights.correction_bias)
                 .map(|(logit, bias)| sigmoid(*logit) + bias)
                 .collect();
-            let picked = select(&scores, top_k);
+            let picked = ops::top_k(&scores, top_k);
 
             let (chosen, rest) = row.split_at_mut(top_k);
             for (slot, expert) in chosen.iter_mut().zip(&picked) {
@@ -515,16 +515,6 @@ impl Reading {
             }
         }
     }
-}
-
-/// The `top_k` highest scores, best first, ties going to the lower index.
-fn select(scores: &[f32], top_k: usize) -> Vec<usize> {
-    let rank = |a: &usize, b: &usize| scores[*b].total_cmp(&scores[*a]).then(a.cmp(b));
-    let mut order: Vec<usize> = (0..scores.len()).collect();
-    order.select_nth_unstable_by(top_k - 1, rank);
-    order.truncate(top_k);
-    order.sort_unstable_by(rank);
-    order
 }
 
 fn sigmoid(x: f32) -> f32 {
