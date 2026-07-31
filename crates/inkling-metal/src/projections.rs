@@ -197,10 +197,11 @@ fn whole<'a>(
 /// Every layer's own projections on the device, which for Inkling-Small is 42
 /// layers of five and two of three more.
 ///
-/// 9.0 GB of packed bytes, wrapped where the checkpoint mapped them and holding
-/// no resident set of their own — the same bargain
-/// [`ModelExperts`](crate::ModelExperts) strikes over its 137 GB, and cheap
-/// enough for the same reason that there is no residency question to answer.
+/// 1.19 GB of packed bytes — 9.6 GB were it decoded — wrapped where the
+/// checkpoint mapped them and holding no resident set of their own. The same
+/// bargain [`ModelExperts`](crate::ModelExperts) strikes over its 138 GB, and
+/// cheap enough for the same reason that there is no residency question to
+/// answer.
 #[derive(Debug)]
 pub struct ModelProjections<'a> {
     /// Indexed by layer, `None` where nothing here answers for one — which is a
