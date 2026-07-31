@@ -12,12 +12,20 @@
 //! and moving a module is a smaller thing than lifting one out of a binary.
 
 pub mod args;
+pub mod backend;
 pub mod chat;
 pub mod config;
 pub mod generate;
 pub mod inspect;
 pub mod openai;
 pub mod serve;
+
+/// The width a report's labels are padded to.
+///
+/// Shared because two modules write into the same column of the same stderr: the
+/// backend says what it is and what its upload cost before the first token, and
+/// the generation says what the steps cost after the last.
+pub const LABEL: usize = 9;
 
 /// Reading a response the way a client does. Behind a feature so that the
 /// checkpoint-gated test in `tests/` — which links this crate from outside and

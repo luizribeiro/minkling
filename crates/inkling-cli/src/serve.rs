@@ -63,8 +63,8 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::args::Serve;
 use crate::chat::{self, Channel, Channels, MARKERS};
-use crate::config;
 use crate::openai::{ChatRequest, Completion, Finish, RequestError};
+use crate::{backend, config};
 
 const COMPLETIONS: &str = "/v1/chat/completions";
 const MODELS: &str = "/v1/models";
@@ -449,9 +449,13 @@ pub fn run(args: &Serve) -> Result<()> {
     let tokenizer = Tokenizer::open(&args.checkpoint, &config)?;
     let markers = markers(&tokenizer)?;
 
+    // The device before the checkpoint, so that a backend this machine cannot
+    // give ends the process before a client can wait on a server that was going
+    // to fail.
+    let gpu = backend::open(args.backend)?;
     eprintln!("loading {}", args.checkpoint.display());
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
-    let weights = CheckpointWeights::open(&checkpoint, &config.text_config)?;
+    let weights = backend::weights(gpu.as_ref(), &checkpoint, &config.text_config)?;
     let generator = Generator::new(weights.model(), weights.head(), weights.head_projection());
 
     let mut engine = Engine {

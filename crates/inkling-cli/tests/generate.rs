@@ -76,8 +76,15 @@ const GENERATED: usize = 3;
 /// recorded `input_ids` have to be the same eight numbers. They are asserted to
 /// be, first and separately, because a mismatch there and a wrong continuation
 /// are different faults and the second would hide the first.
+///
+/// **Both backends, and that is the point of running it twice.** `--backend` is
+/// what keeps the CPU path selectable, and a path nothing runs is a path that
+/// stops working quietly. The two are asserted against the same recorded text
+/// rather than against each other, so a run where both drifted the same way is
+/// still a failure. The cost is one more prefill: about eighty seconds a
+/// backend, of which the stack is nearly all.
 #[test]
-fn the_command_writes_the_oracles_continuation_of_the_recorded_prompt() {
+fn either_backend_writes_the_oracles_continuation_of_the_recorded_prompt() {
     let Some(dir) = checkpoint_dir() else { return };
     let tokenizer = Tokenizer::open(&dir, &config(&dir)).expect("the checkpoint's tokenizer opens");
     let activations = fixture::open(ACTIVATIONS);
@@ -95,18 +102,27 @@ fn the_command_writes_the_oracles_continuation_of_the_recorded_prompt() {
         .decode(&oracle[..GENERATED])
         .expect("the continuation decodes");
 
-    let output = inklingrs(&[
-        "generate",
-        dir.to_str().expect("a printable checkpoint path"),
-        "--prompt",
-        &prompt,
-        "--max-tokens",
-        &GENERATED.to_string(),
-    ]);
-    eprintln!("{prompt:?} ->\n{}", stderr(&output));
+    for backend in ["metal", "cpu"] {
+        let output = inklingrs(&[
+            "generate",
+            dir.to_str().expect("a printable checkpoint path"),
+            "--prompt",
+            &prompt,
+            "--max-tokens",
+            &GENERATED.to_string(),
+            "--backend",
+            backend,
+        ]);
+        eprintln!("{prompt:?} on {backend} ->\n{}", stderr(&output));
 
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output), want);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(stdout(&output), want, "on {backend}");
+        assert!(
+            stderr(&output).contains(backend),
+            "the report does not say which backend ran: {}",
+            stderr(&output)
+        );
+    }
 }
 
 /// A path that is not a checkpoint, which is what a typo makes. It has to be

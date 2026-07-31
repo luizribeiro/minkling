@@ -51,13 +51,11 @@ use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use inkling_core::{Checkpoint, CheckpointWeights, Ending, Generator, ModelCache, Stop, Tokenizer};
+use inkling_core::{Checkpoint, Ending, Generator, ModelCache, Stop, Tokenizer};
 
+use crate::LABEL;
 use crate::args::Generate;
-use crate::config;
-
-/// The width the report's labels are padded to.
-const LABEL: usize = 9;
+use crate::{backend, config};
 
 pub fn run(args: &Generate) -> Result<()> {
     let config = config::of_checkpoint(&args.checkpoint)?;
@@ -73,8 +71,11 @@ pub fn run(args: &Generate) -> Result<()> {
     }
     eprintln!("{:<LABEL$}{} tokens", "prompt", ids.len());
 
+    // Before the checkpoint is mapped, so that a backend this machine cannot
+    // give ends the command in a millisecond rather than after a 130 GiB load.
+    let gpu = backend::open(args.backend)?;
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
-    let weights = CheckpointWeights::open(&checkpoint, &config.text_config)?;
+    let weights = backend::weights(gpu.as_ref(), &checkpoint, &config.text_config)?;
     let generator = Generator::new(weights.model(), weights.head(), weights.head_projection());
     let ending = Ending {
         budget: args.max_tokens,

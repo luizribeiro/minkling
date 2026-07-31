@@ -20,6 +20,41 @@ pub enum Command {
     Serve(Serve),
 }
 
+/// Where the model's largest projection runs.
+///
+/// A runtime flag rather than a Cargo feature, and the reason is what the CPU
+/// path is for. It is the oracle every kernel in this tree is validated against,
+/// so a disagreement between the two is settled by putting the same prompt
+/// through both — which a flag allows and a build-time choice would turn into a
+/// rebuild. It is also the first thing a report about a wrong token has to say,
+/// and a flag can be printed back where a feature has to be remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// Every weight decoded on the way through, a row at a time — 8.98 s a
+    /// token, of which the head is 0.69 s. The path every fixture in the tree
+    /// pins.
+    Cpu,
+    /// `lm_head` multiplied on the GPU against codes that are never decoded,
+    /// which is 8.40 s a token.
+    ///
+    /// The default, because the two produce the same tokens and this is the
+    /// faster of them. Asking for it explicitly is still worth allowing: a
+    /// command line that says which backend ran is a command line that can be
+    /// pasted into a bug report.
+    #[default]
+    Metal,
+}
+
+impl Backend {
+    fn parse(name: &str) -> Result<Self, ArgError> {
+        match name {
+            "cpu" => Ok(Self::Cpu),
+            "metal" => Ok(Self::Metal),
+            _ => Err(ArgError::UnknownBackend(name.to_string())),
+        }
+    }
+}
+
 /// A generation, as a command line describes one.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Generate {
@@ -32,6 +67,8 @@ pub struct Generate {
     pub prompt: String,
     /// How many tokens may be decoded before the budget ends the generation.
     pub max_tokens: usize,
+    /// Where `lm_head` multiplies.
+    pub backend: Backend,
 }
 
 /// A server, as a command line describes one.
@@ -43,6 +80,8 @@ pub struct Serve {
     pub address: String,
     /// The budget for a request that names none of its own.
     pub max_tokens: usize,
+    /// Where `lm_head` multiplies.
+    pub backend: Backend,
 }
 
 /// How many tokens `generate` decodes when the caller names no budget.
@@ -69,8 +108,10 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
 
 pub const USAGE: &str = "usage:\n  \
     inklingrs inspect <config.json>\n  \
-    inklingrs generate <checkpoint-dir> --prompt <text> [--max-tokens <n>]\n  \
-    inklingrs serve <checkpoint-dir> [--address <host:port>] [--max-tokens <n>]";
+    inklingrs generate <checkpoint-dir> --prompt <text> [--max-tokens <n>] \
+        [--backend cpu|metal]\n  \
+    inklingrs serve <checkpoint-dir> [--address <host:port>] [--max-tokens <n>] \
+        [--backend cpu|metal]";
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ArgError {
@@ -94,6 +135,9 @@ pub enum ArgError {
 
     #[error("{0} is not a count of at least one")]
     NotACount(String),
+
+    #[error("{0} is not a backend, which is cpu or metal")]
+    UnknownBackend(String),
 }
 
 impl Command {
@@ -146,11 +190,13 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
     let mut checkpoint = None;
     let mut prompt = None;
     let mut max_tokens = DEFAULT_MAX_TOKENS;
+    let mut backend = Backend::default();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--prompt" | "-p" => prompt = Some(value(&arg, &mut args)?),
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
+            "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
             _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
             _ => return Err(ArgError::Unexpected(arg)),
@@ -172,6 +218,7 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
                 what: "--prompt <text>",
             })?,
         max_tokens,
+        backend,
     }))
 }
 
@@ -180,11 +227,13 @@ fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
     let mut checkpoint = None;
     let mut address = DEFAULT_ADDRESS.to_string();
     let mut max_tokens = DEFAULT_SERVE_MAX_TOKENS;
+    let mut backend = Backend::default();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--address" | "-a" => address = value(&arg, &mut args)?,
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
+            "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
             _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
             _ => return Err(ArgError::Unexpected(arg)),
@@ -198,6 +247,7 @@ fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
         })?,
         address,
         max_tokens,
+        backend,
     }))
 }
 
@@ -277,6 +327,7 @@ mod tests {
                 checkpoint: PathBuf::from("models/small"),
                 prompt: "Once".to_string(),
                 max_tokens: 3,
+                backend: Backend::Metal,
             })
         );
     }
@@ -308,6 +359,58 @@ mod tests {
                 .max_tokens,
             DEFAULT_MAX_TOKENS
         );
+    }
+
+    /// The backend is a word and each command reads the same two, which is what
+    /// makes "run it on the CPU" the same edit to either command line.
+    #[test]
+    fn either_command_takes_a_backend_by_name() {
+        for backend in [("cpu", Backend::Cpu), ("metal", Backend::Metal)] {
+            let (name, want) = backend;
+            assert_eq!(
+                generated(&["generate", "models/small", "-p", "Once", "--backend", name])
+                    .expect("parses")
+                    .backend,
+                want
+            );
+            assert_eq!(
+                serving(&["serve", "models/small", "-b", name])
+                    .expect("parses")
+                    .backend,
+                want
+            );
+        }
+    }
+
+    /// What a run nobody said anything about gets, which is the fast one. The
+    /// CPU path is what a fixture is compared against and not what a caller
+    /// should have to wait for by omission.
+    #[test]
+    fn a_command_that_names_no_backend_runs_on_the_gpu() {
+        assert_eq!(
+            generated(&["generate", "models/small", "-p", "Once"])
+                .expect("parses")
+                .backend,
+            Backend::Metal
+        );
+        assert_eq!(
+            serving(&["serve", "models/small"]).expect("parses").backend,
+            Backend::Metal
+        );
+    }
+
+    /// A backend this binary does not have is a mistake and not a fallback: a
+    /// typo silently answered by the default would report the timings of a
+    /// backend nobody asked for.
+    #[test]
+    fn a_backend_this_binary_does_not_have_is_refused() {
+        for name in ["gpu", "gpU", "gpu ", "cuda", ""] {
+            assert_eq!(
+                parse(&["generate", "models/small", "-p", "Once", "-b", name]),
+                Err(ArgError::UnknownBackend(name.to_string())),
+                "{name:?}"
+            );
+        }
     }
 
     /// A prompt is text and not a flag, so what follows `--prompt` is taken as
@@ -417,6 +520,7 @@ mod tests {
                 checkpoint: PathBuf::from("models/small"),
                 address: "0.0.0.0:9000".to_string(),
                 max_tokens: 3,
+                backend: Backend::Metal,
             })
         );
     }
