@@ -2,6 +2,7 @@ pub mod attention;
 pub mod checkpoint;
 pub mod config;
 pub mod embed;
+pub mod generate;
 pub mod head;
 pub mod layer;
 pub mod mask;
@@ -22,6 +23,7 @@ pub use attention::{
 pub use checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 pub use config::{Config, TextConfig};
 pub use embed::Embed;
+pub use generate::{Generator, greedy};
 pub use head::LmHead;
 pub use layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 pub use mask::{BandedMask, MASKED, is_masked};
