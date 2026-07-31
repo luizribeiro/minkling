@@ -107,12 +107,31 @@ impl<'a> DenseMlp<'a> {
     }
 }
 
-/// `y = x @ wᵀ` for one row, against a `[out, in]` row-major weight.
-fn linear(x: &[f32], weight: &[f32], in_dim: usize) -> Vec<f32> {
-    weight
-        .chunks_exact(in_dim)
-        .map(|row| x.iter().zip(row).map(|(x, w)| x * w).sum())
-        .collect()
+/// `y = x @ wᵀ`, for `[rows, in_dim]` against the `[out, in]` row-major weight
+/// `nn.Linear` stores. None of Inkling's projections carries a bias.
+pub fn linear(x: &[f32], weight: &[f32], in_dim: usize) -> Vec<f32> {
+    assert_eq!(
+        x.len() % in_dim,
+        0,
+        "{} values are not whole rows of {in_dim}",
+        x.len()
+    );
+    assert_eq!(
+        weight.len() % in_dim,
+        0,
+        "{} weights are not whole rows of {in_dim}",
+        weight.len()
+    );
+
+    let mut out = Vec::with_capacity(x.len() / in_dim * (weight.len() / in_dim));
+    for x in x.chunks_exact(in_dim) {
+        out.extend(
+            weight
+                .chunks_exact(in_dim)
+                .map(|row| x.iter().zip(row).map(|(x, w)| x * w).sum::<f32>()),
+        );
+    }
+    out
 }
 
 /// `silu(gate) * up`, written over `gate`.
@@ -261,6 +280,16 @@ mod tests {
             got.iter().all(|y| (y - 1.0).abs() <= TOLERANCE),
             "uniform row should normalise to its weight: {got:?}"
         );
+    }
+
+    /// `[rows, in]` against a `[out, in]` weight, one output row per input row.
+    /// The two axes are unequal here, so a projection that transposed the weight
+    /// would not even fit.
+    #[test]
+    fn a_projection_maps_each_row_against_every_weight_row() {
+        let x = [1.0, 2.0, 3.0, 10.0, 20.0, 30.0];
+        let weight = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        assert_eq!(linear(&x, &weight, 3), [1.0, 3.0, 10.0, 30.0]);
     }
 
     #[test]

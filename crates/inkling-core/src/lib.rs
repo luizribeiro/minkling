@@ -9,10 +9,13 @@ pub mod sconv;
 #[cfg(test)]
 mod fixture;
 
-pub use attention::{Sdpa, split_heads};
+pub use attention::{
+    Attention, AttentionCache, AttentionConfig, AttentionWeights, LogScaling, Sdpa, merge_heads,
+    split_heads,
+};
 pub use checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 pub use config::{Config, TextConfig};
 pub use mask::{BandedMask, MASKED, is_masked};
-pub use ops::{DenseMlp, rms_norm};
+pub use ops::{DenseMlp, linear, rms_norm};
 pub use quant::{Dequantized, QuantError};
 pub use sconv::{ConvState, ShortConv};
