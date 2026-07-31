@@ -13,6 +13,12 @@ inkling-core = { path = "crates/inkling-core" }
 inkling-metal = { path = "crates/inkling-metal" }
 
 anyhow = "1"
+
+# `sysconf(_SC_PAGESIZE)`, and nothing else. Metal takes the bounds of a no-copy
+# wrap in pages and raises an Objective-C exception for bounds that are not — an
+# exception that unwinds through no Rust destructor — so the page size has to be
+# asked for rather than written down.
+libc = "0.2"
 memmap2 = "0.9"
 safetensors = "0.6"
 serde = { version = "1", features = [ "derive" ] }
@@ -46,6 +52,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 ] }
 objc2-metal = { version = "0.3", default-features = false, features = [
   "std",
+  "block2",
   "MTLAllocation",
   "MTLBuffer",
   "MTLCommandBuffer",

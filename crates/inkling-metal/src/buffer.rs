@@ -1,6 +1,8 @@
 //! Memory a kernel reads and writes, and the CPU reads and writes with it.
 
+use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -23,6 +25,19 @@ use crate::device::{Device, MetalError};
 /// here waits for that before returning.
 const STORAGE: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 
+/// The granularity `newBufferWithBytesNoCopy:` takes its bounds in, which on
+/// Apple silicon is 16 KiB.
+///
+/// Asked of the kernel rather than written down, because a wrap whose bounds are
+/// not the page size Metal is using raises an Objective-C exception — which
+/// unwinds through no Rust destructor and takes the process with it.
+fn page() -> usize {
+    // SAFETY: `sysconf` reads a constant the kernel published at exec, and
+    // `_SC_PAGESIZE` is one every POSIX system defines rather than an optional
+    // limit that can come back as -1.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+}
+
 /// A type a [`Buffer`] can hold.
 ///
 /// # Safety
@@ -30,6 +45,10 @@ const STORAGE: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 /// Every bit pattern must be a valid `Self`, and `Self` must carry no padding.
 /// A buffer's bytes are whatever the GPU last wrote there, and reading them
 /// back reinterprets them as `Self` without looking.
+///
+/// `Self` must also have a size, which a zero-sized type would satisfy the
+/// paragraph above while not having: [`Device::wrap`] divides a byte count by it
+/// to say how many elements a range of pages holds.
 pub unsafe trait Element: Copy {}
 
 // SAFETY: all three are plain fixed-width numbers with no invalid bit pattern
@@ -62,15 +81,7 @@ impl Device {
                 len,
                 size: size_of::<T>(),
             })?;
-        let raw = self
-            .raw()
-            .newBufferWithLength_options(bytes, STORAGE)
-            .ok_or(MetalError::Allocation { bytes })?;
-        Ok(Buffer {
-            raw,
-            len,
-            element: PhantomData,
-        })
+        Buffer::of(self.raw().newBufferWithLength_options(bytes, STORAGE), len)
     }
 
     /// [`Device::zeroed`] filled from a slice, for values that already exist
@@ -79,6 +90,133 @@ impl Device {
         let mut buffer = self.zeroed(values.len())?;
         buffer.as_mut_slice().copy_from_slice(values);
         Ok(buffer)
+    }
+
+    /// Bytes this process already holds, given to the GPU where they lie.
+    ///
+    /// **No copy at all, and no residency of its own.** Wrapping a gibibyte of
+    /// a mapped checkpoint takes about 40 microseconds against the 130
+    /// milliseconds copying it takes, and leaves the resident set where it was:
+    /// what the GPU then reads through it are the file's own pages, faulted by
+    /// the same demand paging the CPU path faults them by. That is what makes a
+    /// bank of experts nobody routed to cost nothing to have wrapped.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must lie in pages that are mapped for their whole length and
+    /// stay mapped for the [`Mapped`]'s life — a slice of a mapping or of a
+    /// whole-page allocation, not of a `Vec`. What is wrapped is the *pages*
+    /// `bytes` falls in, which reach out to a page boundary either side of it,
+    /// and Metal reads that whole range as one.
+    ///
+    /// Nothing may write those pages while a dispatch bound to the buffer is
+    /// running. **The borrow does not say this** and cannot: a `&[u8]` rules out
+    /// writes through Rust references, and the memory is reachable by raw
+    /// pointer and by any other process holding the same file. It is the
+    /// assumption [`Checkpoint`](inkling_core::Checkpoint) already maps under —
+    /// that a checkpoint is a read-only artefact for the life of the process —
+    /// and this inherits it rather than strengthening it.
+    pub unsafe fn wrap<'a, T: Element>(
+        &self,
+        bytes: &'a [u8],
+    ) -> Result<Mapped<'a, T>, MetalError> {
+        let page = page();
+        let offset = bytes.as_ptr() as usize % page;
+        if offset % size_of::<T>() != 0 {
+            return Err(MetalError::Misaligned {
+                offset,
+                size: size_of::<T>(),
+            });
+        }
+
+        let len = (offset + bytes.len()).div_ceil(page) * page;
+        // SAFETY: stepping back to the start of the page `bytes` begins in. A
+        // mapping starts on a page boundary, so a pointer within one cannot be
+        // rounded down out of it — which is what this needs to stay inside the
+        // allocation it was derived from.
+        let base = unsafe { NonNull::from(bytes).cast::<c_void>().byte_sub(offset) };
+        // SAFETY: `base` is page-aligned and `len` a whole number of pages,
+        // which is what this call raises an Objective-C exception for the
+        // absence of. The range is the caller's mapping, which the contract
+        // above says outlives the buffer. The deallocator is `None`, which is
+        // what says the memory is not Metal's to free.
+        let raw = unsafe {
+            self.raw()
+                .newBufferWithBytesNoCopy_length_options_deallocator(base, len, STORAGE, None)
+        };
+
+        Ok(Mapped {
+            buffer: Buffer::of(raw, len / size_of::<T>())?,
+            offset: offset / size_of::<T>(),
+            wrapped: PhantomData,
+        })
+    }
+}
+
+impl<T: Element> Buffer<T> {
+    /// What the device answered, as an error if it answered nothing.
+    ///
+    /// `len` is in elements and the error is in bytes, because what a driver
+    /// refuses is a size and what a caller asked for is a count.
+    fn of(
+        raw: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+        len: usize,
+    ) -> Result<Self, MetalError> {
+        Ok(Self {
+            raw: raw.ok_or(MetalError::Allocation {
+                bytes: len * size_of::<T>(),
+            })?,
+            len,
+            element: PhantomData,
+        })
+    }
+}
+
+/// Pages of this process's address space the GPU reads in place, from
+/// [`Device::wrap`].
+///
+/// The wrap is of pages and a checkpoint's tensors are not page-aligned — the
+/// shard header is not padded, so every tensor in this checkpoint starts one
+/// byte past a word — so what is wrapped is the pages the tensor falls in and
+/// [`Mapped::offset`] is where in them it starts.
+///
+/// Read-only, and that is not a convention: the pages are a read-only mapping,
+/// so a kernel that wrote through this binding would take the whole process
+/// down with a bus error. Nothing here hands out a mutable slice, and the one
+/// thing it does hand out — an [`Arg`] — belongs in a slot the kernel declares
+/// `device const`.
+#[derive(Debug)]
+pub struct Mapped<'a, T> {
+    buffer: Buffer<T>,
+    offset: usize,
+    wrapped: PhantomData<&'a [u8]>,
+}
+
+#[expect(
+    clippy::len_without_is_empty,
+    reason = "a wrap is a whole number of pages and the device refuses a zero-byte one, so no \
+              wrap is empty to ask about"
+)]
+impl<T: Element> Mapped<'_, T> {
+    /// Where the wrapped bytes start, in elements of `T` from the buffer's own
+    /// start.
+    ///
+    /// A kernel is handed this and adds it, rather than being bound a buffer at
+    /// an offset: what Metal requires of a binding offset varies by device, and
+    /// what an added index requires is only that the elements line up — which
+    /// [`Device::wrap`] refuses the wrap for the absence of.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// How many elements of `T` the wrapped pages hold, which is the tensor
+    /// rounded out to its page bounds rather than the tensor.
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn arg(&mut self) -> Arg<'_> {
+        self.buffer.arg()
     }
 }
 
@@ -138,8 +276,163 @@ impl Arg<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::page;
     use crate::device::MetalError;
     use crate::testing::device;
+
+    /// Pages of this process's own, standing in for a checkpoint's mapping: the
+    /// one thing [`Device::wrap`] needs that a `Vec` cannot give is that the
+    /// bytes either side of the slice, out to the page bounds, are mapped.
+    struct Pages {
+        raw: *mut libc::c_void,
+        len: usize,
+    }
+
+    impl Pages {
+        fn new(pages: usize) -> Self {
+            let len = pages * page();
+            // SAFETY: an anonymous private mapping of a whole number of pages,
+            // which is the shape `mmap` is documented to return page-aligned.
+            let raw = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(raw, libc::MAP_FAILED, "the anonymous mapping is made");
+            Self { raw, len }
+        }
+
+        /// `len` bytes of the mapping, `at` bytes in.
+        fn at(&self, at: usize, len: usize) -> &[u8] {
+            // SAFETY: `at + len` is inside the mapping, which stays mapped for
+            // as long as `self` — which the borrow says.
+            unsafe { std::slice::from_raw_parts(self.raw.cast::<u8>().add(at), len) }
+        }
+
+        /// `values` written into the mapping `at` bytes in, through the mapping
+        /// rather than through anything Metal knows about.
+        fn write(&self, at: usize, values: &[f32]) {
+            assert!(at + size_of_val(values) <= self.len, "inside the mapping");
+            // SAFETY: the mapping is writable, `values` is elsewhere, and the
+            // range written is inside it by the assertion above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    values.as_ptr().cast::<u8>(),
+                    self.raw.cast::<u8>().add(at),
+                    size_of_val(values),
+                )
+            };
+        }
+    }
+
+    impl Drop for Pages {
+        fn drop(&mut self) {
+            // SAFETY: the mapping this made, unmapped once.
+            unsafe { libc::munmap(self.raw, self.len) };
+        }
+    }
+
+    #[test]
+    fn the_page_size_is_one_a_wrap_can_be_rounded_to() {
+        let page = page();
+        assert!(page.is_power_of_two() && page >= 4096, "{page}");
+    }
+
+    /// The whole claim: a wrap copies nothing, so what the GPU reads through it
+    /// is whatever the pages hold *now* rather than what they held when it was
+    /// made.
+    ///
+    /// Stated by writing through the mapping after the wrap and reading back
+    /// through the kernel, which is the one assertion a copy cannot pass. The
+    /// write lands before any dispatch is encoded, which is what
+    /// [`Device::wrap`]'s contract asks — a write racing a running kernel is
+    /// the thing it forbids, not a write between them.
+    ///
+    /// A checkpoint's pages are never written at all. But nothing else tells a
+    /// wrap from a copy so sharply, and 137 GB of expert banks is exactly the
+    /// size at which the two have to be told apart by something.
+    #[test]
+    fn a_wrap_reads_the_pages_rather_than_a_copy_of_them() {
+        let Some(device) = device() else { return };
+        let kernel = device
+            .compile(crate::testing::SAXPY, crate::testing::SAXPY_ENTRY)
+            .expect("saxpy compiles");
+
+        let pages = Pages::new(4);
+        let len = 1024;
+        // Straddling a page boundary, so that the wrap has to round out in both
+        // directions rather than only up.
+        let at = page() - 8;
+        // SAFETY: a slice of the anonymous mapping above, which outlives the
+        // wrap and which nothing else holds.
+        let mut wrapped = unsafe { device.wrap::<f32>(pages.at(at, len * size_of::<f32>())) }
+            .expect("the pages wrap");
+        let (offset, wrapped_len) = (wrapped.offset(), wrapped.len());
+        assert_eq!(
+            offset,
+            at / size_of::<f32>(),
+            "where in its pages it starts"
+        );
+        assert_eq!(
+            wrapped_len,
+            2 * page() / size_of::<f32>(),
+            "the two pages a slice across a boundary falls in"
+        );
+
+        // Written *after* the wrap, through the mapping and not through Metal.
+        let written: Vec<f32> = (0..len).map(|i| i as f32 * 0.25 - 3.0).collect();
+        pages.write(at, &written);
+
+        let mut alpha = device.buffer(&[2.0f32]).unwrap();
+        let mut count = device.buffer(&[wrapped_len as u32]).unwrap();
+        let mut zeros = device.zeroed::<f32>(wrapped_len).unwrap();
+        let mut out = device.zeroed::<f32>(wrapped_len).unwrap();
+        let args = [
+            alpha.arg(),
+            count.arg(),
+            wrapped.arg(),
+            zeros.arg(),
+            out.arg(),
+        ];
+        device
+            .run(&kernel, &args, crate::kernel::Grid::new(wrapped_len, 64))
+            .expect("the dispatch completes");
+
+        let got = &out.as_slice()[offset..][..len];
+        assert_eq!(
+            got,
+            written.iter().map(|x| 2.0 * x).collect::<Vec<f32>>(),
+            "the kernel read a copy taken at wrap time"
+        );
+    }
+
+    /// The checkpoint's own misalignment, which is why a wrapped weight is read
+    /// a byte at a time. Its shard headers are not padded, so every tensor in it
+    /// starts one byte past a word — and a wrap that promised `u32` elements
+    /// over those bytes would hand the kernel a pointer it cannot dereference.
+    #[test]
+    fn a_wrap_whose_elements_do_not_line_up_is_refused() {
+        let Some(device) = device() else { return };
+        let pages = Pages::new(2);
+        let odd = pages.at(1, 64);
+
+        // SAFETY: a slice of the mapping above, as in the case before it.
+        let err = unsafe { device.wrap::<u32>(odd) }.expect_err("one byte past a word");
+        assert!(
+            matches!(err, MetalError::Misaligned { offset: 1, size: 4 }),
+            "{err}"
+        );
+        // SAFETY: as above.
+        assert!(
+            unsafe { device.wrap::<u8>(odd) }.is_ok(),
+            "bytes always line up"
+        );
+    }
 
     #[test]
     fn a_buffer_round_trips_its_values() {

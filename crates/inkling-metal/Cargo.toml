@@ -11,6 +11,7 @@ rust-version.workspace = true
 # would be the model reaching into a backend; this way the backend is one
 # implementation of operations the model names.
 inkling-core.workspace = true
+libc.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-metal.workspace = true

@@ -18,6 +18,9 @@ pub enum MetalError {
     #[error("the Metal device would not allocate a buffer of {bytes} bytes")]
     Allocation { bytes: usize },
 
+    #[error("bytes {offset} into their page are not aligned for an element of {size}")]
+    Misaligned { offset: usize, size: usize },
+
     #[error("kernel source does not compile:\n{0}")]
     Compile(String),
 

@@ -23,7 +23,7 @@ pub mod matmul;
 #[cfg(test)]
 mod testing;
 
-pub use buffer::{Arg, Buffer, Element};
+pub use buffer::{Arg, Buffer, Element, Mapped};
 pub use device::{Device, MetalError};
 pub use kernel::{Grid, Kernel};
 pub use matmul::{MatmulError, PackedMatmul, PackedProjection};
