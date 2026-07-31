@@ -36,7 +36,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-from inkling_ref import f32, gamma, projection, taps
+from inkling_ref import f32, layer_parameters
 from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
 from mlx_vlm.models.inkling.config import TextConfig
 from mlx_vlm.models.inkling.language import (
@@ -65,12 +65,9 @@ N_ROUTED = 16
 N_SHARED = 2
 TOP_K = 3
 
-# The checkpoint's own route_scale. The global scales are not the checkpoint's —
-# layer 2's 0.007 would put every recorded output two decades below its input —
-# but they are far enough from one that dropping either shows.
+# The checkpoint's own route_scale. The two global scales the layers are drawn
+# with are `inkling_ref`'s, shared with the stack fixture.
 ROUTE_SCALE = 8.0
-DENSE_GLOBAL_SCALE = 0.6
-MOE_GLOBAL_SCALE = 0.35
 
 PREFILL = 8
 CONTINUE = 3
@@ -110,83 +107,6 @@ def config():
         n_shared_experts=N_SHARED,
         route_scale=ROUTE_SCALE,
     )
-
-
-def attention_parameters(rng):
-    """Every tensor `InklingAttention` holds, drawn as the attention fixture
-    draws them.
-
-    `rel_proj` is contracted over `d_rel` rather than over its own width, so it
-    is scaled by that; `nn.Linear` leaves it zeroed, which would make the mask a
-    plain causal one."""
-    kv_width = KV_HEADS * HEAD_DIM
-    return {
-        "q_proj.weight": projection(rng, HEADS * HEAD_DIM, HIDDEN),
-        "k_proj.weight": projection(rng, kv_width, HIDDEN),
-        "v_proj.weight": projection(rng, kv_width, HIDDEN),
-        "r_proj.weight": projection(rng, HEADS * D_REL, HIDDEN),
-        "o_proj.weight": projection(rng, HIDDEN, HEADS * HEAD_DIM),
-        "q_norm.weight": gamma(rng, HEAD_DIM),
-        "k_norm.weight": gamma(rng, HEAD_DIM),
-        "k_sconv.conv.weight": taps(rng, kv_width, SCONV_KERNEL),
-        "v_sconv.conv.weight": taps(rng, kv_width, SCONV_KERNEL),
-        "rel_proj": f32(rng.standard_normal((D_REL, SLIDING_WINDOW)) / np.sqrt(D_REL)),
-    }
-
-
-def dense_parameters(rng):
-    """`InklingDenseMLP`: a SwiGLU MLP at `dense_intermediate_size`, times a
-    learned output scale."""
-    return {
-        "gate_proj.weight": projection(rng, DENSE_INTERMEDIATE, HIDDEN),
-        "up_proj.weight": projection(rng, DENSE_INTERMEDIATE, HIDDEN),
-        "down_proj.weight": projection(rng, HIDDEN, DENSE_INTERMEDIATE),
-        "global_scale": f32([DENSE_GLOBAL_SCALE]),
-    }
-
-
-def expert_bank(rng, count):
-    """The three `SwitchLinear` projections one `SwitchGLU` holds, `[experts,
-    out, in]`."""
-    return {
-        f"{name}.weight": mx.stack(
-            [projection(rng, out_dim, in_dim) for _ in range(count)]
-        )
-        for name, (out_dim, in_dim) in (
-            ("gate_proj", (MOE_INTERMEDIATE, HIDDEN)),
-            ("up_proj", (MOE_INTERMEDIATE, HIDDEN)),
-            ("down_proj", (HIDDEN, MOE_INTERMEDIATE)),
-        )
-    }
-
-
-def moe_parameters(rng):
-    """`InklingSparseMoE`: a `[n_routed + n_shared, hidden]` gate with the shared
-    experts last, a selection-only correction bias over the range the trained one
-    spans, and the two expert banks."""
-    return {
-        "gate_weight": projection(rng, N_ROUTED + N_SHARED, HIDDEN),
-        "e_score_correction_bias": f32(rng.uniform(0.05, 0.8, N_ROUTED)),
-        "global_scale": f32([MOE_GLOBAL_SCALE]),
-        **{f"switch_mlp.{name}": w for name, w in expert_bank(rng, N_ROUTED).items()},
-        **{
-            f"shared_experts.{name}": w
-            for name, w in expert_bank(rng, N_SHARED).items()
-        },
-    }
-
-
-def parameters(rng, layer_index):
-    """Every tensor `InklingDecoderLayer` holds, for one layer index."""
-    mlp = dense_parameters(rng) if layer_index < MOE_LAYER else moe_parameters(rng)
-    return {
-        **{f"self_attn.{name}": w for name, w in attention_parameters(rng).items()},
-        "input_layernorm.weight": gamma(rng, HIDDEN),
-        "post_attention_layernorm.weight": gamma(rng, HIDDEN),
-        "attn_sconv.conv.weight": taps(rng, HIDDEN, SCONV_KERNEL),
-        "mlp_sconv.conv.weight": taps(rng, HIDDEN, SCONV_KERNEL),
-        **{f"mlp.{name}": w for name, w in mlp.items()},
-    }
 
 
 def decoder_layer(layer_index, weights):
@@ -310,7 +230,7 @@ def collect():
 
     weights, layers, cases = {}, {}, {}
     for name, layer_index in CASES.items():
-        weights[name] = parameters(rng, layer_index)
+        weights[name] = layer_parameters(rng, config(), layer_index)
         layers[name], cases[name] = case(layer_index, weights[name], x, x_continue)
 
     tensors = {"x": x, "continue_x": x_continue}
