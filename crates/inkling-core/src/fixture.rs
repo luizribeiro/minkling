@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use crate::checkpoint::{Checkpoint, Dtype, TensorView};
+use crate::moe::ExpertBank;
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../reference/fixtures");
 
@@ -53,6 +54,46 @@ pub fn indices(view: &TensorView<'_>) -> Vec<usize> {
         .chunks_exact(size_of::<i32>())
         .map(|b| i32::from_le_bytes(b.try_into().expect("chunked into ints")) as usize)
         .collect()
+}
+
+/// One `SwitchGLU`'s three projections, owned so the borrowed [`ExpertBank`]
+/// can be handed out repeatedly.
+///
+/// Every bundle names them `{prefix}.{gate,up,down}_proj.weight`. A synthetic
+/// bank is held whole, which the checkpoint's 25 GB of routed experts cannot be
+/// — those are decoded per expert per call instead.
+pub struct Bank {
+    experts: usize,
+    dim: usize,
+    gate_proj: Vec<f32>,
+    up_proj: Vec<f32>,
+    down_proj: Vec<f32>,
+}
+
+impl Bank {
+    pub fn load(ckpt: &Checkpoint, prefix: &str, experts: usize, dim: usize) -> Self {
+        let of = |name: &str| f32s(&tensor(ckpt, &format!("{prefix}.{name}.weight")));
+        Self {
+            experts,
+            dim,
+            gate_proj: of("gate_proj"),
+            up_proj: of("up_proj"),
+            down_proj: of("down_proj"),
+        }
+    }
+
+    /// `[rows, dim]` through one of its experts.
+    pub fn expert(&self, index: usize, rows: &[f32]) -> Vec<f32> {
+        ExpertBank::new(
+            self.experts,
+            self.dim,
+            &self.gate_proj,
+            &self.up_proj,
+            &self.down_proj,
+        )
+        .expert(index)
+        .forward(rows)
+    }
 }
 
 /// The worst absolute disagreement with a reference tensor, as a fraction of

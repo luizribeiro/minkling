@@ -543,8 +543,7 @@ fn log_sigmoid(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::Checkpoint;
-    use crate::fixture::{self, ACTIVATIONS, deviation, indices};
+    use crate::fixture::{self, ACTIVATIONS, Bank, deviation, indices};
 
     /// Synthetic routers and the sequences mlx-vlm ran through them, beside the
     /// trained gate of the captured MoE layer, from `just dump-moe-fixture`.
@@ -606,42 +605,6 @@ mod tests {
         out: Vec<f32>,
     }
 
-    /// One `SwitchGLU`'s three projections, owned so the borrowed
-    /// [`ExpertBank`] can be handed out repeatedly.
-    struct Bank {
-        experts: usize,
-        gate_proj: Vec<f32>,
-        up_proj: Vec<f32>,
-        down_proj: Vec<f32>,
-    }
-
-    impl Bank {
-        fn load(ckpt: &Checkpoint, case: &str, module: &str, experts: usize) -> Self {
-            let of = |name: &str| {
-                fixture::f32s(&fixture::tensor(
-                    ckpt,
-                    &format!("{case}.{module}.{name}.weight"),
-                ))
-            };
-            Self {
-                experts,
-                gate_proj: of("gate_proj"),
-                up_proj: of("up_proj"),
-                down_proj: of("down_proj"),
-            }
-        }
-
-        fn view(&self, dim: usize) -> ExpertBank<'_> {
-            ExpertBank::new(
-                self.experts,
-                dim,
-                &self.gate_proj,
-                &self.up_proj,
-                &self.down_proj,
-            )
-        }
-    }
-
     impl Case {
         fn load(case: &str) -> Self {
             let ckpt = fixture::open(FIXTURE);
@@ -658,15 +621,19 @@ mod tests {
             };
 
             let gate_weight = of("gate_weight");
+            let hidden = gate_weight.len() / (config.n_routed + config.n_shared);
+            let bank = |module: &str, experts| {
+                Bank::load(&ckpt, &format!("{case}.{module}"), experts, hidden)
+            };
             Self {
                 name: case.to_string(),
-                hidden: gate_weight.len() / (config.n_routed + config.n_shared),
+                hidden,
                 config,
                 gate_weight,
                 correction_bias: of("e_score_correction_bias"),
                 global_scale: of("global_scale")[0],
-                routed: Bank::load(&ckpt, case, "switch_mlp", config.n_routed),
-                shared: Bank::load(&ckpt, case, "shared_experts", config.n_shared),
+                routed: bank("switch_mlp", config.n_routed),
+                shared: bank("shared_experts", config.n_shared),
                 x: fixture::f32s(&fixture::tensor(&ckpt, "x")),
                 logits: of("gate_logits"),
                 scores: of("gate_scores_biased"),
@@ -700,11 +667,10 @@ mod tests {
         }
 
         fn forward(&self) -> MoeOutput {
-            let (routed, shared) = (self.routed.view(self.hidden), self.shared.view(self.hidden));
             self.moe().forward(
                 &self.x,
-                |expert, rows| routed.expert(expert).forward(rows),
-                |expert, rows| shared.expert(expert).forward(rows),
+                |expert, rows| self.routed.expert(expert, rows),
+                |expert, rows| self.shared.expert(expert, rows),
             )
         }
 
@@ -938,7 +904,6 @@ mod tests {
     #[test]
     fn each_expert_is_asked_for_once_with_all_of_its_tokens() {
         let case = Case::load("main");
-        let bank = case.routed.view(case.hidden);
         let (mut asked, mut rows) = (Vec::new(), 0);
 
         let out = case.moe().forward(
@@ -946,9 +911,9 @@ mod tests {
             |expert, batch| {
                 asked.push(expert);
                 rows += batch.len() / case.hidden;
-                bank.expert(expert).forward(batch)
+                case.routed.expert(expert, batch)
             },
-            |expert, batch| case.shared.view(case.hidden).expert(expert).forward(batch),
+            |expert, batch| case.shared.expert(expert, batch),
         );
 
         let mut distinct = case.topk_idx.clone();
