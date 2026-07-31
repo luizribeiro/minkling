@@ -60,6 +60,9 @@ pub enum QuantError {
         weights: Vec<usize>,
         scales: Vec<usize>,
     },
+
+    #[error("{values} decoded values do not fill a buffer of {buffer}")]
+    WrongBufferLen { values: usize, buffer: usize },
 }
 
 /// A decoded tensor: the logical shape the packed one stood for, and its
@@ -68,6 +71,51 @@ pub enum QuantError {
 pub struct Dequantized {
     pub shape: Vec<usize>,
     pub values: Vec<f32>,
+}
+
+/// The buffer a forward pass decodes its weights into, handed out a run at a
+/// time and never grown.
+///
+/// One allocation serves the whole pass. That is not only about the peak: the
+/// alternative is a fresh `Vec` per projection, and at 67 MB each macOS serves
+/// those from `mmap` and returns them on drop, so a 42-layer pass would fault in
+/// and zero the same forty gigabytes of fresh pages over and over before
+/// decoding a single code into them.
+///
+/// The runs a caller takes are disjoint and live as long as the buffer, which is
+/// what lets one layer hold all five of its attention projections at once.
+#[derive(Debug)]
+pub struct Scratch<'a> {
+    free: &'a mut [f32],
+}
+
+impl<'a> Scratch<'a> {
+    pub fn new(buffer: &'a mut [f32]) -> Self {
+        Self { free: buffer }
+    }
+
+    /// The next `len` values, which the caller decodes into.
+    ///
+    /// Panics rather than growing: the buffer is sized from the config before
+    /// the pass starts, so a run that does not fit means the two disagree about
+    /// what the model is, and growing would quietly relocate the runs already
+    /// handed out.
+    pub fn take(&mut self, len: usize) -> &'a mut [f32] {
+        let free = std::mem::take(&mut self.free);
+        assert!(
+            len <= free.len(),
+            "a run of {len} against {} left in the scratch",
+            free.len()
+        );
+        let (run, rest) = free.split_at_mut(len);
+        self.free = rest;
+        run
+    }
+
+    /// How many values are left unclaimed.
+    pub fn remaining(&self) -> usize {
+        self.free.len()
+    }
 }
 
 /// Decode a `U32` weight tensor and its `U8` scales into f32.
@@ -90,6 +138,48 @@ pub fn dequantize(
 /// occupies bits `4i..4i+4`. That order was established by handing MLX words
 /// with a single nonzero nibble and seeing which output slot moved.
 pub fn dequantize_blocks(packed: &[u8], scales: &[u8]) -> Result<Vec<f32>, QuantError> {
+    let mut values = vec![0.0; decoded_len(packed, scales)?];
+    dequantize_blocks_into(packed, scales, &mut values)?;
+    Ok(values)
+}
+
+/// [`dequantize_blocks`], into a buffer the caller already holds.
+///
+/// This is the form the stack decodes through. A `[4096, 4096]` projection is
+/// 67 MB of float32 and a forward pass touches two hundred of them, so what a
+/// layer decodes into is a [`Scratch`] the pass allocated once, and what
+/// changes between layers is only which bytes were read into it.
+pub fn dequantize_blocks_into(
+    packed: &[u8],
+    scales: &[u8],
+    out: &mut [f32],
+) -> Result<(), QuantError> {
+    let values = decoded_len(packed, scales)?;
+    if out.len() != values {
+        return Err(QuantError::WrongBufferLen {
+            values,
+            buffer: out.len(),
+        });
+    }
+
+    let blocks = packed.chunks_exact(WORDS_PER_GROUP * WORD_BYTES);
+    for ((block, &byte), out) in blocks.zip(scales).zip(out.chunks_exact_mut(GROUP_SIZE)) {
+        let scale = block_scale(byte);
+        for (word, out) in block
+            .chunks_exact(WORD_BYTES)
+            .zip(out.chunks_exact_mut(CODES_PER_WORD))
+        {
+            let word = u32::from_le_bytes(word.try_into().expect("chunked into words"));
+            for (shift, out) in (0..u32::BITS).step_by(BITS).zip(out) {
+                *out = ELEMENTS[((word >> shift) & CODE_MASK) as usize] * scale;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How many values a run of packed codes decodes to, or why it cannot.
+fn decoded_len(packed: &[u8], scales: &[u8]) -> Result<usize, QuantError> {
     if packed.len() % WORD_BYTES != 0 {
         return Err(QuantError::PartialWord(packed.len()));
     }
@@ -104,19 +194,7 @@ pub fn dequantize_blocks(packed: &[u8], scales: &[u8]) -> Result<Vec<f32>, Quant
             scales: scales.len(),
         });
     }
-
-    let mut values = Vec::with_capacity(words * CODES_PER_WORD);
-    let blocks = packed.chunks_exact(WORDS_PER_GROUP * WORD_BYTES);
-    for (block, &byte) in blocks.zip(scales) {
-        let scale = block_scale(byte);
-        for word in block.chunks_exact(WORD_BYTES) {
-            let word = u32::from_le_bytes(word.try_into().expect("chunked into words"));
-            for shift in (0..u32::BITS).step_by(BITS) {
-                values.push(ELEMENTS[((word >> shift) & CODE_MASK) as usize] * scale);
-            }
-        }
-    }
-    Ok(values)
+    Ok(words * CODES_PER_WORD)
 }
 
 /// The multiplier a scale byte stands for.
@@ -297,6 +375,76 @@ mod tests {
                 "value {i}: {got:e} against {want:e}"
             );
         }
+    }
+
+    /// Decoding into a buffer is the form the stack uses for every weight it
+    /// touches, so it has to produce what allocating produces — over the same
+    /// trained and synthetic slices, and bit for bit, because the two share
+    /// their arithmetic and differ only in where they put it.
+    #[test]
+    fn decoding_into_a_buffer_matches_decoding_into_a_fresh_vector() {
+        let ckpt = fixture();
+        for slice in SLICES {
+            let (weights, scales) = (
+                ckpt.tensor(&format!("{slice}.weight")).expect("weight"),
+                ckpt.tensor(&format!("{slice}.scales")).expect("scales"),
+            );
+            let want = dequantize(&weights, &scales).expect("slice decodes").values;
+
+            let mut buffer = vec![f32::NAN; want.len()];
+            dequantize_blocks_into(weights.data(), scales.data(), &mut buffer)
+                .expect("slice decodes into a buffer");
+            assert_identical(slice, &buffer, &want);
+        }
+    }
+
+    /// The buffer is sized from the config rather than from the tensor, so a
+    /// buffer that does not fit is the two disagreeing about the model. Refused
+    /// rather than filled as far as it goes: a short buffer that decoded a
+    /// prefix would leave a projection silently truncated.
+    #[test]
+    fn a_buffer_of_the_wrong_length_is_refused() {
+        let (packed, scales) = ([0; WORDS_PER_GROUP * WORD_BYTES], [0x7f]);
+        for buffer in [GROUP_SIZE - 1, GROUP_SIZE + 1] {
+            let err = dequantize_blocks_into(&packed, &scales, &mut vec![0.0; buffer]).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    QuantError::WrongBufferLen {
+                        values: GROUP_SIZE,
+                        ..
+                    }
+                ),
+                "got {err:?}"
+            );
+        }
+    }
+
+    /// The runs a pass takes are disjoint and outlive the take, which is what
+    /// lets one layer hold all five of its attention projections at once.
+    #[test]
+    fn the_scratch_hands_out_disjoint_runs_that_outlive_the_take() {
+        let mut buffer = vec![0.0; 6];
+        let mut scratch = Scratch::new(&mut buffer);
+
+        let first = scratch.take(2);
+        let second = scratch.take(3);
+        assert_eq!(scratch.remaining(), 1);
+
+        first.fill(1.0);
+        second.fill(2.0);
+        assert_eq!(buffer, [1.0, 1.0, 2.0, 2.0, 2.0, 0.0]);
+    }
+
+    /// Growing would relocate the runs already handed out, so a run that does
+    /// not fit is a panic rather than a reallocation.
+    #[test]
+    #[should_panic(expected = "a run of 3 against 2 left in the scratch")]
+    fn a_run_past_the_end_of_the_scratch_panics() {
+        let mut buffer = vec![0.0; 4];
+        let mut scratch = Scratch::new(&mut buffer);
+        scratch.take(2);
+        scratch.take(3);
     }
 
     #[test]
