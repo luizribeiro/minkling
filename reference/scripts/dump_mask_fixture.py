@@ -26,14 +26,13 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-from inkling_ref import checkpoint_tensor, index_of
+from inkling_ref import CAPTURED_LAYERS, checkpoint_tensor, index_of
 from mlx_vlm.models.inkling.config import TextConfig
 from mlx_vlm.models.inkling.language import banded_additive_mask
 
-# The layers dump_activations.py captured, whose masks are the regression
-# anchor these synthetic cases surround, and the prompt length it captured them
-# over — the key span of the masks in layer_activations.safetensors.
-CAPTURED_LAYERS = (0, 2)
+# The prompt length the captured layers' masks were recorded over — the key
+# span of the masks in layer_activations.safetensors, which these synthetic
+# cases surround.
 ACTIVATION_SEQ_LEN = 8
 
 SEED = 20260801

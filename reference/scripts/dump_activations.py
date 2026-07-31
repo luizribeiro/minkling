@@ -20,12 +20,11 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
-from inkling_ref import load_model, tokenizer
+from inkling_ref import CAPTURED_LAYERS, load_model, tokenizer
 from mlx_vlm.models.inkling import language
 
 PROMPT = "The lighthouse keeper counted the ships that passed the headland."
 SEQ_LEN = 8
-CAPTURED_LAYERS = (0, 2)
 
 
 class Capture:

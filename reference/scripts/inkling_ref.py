@@ -10,6 +10,16 @@ import mlx.core as mx
 import numpy as np
 from mlx_vlm import load
 
+# The decoder layers `dump_activations.py` captures, and so the layers every
+# trained fixture is cut from. Three scripts have to agree on them — the
+# activations, the sconv kernels and the mask projections are all indexed by
+# layer, and a bundle that names a layer the others do not is a fixture the
+# Rust side cannot open.
+#
+# `check_layer_coverage` refuses a set that stops covering what the fixtures
+# exist to pin.
+CAPTURED_LAYERS = (0, 2)
+
 
 def gib(n_bytes):
     return n_bytes / (1 << 30)

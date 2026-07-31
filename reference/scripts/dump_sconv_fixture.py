@@ -28,14 +28,12 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-from inkling_ref import checkpoint_tensor, f32, index_of, taps
+from inkling_ref import CAPTURED_LAYERS, checkpoint_tensor, f32, index_of, taps
 from mlx_lm.models.cache import ArraysCache
 from mlx_vlm.models.inkling.language import InklingShortConvolution
 
-# The layers dump_activations.py captured, and the four conv slots each one
-# holds. The index is the module's `conv_idx`: its slot in the layer's shared
-# four-entry conv cache.
-CAPTURED_LAYERS = (0, 2)
+# The four conv slots each captured layer holds. The index is the module's
+# `conv_idx`: its slot in the layer's shared four-entry conv cache.
 CONVS = (
     ("k_sconv", "self_attn.k_sconv"),
     ("v_sconv", "self_attn.v_sconv"),
