@@ -116,6 +116,7 @@ impl TextConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::AttentionConfig;
 
     /// Trimmed from `thinkingmachines/Inkling-Small`, values verbatim.
     const INKLING_SMALL: &str = r#"{
@@ -157,6 +158,46 @@ mod tests {
         let t = cfg().text_config;
         assert_eq!(t.global_layers(), vec![5, 11, 17, 23, 29, 35, 41]);
         assert_eq!(t.num_sliding_layers(), 35);
+    }
+
+    /// Which of the two sets of head fields an attention layer reads.
+    /// Inkling-Small sets them to the same numbers, so the checkpoint cannot
+    /// tell a port that read the wrong set from one that read the right one;
+    /// this moves them apart first, the way mlx-vlm's own defaults do.
+    #[test]
+    fn a_sliding_layer_reads_the_swa_head_fields_and_a_global_one_the_plain_ones() {
+        let mut t = cfg().text_config;
+        assert_eq!(
+            [
+                t.swa_num_attention_heads,
+                t.swa_num_key_value_heads,
+                t.swa_head_dim
+            ],
+            [t.num_attention_heads, t.num_key_value_heads, t.head_dim],
+            "a checkpoint whose two sets differ would settle this on its own"
+        );
+        t.swa_num_attention_heads = 16;
+        t.swa_num_key_value_heads = 4;
+        t.swa_head_dim = 64;
+
+        let (local, global) = (0, 5);
+        assert!(t.layer_is_sliding(local) && !t.layer_is_sliding(global));
+
+        let sliding = AttentionConfig::for_layer(&t, local);
+        assert_eq!(
+            [sliding.heads, sliding.kv_heads, sliding.head_dim],
+            [16, 4, 64]
+        );
+        assert_eq!(sliding.sliding, t.sliding_window_size);
+        assert!(
+            sliding.log_scaling.is_none(),
+            "log scaling is a global layer's"
+        );
+
+        let full = AttentionConfig::for_layer(&t, global);
+        assert_eq!([full.heads, full.kv_heads, full.head_dim], [32, 8, 128]);
+        assert_eq!(full.sliding, 0, "a global layer has no window");
+        assert!(full.log_scaling.is_some());
     }
 
     #[test]

@@ -17,6 +17,7 @@
 //! Everything here takes one sequence at a time: batching is the scheduler's,
 //! and a batch of sequences is a loop over these.
 
+use crate::config::TextConfig;
 use crate::mask::{BandedMask, is_masked};
 use crate::ops::{linear, rms_norm};
 use crate::sconv::{ConvState, ShortConv};
@@ -168,6 +169,37 @@ pub struct AttentionConfig {
     pub sliding: usize,
     pub rms_norm_eps: f32,
     pub log_scaling: Option<LogScaling>,
+}
+
+impl AttentionConfig {
+    /// What `InklingAttention.__init__` reads for one layer.
+    ///
+    /// A sliding layer takes its head counts, its head width and its window
+    /// from the `swa_` fields and a global layer from the plain ones. The two
+    /// sets hold the same numbers in Inkling-Small, so nothing about that
+    /// checkpoint can tell a port that read the wrong one — but they are
+    /// separate fields for a reason, and mlx-vlm's own defaults give a sliding
+    /// layer twice a global layer's KV heads.
+    ///
+    /// Log scaling is a global layer's alone, whatever the checkpoint sets
+    /// `log_scaling_n_floor` to.
+    pub fn for_layer(config: &TextConfig, layer: usize) -> Self {
+        let sliding = config.layer_is_sliding(layer);
+        let either = |swa, global| if sliding { swa } else { global };
+
+        Self {
+            heads: either(config.swa_num_attention_heads, config.num_attention_heads),
+            kv_heads: either(config.swa_num_key_value_heads, config.num_key_value_heads),
+            head_dim: either(config.swa_head_dim, config.head_dim),
+            d_rel: config.d_rel,
+            sliding: either(config.sliding_window_size, 0),
+            rms_norm_eps: config.rms_norm_eps,
+            log_scaling: config
+                .log_scaling_n_floor
+                .filter(|_| !sliding)
+                .map(|floor| LogScaling::new(floor, config.log_scaling_alpha)),
+        }
+    }
 }
 
 /// One attention layer's tensors, as the checkpoint stores them: the five
