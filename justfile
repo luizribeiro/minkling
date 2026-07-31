@@ -25,6 +25,12 @@ smoke model="models/Inkling-Small-mxfp4":
 prefill-bench model="models/Inkling-Small-mxfp4" *args:
     reference/.venv/bin/python reference/scripts/prefill_bench.py {{ model }} {{ args }}
 
+# Per-depth MTP acceptance and the speculation depth that pays for itself.
+# Needs a checkpoint with the MTP tensors, so not the mxfp4 quant.
+mtp-acceptance model="models/Inkling-Small-8bit" *args:
+    reference/.venv/bin/python reference/scripts/mtp_acceptance.py {{ model }} \
+        --json reference/results/mtp_acceptance.json {{ args }}
+
 # Regenerate the committed reference activations the Rust layers are tested against
 dump-activations model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_activations.py {{ model }}
