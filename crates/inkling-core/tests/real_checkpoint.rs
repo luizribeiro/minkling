@@ -3,6 +3,7 @@
 //! unset, each test reports a skip and passes.
 
 use std::cell::{Cell, RefCell};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -18,7 +19,7 @@ use inkling_core::layer::{
 };
 use inkling_core::model::{ModelCache, ModelWeights};
 use inkling_core::moe::{GateWeights, MoeConfig, SparseMoe};
-use inkling_core::ops::{DenseMlp, top_k};
+use inkling_core::ops::{DenseMlp, DenseProjection, top_k};
 use inkling_core::quant::{Scratch, dequantize};
 use inkling_core::tokenizer::{Tokenizer, TokenizerError};
 use inkling_core::weights::{
@@ -1423,6 +1424,46 @@ fn the_heads_padding_rows_are_zero_and_would_outrank_most_of_the_vocabulary() {
         "no real logit beats zero, so the padding takes the argmax and the hermetic case is \
          reachable here too"
     );
+}
+
+/// The one place a backend is chosen, and the one thing it checks: a projection
+/// that is not the head's shape is refused when it is handed over, rather than
+/// discovered by [`LmHead::forward`] a prefill later.
+///
+/// Caught rather than asserted with `#[should_panic]`, because a gated case has
+/// to be able to report a skip and return — which a test that is required to
+/// panic cannot do.
+///
+/// Both mistakes are here because they are different mistakes: a projection to
+/// the padded width is the truncation left undone, and one from a different
+/// width is another tensor entirely.
+#[test]
+fn a_head_of_the_wrong_shape_is_refused_when_it_is_handed_over() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = text_config(&dir);
+    let hidden = config.hidden_size;
+
+    let refused = |rows: usize, in_dim: usize| {
+        let weight = vec![0.0f32; rows * in_dim];
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let weights =
+                CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+            weights.with_head(Box::new(DenseProjection::new(in_dim, &weight)));
+        }))
+        .expect_err("a head that is not the head's shape is refused");
+        *panicked
+            .downcast::<String>()
+            .expect("the refusal says which shape it wanted")
+    };
+
+    let vocab = LmHead::for_config(&config).vocab();
+    assert!(vocab < config.vocab_size, "this head is padded at all");
+
+    let padded = refused(config.vocab_size, hidden);
+    assert!(padded.contains(&format!("{vocab} logits")), "{padded}");
+    let narrow = refused(vocab, hidden / 2);
+    assert!(narrow.contains(&format!("from {hidden}")), "{narrow}");
 }
 
 /// One call of the engine, timed: `ids` through the model and the head, and the
