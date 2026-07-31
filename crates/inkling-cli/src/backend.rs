@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
-use inkling_metal::{Device, PackedMatmul, PackedProjection};
+use inkling_metal::{Device, ModelExperts, PackedMatmul, PackedProjection};
 
 use crate::LABEL;
 use crate::args::Backend;
@@ -87,10 +87,24 @@ pub fn weights<'a>(
     let head =
         PackedProjection::wrap_packed(&gpu.device, &gpu.matmul, &weights.head_packed(), rows)
             .context("giving lm_head to the Metal device")?;
+
+    let banks = weights.expert_banks();
+    let experts = ModelExperts::wrap(
+        &gpu.device,
+        &gpu.matmul,
+        &banks,
+        config.num_hidden_layers,
+        config.hidden_size,
+    )
+    .context("giving the expert banks to the Metal device")?;
     eprintln!(
-        "{:<LABEL$}metal, {rows} rows of lm_head wrapped in {:.2?}",
+        "{:<LABEL$}metal, {rows} rows of lm_head and {} MoE layers' banks wrapped in {:.2?}",
         "backend",
+        experts.layers(),
         started.elapsed()
     );
-    Ok(weights.with_head(Box::new(head)))
+
+    Ok(weights
+        .with_head(Box::new(head))
+        .with_experts(Box::new(experts)))
 }
