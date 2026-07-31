@@ -16,7 +16,8 @@
 //! So a second client waits rather than fails. `tiny_http` accepts and parses on
 //! a thread of its own and hands requests over one at a time, so a request that
 //! arrives mid-generation is queued and answered when the one before it is
-//! finished. At 9.2 s a token that is a long wait, and it is an honest one.
+//! finished. At 0.16 s a token that is a wait a client can sit through, and at
+//! the CPU path's 8.9 s it is a long one — honest either way.
 //!
 //! # Each request prefills its whole prompt
 //!
@@ -30,8 +31,9 @@
 //!
 //! A blocking accept loop is what a server holding one model and decoding one
 //! request at a time actually is, so an async runtime would buy an executor to
-//! hide a 9.2 s CPU-bound step behind, and hiding it is not possible. `tiny_http`
-//! is MIT/Apache-2.0 over four transitive crates — `ascii`, `chunked_transfer`,
+//! hide a step behind that the process has nothing else to do during, and
+//! hiding it is not possible. `tiny_http` is MIT/Apache-2.0 over four
+//! transitive crates — `ascii`, `chunked_transfer`,
 //! `httpdate`, `log` — against roughly a hundred for an `axum`/`hyper`/`tokio`
 //! stack, which matters in a tree where `tokenizers` has so far been the only
 //! heavy dependency.
@@ -614,9 +616,9 @@ mod tests {
         assert_eq!(dechunked(&format!("{}{LAST_CHUNK}", chunked(text))), text);
     }
 
-    /// A frame per token, flushed as it is decoded. At 9.2 s a step, a reply
-    /// buffered until the end is a client watching nothing for a minute — which
-    /// is the whole reason the streaming path is the primary one.
+    /// A frame per token, flushed as it is decoded. A reply buffered until the
+    /// end is a client watching nothing for as long as the whole budget takes —
+    /// which is the whole reason the streaming path is the primary one.
     #[test]
     fn every_frame_is_written_as_its_token_arrives() {
         let mut socket = Socket::default();
@@ -677,7 +679,7 @@ mod tests {
     /// The case `Stop::Sink` exists for. A client that hung up makes the next
     /// write fail, and the failure has to come back as a `Break` — which is what
     /// `Generator::stream` reads as a reason to stop rather than spend the rest
-    /// of the budget at 9.2 s a token on a reply nobody will read.
+    /// of the budget on a reply nobody will read.
     #[test]
     fn a_client_that_hung_up_ends_the_generation_at_the_next_token() {
         let mut socket = Socket {

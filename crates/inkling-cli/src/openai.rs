@@ -7,10 +7,10 @@
 //!
 //! # Streaming is the path, not a mode
 //!
-//! A decode step is 9.2 s. Twenty tokens is three minutes, so a client that
-//! cannot see the reply until it is finished is looking at a hung server for as
-//! long as the reply takes. Everything here is built around the token that just
-//! arrived; the collected form is the same tokens, added up.
+//! A decode step is 0.16 s on the device path and 8.9 s on the CPU's, so a
+//! client that cannot see the reply until it is finished is looking at a hung
+//! server for as long as the reply takes. Everything here is built around the
+//! token that just arrived; the collected form is the same tokens, added up.
 //!
 //! # The thinking channel goes in a field of its own
 //!
@@ -157,7 +157,7 @@ fn frame(payload: &serde_json::Value) -> String {
 /// text itself — is where the two forms drift apart, and the drift is invisible
 /// until a client compares them.
 ///
-/// The cost of doing both is a `String` per reply, against 9.2 s a token.
+/// The cost of doing both is a `String` per reply, against a decode step.
 #[derive(Debug)]
 pub struct Completion {
     id: String,
@@ -211,7 +211,7 @@ impl Completion {
     ///
     /// The token is counted whether or not it showed anything. What the budget
     /// spends is decode steps, and a step that produced no visible text cost the
-    /// same 9.2 s as one that did.
+    /// same as one that did.
     pub fn push(&mut self, channel: Channel, text: &str) -> Option<String> {
         self.completion_tokens += 1;
         self.delta(channel, text)

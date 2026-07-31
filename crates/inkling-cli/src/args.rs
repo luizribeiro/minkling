@@ -349,7 +349,7 @@ mod tests {
     }
 
     /// A budget nobody named still has to be one a caller can wait out. At
-    /// 9.2 s a token an unbounded default would be a hang.
+    /// 8.9 s a token on the CPU path an unbounded default would be a hang.
     #[test]
     fn a_generation_that_names_no_budget_gets_the_default() {
         assert_eq!(

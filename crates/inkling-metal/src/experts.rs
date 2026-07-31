@@ -34,8 +34,9 @@
 //! Two things would move it. The shared bank is two experts and gets three
 //! dispatches of its own, the same as the routed bank's six; and gate and up
 //! read different tensors but the same rows. Merging either pair is a dispatch
-//! count halved, and neither is worth doing before the 9 GB of layer
-//! projections that are now 78% of a step.
+//! count halved, and neither was worth doing before the 9 GB of layer
+//! projections that were 78% of a step — which `crate::projections` has since
+//! taken, leaving dispatching the term rather than the arithmetic.
 //!
 //! **The SwiGLU stays on the CPU.** Between `gate_proj` and `down_proj` sits
 //! `silu(gate) * up` over `[rows, 2048]`, which for a decode step is eight rows

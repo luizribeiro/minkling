@@ -56,7 +56,7 @@
 //!
 //! [`Generator::stream`] hands each id to a sink as it is decided rather than
 //! returning them all at the end, and that is a decision the price of a step
-//! forces: a decode step costs 9.2 s on the CPU path, so a caller that waits for
+//! forces: a decode step costs 8.9 s on the CPU path, so a caller that waits for
 //! the last one waits minutes for the first. Nothing here writes anything —
 //! whether a token becomes text, a line on a terminal or a chunk on a socket is
 //! the sink's, and [`crate::detokenize`] is what makes a token's worth of text
@@ -64,9 +64,8 @@
 //!
 //! Three things end a generation, and [`Stop`] says which: the end-of-sequence
 //! id, the budget, or the sink declining the next one. The last exists because a
-//! sink can fail — a closed pipe, a client that hung up — and at 9.2 s a step,
-//! discovering that only after the budget runs out is minutes of arithmetic
-//! nobody will read.
+//! sink can fail — a closed pipe, a client that hung up — and discovering that
+//! only after the budget runs out is a budget of arithmetic nobody will read.
 
 use std::ops::ControlFlow;
 
@@ -183,7 +182,8 @@ impl<'a> Generator<'a> {
     ///
     /// The prompt is prefilled by the first step rather than by a step of its
     /// own, so that step's cost is a prefill's and every later one's is a
-    /// decode's. Against this checkpoint those are 54.7 s and 9.2 s — the two
+    /// decode's. Against this checkpoint those are 1.13 s and 0.16 s on the
+    /// device path and 24.3 s and 8.9 s on the CPU's — the two
     /// regimes are worth telling apart in anything that reports timings, and a
     /// mean over the steps of one call describes neither.
     ///
@@ -549,10 +549,10 @@ mod tests {
         assert_eq!(streamed, generated);
     }
 
-    /// A sink that stops taking tokens stops the model too. At 9.2 s a decode
-    /// step, a closed pipe discovered only when the budget runs out is minutes
-    /// of arithmetic nobody will read — so what says this works is the count of
-    /// tokens the sink was offered, not the ones it kept.
+    /// A sink that stops taking tokens stops the model too. A closed pipe
+    /// discovered only when the budget runs out is a budget of arithmetic nobody
+    /// will read — so what says this works is the count of tokens the sink was
+    /// offered, not the ones it kept.
     #[test]
     fn a_sink_that_declines_a_token_ends_the_generation() {
         let stack = Stack::load();
