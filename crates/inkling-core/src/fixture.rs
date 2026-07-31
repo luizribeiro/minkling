@@ -1,7 +1,9 @@
-//! Test-only access to the committed reference fixtures.
+//! Test-only access to the committed reference fixtures, behind the
+//! `test-support` feature: the paths here are relative to this crate's source
+//! tree, so nothing outside a test can use them.
 //!
-//! Each is a safetensors bundle under `reference/fixtures`, written by a
-//! `just dump-*` recipe and read back through [`Checkpoint`]'s single-file
+//! Each fixture is a safetensors bundle under `reference/fixtures`, written by
+//! a `just dump-*` recipe and read back through [`Checkpoint`]'s single-file
 //! layout.
 
 use std::path::PathBuf;

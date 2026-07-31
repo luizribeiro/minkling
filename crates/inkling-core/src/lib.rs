@@ -6,8 +6,8 @@ pub mod ops;
 pub mod quant;
 pub mod sconv;
 
-#[cfg(test)]
-mod fixture;
+#[cfg(feature = "test-support")]
+pub mod fixture;
 
 pub use attention::{
     Attention, AttentionCache, AttentionConfig, AttentionWeights, LogScaling, Sdpa, merge_heads,

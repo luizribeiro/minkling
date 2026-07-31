@@ -62,6 +62,7 @@ name = "inkling-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "inkling-core",
  "memmap2",
  "safetensors",
  "serde",

@@ -13,5 +13,14 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[features]
+# Reading the committed reference fixtures. The unit tests reach `fixture`
+# through `crate::`, but the checkpoint-gated tests in `tests/` link the crate
+# from outside and cannot see a `cfg(test)` module. Depending on ourselves turns
+# the feature on for every test target and leaves it off everywhere else, which
+# keeps a module that hardcodes a source-tree path out of the shipped binary.
+test-support = []
+
 [dev-dependencies]
+inkling-core = { path = ".", features = [ "test-support" ] }
 tempfile.workspace = true
