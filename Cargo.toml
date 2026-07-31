@@ -20,6 +20,13 @@ serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 
+# The CPU ops are scalar loops, and a test that drives the whole 42-layer stack
+# runs tens of gigabytes through them. Unoptimised that is half an hour; this
+# makes it minutes. `test` inherits from `dev`, and so does a dependency built
+# for a test binary, so this is the setting both need.
+[profile.dev]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
