@@ -32,6 +32,15 @@ pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
 /// normalises to zero rather than to something obviously wrong. MLX accumulates
 /// in f32 and does flush such a row.
 ///
+/// Apple GPUs have no double at all, so a Metal RMSNorm cannot buy that range
+/// the way this does. It has to buy it the way [`softmax`] below already does —
+/// divide each row by its largest magnitude before squaring, and put the factor
+/// back after the reciprocal square root — which holds the same range entirely
+/// in f32. Until that kernel exists, `a_row_that_squares_past_f32_still_normalises`
+/// below is what a naive port fails: that failure is the intended signal, and the
+/// answer is to scale the kernel's row, never to lower this accumulator to
+/// match it.
+///
 /// `eps` sits under the square root, which is what keeps an all-zero row from
 /// dividing by zero: it scales by `1/sqrt(eps)` and stays zero.
 fn inverse_rms(row: &[f32], eps: f32) -> f32 {
