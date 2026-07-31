@@ -29,6 +29,14 @@ prefill-bench model="models/Inkling-Small-mxfp4" *args:
 dump-activations model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_activations.py {{ model }}
 
+# Recapture one sliding and one global layer over a sequence long enough to reach
+# past the 1024-token relative-position band. Gitignored rather than committed —
+# the masks alone are 210 MB a layer — and the tests that read it skip when it is
+# absent, so regenerate it before running them.
+dump-long-activations model="models/Inkling-Small-mxfp4" tokens="1280":
+    reference/.venv/bin/python reference/scripts/dump_activations.py {{ model }} \
+        --seq-len {{ tokens }} --layers 0 5 --name long_activations
+
 # Regenerate the committed MXFP4 slices the Rust dequantiser is tested against
 dump-quant-fixture model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_quant_fixture.py {{ model }}

@@ -1,6 +1,5 @@
-"""Dump the intermediate activations of a fixed 8-token forward pass through one
-dense layer and one MoE layer, as float32, for the Rust engine to compare
-against.
+"""Dump the intermediate activations of a fixed forward pass through a few
+decoder layers, as float32, for the Rust engine to compare against.
 
 Reading generated text cannot tell a correct port from one that uses
 1/sqrt(head_dim) as the attention scale, runs the short convolutions in bf16,
@@ -8,8 +7,18 @@ folds the router's correction bias into the expert weights, or transposes the
 relative-position bias. Each of those produces fluent output and wrong numbers.
 Recorded tensors are the only cheap way to catch them.
 
-Eight tokens keeps the bundle small enough to commit, so `cargo test` compares
-against it without the 131 GB checkpoint anywhere in sight.
+Two captures come out of this, and the length is what separates them.
+
+Eight tokens keeps a bundle small enough to commit, so `cargo test` compares
+against it without the 131 GB checkpoint anywhere in sight. What it cannot
+reach is anything that needs distance: at eight tokens no key is old enough to
+be capped by a sliding layer's 512-token window or to fall outside a global
+layer's 1024-token band.
+
+Past the band the mask alone is `[1, 32, L, L]` — 210 MB a layer at 1280 tokens
+— so that capture is generated on demand by `just dump-long-activations` and
+gitignored rather than committed. It is reproducible from this file: the prompt
+is one sentence repeated.
 
 Everything is captured by wrapping the reference's own modules and functions,
 never by recomputing: a recomputation that drifts from the reference would make
@@ -180,11 +189,23 @@ def check_layer_coverage(config, layer_indices):
             raise SystemExit(f"layers {list(layer_indices)} do not cover both {both}")
 
 
-def token_ids(processor):
-    ids = tokenizer(processor).encode(PROMPT)[:SEQ_LEN]
-    if len(ids) < SEQ_LEN:
-        raise SystemExit(f"prompt tokenises to {len(ids)} ids, need {SEQ_LEN}")
-    return ids
+def token_ids(processor, seq_len):
+    """`seq_len` ids, and how many times the prompt had to be repeated to reach
+    them.
+
+    What the tokens say decides nothing — every layer computes the same
+    arithmetic over whatever it is handed — so a capture long enough to reach
+    past the relative-position band repeats one sentence rather than carrying a
+    thousand tokens of prose. Nothing outside this file is needed to reproduce
+    the input, and a capture short enough for one copy tokenises exactly as it
+    did before there was a second."""
+    tokenize = tokenizer(processor).encode
+    text, repeats = PROMPT, 1
+    ids = tokenize(text)
+    while len(ids) < seq_len:
+        text, repeats = f"{text} {PROMPT}", repeats + 1
+        ids = tokenize(text)
+    return ids[:seq_len], repeats
 
 
 def as_fixture_dtype(value):
@@ -198,11 +219,12 @@ def dtype_name(value):
     return str(value.dtype).rsplit(".", 1)[-1]
 
 
-def build_manifest(model, model_path, input_ids, layer_indices, tensors):
+def build_manifest(model, model_path, input_ids, repeats, layer_indices, tensors):
     index = json.loads((Path(model_path) / "model.safetensors.index.json").read_text())
     config = model.config.text_config
     return {
         "prompt": PROMPT,
+        "prompt_repeats": repeats,
         "input_ids": input_ids,
         "checkpoint": {
             "path": str(model_path),
@@ -226,15 +248,18 @@ def build_manifest(model, model_path, input_ids, layer_indices, tensors):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model", help="path to a local checkpoint directory")
+    ap.add_argument("--seq-len", type=int, default=SEQ_LEN)
+    ap.add_argument("--layers", type=int, nargs="+", default=CAPTURED_LAYERS)
+    ap.add_argument("--name", default="layer_activations")
     ap.add_argument("--out-dir", default="reference/fixtures")
     args = ap.parse_args()
 
     model, processor = load_model(args.model)
-    check_layer_coverage(model.config.text_config, CAPTURED_LAYERS)
-    ids = token_ids(processor)
+    check_layer_coverage(model.config.text_config, args.layers)
+    ids, repeats = token_ids(processor, args.seq_len)
     inputs = mx.array(ids, dtype=mx.int32)[None, :]
 
-    capture = Capture(CAPTURED_LAYERS)
+    capture = Capture(args.layers)
     instrument(capture, model)
     capture.record("input_ids", inputs)
     model.language_model(
@@ -248,16 +273,17 @@ def main():
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    mx.save_safetensors(str(out_dir / "layer_activations.safetensors"), tensors)
-    manifest = build_manifest(model, args.model, ids, CAPTURED_LAYERS, tensors)
-    with open(out_dir / "manifest.json", "w") as f:
+    bundle = out_dir / f"{args.name}.safetensors"
+    mx.save_safetensors(str(bundle), tensors)
+    manifest = build_manifest(model, args.model, ids, repeats, args.layers, tensors)
+    with open(out_dir / f"{args.name}.json", "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
 
     for entry in manifest["tensors"]:
         print(f"{entry['name']:<34}  {entry['dtype']:<8}  {entry['shape']}")
-    size = (out_dir / "layer_activations.safetensors").stat().st_size
-    print(f"\n{len(tensors)} tensors, {size / (1 << 20):.2f} MiB -> {out_dir}")
+    size = bundle.stat().st_size
+    print(f"\n{len(tensors)} tensors, {size / (1 << 20):.2f} MiB -> {bundle}")
 
 
 if __name__ == "__main__":

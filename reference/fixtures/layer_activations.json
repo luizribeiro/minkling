@@ -1,5 +1,6 @@
 {
   "prompt": "The lighthouse keeper counted the ships that passed the headland.",
+  "prompt_repeats": 1,
   "input_ids": [
     976,
     180069,
