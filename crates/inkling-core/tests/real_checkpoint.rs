@@ -4,7 +4,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 use inkling_core::attention::{Attention, AttentionConfig, AttentionWeights};
@@ -25,7 +24,7 @@ use inkling_core::tokenizer::{Tokenizer, TokenizerError};
 use inkling_core::weights::{
     CheckpointWeights, Packed, PackedExperts, expert_scratch_floats, layer_scratch_floats,
 };
-use inkling_core::{Checkpoint, Config, Dtype, TensorView, TextConfig};
+use inkling_core::{Checkpoint, Dtype, TensorView, TextConfig};
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
 
@@ -41,19 +40,6 @@ fn checkpoint_dir() -> Option<PathBuf> {
 fn checkpoint_tensor<'a>(ckpt: &'a Checkpoint, name: &str) -> TensorView<'a> {
     ckpt.tensor(name)
         .unwrap_or_else(|err| panic!("checkpoint holds {name}: {err}"))
-}
-
-fn resident_bytes() -> u64 {
-    let pid = std::process::id().to_string();
-    let out = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid])
-        .output()
-        .expect("ps runs");
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u64>()
-        .expect("ps reports rss in KiB")
-        * 1024
 }
 
 #[test]
@@ -90,11 +76,11 @@ fn routed_expert_weights_are_packed_eight_nibbles_per_u32() {
 fn opening_does_not_fault_in_the_weights() {
     let Some(dir) = checkpoint_dir() else { return };
 
-    let before = resident_bytes();
+    let before = fixture::resident_bytes();
     let started = Instant::now();
     let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
     let elapsed = started.elapsed();
-    let after = resident_bytes();
+    let after = fixture::resident_bytes();
     assert_eq!(ckpt.num_shards(), 30);
 
     let grew = after.saturating_sub(before);
@@ -133,14 +119,8 @@ fn opening_does_not_fault_in_the_weights() {
 /// that.
 const ATTENTION_TOLERANCE: f32 = 6e-3;
 
-fn config(dir: &Path) -> Config {
-    let path = dir.join("config.json");
-    let text = std::fs::read_to_string(&path).expect("checkpoint carries a config.json");
-    serde_json::from_str::<Config>(&text).expect("config.json parses")
-}
-
 fn text_config(dir: &Path) -> TextConfig {
-    config(dir).text_config
+    fixture::config(dir).text_config
 }
 
 /// One layer's attention tensors, decoded out of the checkpoint.
@@ -878,7 +858,7 @@ impl<'a> Watched<'a> {
                     )
                 })
                 .collect(),
-            peak: Cell::new(resident_bytes()),
+            peak: Cell::new(fixture::resident_bytes()),
             drift: RefCell::new(Vec::new()),
         }
     }
@@ -897,7 +877,8 @@ impl ModelWeights for Watched<'_> {
 
     fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: &[f32]) -> Vec<f32> {
         let out = self.inner.run_layer(index, cache, x);
-        self.peak.set(self.peak.get().max(resident_bytes()));
+        self.peak
+            .set(self.peak.get().max(fixture::resident_bytes()));
         if let Some((_, want)) = self.recorded.iter().find(|(layer, _)| *layer == index) {
             self.drift.borrow_mut().push((index, deviation(&out, want)));
         }
@@ -998,7 +979,7 @@ fn the_whole_stack_holds_its_resident_set_under_a_bound() {
     let activations = fixture::open(ACTIVATIONS);
     let (ids, _, _) = recorded_stack(&activations);
 
-    let before = resident_bytes();
+    let before = fixture::resident_bytes();
     let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
     let watched = Watched::new(&weights, &activations);
     weights
@@ -1716,7 +1697,7 @@ fn the_argmax_survives_the_whole_model_against_real_weights() {
 
 /// The checkpoint's own tokenizer, and the eos the config names for it.
 fn tokenizer(dir: &Path) -> Tokenizer {
-    Tokenizer::open(dir, &config(dir)).expect("the checkpoint's tokenizer opens")
+    Tokenizer::open(dir, &fixture::config(dir)).expect("the checkpoint's tokenizer opens")
 }
 
 /// The same `tokenizer.json` through the loader's own decode, which is what

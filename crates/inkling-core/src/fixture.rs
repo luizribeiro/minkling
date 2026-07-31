@@ -5,9 +5,14 @@
 //! Each fixture is a safetensors bundle under `reference/fixtures`, written by
 //! a `just dump-*` recipe and read back through [`Checkpoint`]'s single-file
 //! layout.
+//!
+//! Two things here are not fixtures at all — [`config`] and [`resident_bytes`] —
+//! and they are here for the same reason the fixtures are: three test binaries
+//! in three crates need them, and a test binary cannot see another's helpers.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::Deserialize;
 
@@ -64,6 +69,39 @@ pub const VOCAB_PADDING_ROWS: usize = 32;
 /// set that does not cover both a dense and a MoE MLP, and both a sliding and a
 /// global attention.
 pub const CAPTURED_LAYERS: [usize; 3] = [0, 2, 5];
+
+/// The `config.json` of a checkpoint directory, which is what every test gated
+/// on `INKLINGRS_CHECKPOINT` starts from.
+///
+/// The checkpoint itself is 130.6 GiB and named by an environment variable, so
+/// it is nothing like a fixture — but reading its config is the same three lines
+/// in `inkling-core`, `inkling-cli` and `inkling-metal`, and the third copy
+/// would mean a `serde_json` dependency for a crate that reads no json.
+pub fn config(dir: &Path) -> Config {
+    let path = dir.join("config.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("{} reads: {err}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|err| panic!("{} parses: {err}", path.display()))
+}
+
+/// What this process holds resident, in bytes.
+///
+/// A bound on what a forward pass may hold is made of this reading, and the
+/// reading has to come from outside the process: the packed weights are mapped,
+/// so what a pass costs is how many of those pages it touched, and nothing this
+/// side of `ps` knows that.
+pub fn resident_bytes() -> u64 {
+    let pid = std::process::id().to_string();
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .expect("ps reports rss in KiB")
+        * 1024
+}
 
 pub fn open(file: &str) -> Checkpoint {
     let path = PathBuf::from(DIR).join(file);

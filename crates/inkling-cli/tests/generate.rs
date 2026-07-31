@@ -12,11 +12,11 @@
 //! directory; unset, it reports a skip and passes, the way
 //! `inkling-core`'s own checkpoint tests do.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
+use inkling_core::Tokenizer;
 use inkling_core::fixture::{self, ACTIVATIONS, indices};
-use inkling_core::{Config, Tokenizer};
 use tempfile::TempDir;
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -27,12 +27,6 @@ fn checkpoint_dir() -> Option<PathBuf> {
         eprintln!("skipping: {CHECKPOINT_VAR} is unset");
     }
     dir
-}
-
-fn config(dir: &Path) -> Config {
-    let text =
-        std::fs::read_to_string(dir.join("config.json")).expect("the checkpoint carries a config");
-    serde_json::from_str(&text).expect("config.json parses")
 }
 
 fn inklingrs(args: &[&str]) -> Output {
@@ -86,7 +80,8 @@ const GENERATED: usize = 3;
 #[test]
 fn either_backend_writes_the_oracles_continuation_of_the_recorded_prompt() {
     let Some(dir) = checkpoint_dir() else { return };
-    let tokenizer = Tokenizer::open(&dir, &config(&dir)).expect("the checkpoint's tokenizer opens");
+    let tokenizer =
+        Tokenizer::open(&dir, &fixture::config(&dir)).expect("the checkpoint's tokenizer opens");
     let activations = fixture::open(ACTIVATIONS);
 
     let ids = recorded(&activations, "input_ids");

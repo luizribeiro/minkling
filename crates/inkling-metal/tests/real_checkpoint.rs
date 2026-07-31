@@ -15,15 +15,14 @@
 //! a case that has to live here, beside the kernel it is measuring.
 
 use std::ops::ControlFlow;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use inkling_core::fixture::{self, ACTIVATIONS, deviation, indices};
 use inkling_core::ops::linear;
 use inkling_core::quant::{BITS, dequantize_blocks_into};
 use inkling_core::{
-    Checkpoint, CheckpointWeights, Config, Dtype, Ending, Generator, ModelCache, TensorView,
+    Checkpoint, CheckpointWeights, Dtype, Ending, Generator, ModelCache, TensorView,
 };
 use inkling_metal::{Device, MetalError, PackedMatmul, PackedProjection};
 
@@ -68,27 +67,6 @@ const CODES_PER_WORD: usize = u32::BITS as usize / BITS;
 /// invert while still producing weights of the right magnitude — 3.2, seven
 /// decades above.
 const TOLERANCE: f32 = 1e-6;
-
-/// The checkpoint's own config, which is what says how wide the head is and
-/// where the vocabulary stops.
-fn config(dir: &Path) -> Config {
-    let text =
-        std::fs::read_to_string(dir.join("config.json")).expect("the checkpoint carries a config");
-    serde_json::from_str(&text).expect("config.json parses")
-}
-
-fn resident_bytes() -> u64 {
-    let pid = std::process::id().to_string();
-    let out = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid])
-        .output()
-        .expect("ps runs");
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u64>()
-        .expect("ps reports rss in KiB")
-        * 1024
-}
 
 fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var_os(CHECKPOINT_VAR).map(PathBuf::from);
@@ -454,7 +432,7 @@ fn the_generated_tokens_match_the_oracle_with_the_head_on_the_device() {
     let Some(device) = device() else { return };
     let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
 
-    let config = config(&dir).text_config;
+    let config = fixture::config(&dir).text_config;
     let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
     let activations = fixture::open(ACTIVATIONS);
     let ids = indices(&fixture::tensor(&activations, "input_ids"));
@@ -480,7 +458,7 @@ fn the_generated_tokens_match_the_oracle_with_the_head_on_the_device() {
     let mut steps: Vec<Duration> = Vec::new();
     let mut got = Vec::new();
     let mut step = Instant::now();
-    let mut peak = resident_bytes();
+    let mut peak = fixture::resident_bytes();
     generator.stream(
         &mut ModelCache::new(&config),
         &ids,
@@ -491,7 +469,7 @@ fn the_generated_tokens_match_the_oracle_with_the_head_on_the_device() {
         &weights,
         |id| {
             steps.push(step.elapsed());
-            peak = peak.max(resident_bytes());
+            peak = peak.max(fixture::resident_bytes());
             got.push(id);
             step = Instant::now();
             ControlFlow::Continue(())
