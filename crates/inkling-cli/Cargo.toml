@@ -17,8 +17,17 @@ thiserror.workspace = true
 inkling-core.workspace = true
 inkling-metal.workspace = true
 
+[features]
+# Reading a response the way a client does, for the tests at either end of the
+# server: the ones inside the modules and the checkpoint-gated one in `tests/`,
+# which links this crate from outside. Depending on ourselves turns it on for
+# every test target and leaves it off in the shipped binary, the same way
+# `inkling-core` does it for the reference fixtures.
+test-support = []
+
 [dev-dependencies]
 # `test-support` for the committed activation dump, which is where the recorded
 # prompt and the oracle's continuation live.
 inkling-core = { workspace = true, features = [ "test-support" ] }
+inkling-cli = { path = ".", features = [ "test-support" ] }
 tempfile.workspace = true

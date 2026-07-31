@@ -16,3 +16,10 @@ pub mod chat;
 pub mod config;
 pub mod generate;
 pub mod inspect;
+pub mod openai;
+
+/// Reading a response the way a client does. Behind a feature so that the
+/// checkpoint-gated test in `tests/` — which links this crate from outside and
+/// cannot see a `cfg(test)` module — and the unit tests here share one copy.
+#[cfg(feature = "test-support")]
+pub mod wire;
