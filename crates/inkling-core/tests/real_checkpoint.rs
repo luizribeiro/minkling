@@ -130,12 +130,14 @@ fn opening_does_not_fault_in_the_weights() {
 /// that.
 const ATTENTION_TOLERANCE: f32 = 6e-3;
 
-fn text_config(dir: &Path) -> TextConfig {
+fn config(dir: &Path) -> Config {
     let path = dir.join("config.json");
     let text = std::fs::read_to_string(&path).expect("checkpoint carries a config.json");
-    serde_json::from_str::<Config>(&text)
-        .expect("config.json parses")
-        .text_config
+    serde_json::from_str::<Config>(&text).expect("config.json parses")
+}
+
+fn text_config(dir: &Path) -> TextConfig {
+    config(dir).text_config
 }
 
 /// One layer's attention tensors, decoded out of the checkpoint.
