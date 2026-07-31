@@ -31,6 +31,10 @@ mtp-acceptance model="models/Inkling-Small-8bit" *args:
     reference/.venv/bin/python reference/scripts/mtp_acceptance.py {{ model }} \
         --json reference/results/mtp_acceptance.json {{ args }}
 
+# Check that the checkpoint's tiktoken export and tokenizer.json agree, id for id
+compare-tokenizers model="models/Inkling-Small-mxfp4":
+    reference/.venv/bin/python reference/scripts/compare_tokenizers.py {{ model }}
+
 # Regenerate the committed reference activations the Rust layers are tested against
 dump-activations model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_activations.py {{ model }}

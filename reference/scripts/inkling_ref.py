@@ -184,6 +184,34 @@ def tokenizer(processor):
     return getattr(processor, "tokenizer", processor)
 
 
+def byte_level_chars():
+    """The GPT-2 byte-level alphabet, byte to character: the printable Latin-1
+    bytes stand for themselves and the other 68 are lifted to U+0100 and up, in
+    byte order. Inkling's vocabulary is spelled in it, so a piece is not text —
+    it is these characters standing for the bytes the piece contributes."""
+    printable = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    table = {b: chr(b) for b in printable}
+    lifted = (b for b in range(256) if b not in table)
+    for offset, b in enumerate(lifted):
+        table[b] = chr(256 + offset)
+    return table
+
+
+BYTE_CHARS = byte_level_chars()
+CHAR_BYTES = {c: b for b, c in BYTE_CHARS.items()}
+
+
+def piece_bytes(piece):
+    """One vocabulary entry as the bytes it stands for. An added token is
+    literal text rather than byte-level, but every character it is spelled with
+    is its own byte-level spelling, so one mapping serves both."""
+    return bytes(CHAR_BYTES[c] for c in piece)
+
+
 def _resolve_eos_token(model, processor):
     # The checkpoint lists every special token under additional_special_tokens
     # and names no eos, so mlx-vlm's `pad_token = eos_token` fallback assigns
