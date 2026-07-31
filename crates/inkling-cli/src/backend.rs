@@ -8,20 +8,18 @@
 //! "the CPU path still works" a claim a caller can check by rerunning the same
 //! command with one word changed.
 //!
-//! # The weight is uploaded once and lives as long as the process
+//! # The weight is not moved at all
 //!
-//! `lm_head` is 411 MB of codes under 26 MB of scales, and the upload of it
-//! takes 49 ms against the 1.4 ms a dispatch against it takes. A projection that
-//! uploaded per call would therefore spend thirty times the multiply it enables,
-//! so it is uploaded once, at load time, into shared storage the CPU and the GPU
-//! both address — and owned by the [`CheckpointWeights`] the command holds until
-//! it exits.
+//! `lm_head` is 411 MB of codes under 26 MB of scales, and copying that onto the
+//! device took 49 ms against the 1.4 ms a dispatch against it takes — so it was
+//! copied once, at load time, rather than per call. Wrapped where the checkpoint
+//! mapped it, the same 0.41 GiB is handed over in 52 microseconds and costs no
+//! resident set of its own, which is what makes "once at load time" stop being a
+//! decision worth defending.
 //!
-//! What that costs is measured rather than assumed: over the same four-token
-//! generation the resident set peaks at 20.79 GiB with the head on the device
-//! against 20.36 GiB without it. The 0.44 GiB is the buffers; the pages they
-//! were copied from stay mapped, and no weight is decoded to make them, so the
-//! model does not become two models.
+//! What is still owned by the [`CheckpointWeights`] the command holds until it
+//! exits is the *binding*: a `MTLBuffer` over pages the mapping owns, which
+//! borrows the checkpoint and cannot outlive it.
 
 use std::time::Instant;
 
@@ -67,9 +65,9 @@ pub fn open(backend: Backend) -> Result<Option<Gpu>> {
 
 /// The checkpoint's weights, with the head wherever the backend put it.
 ///
-/// The head is cut to the vocabulary on the way up, so the 966 padding rows the
-/// checkpoint carries are not uploaded — the truncation
-/// [`inkling_core::head`] describes, honoured by not moving the bytes.
+/// The head is cut to the vocabulary on the way over, so the 966 padding rows
+/// the checkpoint carries are never indexed — the truncation
+/// [`inkling_core::head`] describes, honoured by not reaching the bytes.
 pub fn weights<'a>(
     gpu: Option<&'a Gpu>,
     ckpt: &'a Checkpoint,
@@ -87,10 +85,10 @@ pub fn weights<'a>(
     let rows = weights.head().vocab();
     let started = Instant::now();
     let head =
-        PackedProjection::upload_packed(&gpu.device, &gpu.matmul, &weights.head_packed(), rows)
-            .context("uploading lm_head to the Metal device")?;
+        PackedProjection::wrap_packed(&gpu.device, &gpu.matmul, &weights.head_packed(), rows)
+            .context("giving lm_head to the Metal device")?;
     eprintln!(
-        "{:<LABEL$}metal, {rows} rows of lm_head uploaded in {:.2?}",
+        "{:<LABEL$}metal, {rows} rows of lm_head wrapped in {:.2?}",
         "backend",
         started.elapsed()
     );

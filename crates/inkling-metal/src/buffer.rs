@@ -264,6 +264,36 @@ impl<T: Element> Buffer<T> {
     }
 }
 
+/// Bytes a kernel reads, however they got where they are: a copy the device
+/// made, or the checkpoint's own pages wrapped where they lie.
+///
+/// One type rather than two paths through every caller, because the difference
+/// between them is exactly one number — where in the binding the tensor starts,
+/// which a copy puts at zero and a wrap puts wherever the page boundary fell.
+/// A kernel is handed that number either way and cannot tell which it got.
+#[derive(Debug)]
+pub enum Bytes<'a> {
+    Copied(Buffer<u8>),
+    Mapped(Mapped<'a, u8>),
+}
+
+impl Bytes<'_> {
+    /// Where the tensor starts, in bytes from the binding's own start.
+    pub fn offset(&self) -> usize {
+        match self {
+            Self::Copied(_) => 0,
+            Self::Mapped(mapped) => mapped.offset(),
+        }
+    }
+
+    pub fn arg(&mut self) -> Arg<'_> {
+        match self {
+            Self::Copied(buffer) => buffer.arg(),
+            Self::Mapped(mapped) => mapped.arg(),
+        }
+    }
+}
+
 /// A buffer bound to a kernel argument slot, from [`Buffer::arg`].
 #[derive(Debug)]
 pub struct Arg<'a>(&'a ProtocolObject<dyn MTLBuffer>);

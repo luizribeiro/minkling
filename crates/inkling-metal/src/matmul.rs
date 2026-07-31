@@ -9,13 +9,24 @@
 //! that dequantised into a buffer and multiplied that would be the CPU path with
 //! a GPU under it, and would have given away the whole point before it started:
 //! every token touches all of every projection, so a decode step moves 41 GB of
-//! float32 where the packed bytes are 5 GB. Here a thread loads one packed word,
-//! turns its eight nibbles into eight floats it holds in registers, multiplies
-//! them against eight inputs, and never writes a decoded weight anywhere.
+//! float32 where the packed bytes are 5 GB. Here a thread loads one packed byte,
+//! turns its two nibbles into two floats it holds in registers, multiplies them
+//! against two inputs, and never writes a decoded weight anywhere.
 //!
-//! **One simdgroup per output element.** Lane `l` walks its weight row from word
+//! **A byte at a time, because the checkpoint is not word-aligned.** MXFP4 packs
+//! eight codes into a little-endian `u32`, which is two codes to a byte with the
+//! low nibble first — so a byte is a whole number of codes and reading the
+//! weight bytewise needs nothing of the format that reading it wordwise does.
+//! What it buys is that the bytes can be the checkpoint's own: this quant's
+//! shard headers are not padded, so every tensor in it begins one byte past a
+//! word and a `device const uint *` cannot be pointed at one. Bound as bytes it
+//! can, and [`Device::wrap`](crate::Device::wrap) then gives the GPU `lm_head`
+//! where the checkpoint mapped it rather than 0.41 GiB of copy. It costs 2% of
+//! the dispatch, measured on that same head.
+//!
+//! **One simdgroup per output element.** Lane `l` walks its weight row from byte
 //! `l` in strides of the simdgroup width and the group sums what the lanes held,
-//! so the 32 lanes of one reduction read 32 consecutive words — which is what
+//! so the 32 lanes of one reduction read 32 consecutive bytes — which is what
 //! makes a matmul this memory-bound run at the bandwidth rather than at a
 //! thirty-second of it. The cost is that a call with several rows of `x` reads
 //! the weight once per row; decode is one row, and a prefill shape that wants
@@ -35,7 +46,7 @@ use inkling_core::ops::Projection;
 use inkling_core::quant::{BITS, ELEMENTS, GROUP_SIZE};
 use inkling_core::weights::Packed;
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, Bytes};
 use crate::device::{Device, MetalError};
 use crate::kernel::{Grid, Kernel};
 
@@ -49,12 +60,12 @@ const ENTRY: &str = "packed_matmul";
 /// gives for the lane.
 const THREADS_PER_GROUP: usize = 256;
 
-/// Codes packed into one `u32`, which is where the `[out, in/8]` shape of a
-/// packed weight comes from.
-const CODES_PER_WORD: usize = u32::BITS as usize / BITS;
+/// Codes packed into one byte, which is what makes a byte a whole number of
+/// codes and so what lets the weight be read without regard to word alignment.
+pub(crate) const CODES_PER_BYTE: usize = u8::BITS as usize / BITS;
 
-/// Packed words one scale byte covers.
-const WORDS_PER_GROUP: usize = GROUP_SIZE / CODES_PER_WORD;
+/// Packed bytes one scale byte covers.
+const BYTES_PER_GROUP: usize = GROUP_SIZE / CODES_PER_BYTE;
 
 /// Where an f32's exponent field starts, above its 23 stored mantissa bits.
 const EXPONENT_SHIFT: u32 = f32::MANTISSA_DIGITS - 1;
@@ -108,53 +119,93 @@ impl PackedMatmul {
     }
 }
 
-/// One projection's weights, resident on the device exactly as the checkpoint
-/// stores them.
+/// One projection's weights, on the device exactly as the checkpoint stores
+/// them.
 ///
-/// Uploaded once and multiplied against many times, which is the shape the model
-/// wants: `lm_head` is 411 MB of codes, and a decode step that re-uploaded them
-/// would be moving more bytes than the multiply reads.
+/// Made resident once and multiplied against many times, which is the shape the
+/// model wants: `lm_head` is 411 MB of codes, and a decode step that re-uploaded
+/// them would be moving more bytes than the multiply reads. Wrapped it is not
+/// moving them at all.
 #[derive(Debug)]
 pub struct PackedProjection<'a> {
     device: &'a Device,
     matmul: &'a PackedMatmul,
     in_dim: usize,
     out_dim: usize,
-    resident: RefCell<Resident>,
+    resident: RefCell<Resident<'a>>,
 }
 
 /// What a projection holds on the device between calls: the two tensors the
 /// checkpoint pairs, and the shape the kernel reads its bounds out of.
 #[derive(Debug)]
-struct Resident {
+struct Resident<'a> {
     shape: Buffer<u32>,
-    codes: Buffer<u8>,
-    scales: Buffer<u8>,
+    codes: Bytes<'a>,
+    scales: Bytes<'a>,
 }
 
-/// The three scalars in the order the kernel's `Shape` struct declares them.
+/// The scalars in the order the kernel's `Shape` struct declares them.
 ///
 /// The kernel reads them as `uint`, so this is where a shape too large to
 /// describe has to stop. Unreachable through any real weight — four billion rows
 /// of anything is decades past the 348 GiB one allocation can hold — and a
 /// truncation would not fail: it would dispatch a grid for the wrong shape over
 /// buffers of the right one.
-fn shape(rows: usize, in_dim: usize, out_dim: usize) -> [u32; 3] {
-    [rows, in_dim, out_dim].map(|extent| {
+fn shape(rows: usize, in_dim: usize, out_dim: usize, resident: &Resident<'_>) -> [u32; 5] {
+    [
+        rows,
+        in_dim,
+        out_dim,
+        resident.codes.offset(),
+        resident.scales.offset(),
+    ]
+    .map(|extent| {
         u32::try_from(extent).unwrap_or_else(|_| panic!("{extent} is wider than a kernel's uint"))
     })
 }
 
+/// Whether `codes` and `scales` are an `[out_dim, in_dim]` MXFP4 weight, which
+/// has to be settled on the way in: the kernel takes its bounds from the shape
+/// it was told and would read off the end of whichever tensor was short.
+pub(crate) fn pairs(
+    in_dim: usize,
+    out_dim: usize,
+    codes: usize,
+    scales: usize,
+) -> Result<(), MatmulError> {
+    if in_dim == 0 || in_dim % GROUP_SIZE != 0 {
+        return Err(MatmulError::PartialGroup(in_dim));
+    }
+
+    let expected = out_dim * in_dim / CODES_PER_BYTE;
+    if codes != expected {
+        return Err(MatmulError::WrongCodeLen {
+            rows: out_dim,
+            in_dim,
+            expected,
+            got: codes,
+        });
+    }
+    let expected = out_dim * in_dim / GROUP_SIZE;
+    if scales != expected {
+        return Err(MatmulError::WrongScaleLen {
+            rows: out_dim,
+            in_dim,
+            expected,
+            got: scales,
+        });
+    }
+    Ok(())
+}
+
 impl<'a> PackedProjection<'a> {
-    /// Upload an `[out_dim, in_dim]` MXFP4 weight, as the two tensors the
-    /// checkpoint pairs: `codes` is the bytes of the `U32` weight and `scales`
-    /// the bytes of the `U8` one, both taken as they are mapped.
+    /// Copy an `[out_dim, in_dim]` MXFP4 weight onto the device, as the two
+    /// tensors the checkpoint pairs: `codes` is the bytes of the `U32` weight
+    /// and `scales` the bytes of the `U8` one.
     ///
-    /// The codes arrive as bytes and are bound to a `device const uint *`. That
-    /// is a reinterpretation safetensors already made — the packed words are
-    /// little-endian in the file and this machine is little-endian, so the bytes
-    /// *are* the words — and taking `&[u32]` instead would mean transcoding
-    /// `lm_head`'s 411 MB on the way in without changing a bit of it.
+    /// For weights that are not a mapping's — a test's synthetic bytes, and
+    /// anything a future path builds rather than reads.
+    /// [`PackedProjection::wrap_packed`] is what a checkpoint's own tensor takes.
     pub fn upload(
         device: &'a Device,
         matmul: &'a PackedMatmul,
@@ -163,59 +214,70 @@ impl<'a> PackedProjection<'a> {
         codes: &[u8],
         scales: &[u8],
     ) -> Result<Self, MatmulError> {
-        if in_dim == 0 || in_dim % GROUP_SIZE != 0 {
-            return Err(MatmulError::PartialGroup(in_dim));
-        }
+        pairs(in_dim, out_dim, codes.len(), scales.len())?;
+        Self::over(
+            device,
+            matmul,
+            in_dim,
+            out_dim,
+            Bytes::Copied(device.buffer(codes)?),
+            Bytes::Copied(device.buffer(scales)?),
+        )
+    }
 
-        let expected = out_dim * in_dim * BITS / u8::BITS as usize;
-        if codes.len() != expected {
-            return Err(MatmulError::WrongCodeLen {
-                rows: out_dim,
-                in_dim,
-                expected,
-                got: codes.len(),
-            });
-        }
-        let expected = out_dim * in_dim / GROUP_SIZE;
-        if scales.len() != expected {
-            return Err(MatmulError::WrongScaleLen {
-                rows: out_dim,
-                in_dim,
-                expected,
-                got: scales.len(),
-            });
-        }
+    /// A checkpoint's own tensor, cut to its first `out_dim` slices and read
+    /// where it is mapped.
+    ///
+    /// The cut is what the head's truncation is: `lm_head` is `[201024, 4096]`
+    /// and 200058 of those rows are vocabulary, so a projection built to the
+    /// vocabulary stops dispatching where the padding starts. Wrapped, the 966
+    /// padding rows are not even a range that was declined — they are pages
+    /// nothing indexes.
+    pub fn wrap_packed(
+        device: &'a Device,
+        matmul: &'a PackedMatmul,
+        packed: &Packed<'a>,
+        out_dim: usize,
+    ) -> Result<Self, MatmulError> {
+        let (codes, scales) = packed.prefix(out_dim);
+        let in_dim = packed.slice_len();
+        pairs(in_dim, out_dim, codes.len(), scales.len())?;
+        // SAFETY: the bytes are a `Checkpoint`'s mapping, which outlives this by
+        // the lifetime they carry and which nothing writes — the assumption that
+        // module already maps under.
+        let (codes, scales) = unsafe { (device.wrap(codes)?, device.wrap(scales)?) };
+        Self::over(
+            device,
+            matmul,
+            in_dim,
+            out_dim,
+            Bytes::Mapped(codes),
+            Bytes::Mapped(scales),
+        )
+    }
 
+    fn over(
+        device: &'a Device,
+        matmul: &'a PackedMatmul,
+        in_dim: usize,
+        out_dim: usize,
+        codes: Bytes<'a>,
+        scales: Bytes<'a>,
+    ) -> Result<Self, MatmulError> {
+        let mut resident = Resident {
+            shape: device.zeroed(SHAPE_FIELDS)?,
+            codes,
+            scales,
+        };
+        let shape = shape(0, in_dim, out_dim, &resident);
+        resident.shape.as_mut_slice().copy_from_slice(&shape);
         Ok(Self {
-            resident: RefCell::new(Resident {
-                shape: device.buffer(&shape(0, in_dim, out_dim))?,
-                codes: device.buffer(codes)?,
-                scales: device.buffer(scales)?,
-            }),
+            resident: RefCell::new(resident),
             device,
             matmul,
             in_dim,
             out_dim,
         })
-    }
-
-    /// [`PackedProjection::upload`] over a checkpoint's own tensor, cut to its
-    /// first `out_dim` slices.
-    ///
-    /// The cut is what the head's truncation is: `lm_head` is `[201024, 4096]`
-    /// and 200058 of those rows are vocabulary, so a projection built to the
-    /// vocabulary leaves 966 rows of padding in the mapping rather than putting
-    /// 2 MB of guaranteed zeros on the device and dispatching over them. A bank
-    /// of experts is the other caller this shape has — one slice of a leading
-    /// axis, offset rather than cut — and it is not this method.
-    pub fn upload_packed(
-        device: &'a Device,
-        matmul: &'a PackedMatmul,
-        packed: &Packed<'_>,
-        out_dim: usize,
-    ) -> Result<Self, MatmulError> {
-        let (codes, scales) = packed.prefix(out_dim);
-        Self::upload(device, matmul, packed.slice_len(), out_dim, codes, scales)
     }
 
     /// `[rows, in_dim]` in, `[rows, out_dim]` out.
@@ -239,10 +301,8 @@ impl<'a> PackedProjection<'a> {
 
         let mut resident = self.resident.borrow_mut();
         let resident = &mut *resident;
-        resident
-            .shape
-            .as_mut_slice()
-            .copy_from_slice(&shape(rows, self.in_dim, self.out_dim));
+        let shape = shape(rows, self.in_dim, self.out_dim, resident);
+        resident.shape.as_mut_slice().copy_from_slice(&shape);
 
         let mut x = self.device.buffer(x)?;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
@@ -294,7 +354,7 @@ impl Projection for PackedProjection<'_> {
 /// eight magnitudes — and each is a fact read off MLX rather than off the OCP
 /// specification. A second copy of that table living in a source string is a
 /// copy that can drift from the checkpoint it decodes.
-fn source() -> String {
+pub(crate) fn source() -> String {
     let elements: Vec<String> = ELEMENTS.iter().map(|value| format!("{value:?}f")).collect();
     format!(
         "\
@@ -303,8 +363,8 @@ using namespace metal;
 
 constant uint BITS = {BITS};
 constant uint CODE_MASK = {};
-constant uint CODES_PER_WORD = {CODES_PER_WORD};
-constant uint WORDS_PER_GROUP = {WORDS_PER_GROUP};
+constant uint CODES_PER_BYTE = {CODES_PER_BYTE};
+constant uint BYTES_PER_GROUP = {BYTES_PER_GROUP};
 constant uint EXPONENT_SHIFT = {EXPONENT_SHIFT};
 constant float ELEMENTS[] = {{ {} }};
 {BODY}",
@@ -313,18 +373,54 @@ constant float ELEMENTS[] = {{ {} }};
     )
 }
 
+/// How many `uint`s the kernel's `Shape` struct declares.
+const SHAPE_FIELDS: usize = 5;
+
 /// Everything of the kernel that the format does not decide.
-const BODY: &str = r#"
+///
+/// `weight_dot` is the decode, kept a function of its own because it is the one
+/// reading of the format on this side of the engine and a second copy of it
+/// would be a second reading that could drift.
+pub(crate) const BODY: &str = r#"
+/// One output element: lane `l` walks the weight row from byte `l` in strides
+/// of the simdgroup width, and the caller reduces what the lanes held.
+///
+/// A byte is two codes, low nibble first, and its group's scale is a power of
+/// two — so every product here is exact and only the order they are summed in
+/// separates this from any other way of adding them up.
+inline float weight_dot(
+    device const uchar *packed,
+    device const uchar *scale,
+    device const float *values,
+    uint bytes,
+    uint lane,
+    uint width
+) {
+    float sum = 0.0f;
+    for (uint b = lane; b < bytes; b += width) {
+        const uint code = packed[b];
+        const uint low = code & CODE_MASK;
+        const uint high = (code >> BITS) & CODE_MASK;
+        device const float *v = values + b * CODES_PER_BYTE;
+
+        float dot = ELEMENTS[low] * v[0] + ELEMENTS[high] * v[1];
+        sum += dot * as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
+    }
+    return sum;
+}
+
 struct Shape {
     uint rows;
     uint in_dim;
     uint out_dim;
+    uint code_base;
+    uint scale_base;
 };
 
 kernel void packed_matmul(
     constant Shape &shape [[buffer(0)]],
     device const float *x [[buffer(1)]],
-    device const uint *codes [[buffer(2)]],
+    device const uchar *codes [[buffer(2)]],
     device const uchar *scales [[buffer(3)]],
     device float *out [[buffer(4)]],
     uint position [[thread_position_in_grid]],
@@ -338,27 +434,16 @@ kernel void packed_matmul(
 
     const uint row = element / shape.out_dim;
     const uint col = element % shape.out_dim;
-    const uint words = shape.in_dim / CODES_PER_WORD;
+    const uint bytes = shape.in_dim / CODES_PER_BYTE;
 
-    device const uint *packed = codes + (ulong)col * words;
-    device const uchar *scale = scales + (ulong)col * (words / WORDS_PER_GROUP);
-    device const float *values = x + (ulong)row * shape.in_dim;
-
-    // The whole of the decode. A word's eight codes become eight floats that
-    // live in registers for the eight multiplies below and are never stored.
-    // The group scale is applied once to their sum rather than eight times to
-    // its terms, which is the same value and one multiply instead of eight.
-    float sum = 0.0f;
-    for (uint word = lane; word < words; word += width) {
-        const uint code = packed[word];
-        device const float *v = values + word * CODES_PER_WORD;
-
-        float dot = 0.0f;
-        for (uint i = 0; i < CODES_PER_WORD; ++i) {
-            dot += ELEMENTS[(code >> (BITS * i)) & CODE_MASK] * v[i];
-        }
-        sum += dot * as_type<float>(uint(scale[word / WORDS_PER_GROUP]) << EXPONENT_SHIFT);
-    }
+    float sum = weight_dot(
+        codes + shape.code_base + (ulong)col * bytes,
+        scales + shape.scale_base + (ulong)col * (bytes / BYTES_PER_GROUP),
+        x + (ulong)row * shape.in_dim,
+        bytes,
+        lane,
+        width
+    );
 
     sum = simd_sum(sum);
     if (lane == 0) {
@@ -416,6 +501,9 @@ mod tests {
     /// computed independently of what it checks.
     const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
+    /// Codes to a little-endian word, which is the shape [`pack`] writes.
+    const CODES_PER_WORD: usize = u32::BITS as usize / BITS;
+
     /// What a code under a scale byte stands for, from the format rather than
     /// from a decoder: bit 3 carries the sign, the three below it index the
     /// magnitudes, and the byte is an exponent biased by 127.
@@ -427,6 +515,11 @@ mod tests {
 
     /// Codes packed the way the checkpoint packs them: eight to a little-endian
     /// word, code `i` of a word in bits `4i..4i+4`.
+    ///
+    /// Written as words where the kernel reads bytes, on purpose. That the two
+    /// framings describe the same bytes is the claim the byte-addressed decode
+    /// rests on, and a test that packed bytewise would assume it rather than
+    /// check it.
     fn pack(codes: &[u8]) -> Vec<u8> {
         codes
             .chunks_exact(CODES_PER_WORD)
@@ -679,14 +772,16 @@ mod tests {
     ///
     /// Stated as a kernel rather than as a mutated input, because that is where
     /// the mistake would live: the same source, the same dispatch, the same
-    /// bytes, and the eight codes of each word read from the top down instead of
-    /// from the bottom up.
+    /// bytes, and each byte's two codes taken high nibble first.
     #[test]
-    fn reading_each_words_nibbles_from_the_top_down_is_a_different_answer() {
+    fn reading_each_bytes_nibbles_the_other_way_round_is_a_different_answer() {
         let Some(device) = device() else { return };
         let case = Case::noisy(IN_DIM, OUT_DIM, 1);
 
-        let reversed = source().replace("(code >> (BITS * i))", "(code >> (32u - BITS * (i + 1)))");
+        let reversed = source().replace(
+            "ELEMENTS[low] * v[0] + ELEMENTS[high] * v[1]",
+            "ELEMENTS[high] * v[0] + ELEMENTS[low] * v[1]",
+        );
         assert_ne!(reversed, source(), "the mutation changed nothing");
         let mutant = PackedMatmul::from_source(&device, &reversed).expect("the mutant compiles");
 
@@ -783,39 +878,50 @@ mod tests {
         }
     }
 
-    /// A checkpoint's packed tensor onto the device, cut where the vocabulary
-    /// ends — and answering what the CPU makes of the same rows.
+    /// A checkpoint's packed tensor read where it is mapped, cut where the
+    /// vocabulary ends — and answering what the CPU makes of the same rows.
     ///
     /// [`PackedRows`] is the oracle rather than a decoded tensor here on
     /// purpose: it is the projection the engine runs today, so what this states
     /// is that exchanging one for the other is a change of backend and not a
     /// change of answer.
     ///
+    /// It is also where the misalignment is met on real bytes. This tensor sits
+    /// one byte past a word in its file, like every other tensor in the quant,
+    /// so a kernel that wanted words could not be pointed at it at all — and the
+    /// deviation below is what says reading it a byte at a time decodes the same
+    /// weight.
+    ///
     /// The rows past the cut are the assertion's other half. They decode to
     /// exactly 0.0 — [`inkling_core::head`] is where that matters — so a
-    /// dispatch that quietly uploaded the whole tensor would still agree on the
-    /// 32 rows it was asked about, and only the length says otherwise.
+    /// dispatch that quietly ran the whole tensor would still agree on the 32
+    /// rows it was asked about, and only the length says otherwise.
     #[test]
-    fn a_checkpoints_packed_tensor_uploads_the_rows_it_was_cut_to() {
+    fn a_checkpoints_packed_tensor_runs_the_rows_it_was_cut_to() {
         let Some(device) = device() else { return };
         let matmul = matmul(&device);
         let ckpt = fixture::open(fixture::MXFP4);
         let packed =
             Packed::open(&ckpt, fixture::VOCAB_PADDING).expect("the fixture holds the slice");
+        assert_ne!(
+            packed.prefix(1).0.as_ptr() as usize % size_of::<u32>(),
+            0,
+            "a word-aligned fixture would not exercise the reading this needs"
+        );
 
         let mut noise = Noise(0x0f1e_2d3c);
         let x: Vec<f32> = (0..2 * packed.slice_len())
             .map(|_| noise.signed())
             .collect();
         let got =
-            PackedProjection::upload_packed(&device, &matmul, &packed, fixture::VOCAB_PADDING_ROWS)
-                .expect("the cut tensor uploads")
+            PackedProjection::wrap_packed(&device, &matmul, &packed, fixture::VOCAB_PADDING_ROWS)
+                .expect("the cut tensor wraps")
                 .multiply(&x)
                 .expect("the dispatch completes");
         assert_eq!(
             got.len(),
             2 * fixture::VOCAB_PADDING_ROWS,
-            "the padding rows were uploaded"
+            "the padding rows were dispatched over"
         );
 
         let want = PackedRows::new(packed, fixture::VOCAB_PADDING_ROWS).forward(&x);

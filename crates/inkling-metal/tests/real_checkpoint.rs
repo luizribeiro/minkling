@@ -440,10 +440,10 @@ fn the_generated_tokens_match_the_oracle_with_the_head_on_the_device() {
     let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
     let vocab = weights.head().vocab();
     let started = Instant::now();
-    let head = PackedProjection::upload_packed(&device, &matmul, &weights.head_packed(), vocab)
-        .expect("the head uploads");
+    let head = PackedProjection::wrap_packed(&device, &matmul, &weights.head_packed(), vocab)
+        .expect("the head wraps");
     eprintln!(
-        "{vocab} rows of the head uploaded in {:?}",
+        "{vocab} rows of the head wrapped in {:?}",
         started.elapsed()
     );
 
