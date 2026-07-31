@@ -4,8 +4,10 @@
 //! This is where [`crate::model`]'s residency decision is actually made. Nothing
 //! here holds a decoded weight between calls. A layer's projections are decoded
 //! into a [`Scratch`] the whole pass shares, the layer is built around those
-//! runs, run, and dropped; the next layer overwrites them. The routed experts go
-//! further and are not decoded at all unless a token chose them.
+//! runs, run, and dropped; the next layer overwrites them — or they are not
+//! decoded at all, which is what handing them to a backend does and what
+//! [`CheckpointWeights::with_projections`] is. The routed experts go further
+//! still and are not decoded even here unless a token chose them.
 //!
 //! What that bounds is stated up front rather than observed: the scratch is
 //! sized by [`CheckpointWeights::scratch_floats`] before the pass starts, from
@@ -42,7 +44,7 @@
 use std::cell::RefCell;
 
 use crate::attention::{
-    AttentionConfig, AttentionProjections, AttentionWeights, DecodedProjections,
+    AttentionConfig, AttentionProjections, AttentionWeights, DecodedProjections, Projections,
 };
 use crate::checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 use crate::config::TextConfig;
@@ -51,7 +53,7 @@ use crate::head::LmHead;
 use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use crate::model::{Model, ModelWeights};
 use crate::moe::{ExpertBank, GateWeights, Gathered, MoeConfig, SparseMoe};
-use crate::ops::{DenseMlp, Projection, linear};
+use crate::ops::{DenseMlp, MlpProjections, Projection, linear};
 use crate::quant::{BITS, QuantError, Scratch, dequantize_blocks_into};
 
 /// Where the language model's tensors live in a multimodal checkpoint.
@@ -261,6 +263,29 @@ impl Projection for PackedRows<'_> {
     }
 }
 
+/// One attention layer's five projections, still packed, for a backend that
+/// takes the weight rather than the values.
+#[derive(Debug, Clone, Copy)]
+pub struct PackedAttention<'a> {
+    pub q_proj: Packed<'a>,
+    pub k_proj: Packed<'a>,
+    pub v_proj: Packed<'a>,
+    pub r_proj: Packed<'a>,
+    pub o_proj: Packed<'a>,
+}
+
+/// One dense layer's feed-forward network, still packed.
+///
+/// The three tensors a [`PackedExperts`] holds, under a module that has no
+/// experts: what a bank's leading axis indexes is which expert, and what these
+/// index is which row of one projection.
+#[derive(Debug, Clone, Copy)]
+pub struct PackedMlp<'a> {
+    pub gate_proj: Packed<'a>,
+    pub up_proj: Packed<'a>,
+    pub down_proj: Packed<'a>,
+}
+
 /// One `SwitchGLU`'s three packed banks, which are a MoE layer's routed 256 or
 /// its shared 2.
 #[derive(Debug, Clone, Copy)]
@@ -345,6 +370,7 @@ pub struct CheckpointWeights<'a> {
     lm_head: Packed<'a>,
     head: Box<dyn Projection + 'a>,
     experts: Option<Box<dyn ExpertBackend + 'a>>,
+    projections: Option<Box<dyn ProjectionBackend + 'a>>,
     embed_norm: Option<Vec<f32>>,
     norm: Vec<f32>,
     layer_scratch: RefCell<Vec<f32>>,
@@ -372,6 +398,42 @@ pub struct LayerBanks<'a> {
     pub routed: PackedExperts<'a>,
     /// The two every token reads.
     pub shared: PackedExperts<'a>,
+}
+
+/// One layer's own projections, still packed, from
+/// [`CheckpointWeights::layer_projections`].
+#[derive(Debug, Clone, Copy)]
+pub struct LayerPacked<'a> {
+    pub layer: usize,
+    pub attention: PackedAttention<'a>,
+    /// The feed-forward network of a dense layer, and `None` where the layer
+    /// routes to experts instead — which is [`LayerBanks`]'s question.
+    pub dense_mlp: Option<PackedMlp<'a>>,
+}
+
+/// Where a layer's own projections multiply, when it is not here.
+///
+/// Per layer for the reason [`ExpertBackend`] is asked per layer: a backend
+/// that could not stand one layer's projections up should be able to say so
+/// about that layer rather than about the model, and the two answers are
+/// separate because only two layers of forty-two have a dense feed-forward
+/// network at all.
+///
+/// Unlike the experts, every layer's attention projections are read by every
+/// token — there is nothing here a decode step might skip — so what a backend
+/// saves is the decoding rather than the reading.
+pub trait ProjectionBackend {
+    /// Layer `layer`'s five attention projections, or `None` for a layer this
+    /// does not answer for — which leaves them to be decoded here.
+    fn attention(&self, layer: usize) -> Option<&dyn Projections>;
+
+    /// Layer `layer`'s dense feed-forward network, or `None` for a layer this
+    /// does not answer for — which leaves it to be decoded here.
+    ///
+    /// Never asked of a layer that routes to experts instead: those have no
+    /// feed-forward network at all, and what runs there is [`ExpertBackend`]'s
+    /// question.
+    fn dense_mlp(&self, layer: usize) -> Option<&dyn MlpProjections>;
 }
 
 impl<'a> CheckpointWeights<'a> {
@@ -405,6 +467,7 @@ impl<'a> CheckpointWeights<'a> {
             expert_scratch: RefCell::new(vec![0.0; expert_scratch_floats(config)]),
             head: Box::new(PackedRows::new(lm_head, LmHead::for_config(config).vocab())),
             experts: None,
+            projections: None,
             embed_tokens,
             lm_head,
             embed_norm,
@@ -453,6 +516,52 @@ impl<'a> CheckpointWeights<'a> {
                 }
             })
             .collect()
+    }
+
+    /// Every layer's own projections, still packed, for a backend that takes the
+    /// weight rather than the values.
+    ///
+    /// Every layer has five attention projections and the first two have a dense
+    /// feed-forward network besides, which is `dense_mlp` being `Some` exactly
+    /// where [`CheckpointWeights::expert_banks`] has no entry.
+    pub fn layer_projections(&self) -> Vec<LayerPacked<'a>> {
+        (0..self.config.num_hidden_layers)
+            .map(|layer| {
+                let module = layer_module(layer);
+                let packed = |name: &str| {
+                    Packed::open(self.ckpt, &format!("{module}.{name}"))
+                        .unwrap_or_else(|err| panic!("layer {layer}: {err}"))
+                };
+                LayerPacked {
+                    layer,
+                    attention: PackedAttention {
+                        q_proj: packed("self_attn.q_proj"),
+                        k_proj: packed("self_attn.k_proj"),
+                        v_proj: packed("self_attn.v_proj"),
+                        r_proj: packed("self_attn.r_proj"),
+                        o_proj: packed("self_attn.o_proj"),
+                    },
+                    dense_mlp: self.config.layer_is_dense(layer).then(|| PackedMlp {
+                        gate_proj: packed("mlp.gate_proj"),
+                        up_proj: packed("mlp.up_proj"),
+                        down_proj: packed("mlp.down_proj"),
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    /// The same weights with every layer's projections multiplied somewhere
+    /// else, in place of decoding them into the pass's scratch a layer at a
+    /// time.
+    ///
+    /// The largest of the three handovers by what it stops decoding: the
+    /// attention projections are 7.40 GB of float32 a decode step and the two
+    /// dense layers 1.61 GB, against the experts' 32 GB and the head's 3.3 —
+    /// and unlike the experts, all of it is read by every token.
+    pub fn with_projections(mut self, projections: Box<dyn ProjectionBackend + 'a>) -> Self {
+        self.projections = Some(projections);
+        self
     }
 
     /// The same weights with the experts run somewhere else — gathered Metal
@@ -523,35 +632,72 @@ impl<'a> CheckpointWeights<'a> {
         run
     }
 
-    fn attention<'s>(&self, module: &str, scratch: &mut Scratch<'s>) -> Attention<'s> {
+    /// One layer's attention tensors, its five projections decoded into the
+    /// pass's scratch unless a backend answers for them.
+    ///
+    /// Nothing is decoded on the backend's arm, which is the whole of what this
+    /// buys: 176 MB of float32 a layer that a decode step reads all of.
+    fn attention<'s>(&'s self, layer: usize, scratch: &mut Scratch<'s>) -> Attention<'s> {
+        let module = layer_module(layer);
         let widened = |name: &str| self.widened(&format!("{module}.self_attn.{name}"));
         Attention {
-            hidden: self.config.hidden_size,
             q_norm: widened("q_norm.weight"),
             k_norm: widened("k_norm.weight"),
             k_sconv: widened("k_sconv.conv.weight"),
             v_sconv: widened("v_sconv.conv.weight"),
             rel_proj: widened("rel_proj"),
-            projections: ["q_proj", "k_proj", "v_proj", "r_proj", "o_proj"]
-                .map(|name| self.decoded(&format!("{module}.self_attn.{name}"), scratch)),
+            projections: match self
+                .projections
+                .as_deref()
+                .and_then(|backend| backend.attention(layer))
+            {
+                Some(handed) => AttentionProjections::backend(handed),
+                None => {
+                    let [q_proj, k_proj, v_proj, r_proj, o_proj] =
+                        ["q_proj", "k_proj", "v_proj", "r_proj", "o_proj"].map(|name| {
+                            self.decoded(&format!("{module}.self_attn.{name}"), scratch)
+                        });
+                    AttentionProjections::decoded(
+                        self.config.hidden_size,
+                        DecodedProjections {
+                            q_proj,
+                            k_proj,
+                            v_proj,
+                            r_proj,
+                            o_proj,
+                        },
+                    )
+                }
+            },
         }
     }
 
     /// Whichever MLP the layer index called for, and the experts it can reach.
     ///
     /// A dense layer's three projections are decoded into the scratch beside its
-    /// attention's; a MoE layer decodes only its gate, which is bfloat16 and
-    /// unpacked, and leaves both banks alone until a token routes into them.
+    /// attention's, or left to whoever answers for them; a MoE layer decodes only
+    /// its gate, which is bfloat16 and unpacked, and leaves both banks alone
+    /// until a token routes into them.
     fn mlp<'s>(&'s self, layer: usize, module: &str, scratch: &mut Scratch<'s>) -> Mlp<'s> {
         let widened = |name: &str| self.widened(&format!("{module}.mlp.{name}"));
         let global_scale = widened("global_scale")[0];
 
         let Some(config) = MoeConfig::for_layer(self.config, layer) else {
-            return Mlp::Dense {
-                projections: ["gate_proj", "up_proj", "down_proj"]
-                    .map(|name| self.decoded(&format!("{module}.mlp.{name}"), scratch)),
-                global_scale,
-            };
+            let (dim, hidden_dim) = (self.config.hidden_size, self.config.dense_intermediate_size);
+            return Mlp::Dense(
+                match self
+                    .projections
+                    .as_deref()
+                    .and_then(|backend| backend.dense_mlp(layer))
+                {
+                    Some(handed) => DenseMlp::backend(dim, hidden_dim, handed, global_scale),
+                    None => {
+                        let [gate_proj, up_proj, down_proj] = ["gate_proj", "up_proj", "down_proj"]
+                            .map(|name| self.decoded(&format!("{module}.mlp.{name}"), scratch));
+                        DenseMlp::new(dim, gate_proj, up_proj, down_proj, global_scale)
+                    }
+                },
+            );
         };
 
         let (routed, shared) = self.banks(layer);
@@ -593,7 +739,7 @@ impl ModelWeights for CheckpointWeights<'_> {
         let mut scratch = Scratch::new(&mut buffer);
         let module = layer_module(index);
 
-        let attention = self.attention(&module, &mut scratch);
+        let attention = self.attention(index, &mut scratch);
         let mlp = self.mlp(index, &module, &mut scratch);
         let [
             input_layernorm,
@@ -616,7 +762,7 @@ impl ModelWeights for CheckpointWeights<'_> {
             mlp_sconv: &mlp_sconv,
         };
         let config = AttentionConfig::for_layer(self.config, index);
-        let layer = DecoderLayer::new(config, weights, mlp.view(self.config.hidden_size));
+        let layer = DecoderLayer::new(config, weights, mlp.view());
         match self
             .experts
             .as_ref()
@@ -628,11 +774,10 @@ impl ModelWeights for CheckpointWeights<'_> {
     }
 }
 
-/// One layer's attention tensors: the five projections decoded into the pass's
-/// scratch, and the small bfloat16 ones widened into vectors of their own.
+/// One layer's attention tensors: the five projections wherever they multiply,
+/// and the small bfloat16 ones widened into vectors of their own.
 struct Attention<'a> {
-    hidden: usize,
-    projections: [&'a [f32]; 5],
+    projections: AttentionProjections<'a>,
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
     k_sconv: Vec<f32>,
@@ -642,18 +787,8 @@ struct Attention<'a> {
 
 impl Attention<'_> {
     fn view(&self) -> AttentionWeights<'_> {
-        let [q_proj, k_proj, v_proj, r_proj, o_proj] = self.projections;
         AttentionWeights {
-            projections: AttentionProjections::decoded(
-                self.hidden,
-                DecodedProjections {
-                    q_proj,
-                    k_proj,
-                    v_proj,
-                    r_proj,
-                    o_proj,
-                },
-            ),
+            projections: self.projections,
             q_norm: &self.q_norm,
             k_norm: &self.k_norm,
             k_sconv: &self.k_sconv,
@@ -663,14 +798,11 @@ impl Attention<'_> {
     }
 }
 
-/// Whichever MLP a layer index called for. A dense layer is three runs of the
-/// scratch and a scale; a MoE layer is its gate, and the two banks its router
-/// can reach but has not.
+/// Whichever MLP a layer index called for. A dense layer is a feed-forward
+/// network over three projections; a MoE layer is its gate, and the two banks
+/// its router can reach but has not.
 enum Mlp<'a> {
-    Dense {
-        projections: [&'a [f32]; 3],
-        global_scale: f32,
-    },
+    Dense(DenseMlp<'a>),
     Sparse(Box<Sparse<'a>>),
 }
 
@@ -686,18 +818,9 @@ struct Sparse<'a> {
 }
 
 impl Mlp<'_> {
-    fn view(&self, hidden: usize) -> LayerMlp<'_> {
+    fn view(&self) -> LayerMlp<'_> {
         match self {
-            Self::Dense {
-                projections: [gate_proj, up_proj, down_proj],
-                global_scale,
-            } => LayerMlp::Dense(DenseMlp::new(
-                hidden,
-                gate_proj,
-                up_proj,
-                down_proj,
-                *global_scale,
-            )),
+            Self::Dense(mlp) => LayerMlp::Dense(*mlp),
             Self::Sparse(moe) => LayerMlp::Sparse(SparseMoe::new(
                 moe.config,
                 GateWeights {
@@ -716,14 +839,14 @@ impl Mlp<'_> {
 impl Experts for Mlp<'_> {
     fn routed(&self, gathered: Gathered<'_>) -> Vec<f32> {
         match self {
-            Self::Dense { .. } => NoExperts.routed(gathered),
+            Self::Dense(_) => NoExperts.routed(gathered),
             Self::Sparse(moe) => through(&moe.routed, gathered, moe.scratch),
         }
     }
 
     fn shared(&self, gathered: Gathered<'_>) -> Vec<f32> {
         match self {
-            Self::Dense { .. } => NoExperts.shared(gathered),
+            Self::Dense(_) => NoExperts.shared(gathered),
             Self::Sparse(moe) => through(&moe.shared, gathered, moe.scratch),
         }
     }

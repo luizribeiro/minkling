@@ -34,10 +34,13 @@ pub use model::{Model, ModelCache, ModelWeights};
 pub use moe::{
     ExpertBank, ExpertBatch, GateWeights, Gathered, MoeConfig, MoeOutput, Routing, SparseMoe,
 };
-pub use ops::{DenseMlp, DenseProjection, Projection, linear, rms_norm, softmax, swiglu};
+pub use ops::{
+    DenseMlp, DenseProjection, MlpProjections, Projection, linear, rms_norm, softmax, swiglu,
+};
 pub use quant::{Dequantized, QuantError, Scratch};
 pub use sconv::{ConvState, ShortConv};
 pub use tokenizer::{Detokenizer, Tokenizer, TokenizerError};
 pub use weights::{
-    CheckpointWeights, ExpertBackend, LayerBanks, Packed, PackedExperts, PackedRows, WeightsError,
+    CheckpointWeights, ExpertBackend, LayerBanks, LayerPacked, Packed, PackedAttention,
+    PackedExperts, PackedMlp, PackedRows, ProjectionBackend, WeightsError,
 };
