@@ -11,7 +11,7 @@ use inkling_core::embed::Embed;
 use inkling_core::fixture::{
     self, ACTIVATIONS, CAPTURED_LAYERS, TokenizerFixture, deviation, indices,
 };
-use inkling_core::generate::{Generator, greedy};
+use inkling_core::generate::greedy;
 use inkling_core::head::LmHead;
 use inkling_core::layer::{
     DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts,
@@ -1425,12 +1425,6 @@ fn the_heads_padding_rows_are_zero_and_would_outrank_most_of_the_vocabulary() {
     );
 }
 
-/// The whole engine over this checkpoint: the stack, its final norm, and the
-/// head, which is what `LanguageModel` is.
-fn generator<'a>(weights: &'a CheckpointWeights<'a>) -> Generator<'a> {
-    Generator::new(weights.model(), weights.head(), weights.head_projection())
-}
-
 /// One call of the engine, timed: `ids` through the model and the head, and the
 /// logits of the last of them.
 ///
@@ -1453,7 +1447,7 @@ fn timed_logits(
     ids: &[usize],
 ) -> Vec<f32> {
     let started = Instant::now();
-    let logits = generator(weights).logits(cache, ids, weights);
+    let logits = weights.generator().logits(cache, ids, weights);
     eprintln!("{what}: {} token(s) in {:?}", ids.len(), started.elapsed());
     logits
 }
@@ -1561,7 +1555,9 @@ fn the_generated_tokens_match_the_oracle_against_real_weights() {
     let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
     let started = Instant::now();
     let got =
-        generator(&weights).generate(&mut ModelCache::new(&config), &ids, GENERATED, &weights);
+        weights
+            .generator()
+            .generate(&mut ModelCache::new(&config), &ids, GENERATED, &weights);
     let elapsed = started.elapsed();
 
     // No mean over these: one prefill of the prompt and `GENERATED - 1` decode

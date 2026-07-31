@@ -51,7 +51,7 @@ use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use inkling_core::{Checkpoint, Ending, Generator, ModelCache, Stop, Tokenizer};
+use inkling_core::{Checkpoint, Ending, ModelCache, Stop, Tokenizer};
 
 use crate::LABEL;
 use crate::args::Generate;
@@ -76,7 +76,7 @@ pub fn run(args: &Generate) -> Result<()> {
     let gpu = backend::open(args.backend)?;
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let weights = backend::weights(gpu.as_ref(), &checkpoint, &config.text_config)?;
-    let generator = Generator::new(weights.model(), weights.head(), weights.head_projection());
+    let generator = weights.generator();
     let ending = Ending {
         budget: args.max_tokens,
         eos: Some(tokenizer.eos() as usize),

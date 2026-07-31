@@ -44,6 +44,7 @@ use std::cell::RefCell;
 use crate::attention::{AttentionConfig, AttentionWeights};
 use crate::checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 use crate::config::TextConfig;
+use crate::generate::Generator;
 use crate::head::LmHead;
 use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use crate::model::{Model, ModelWeights};
@@ -375,6 +376,17 @@ impl<'a> CheckpointWeights<'a> {
     /// The model around the layers, borrowing the two norms this holds.
     pub fn model(&self) -> Model<'_> {
         Model::new(self.config, self.embed_norm.as_deref(), &self.norm)
+    }
+
+    /// The whole of `LanguageModel`: the stack, its final norm and the head,
+    /// against whichever backend this was opened with.
+    ///
+    /// Assembled here rather than by each caller because the three pieces are
+    /// one answer. A generator built from one checkpoint's model and another's
+    /// head would run, and would be wrong in the way this whole module exists to
+    /// make unrepresentable.
+    pub fn generator(&self) -> Generator<'_> {
+        Generator::new(self.model(), self.head(), self.head_projection())
     }
 
     /// The final projection this config asks for.

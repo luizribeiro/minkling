@@ -456,7 +456,7 @@ pub fn run(args: &Serve) -> Result<()> {
     eprintln!("loading {}", args.checkpoint.display());
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let weights = backend::weights(gpu.as_ref(), &checkpoint, &config.text_config)?;
-    let generator = Generator::new(weights.model(), weights.head(), weights.head_projection());
+    let generator = weights.generator();
 
     let mut engine = Engine {
         tokenizer,

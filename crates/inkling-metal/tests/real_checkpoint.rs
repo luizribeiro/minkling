@@ -21,9 +21,7 @@ use std::time::{Duration, Instant};
 use inkling_core::fixture::{self, ACTIVATIONS, deviation, indices};
 use inkling_core::ops::linear;
 use inkling_core::quant::{BITS, dequantize_blocks_into};
-use inkling_core::{
-    Checkpoint, CheckpointWeights, Dtype, Ending, Generator, ModelCache, TensorView,
-};
+use inkling_core::{Checkpoint, CheckpointWeights, Dtype, Ending, ModelCache, TensorView};
 use inkling_metal::{Device, MetalError, PackedMatmul, PackedProjection};
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -453,7 +451,7 @@ fn the_generated_tokens_match_the_oracle_with_the_head_on_the_device() {
     // decode step reads all of it, so an upload per token would move more bytes
     // than the multiply it enables — see `PackedProjection`.
     let weights = weights.with_head(Box::new(head));
-    let generator = Generator::new(weights.model(), weights.head(), weights.head_projection());
+    let generator = weights.generator();
 
     let mut steps: Vec<Duration> = Vec::new();
     let mut got = Vec::new();
