@@ -342,10 +342,34 @@ pub struct CheckpointWeights<'a> {
     embed_tokens: Packed<'a>,
     lm_head: Packed<'a>,
     head: Box<dyn Projection + 'a>,
+    experts: Option<Box<dyn ExpertBackend + 'a>>,
     embed_norm: Option<Vec<f32>>,
     norm: Vec<f32>,
     layer_scratch: RefCell<Vec<f32>>,
     expert_scratch: RefCell<Vec<f32>>,
+}
+
+/// Where the MoE layers' experts run, when it is not here.
+///
+/// Per layer because the answer is per layer twice over: the first two are dense
+/// and have no bank to run anywhere, and a backend that could not stand one
+/// layer's banks up should be able to say so about that layer rather than about
+/// the model.
+pub trait ExpertBackend {
+    /// Layer `layer`'s experts, or `None` for a layer this does not answer for —
+    /// which leaves the CPU path to decode them.
+    fn layer(&self, layer: usize) -> Option<&dyn Experts>;
+}
+
+/// One MoE layer's two banks, still packed, from
+/// [`CheckpointWeights::expert_banks`].
+#[derive(Debug, Clone, Copy)]
+pub struct LayerBanks<'a> {
+    pub layer: usize,
+    /// The 256 a token reads six of.
+    pub routed: PackedExperts<'a>,
+    /// The two every token reads.
+    pub shared: PackedExperts<'a>,
 }
 
 impl<'a> CheckpointWeights<'a> {
@@ -378,6 +402,7 @@ impl<'a> CheckpointWeights<'a> {
             layer_scratch: RefCell::new(vec![0.0; layer_scratch_floats(config)]),
             expert_scratch: RefCell::new(vec![0.0; expert_scratch_floats(config)]),
             head: Box::new(PackedRows::new(lm_head, LmHead::for_config(config).vocab())),
+            experts: None,
             embed_tokens,
             lm_head,
             embed_norm,
@@ -406,6 +431,37 @@ impl<'a> CheckpointWeights<'a> {
     /// The final projection this config asks for.
     pub fn head(&self) -> LmHead {
         LmHead::for_config(self.config)
+    }
+
+    /// Every MoE layer's two banks, still packed, for a backend that takes the
+    /// weight rather than the values.
+    ///
+    /// The dense layers are absent rather than empty: they have no `switch_mlp`
+    /// at all, so there is nothing for a backend to be handed and nothing for it
+    /// to answer for.
+    pub fn expert_banks(&self) -> Vec<LayerBanks<'a>> {
+        (0..self.config.num_hidden_layers)
+            .filter(|layer| !self.config.layer_is_dense(*layer))
+            .map(|layer| {
+                let (routed, shared) = self.banks(layer);
+                LayerBanks {
+                    layer,
+                    routed,
+                    shared,
+                }
+            })
+            .collect()
+    }
+
+    /// The same weights with the experts run somewhere else — gathered Metal
+    /// dispatches against banks that are never decoded, in place of the CPU's
+    /// expert-at-a-time decode.
+    ///
+    /// The other half of [`CheckpointWeights::with_head`], and the larger one: a
+    /// decode step decodes 32 GB of experts against the head's 3.3.
+    pub fn with_experts(mut self, experts: Box<dyn ExpertBackend + 'a>) -> Self {
+        self.experts = Some(experts);
+        self
     }
 
     /// The tensor its rows come out of, still packed. Which tensor that is is
@@ -495,20 +551,31 @@ impl<'a> CheckpointWeights<'a> {
             };
         };
 
-        let bank = |name: &str| {
-            PackedExperts::open(self.ckpt, &format!("{module}.mlp.{name}"))
-                .unwrap_or_else(|err| panic!("layer {layer}: {err}"))
-        };
+        let (routed, shared) = self.banks(layer);
         Mlp::Sparse(Box::new(Sparse {
             config,
             gate_weight: widened("gate_weight"),
             correction_bias: widened("e_score_correction_bias"),
             global_scale,
-            routed: bank("switch_mlp"),
-            shared: bank("shared_experts"),
+            routed,
+            shared,
             scratch: &self.expert_scratch,
         }))
     }
+
+    /// One MoE layer's routed and shared banks, still packed.
+    fn banks(&self, layer: usize) -> (PackedExperts<'a>, PackedExperts<'a>) {
+        let bank = |name: &str| {
+            PackedExperts::open(self.ckpt, &format!("{}.mlp.{name}", layer_module(layer)))
+                .unwrap_or_else(|err| panic!("layer {layer}: {err}"))
+        };
+        (bank("switch_mlp"), bank("shared_experts"))
+    }
+}
+
+/// Where one decoder layer's tensors live.
+fn layer_module(layer: usize) -> String {
+    format!("{MODEL}.layers.{layer}")
 }
 
 impl ModelWeights for CheckpointWeights<'_> {
@@ -521,7 +588,7 @@ impl ModelWeights for CheckpointWeights<'_> {
     fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: &[f32]) -> Vec<f32> {
         let mut buffer = self.layer_scratch.borrow_mut();
         let mut scratch = Scratch::new(&mut buffer);
-        let module = format!("{MODEL}.layers.{index}");
+        let module = layer_module(index);
 
         let attention = self.attention(&module, &mut scratch);
         let mlp = self.mlp(index, &module, &mut scratch);
@@ -546,8 +613,15 @@ impl ModelWeights for CheckpointWeights<'_> {
             mlp_sconv: &mlp_sconv,
         };
         let config = AttentionConfig::for_layer(self.config, index);
-        DecoderLayer::new(config, weights, mlp.view(self.config.hidden_size))
-            .forward(cache, x, &mlp)
+        let layer = DecoderLayer::new(config, weights, mlp.view(self.config.hidden_size));
+        match self
+            .experts
+            .as_ref()
+            .and_then(|backend| backend.layer(index))
+        {
+            Some(experts) => layer.forward(cache, x, experts),
+            None => layer.forward(cache, x, &mlp),
+        }
     }
 }
 

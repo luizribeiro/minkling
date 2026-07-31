@@ -89,7 +89,7 @@ impl LayerMlp<'_> {
         }
     }
 
-    fn forward(&self, x: &[f32], experts: &impl Experts) -> Vec<f32> {
+    fn forward(&self, x: &[f32], experts: &(impl Experts + ?Sized)) -> Vec<f32> {
         match self {
             Self::Dense(mlp) => mlp.forward(x),
             Self::Sparse(moe) => moe
@@ -200,7 +200,12 @@ impl<'a> DecoderLayer<'a> {
 
     /// `[tokens, hidden]` in and out, continuing from `cache` and leaving this
     /// call's keys, values and convolution windows behind in it.
-    pub fn forward(&self, cache: &mut DecoderCache, x: &[f32], experts: &impl Experts) -> Vec<f32> {
+    pub fn forward(
+        &self,
+        cache: &mut DecoderCache,
+        x: &[f32],
+        experts: &(impl Experts + ?Sized),
+    ) -> Vec<f32> {
         self.run(cache, x, experts, Residual::PreNorm)
     }
 
@@ -213,7 +218,7 @@ impl<'a> DecoderLayer<'a> {
         &self,
         cache: &mut DecoderCache,
         x: &[f32],
-        experts: &impl Experts,
+        experts: &(impl Experts + ?Sized),
         residual: Residual,
     ) -> Vec<f32> {
         assert_eq!(

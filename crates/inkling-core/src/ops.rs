@@ -264,6 +264,12 @@ pub fn softmax(row: &mut [f32]) {
 /// has to join them, and a second spelling of which operand the activation goes
 /// on is the one mistake this whole comment exists to prevent.
 pub fn swiglu(gate: &mut [f32], up: &[f32]) {
+    // A zip over unequal lengths is a truncation and not a panic, which for two
+    // projections of a width that disagreed would be an answer of the shorter
+    // one's shape rather than an error. [`DenseMlp::new`] settles this at
+    // construction; a caller assembling the two out of separate dispatches has
+    // nowhere else to.
+    assert_eq!(gate.len(), up.len(), "the gate against what gates it");
     for (gate, up) in gate.iter_mut().zip(up) {
         *gate = silu(*gate) * up;
     }
