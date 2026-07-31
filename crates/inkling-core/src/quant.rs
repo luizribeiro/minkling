@@ -30,7 +30,12 @@ const EXPONENT_SHIFT: u32 = f32::MANTISSA_DIGITS - 1;
 /// code 8 is `-0.0`, MLX carries that sign through the scale multiply, and a
 /// table that spelled it `0.0` would differ from MLX on exactly those values
 /// while looking right everywhere else.
-const ELEMENTS: [f32; 16] = [
+///
+/// Public because a Metal kernel decoding these codes in registers writes this
+/// table into its own source rather than keeping a second copy of it. A copy is
+/// a thing that can drift from the checkpoint it decodes; this one is what the
+/// fixture pins.
+pub const ELEMENTS: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
