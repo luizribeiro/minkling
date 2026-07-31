@@ -22,6 +22,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from inkling_ref import f32, gamma, projection
 from mlx.utils import tree_flatten
 from mlx_vlm.models.inkling.config import TextConfig
 from mlx_vlm.models.inkling.language import InklingDenseMLP
@@ -51,12 +52,6 @@ NORM_SHAPES = {
 }
 
 
-def gamma(rng, dims):
-    """A trained RMSNorm weight sits near 1 and is not uniform, so reading it as
-    a scalar — or dropping it — has to change the answer."""
-    return 1.0 + 0.5 * rng.standard_normal(dims)
-
-
 def norm_input(rng, name, shape):
     x = rng.standard_normal(shape)
     if name == "norm_zero_row":
@@ -68,9 +63,9 @@ def norm_input(rng, name, shape):
 
 
 def rms_norm_case(rng, name, shape, eps):
-    x = mx.array(norm_input(rng, name, shape), dtype=mx.float32)
+    x = f32(norm_input(rng, name, shape))
     norm = nn.RMSNorm(shape[-1], eps=eps)
-    norm.load_weights([("weight", mx.array(gamma(rng, shape[-1]), dtype=mx.float32))])
+    norm.load_weights([("weight", gamma(rng, shape[-1]))])
     return {
         f"{name}.input": x,
         f"{name}.weight": norm.weight,
@@ -78,24 +73,17 @@ def rms_norm_case(rng, name, shape, eps):
     }
 
 
-def projection(rng, out_dim, in_dim):
-    """Scaled by fan-in so the gate lands where silu is still curved. Unit-scale
-    weights would drive it into the linear tail, where a wrong activation is
-    indistinguishable from the right one."""
-    return rng.standard_normal((out_dim, in_dim)) / np.sqrt(in_dim)
-
-
 def dense_mlp_case(rng, config):
     weights = {
         "gate_proj.weight": projection(rng, HIDDEN_DIM, DIM),
         "up_proj.weight": projection(rng, HIDDEN_DIM, DIM),
         "down_proj.weight": projection(rng, DIM, HIDDEN_DIM),
-        "global_scale": np.array([GLOBAL_SCALE]),
+        "global_scale": f32([GLOBAL_SCALE]),
     }
     mlp = InklingDenseMLP(config)
-    mlp.load_weights([(k, mx.array(v, dtype=mx.float32)) for k, v in weights.items()])
+    mlp.load_weights(list(weights.items()))
 
-    x = mx.array(rng.standard_normal(MLP_INPUT_SHAPE), dtype=mx.float32)
+    x = f32(rng.standard_normal(MLP_INPUT_SHAPE))
     tensors = {f"mlp.{name}": value for name, value in tree_flatten(mlp.parameters())}
     tensors["mlp.input"] = x
     tensors["mlp.output"] = mlp(x)
@@ -106,7 +94,7 @@ def collect():
     rng = np.random.default_rng(SEED)
     config = TextConfig(hidden_size=DIM, intermediate_size=HIDDEN_DIM)
 
-    tensors = {"rms_norm_eps": mx.array([config.rms_norm_eps], dtype=mx.float32)}
+    tensors = {"rms_norm_eps": f32([config.rms_norm_eps])}
     for name, shape in NORM_SHAPES.items():
         tensors.update(rms_norm_case(rng, name, shape, config.rms_norm_eps))
     tensors.update(dense_mlp_case(rng, config))

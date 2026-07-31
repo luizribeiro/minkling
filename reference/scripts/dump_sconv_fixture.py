@@ -28,7 +28,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-from inkling_ref import checkpoint_tensor, index_of
+from inkling_ref import checkpoint_tensor, f32, index_of, taps
 from mlx_lm.models.cache import ArraysCache
 from mlx_vlm.models.inkling.language import InklingShortConvolution
 
@@ -61,22 +61,6 @@ def sconv(kernel_size, weight):
     return conv
 
 
-def taps(rng, kernel_size):
-    """`[channels, kernel_size, 1]`, the layout `nn.Conv1d` expects and the
-    layout the checkpoint stores.
-
-    Drawn so no two taps of a channel are close in magnitude: a kernel read in
-    reversed time order still produces plausible numbers, and only an asymmetric
-    kernel makes it produce different ones. The ramp is about the four-fold one
-    the trained kernels show, which also keeps the convolution and the residual
-    within a factor of a few of each other — a residual lost in the noise would
-    be a residual nothing tests."""
-    magnitude = 0.4 * 1.6 ** np.arange(kernel_size)
-    signs = rng.choice([-1.0, 1.0], size=(CHANNELS, kernel_size))
-    spread = 1.0 + 0.25 * rng.standard_normal((CHANNELS, kernel_size))
-    return mx.array((signs * spread * magnitude)[..., None], dtype=mx.float32)
-
-
 def conv_mask():
     """Row 0 drops timesteps in the middle, so the zeroing has to propagate
     through the following windows. Row 1 drops everything, which leaves the
@@ -87,7 +71,7 @@ def conv_mask():
     mask = np.ones((BATCH, LENGTH), dtype=np.float32)
     mask[0, 2:4] = 0.0
     mask[1, :] = 0.0
-    return mx.array(mask)
+    return f32(mask)
 
 
 def streamed(conv, x):
@@ -98,11 +82,11 @@ def streamed(conv, x):
 
 
 def synthetic_cases(rng, kernel_size):
-    weight = taps(rng, kernel_size)
+    weight = taps(rng, CHANNELS, kernel_size)
     conv = sconv(kernel_size, weight)
 
     def normal(*shape):
-        return mx.array(rng.standard_normal(shape), dtype=mx.float32)
+        return f32(rng.standard_normal(shape))
 
     x = normal(BATCH, LENGTH, CHANNELS)
     cases = {"weight": weight, "input": x, "whole": conv(x)}
@@ -165,7 +149,7 @@ def check_streaming_agrees(tensors):
 
 def collect(model_path, kernel_size):
     rng = np.random.default_rng(SEED)
-    tensors = {"kernel_size": mx.array([kernel_size], dtype=mx.float32)}
+    tensors = {"kernel_size": f32([kernel_size])}
     tensors.update(synthetic_cases(rng, kernel_size))
     tensors.update(real_weights(model_path))
     mx.eval(list(tensors.values()))
