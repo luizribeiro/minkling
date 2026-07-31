@@ -37,6 +37,10 @@ dump-long-activations model="models/Inkling-Small-mxfp4" tokens="1280":
     reference/.venv/bin/python reference/scripts/dump_activations.py {{ model }} \
         --seq-len {{ tokens }} --layers 0 5 --name long_activations
 
+# Regenerate the committed embed_norm weight the Rust embedding is tested against
+dump-embed-fixture model="models/Inkling-Small-mxfp4":
+    reference/.venv/bin/python reference/scripts/dump_embed_fixture.py {{ model }}
+
 # Regenerate the committed MXFP4 slices the Rust dequantiser is tested against
 dump-quant-fixture model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_quant_fixture.py {{ model }}
@@ -67,3 +71,10 @@ dump-op-fixture:
 
 fetch repo="thinkingmachines/Inkling-Small":
     hf download {{ repo }}
+
+# Quantise the BF16 original to 8-bit, keeping the MTP tensors the mxfp4 quant
+# dropped. Streams a shard at a time and resumes from what it has already
+# written, so it can be run in chunks and re-run until it prints an index:
+#   just quantize "$src" "$dst" --time-budget 480
+quantize src="/mnt/truenas/models/thinkingmachines/Inkling-Small" dst="models/Inkling-Small-8bit" *args:
+    reference/.venv/bin/python reference/scripts/quantize.py {{ src }} {{ dst }} {{ args }}
