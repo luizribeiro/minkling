@@ -63,6 +63,14 @@ pub trait MlpProjections: Debug {
     fn gate_proj(&self) -> &dyn Projection;
     fn up_proj(&self) -> &dyn Projection;
     fn down_proj(&self) -> &dyn Projection;
+
+    /// The two that consume the same input, in one call — the same bargain
+    /// [`crate::attention::Projections::qkvr`] is, over the pair rather than the
+    /// four. `down_proj` is not here because it multiplies what the activation
+    /// makes of these two.
+    fn gate_up(&self, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        (self.gate_proj().forward(x), self.up_proj().forward(x))
+    }
 }
 
 /// A dense layer's feed-forward network: a SwiGLU MLP times a learned
@@ -206,8 +214,8 @@ impl<'a> DenseMlp<'a> {
             self.dim()
         );
 
-        let mut gate = three.gate_proj().forward(x);
-        swiglu(&mut gate, &three.up_proj().forward(x));
+        let (mut gate, up) = three.gate_up(x);
+        swiglu(&mut gate, &up);
         three
             .down_proj()
             .forward(&gate)
@@ -377,6 +385,8 @@ fn silu(x: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use crate::checkpoint::Checkpoint;
     use crate::fixture::{self, deviation};
@@ -456,11 +466,14 @@ mod tests {
         /// layer.
         fn handed(&self, hidden_dim: usize) -> Handed<'_> {
             let between = hidden_dim * self.dim;
-            Handed(Decoded {
-                gate_proj: DenseProjection::new(self.dim, &self.gate_proj[..between]),
-                up_proj: DenseProjection::new(self.dim, &self.up_proj[..between]),
-                down_proj: DenseProjection::new(hidden_dim, &self.down_proj[..between]),
-            })
+            Handed {
+                three: Decoded {
+                    gate_proj: DenseProjection::new(self.dim, &self.gate_proj[..between]),
+                    up_proj: DenseProjection::new(self.dim, &self.up_proj[..between]),
+                    down_proj: DenseProjection::new(hidden_dim, &self.down_proj[..between]),
+                },
+                gate_up: Cell::new(0),
+            }
         }
     }
 
@@ -468,19 +481,29 @@ mod tests {
     /// something the MLP cannot see inside, which is the whole of what a backend
     /// is from here.
     #[derive(Debug)]
-    struct Handed<'a>(Decoded<'a>);
+    struct Handed<'a> {
+        three: Decoded<'a>,
+        /// How many times the MLP asked for the two that share an input
+        /// together, which is what says it did not ask for them one at a time.
+        gate_up: Cell<usize>,
+    }
 
     impl MlpProjections for Handed<'_> {
+        fn gate_up(&self, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
+            self.gate_up.set(self.gate_up.get() + 1);
+            (self.gate_proj().forward(x), self.up_proj().forward(x))
+        }
+
         fn gate_proj(&self) -> &dyn Projection {
-            self.0.gate_proj()
+            self.three.gate_proj()
         }
 
         fn up_proj(&self) -> &dyn Projection {
-            self.0.up_proj()
+            self.three.up_proj()
         }
 
         fn down_proj(&self) -> &dyn Projection {
-            self.0.down_proj()
+            self.three.down_proj()
         }
     }
 
@@ -640,6 +663,23 @@ mod tests {
         );
     }
 
+    /// The two that share an input are asked for in one call, not two.
+    ///
+    /// The same claim [`crate::attention`]'s own spy makes about the four:
+    /// where a multiply is a dispatch, asking twice is a round trip that the
+    /// arithmetic did not need. An MLP that went back to `gate_proj()` and
+    /// `up_proj()` separately would produce the same answer, so the count is
+    /// what says otherwise.
+    #[test]
+    fn an_mlp_asks_a_backend_for_the_two_that_share_an_input_together() {
+        let mlp = Mlp::load(&fixture::open(FIXTURE));
+        let handed = mlp.handed(mlp.hidden_dim());
+
+        DenseMlp::backend(mlp.dim, mlp.hidden_dim(), &handed, mlp.global_scale).forward(&mlp.input);
+
+        assert_eq!(handed.gate_up.get(), 1, "one call a forward");
+    }
+
     /// Three projections that agree with each other but not with the layer are
     /// refused, which is the mistake only a stated width catches: they are
     /// another MLP's, and every check they could be put to among themselves
@@ -662,7 +702,7 @@ mod tests {
     fn a_down_projection_that_maps_back_to_another_width_is_refused() {
         let mlp = Mlp::load(&fixture::open(FIXTURE));
         let mut handed = mlp.handed(mlp.hidden_dim());
-        handed.0.down_proj =
+        handed.three.down_proj =
             DenseProjection::new(mlp.hidden_dim(), &mlp.down_proj[..mlp.down_proj.len() / 2]);
 
         DenseMlp::backend(mlp.dim, mlp.hidden_dim(), &handed, mlp.global_scale);

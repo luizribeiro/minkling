@@ -235,6 +235,37 @@ pub trait Projections: Debug {
     fn v_proj(&self) -> &dyn Projection;
     fn r_proj(&self) -> &dyn Projection;
     fn o_proj(&self) -> &dyn Projection;
+
+    /// The four that consume the same normed hidden state, in one call.
+    ///
+    /// Asked for together because they *are* together: `q`, `k`, `v` and `r`
+    /// read one input and nothing of each other, so a backend can answer all
+    /// four before it is asked about any of them. Where a multiply is a loop
+    /// that buys nothing and this default is the whole story; where a multiply
+    /// is a dispatch it is four round trips against one.
+    ///
+    /// `o_proj` is not here and cannot be: it multiplies what the attention
+    /// step produced out of these.
+    fn qkvr(&self, x: &[f32]) -> Qkvr {
+        Qkvr {
+            q: self.q_proj().forward(x),
+            k: self.k_proj().forward(x),
+            v: self.v_proj().forward(x),
+            r: self.r_proj().forward(x),
+        }
+    }
+}
+
+/// What the four projections of one call produced, each `[rows, out_dim]`.
+///
+/// Named rather than a tuple or an array, because `k` and `v` are the same
+/// shape and are the pair an attention layer can silently exchange.
+#[derive(Debug, Clone)]
+pub struct Qkvr {
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub r: Vec<f32>,
 }
 
 /// One attention layer's five projections as the checkpoint's weights decoded
@@ -352,6 +383,14 @@ impl Projections for AttentionProjections<'_> {
 
     fn o_proj(&self) -> &dyn Projection {
         self.held().o_proj()
+    }
+
+    /// Delegated rather than left to the default, which is the one method here
+    /// that has to be: the default would ask this for its four projections and
+    /// multiply through them one at a time, which is exactly what a backend
+    /// that overrode `qkvr` said not to do.
+    fn qkvr(&self, x: &[f32]) -> Qkvr {
+        self.held().qkvr(x)
     }
 }
 
@@ -490,24 +529,15 @@ impl<'a> Attention<'a> {
         let cached = cache.keys.len() / (self.sdpa.kv_heads * head_dim);
         let offset = query_offset.of(cached);
 
-        let projections = &self.weights.projections;
-        let project = |projection: &dyn Projection| projection.forward(x);
+        let projected = self.weights.projections.qkvr(x);
         let norm = |x: &[f32], weight| rms_norm(x, weight, self.config.rms_norm_eps);
 
         // The key is normed after its convolution, not before, and the value is
         // convolved and never normed.
-        let k = self
-            .k_sconv
-            .forward(&mut cache.k_sconv, &project(projections.k_proj()), None);
-        let v = self
-            .v_sconv
-            .forward(&mut cache.v_sconv, &project(projections.v_proj()), None);
-        let mut q = split_heads(
-            &norm(&project(projections.q_proj()), self.weights.q_norm),
-            heads,
-            head_dim,
-        );
-        let rel = project(projections.r_proj());
+        let k = self.k_sconv.forward(&mut cache.k_sconv, &projected.k, None);
+        let v = self.v_sconv.forward(&mut cache.v_sconv, &projected.v, None);
+        let mut q = split_heads(&norm(&projected.q, self.weights.q_norm), heads, head_dim);
+        let rel = projected.r;
 
         cache.keys.extend(norm(&k, self.weights.k_norm));
         cache.values.extend(v);
@@ -632,6 +662,8 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use crate::checkpoint::Checkpoint;
     use crate::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, LONG_ACTIVATIONS, deviation};
@@ -1191,27 +1223,46 @@ mod tests {
     /// something the layer cannot see inside, which is the whole of what a
     /// backend is from here.
     #[derive(Debug)]
-    struct Handed<'a>(AttentionProjections<'a>);
+    struct Handed<'a> {
+        five: AttentionProjections<'a>,
+        /// How many times the layer asked for the four that share an input
+        /// together, which is what says it did not ask for them one at a time.
+        qkvr: Cell<usize>,
+    }
+
+    impl<'a> Handed<'a> {
+        fn new(five: AttentionProjections<'a>) -> Self {
+            Self {
+                five,
+                qkvr: Cell::new(0),
+            }
+        }
+    }
 
     impl Projections for Handed<'_> {
+        fn qkvr(&self, x: &[f32]) -> Qkvr {
+            self.qkvr.set(self.qkvr.get() + 1);
+            self.five.qkvr(x)
+        }
+
         fn q_proj(&self) -> &dyn Projection {
-            self.0.q_proj()
+            self.five.q_proj()
         }
 
         fn k_proj(&self) -> &dyn Projection {
-            self.0.k_proj()
+            self.five.k_proj()
         }
 
         fn v_proj(&self) -> &dyn Projection {
-            self.0.v_proj()
+            self.five.v_proj()
         }
 
         fn r_proj(&self) -> &dyn Projection {
-            self.0.r_proj()
+            self.five.r_proj()
         }
 
         fn o_proj(&self) -> &dyn Projection {
-            self.0.o_proj()
+            self.five.o_proj()
         }
     }
 
@@ -1248,7 +1299,7 @@ mod tests {
     fn a_layer_whose_projections_come_from_a_backend_is_the_same_layer() {
         for layer in Layer::all() {
             let hidden = layer.hidden();
-            let handed = Handed(layer.weights.view(hidden).projections);
+            let handed = Handed::new(layer.weights.view(hidden).projections);
             let mut weights = layer.weights.view(hidden);
             weights.projections = AttentionProjections::backend(&handed);
 
@@ -1273,7 +1324,7 @@ mod tests {
             let zeroed = vec![0.0; layer.weights.o_proj.len().max(layer.weights.q_proj.len())];
 
             for (index, name) in PROJECTIONS.iter().enumerate() {
-                let handed = Handed(AttentionProjections::decoded(
+                let handed = Handed::new(AttentionProjections::decoded(
                     hidden,
                     without(layer.weights.decoded(), index, &zeroed),
                 ));
@@ -1282,6 +1333,26 @@ mod tests {
 
                 assert_ne!(layer.run(weights), whole, "{}: {name}", layer.name);
             }
+        }
+    }
+
+    /// The four that share an input are asked for in one call, not four.
+    ///
+    /// This is the whole of what [`Projections::qkvr`] is: on a backend where a
+    /// multiply is a dispatch, four calls are four round trips to a device that
+    /// could have answered all of them at once. A layer that went back to
+    /// `q_proj()` and the rest one at a time would produce exactly the same
+    /// answer, which is why the count is what is asserted.
+    #[test]
+    fn a_layer_asks_a_backend_for_the_four_that_share_an_input_together() {
+        for layer in Layer::all() {
+            let hidden = layer.hidden();
+            let handed = Handed::new(layer.weights.view(hidden).projections);
+            let mut weights = layer.weights.view(hidden);
+            weights.projections = AttentionProjections::backend(&handed);
+
+            layer.run(weights);
+            assert_eq!(handed.qkvr.get(), 1, "{}: one call a forward", layer.name);
         }
     }
 
@@ -1299,7 +1370,7 @@ mod tests {
         let mut five = layer.weights.decoded();
         five.k_proj = &narrow;
 
-        let handed = Handed(AttentionProjections::decoded(hidden, five));
+        let handed = Handed::new(AttentionProjections::decoded(hidden, five));
         let mut weights = layer.weights.view(hidden);
         weights.projections = AttentionProjections::backend(&handed);
         Attention::new(layer.config, weights);
