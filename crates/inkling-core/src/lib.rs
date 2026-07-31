@@ -1,3 +1,4 @@
+pub mod attention;
 pub mod checkpoint;
 pub mod config;
 pub mod mask;
@@ -8,6 +9,7 @@ pub mod sconv;
 #[cfg(test)]
 mod fixture;
 
+pub use attention::{Sdpa, split_heads};
 pub use checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 pub use config::{Config, TextConfig};
 pub use mask::{BandedMask, MASKED, is_masked};
