@@ -125,14 +125,11 @@ impl TextConfig {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::attention::AttentionConfig;
-    use crate::moe::MoeConfig;
-
-    /// Trimmed from `thinkingmachines/Inkling-Small`, values verbatim.
-    const INKLING_SMALL: &str = r#"{
+/// Trimmed from `thinkingmachines/Inkling-Small`, values verbatim. Shared with
+/// the tests of anything else that needs a checkpoint's config to exist without
+/// a checkpoint behind it.
+#[cfg(feature = "test-support")]
+pub const INKLING_SMALL: &str = r#"{
       "eos_token_id": 200006,
       "text_config": {
         "model_max_length": 1048576, "hidden_size": 4096, "num_hidden_layers": 42,
@@ -154,6 +151,12 @@ mod tests {
       },
       "mtp_config": { "num_nextn_predict_layers": 8, "local_layer_ids": [0,2,4,5,6,7] }
     }"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attention::AttentionConfig;
+    use crate::moe::MoeConfig;
 
     fn cfg() -> Config {
         serde_json::from_str(INKLING_SMALL).expect("parses")

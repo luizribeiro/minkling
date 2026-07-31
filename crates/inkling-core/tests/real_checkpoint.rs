@@ -9,7 +9,9 @@ use std::time::Instant;
 
 use inkling_core::attention::{Attention, AttentionConfig, AttentionWeights};
 use inkling_core::embed::Embed;
-use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, deviation, indices};
+use inkling_core::fixture::{
+    self, ACTIVATIONS, CAPTURED_LAYERS, TokenizerFixture, deviation, indices,
+};
 use inkling_core::generate::{Generator, greedy};
 use inkling_core::head::LmHead;
 use inkling_core::layer::{
@@ -19,6 +21,7 @@ use inkling_core::model::{ModelCache, ModelWeights};
 use inkling_core::moe::{GateWeights, MoeConfig, SparseMoe};
 use inkling_core::ops::{DenseMlp, top_k};
 use inkling_core::quant::{Scratch, dequantize};
+use inkling_core::tokenizer::{Tokenizer, TokenizerError};
 use inkling_core::weights::{
     CheckpointWeights, Packed, PackedExperts, expert_scratch_floats, layer_scratch_floats,
 };
@@ -1704,4 +1707,157 @@ fn the_argmax_survives_the_whole_model_against_real_weights() {
         deviation <= MODEL_LOGIT_TOLERANCE,
         "deviation {deviation:e}"
     );
+}
+
+/// The checkpoint's own tokenizer, and the eos the config names for it.
+fn tokenizer(dir: &Path) -> Tokenizer {
+    Tokenizer::open(dir, &config(dir)).expect("the checkpoint's tokenizer opens")
+}
+
+/// The same `tokenizer.json` through the loader's own decode, which is what
+/// this crate's assembled one is checked against. Held rather than reopened:
+/// the file is 27 MB.
+fn reference_tokenizer(dir: &Path) -> tokenizers::Tokenizer {
+    tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json loads")
+}
+
+fn reference_decode(reference: &tokenizers::Tokenizer, ids: &[u32]) -> String {
+    reference.decode(ids, false).expect("the loader decodes")
+}
+
+/// The text/id pair every other fixture was captured from. `dump_activations.py`
+/// keeps the first eight of these ids, so this is also what says the committed
+/// activations belong to this sentence.
+#[test]
+fn the_recorded_prompt_encodes_to_the_ids_the_fixtures_hold() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let fixture = TokenizerFixture::load();
+    let case = fixture.case("prompt");
+
+    let ids = tokenizer(&dir).encode(&case.text).expect("encodes");
+    assert_eq!(ids, case.ids);
+
+    let captured = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+    let prefix: Vec<usize> = ids[..captured.len()]
+        .iter()
+        .map(|&id| id as usize)
+        .collect();
+    assert_eq!(
+        prefix, captured,
+        "the activation dump tokenised something else"
+    );
+}
+
+#[test]
+fn every_recorded_case_decodes_to_the_text_the_reference_decoded() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let tokenizer = tokenizer(&dir);
+
+    for (name, case) in &TokenizerFixture::load().cases {
+        assert_eq!(
+            tokenizer.decode(&case.ids).expect("decodes"),
+            case.text,
+            "{name}"
+        );
+        if case.round_trips {
+            assert_eq!(
+                tokenizer.encode(&case.text).expect("encodes"),
+                case.ids,
+                "{name}"
+            );
+        }
+    }
+}
+
+/// Assembling the text out of each token's bytes has to give what the loader's
+/// own decode gives, for every piece in the vocabulary rather than for the few
+/// a fixture can hold — a spelling this crate mapped wrongly would otherwise
+/// surface only on whatever text happened to use it.
+#[test]
+fn decoding_matches_the_loaders_own_across_the_whole_vocabulary() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let tokenizer = tokenizer(&dir);
+    let reference = reference_tokenizer(&dir);
+    let config = text_config(&dir);
+    let filled = config.unpadded_vocab_size.expect("an unpadded vocab size") as u32;
+
+    // In runs rather than one id at a time: a run is where a character spelled
+    // across several pieces has to survive being reassembled.
+    for start in (0..filled).step_by(64) {
+        let ids: Vec<u32> = (start..(start + 64).min(filled)).collect();
+        assert_eq!(
+            tokenizer.decode(&ids).expect("decodes"),
+            reference_decode(&reference, &ids),
+            "ids {start}..{}",
+            start + ids.len() as u32
+        );
+    }
+}
+
+/// The one thing the tokenizer's own files do not say. They name no eos at all —
+/// every special token is listed under `additional_special_tokens` — so a port
+/// that asked them either finds nothing or settles for `<|endoftext|>`, and
+/// generation then runs until it hits a length cap.
+#[test]
+fn the_eos_id_comes_from_the_config_and_no_tokenizer_file_names_one() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let tokenizer = tokenizer(&dir);
+    let recorded = TokenizerFixture::load();
+
+    assert_eq!(tokenizer.eos(), recorded.eos_token_id);
+    assert_eq!(
+        tokenizer.piece(tokenizer.eos()).as_deref(),
+        Some(recorded.eos_token.as_str())
+    );
+
+    for file in ["tokenizer_config.json", "special_tokens_map.json"] {
+        let text = std::fs::read_to_string(dir.join(file)).expect("the checkpoint carries it");
+        let declared: serde_json::Value = serde_json::from_str(&text).expect("parses");
+        assert!(
+            declared.get("eos_token").is_none(),
+            "{file} names an eos after all, so the config is no longer the only source"
+        );
+    }
+    assert_eq!(tokenizer.id_of("<|endoftext|>"), Some(199999));
+    assert_ne!(tokenizer.eos(), 199999, "the guess a missing eos invites");
+}
+
+#[test]
+fn every_piece_in_the_filled_vocabulary_is_a_byte_level_spelling() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let tokenizer = tokenizer(&dir);
+    let config = text_config(&dir);
+    let filled = config.unpadded_vocab_size.expect("an unpadded vocab size") as u32;
+
+    for id in 0..filled {
+        tokenizer.token_bytes(id).expect("a byte-level spelling");
+    }
+    // The rest of the 201024 the embedding is padded to hold no token at all.
+    assert!(matches!(
+        tokenizer.token_bytes(filled),
+        Err(TokenizerError::UnknownToken(_))
+    ));
+}
+
+/// The oracle's own continuation, decoded a token at a time as a generator
+/// would surface it, against decoding the whole of it at once.
+#[test]
+fn streaming_the_oracles_continuation_matches_decoding_it_whole() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let tokenizer = tokenizer(&dir);
+    let activations = fixture::open(ACTIVATIONS);
+    let ids: Vec<u32> = indices(&fixture::tensor(&activations, "greedy_continuation"))
+        .iter()
+        .map(|&id| id as u32)
+        .collect();
+
+    let mut stream = tokenizer.stream();
+    let mut streamed = String::new();
+    for &id in &ids {
+        streamed.push_str(&stream.push(id).expect("decodes"));
+    }
+    streamed.push_str(&stream.finish());
+
+    eprintln!("the oracle continued with {streamed:?}");
+    assert_eq!(streamed, reference_decode(&reference_tokenizer(&dir), &ids));
 }

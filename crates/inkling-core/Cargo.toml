@@ -12,6 +12,7 @@ safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokenizers.workspace = true
 
 [features]
 # Reading the committed reference fixtures. The unit tests reach `fixture`
@@ -24,3 +25,4 @@ test-support = []
 [dev-dependencies]
 inkling-core = { path = ".", features = [ "test-support" ] }
 tempfile.workspace = true
+tokenizers.workspace = true

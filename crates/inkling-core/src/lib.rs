@@ -12,6 +12,7 @@ pub mod moe;
 pub mod ops;
 pub mod quant;
 pub mod sconv;
+pub mod tokenizer;
 pub mod weights;
 
 #[cfg(feature = "test-support")]
@@ -34,4 +35,5 @@ pub use moe::{ExpertBank, ExpertBatch, GateWeights, MoeConfig, MoeOutput, Routin
 pub use ops::{DenseMlp, linear, rms_norm, softmax};
 pub use quant::{Dequantized, QuantError, Scratch};
 pub use sconv::{ConvState, ShortConv};
+pub use tokenizer::{Detokenizer, Tokenizer, TokenizerError};
 pub use weights::{CheckpointWeights, Packed, PackedExperts, WeightsError};
