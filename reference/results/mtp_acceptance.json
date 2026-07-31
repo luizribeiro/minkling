@@ -1,0 +1,978 @@
+{
+  "model": "models/Inkling-Small-8bit",
+  "mtp_config": {
+    "num_nextn_predict_layers": 8,
+    "chain_hidden_post_norm": false,
+    "local_layer_ids": [
+      0,
+      2,
+      4,
+      5,
+      6,
+      7
+    ]
+  },
+  "max_tokens": 384,
+  "prompts": [
+    {
+      "prompt": "code",
+      "prompt_tokens": 43,
+      "generated_tokens": 384,
+      "scored_positions": 376,
+      "decode_s": 21.781548416998703,
+      "decode_tok_s": 17.62960064401664,
+      "variants": {
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=0": {
+          "marginal": [
+            0.6462765957446809,
+            0.4973404255319149,
+            0.449468085106383,
+            0.3803191489361702,
+            0.3351063829787234,
+            0.3377659574468085,
+            0.3324468085106383,
+            0.2845744680851064
+          ],
+          "joint": [
+            0.6462765957446809,
+            0.3670212765957447,
+            0.2127659574468085,
+            0.10638297872340426,
+            0.05053191489361702,
+            0.015957446808510637,
+            0.013297872340425532,
+            0.007978723404255319
+          ]
+        },
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=1": {
+          "marginal": [
+            0.7632978723404256,
+            0.5771276595744681,
+            0.5106382978723404,
+            0.4175531914893617,
+            0.40425531914893614,
+            0.36436170212765956,
+            0.35638297872340424,
+            0.2978723404255319
+          ],
+          "joint": [
+            0.7632978723404256,
+            0.4627659574468085,
+            0.2765957446808511,
+            0.13829787234042554,
+            0.09042553191489362,
+            0.04521276595744681,
+            0.034574468085106384,
+            0.018617021276595744
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=0": {
+          "marginal": [
+            0.824468085106383,
+            0.7446808510638298,
+            0.7446808510638298,
+            0.7393617021276596,
+            0.7393617021276596,
+            0.7367021276595744,
+            0.7579787234042553,
+            0.7393617021276596
+          ],
+          "joint": [
+            0.824468085106383,
+            0.6436170212765957,
+            0.526595744680851,
+            0.43351063829787234,
+            0.38563829787234044,
+            0.34308510638297873,
+            0.3191489361702128,
+            0.2978723404255319
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=1": {
+          "marginal": [
+            0.8537234042553191,
+            0.7686170212765957,
+            0.7659574468085106,
+            0.7473404255319149,
+            0.7606382978723404,
+            0.7579787234042553,
+            0.7579787234042553,
+            0.7606382978723404
+          ],
+          "joint": [
+            0.8537234042553191,
+            0.6595744680851063,
+            0.5558510638297872,
+            0.4627659574468085,
+            0.3962765957446808,
+            0.36436170212765956,
+            0.3377659574468085,
+            0.31382978723404253
+          ]
+        }
+      },
+      "text": "<|content_text|>```python\nimport re\n\ndef parse_iso8601_duration(duration_str):\n    \"\"\"\n    Parse an ISO-8601 duration string into total seconds.\n\n    Supports the format P[n]Y[n]M[n]DT[n]H[n]M[n]S, where fractional\n    seconds (e.g., 1.5S) are handled correctly.\n\n    Args:\n        duration_str (str): The ISO-8601 duration (e.g., \"PT1H30M\", \"P1DT2.5S\").\n\n    Returns:\n        float: Total number of seconds.\n\n    Raises:\n        ValueError: If the string is not a valid ISO-8601 duration.\n    \"\"\"\n    # Regex for ISO-8601 duration\n    pattern = re.compile(\n        r'^P(?:(?P<years>\\d+(?:\\.\\d+)?)Y)?'\n        r'(?:(?P<months>\\d+(?:\\.\\d+)?)M)?'\n        r'(?:(?P<days>\\d+(?:\\.\\d+)?)D)?'\n        r'(?:T(?:(?P<hours>\\d+(?:\\.\\d+)?)H)?'\n        r'(?:(?P<minutes>\\d+(?:\\.\\d+)?)M)?'\n        r'(?:(?P<seconds>\\d+(?:\\.\\d+)?)S)?)?$'\n    )\n\n    match = pattern.match(duration_str)\n    if not match:\n        raise ValueError(f\"Invalid ISO-8601 duration: {duration_str}\")\n\n    # Extract components; default to 0 if missing\n    years = float(match.group('years') or 0)\n    months = float(match.group('months') or 0)\n    days = float(match.group('days') or 0)\n    hours = float(match.group('hours') or 0",
+      "best": {
+        "speculated": 2,
+        "expected_tokens_per_round": 2.5132978723404253,
+        "round_over_decode": 1.7893382337570334,
+        "speedup": 1.4045963054527204
+      }
+    },
+    {
+      "prompt": "enumeration",
+      "prompt_tokens": 43,
+      "generated_tokens": 384,
+      "scored_positions": 376,
+      "decode_s": 13.156472000002395,
+      "decode_tok_s": 29.18715594879312,
+      "variants": {
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=0": {
+          "marginal": [
+            0.7872340425531915,
+            0.5026595744680851,
+            0.2845744680851064,
+            0.5,
+            0.40691489361702127,
+            0.3271276595744681,
+            0.4574468085106383,
+            0.2845744680851064
+          ],
+          "joint": [
+            0.7872340425531915,
+            0.375,
+            0.07712765957446809,
+            0.031914893617021274,
+            0.007978723404255319,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=1": {
+          "marginal": [
+            0.9042553191489362,
+            0.6728723404255319,
+            0.38563829787234044,
+            0.5372340425531915,
+            0.4441489361702128,
+            0.35106382978723405,
+            0.4787234042553192,
+            0.2845744680851064
+          ],
+          "joint": [
+            0.9042553191489362,
+            0.598404255319149,
+            0.23138297872340424,
+            0.11436170212765957,
+            0.047872340425531915,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=0": {
+          "marginal": [
+            0.9946808510638298,
+            0.9361702127659575,
+            0.9335106382978723,
+            0.9388297872340425,
+            0.9707446808510638,
+            0.9946808510638298,
+            0.9867021276595744,
+            0.9946808510638298
+          ],
+          "joint": [
+            0.9946808510638298,
+            0.9308510638297872,
+            0.8643617021276596,
+            0.8058510638297872,
+            0.776595744680851,
+            0.7712765957446809,
+            0.7659574468085106,
+            0.7632978723404256
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=1": {
+          "marginal": [
+            0.9973404255319149,
+            0.9840425531914894,
+            0.9946808510638298,
+            0.9946808510638298,
+            1.0,
+            0.9973404255319149,
+            0.9973404255319149,
+            0.9973404255319149
+          ],
+          "joint": [
+            0.9973404255319149,
+            0.9813829787234043,
+            0.976063829787234,
+            0.973404255319149,
+            0.973404255319149,
+            0.9707446808510638,
+            0.9680851063829787,
+            0.9680851063829787
+          ]
+        }
+      },
+      "text": "<|content_text|>Line 1: 1 squared is 1\nLine 2: 2 squared is 4\nLine 3: 3 squared is 9\nLine 4: 4 squared is 16\nLine 5: 5 squared is 25\nLine 6: 6 squared is 36\nLine 7: 7 squared is 49\nLine 8: 8 squared is 64\nLine 9: 9 squared is 81\nLine 10: 10 squared is 100\nLine 11: 11 squared is 121\nLine 12: 12 squared is 144\nLine 13: 13 squared is 169\nLine 14: 14 squared is 196\nLine 15: 15 squared is 225\nLine 16: 16 squared is 256\nLine 17: 17 squared is 289\nLine 18: 18 squared is 324\nLine 19: 19 squared is 361\nLine 20: 20 squared is 400\nLine 21: 21 squared is 441\nLine 22: 22 squared is 484\nLine 23: 23 squared is 529\nLine 24: 24 squared is 576\nLine 25: 25 squared is 625\nLine 26: 26 squared is 676\nLine 27: 27 squared is 729\nLine 28: 28 squared is 784\nLine 29: 29 squared is 841\nLine 30: 30 squared is 900\nLine 31: 31 squared is 961\nLine 32: 32 squared is 1024\nLine 33: 33 squared is 1089\nLine 34: 34 squared is 1156\nLine 35: 35",
+      "best": {
+        "speculated": 6,
+        "expected_tokens_per_round": 6.872340425531915,
+        "round_over_decode": 3.471548087495675,
+        "speedup": 1.9796183870491977
+      }
+    },
+    {
+      "prompt": "json",
+      "prompt_tokens": 43,
+      "generated_tokens": 384,
+      "scored_positions": 376,
+      "decode_s": 13.175985499998205,
+      "decode_tok_s": 29.143930068840188,
+      "variants": {
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=0": {
+          "marginal": [
+            0.75,
+            0.5478723404255319,
+            0.5026595744680851,
+            0.47074468085106386,
+            0.4920212765957447,
+            0.4654255319148936,
+            0.43882978723404253,
+            0.4308510638297872
+          ],
+          "joint": [
+            0.75,
+            0.4175531914893617,
+            0.13031914893617022,
+            0.0425531914893617,
+            0.013297872340425532,
+            0.007978723404255319,
+            0.005319148936170213,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=1": {
+          "marginal": [
+            0.8164893617021277,
+            0.6356382978723404,
+            0.5611702127659575,
+            0.4867021276595745,
+            0.5053191489361702,
+            0.47074468085106386,
+            0.4441489361702128,
+            0.42819148936170215
+          ],
+          "joint": [
+            0.8164893617021277,
+            0.5132978723404256,
+            0.22872340425531915,
+            0.10372340425531915,
+            0.05053191489361702,
+            0.013297872340425532,
+            0.007978723404255319,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=0": {
+          "marginal": [
+            0.9069148936170213,
+            0.8670212765957447,
+            0.8909574468085106,
+            0.8696808510638298,
+            0.8643617021276596,
+            0.8643617021276596,
+            0.8670212765957447,
+            0.8670212765957447
+          ],
+          "joint": [
+            0.9069148936170213,
+            0.8085106382978723,
+            0.7367021276595744,
+            0.648936170212766,
+            0.5638297872340425,
+            0.4787234042553192,
+            0.4122340425531915,
+            0.3617021276595745
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=1": {
+          "marginal": [
+            0.9175531914893617,
+            0.8829787234042553,
+            0.8856382978723404,
+            0.8803191489361702,
+            0.8617021276595744,
+            0.8643617021276596,
+            0.8617021276595744,
+            0.8670212765957447
+          ],
+          "joint": [
+            0.9175531914893617,
+            0.8271276595744681,
+            0.75,
+            0.6781914893617021,
+            0.5877659574468085,
+            0.4973404255319149,
+            0.43617021276595747,
+            0.375
+          ]
+        }
+      },
+      "text": "<|content_text|>[\n  {\"id\": 1, \"name\": \"Alice\", \"city\": \"New York\", \"country\": \"USA\", \"population\": 8500000},\n  {\"id\": 2, \"name\": \"Bob\", \"city\": \"London\", \"country\": \"UK\", \"population\": 8982000},\n  {\"id\": 3, \"name\": \"Charlie\", \"city\": \"Tokyo\", \"country\": \"Japan\", \"population\": 13960000},\n  {\"id\": 4, \"name\": \"Diana\", \"city\": \"Paris\", \"country\": \"France\", \"population\": 2161000},\n  {\"id\": 5, \"name\": \"Evan\", \"city\": \"Berlin\", \"country\": \"Germany\", \"population\": 3645000},\n  {\"id\": 6, \"name\": \"Fiona\", \"city\": \"Sydney\", \"country\": \"Australia\", \"population\": 5312000},\n  {\"id\": 7, \"name\": \"George\", \"city\": \"Toronto\", \"country\": \"Canada\", \"population\": 2731000},\n  {\"id\": 8, \"name\": \"Hannah\", \"city\": \"Mumbai\", \"country\": \"India\", \"population\": 20411000},\n  {\"id\": 9, \"name\": \"Ian\", \"city\": \"S\u00e3o Paulo\", \"country\": \"Brazil\", \"population\": 12252000},\n  {\"id\": 10, \"name\": \"Julia\", \"city\": \"Cairo\", \"country\": \"Egypt\", \"population\": 20485000},\n  {\"id\": 11, \"name\": \"Kevin\", \"city\": \"Seoul\", \"country\": \"South Korea\", \"population\": 9776000},\n  {\"id\": 12, \"name\":",
+      "best": {
+        "speculated": 4,
+        "expected_tokens_per_round": 4.172872340425532,
+        "round_over_decode": 2.666015968800171,
+        "speedup": 1.5652090569823238
+      }
+    },
+    {
+      "prompt": "prose",
+      "prompt_tokens": 33,
+      "generated_tokens": 384,
+      "scored_positions": 376,
+      "decode_s": 13.223782082997786,
+      "decode_tok_s": 29.03859104678686,
+      "variants": {
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=0": {
+          "marginal": [
+            0.2393617021276596,
+            0.12234042553191489,
+            0.14361702127659576,
+            0.10106382978723404,
+            0.11170212765957446,
+            0.10372340425531915,
+            0.10638297872340426,
+            0.1196808510638298
+          ],
+          "joint": [
+            0.2393617021276596,
+            0.013297872340425532,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=1": {
+          "marginal": [
+            0.3271276595744681,
+            0.14095744680851063,
+            0.1595744680851064,
+            0.11170212765957446,
+            0.11702127659574468,
+            0.11436170212765957,
+            0.10638297872340426,
+            0.125
+          ],
+          "joint": [
+            0.3271276595744681,
+            0.02925531914893617,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=0": {
+          "marginal": [
+            0.4015957446808511,
+            0.30319148936170215,
+            0.29521276595744683,
+            0.30319148936170215,
+            0.30851063829787234,
+            0.29521276595744683,
+            0.26063829787234044,
+            0.2978723404255319
+          ],
+          "joint": [
+            0.4015957446808511,
+            0.1196808510638298,
+            0.034574468085106384,
+            0.005319148936170213,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=1": {
+          "marginal": [
+            0.449468085106383,
+            0.324468085106383,
+            0.3324468085106383,
+            0.3271276595744681,
+            0.3058510638297872,
+            0.31382978723404253,
+            0.2872340425531915,
+            0.2978723404255319
+          ],
+          "joint": [
+            0.449468085106383,
+            0.13297872340425532,
+            0.0398936170212766,
+            0.010638297872340425,
+            0.0026595744680851063,
+            0.0,
+            0.0,
+            0.0
+          ]
+        }
+      },
+      "text": "<|content_text|>Every evening at dusk, Elias sat at the scarred pine desk and opened the leather-bound log, its pages already thick with his cramped, precise handwriting. He recorded the barometric pressure, the color of the sea, the precise minute the lamp was lit, and the names of any vessels that passed within sight of the tower. For twenty years, the ritual had been a kind of prayer, a way of asserting order against the chaos of the Atlantic, but lately the entries seemed to belong to a stranger\u2014someone who had never felt the particular dread of a foghorn that sounded too close, or the way the stairs seemed to lengthen when he climbed them alone.\n\nThe distrust began with a discrepancy he could not resolve: on the night of the fourteenth, he had written that the weather was clear and the sea calm, yet he woke with salt crusted in his hair and a bruise blooming on his forearm that he could not explain. He turned back through the pages and found other lies, or perhaps truths he had refused to see\u2014an entry describing a ship that had never arrived, a notation of a visitor\u2019s signature that looked, upon closer inspection, like his own hand written backward. The log was no longer a record of his vigil; it was a mirror that showed him a keeper who was more diligent, more sane, and more alone than he had ever been.\n\nNow he writes with a trembling hand, pausing after each sentence to compare the ink to the reality outside the window, wondering if the book is slowly replacing him with a more perfect version of himself. He has begun to leave gaps\u2014blank spaces where a storm should be described, or a crossed-out line that reads only *do not trust the light*\u2014and he suspects that the lighthouse itself might be using his own words to keep him anchored to the rock. The log sits open on the desk like a second keeper",
+      "best": {
+        "speculated": 1,
+        "expected_tokens_per_round": 1.449468085106383,
+        "round_over_decode": 1.3924583816422014,
+        "speedup": 1.04094176473479
+      }
+    },
+    {
+      "prompt": "table",
+      "prompt_tokens": 42,
+      "generated_tokens": 299,
+      "scored_positions": 291,
+      "decode_s": 10.402934833000472,
+      "decode_tok_s": 28.741889168766498,
+      "variants": {
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=0": {
+          "marginal": [
+            0.4639175257731959,
+            0.21649484536082475,
+            0.25773195876288657,
+            0.3539518900343643,
+            0.3024054982817869,
+            0.29896907216494845,
+            0.2268041237113402,
+            0.3230240549828179
+          ],
+          "joint": [
+            0.4639175257731959,
+            0.10996563573883161,
+            0.037800687285223365,
+            0.01718213058419244,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=1": {
+          "marginal": [
+            0.6529209621993127,
+            0.30584192439862545,
+            0.3127147766323024,
+            0.38831615120274915,
+            0.32646048109965636,
+            0.29896907216494845,
+            0.22336769759450173,
+            0.31958762886597936
+          ],
+          "joint": [
+            0.6529209621993127,
+            0.17869415807560138,
+            0.07216494845360824,
+            0.030927835051546393,
+            0.006872852233676976,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=0": {
+          "marginal": [
+            0.7285223367697594,
+            0.6804123711340206,
+            0.6701030927835051,
+            0.6769759450171822,
+            0.6701030927835051,
+            0.6666666666666666,
+            0.6323024054982818,
+            0.6632302405498282
+          ],
+          "joint": [
+            0.7285223367697594,
+            0.48109965635738833,
+            0.33676975945017185,
+            0.24054982817869416,
+            0.16494845360824742,
+            0.10309278350515463,
+            0.048109965635738834,
+            0.020618556701030927
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=1": {
+          "marginal": [
+            0.8041237113402062,
+            0.7250859106529209,
+            0.711340206185567,
+            0.6769759450171822,
+            0.7010309278350515,
+            0.6735395189003437,
+            0.6529209621993127,
+            0.6632302405498282
+          ],
+          "joint": [
+            0.8041237113402062,
+            0.5601374570446735,
+            0.41580756013745707,
+            0.2920962199312715,
+            0.19931271477663232,
+            0.12714776632302405,
+            0.07560137457044673,
+            0.044673539518900345
+          ]
+        }
+      },
+      "text": "<|content_text|>| Rank | Country | Area (km\u00b2) | Continent |\n|:---:|:---|---:|:---|\n| 1 | Russia | 17,098,242 | Asia / Europe |\n| 2 | Canada | 9,984,670 | North America |\n| 3 | China | 9,706,961 | Asia |\n| 4 | United States | 9,525,067 | North America |\n| 5 | Brazil | 8,515,767 | South America |\n| 6 | Australia | 7,692,024 | Oceania |\n| 7 | India | 3,287,263 | Asia |\n| 8 | Argentina | 2,780,400 | South America |\n| 9 | Kazakhstan | 2,724,900 | Asia / Europe |\n| 10 | Algeria | 2,381,741 | Africa |\n| 11 | Democratic Republic of the Congo | 2,344,858 | Africa |\n| 12 | Saudi Arabia | 2,149,690 | Asia |\n| 13 | Mexico | 1,964,375 | North America |\n| 14 | Indonesia | 1,910,931 | Asia |\n| 15 | Sudan | 1,861,484 | Africa |\n\n*Note: Figures are approximate and include inland water areas. Russia and Kazakhstan span both Europe and Asia; Australia is a continent and country.*<|end_message|>",
+      "best": {
+        "speculated": 2,
+        "expected_tokens_per_round": 2.3642611683848798,
+        "round_over_decode": 1.7893382337570334,
+        "speedup": 1.3213047839595389
+      }
+    },
+    {
+      "prompt": "technical",
+      "prompt_tokens": 40,
+      "generated_tokens": 384,
+      "scored_positions": 376,
+      "decode_s": 13.34347658399929,
+      "decode_tok_s": 28.778107233348027,
+      "variants": {
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=0": {
+          "marginal": [
+            0.3324468085106383,
+            0.18617021276595744,
+            0.15425531914893617,
+            0.17819148936170212,
+            0.15159574468085107,
+            0.14095744680851063,
+            0.11436170212765957,
+            0.09840425531914894
+          ],
+          "joint": [
+            0.3324468085106383,
+            0.07180851063829788,
+            0.015957446808510637,
+            0.0026595744680851063,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=0,hidden_post_norm=1": {
+          "marginal": [
+            0.4734042553191489,
+            0.24468085106382978,
+            0.18617021276595744,
+            0.18882978723404256,
+            0.17287234042553193,
+            0.15159574468085107,
+            0.1276595744680851,
+            0.09840425531914894
+          ],
+          "joint": [
+            0.4734042553191489,
+            0.10904255319148937,
+            0.023936170212765957,
+            0.0026595744680851063,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=0": {
+          "marginal": [
+            0.5957446808510638,
+            0.4521276595744681,
+            0.4441489361702128,
+            0.4521276595744681,
+            0.43351063829787234,
+            0.425531914893617,
+            0.43617021276595747,
+            0.43882978723404253
+          ],
+          "joint": [
+            0.5957446808510638,
+            0.26595744680851063,
+            0.13829787234042554,
+            0.08244680851063829,
+            0.05053191489361702,
+            0.026595744680851064,
+            0.015957446808510637,
+            0.005319148936170213
+          ]
+        },
+        "hidden_first=1,embed_prenormed=1,hidden_post_norm=1": {
+          "marginal": [
+            0.6436170212765957,
+            0.48936170212765956,
+            0.47074468085106386,
+            0.44680851063829785,
+            0.4627659574468085,
+            0.46808510638297873,
+            0.44148936170212766,
+            0.4521276595744681
+          ],
+          "joint": [
+            0.6436170212765957,
+            0.3271276595744681,
+            0.19680851063829788,
+            0.09308510638297872,
+            0.061170212765957445,
+            0.034574468085106384,
+            0.015957446808510637,
+            0.005319148936170213
+          ]
+        }
+      },
+      "text": "<|content_text|>In a Mixture-of-Experts (MoE) layer, each token is processed by a sparse subset of \u201cexpert\u201d feed-forward networks rather than by one monolithic FFN.\n\n**How routing works**\nA lightweight router (a linear layer) takes the token\u2019s hidden state and outputs a score for every expert. The layer then selects the top-$k$ experts (commonly $k=1$ or $2$) for that token. The token is forwarded through only those $k$ experts; their outputs are weighted by the router\u2019s softmax probabilities (often with a load-balancing loss to prevent collapse) and summed to produce the final representation.\n\n**Cost of top-$k$ selection**\nThe router\u2019s score computation is $O(d \\cdot E)$ per token ($d$ = hidden dim, $E$ = number of experts). Selecting the top-$k$ is $O(E \\log k)$, which is negligible compared to the $O(d^2)$ cost of a full FFN. The real savings come from sparsity: only $k$ experts are activated, so the layer\u2019s compute is roughly $k/E$ of a dense layer of the same total capacity. The overhead is mainly memory (storing all expert weights) and communication (in distributed settings, tokens must be routed to the GPUs holding the selected experts).\n\n**Why shared experts are used**\nShared (or \u201ccommon\u201d) experts are always active for every token, alongside the routed top-$k$ experts. They serve two purposes:\n1. **Stability and knowledge preservation:** They provide a consistent baseline transformation, preventing the model from losing general capabilities when routing is noisy or imbalanced.\n2. **Mitigating routing failure:** If the router assigns a token poorly, the shared experts still process it correctly. This reduces the risk of \u201cdead\u201d experts and improves training stability, allowing the",
+      "best": {
+        "speculated": 1,
+        "expected_tokens_per_round": 1.6436170212765957,
+        "round_over_decode": 1.3924583816422014,
+        "speedup": 1.1803706616625693
+      }
+    }
+  ],
+  "probe": {
+    "prompt": "code",
+    "variants": [
+      {
+        "hidden_first": true,
+        "embed_prenormed": false,
+        "hidden_post_norm": false,
+        "depth_1_acceptance": 0.4881889763779528,
+        "marginal": [
+          0.49166666666666664,
+          0.3416666666666667,
+          0.26666666666666666,
+          0.2916666666666667,
+          0.25,
+          0.26666666666666666,
+          0.25,
+          0.23333333333333334
+        ],
+        "joint": [
+          0.49166666666666664,
+          0.21666666666666667,
+          0.075,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "expected_tokens_per_round": 1.7833333333333332
+      },
+      {
+        "hidden_first": true,
+        "embed_prenormed": false,
+        "hidden_post_norm": true,
+        "depth_1_acceptance": 0.6692913385826772,
+        "marginal": [
+          0.6583333333333333,
+          0.4083333333333333,
+          0.31666666666666665,
+          0.30833333333333335,
+          0.2833333333333333,
+          0.2833333333333333,
+          0.25,
+          0.23333333333333334
+        ],
+        "joint": [
+          0.6583333333333333,
+          0.325,
+          0.1,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "expected_tokens_per_round": 2.0833333333333335
+      },
+      {
+        "hidden_first": true,
+        "embed_prenormed": true,
+        "hidden_post_norm": false,
+        "depth_1_acceptance": 0.7322834645669292,
+        "marginal": [
+          0.725,
+          0.6,
+          0.6,
+          0.5666666666666667,
+          0.5666666666666667,
+          0.5916666666666667,
+          0.6166666666666667,
+          0.6
+        ],
+        "joint": [
+          0.725,
+          0.48333333333333334,
+          0.30833333333333335,
+          0.15833333333333333,
+          0.09166666666666666,
+          0.058333333333333334,
+          0.041666666666666664,
+          0.025
+        ],
+        "expected_tokens_per_round": 2.8916666666666666
+      },
+      {
+        "hidden_first": true,
+        "embed_prenormed": true,
+        "hidden_post_norm": true,
+        "depth_1_acceptance": 0.7637795275590551,
+        "marginal": [
+          0.75,
+          0.6416666666666667,
+          0.6583333333333333,
+          0.575,
+          0.6,
+          0.5916666666666667,
+          0.6083333333333333,
+          0.6083333333333333
+        ],
+        "joint": [
+          0.75,
+          0.4583333333333333,
+          0.3333333333333333,
+          0.2,
+          0.1,
+          0.06666666666666667,
+          0.041666666666666664,
+          0.016666666666666666
+        ],
+        "expected_tokens_per_round": 2.966666666666667
+      },
+      {
+        "hidden_first": false,
+        "embed_prenormed": false,
+        "hidden_post_norm": false,
+        "depth_1_acceptance": 0.0
+      },
+      {
+        "hidden_first": false,
+        "embed_prenormed": false,
+        "hidden_post_norm": true,
+        "depth_1_acceptance": 0.0
+      },
+      {
+        "hidden_first": false,
+        "embed_prenormed": true,
+        "hidden_post_norm": false,
+        "depth_1_acceptance": 0.0
+      },
+      {
+        "hidden_first": false,
+        "embed_prenormed": true,
+        "hidden_post_norm": true,
+        "depth_1_acceptance": 0.007874015748031496
+      }
+    ],
+    "best": {
+      "hidden_first": true,
+      "embed_prenormed": true,
+      "hidden_post_norm": true
+    }
+  },
+  "pooled": {
+    "hidden_first=1,embed_prenormed=0,hidden_post_norm=0": {
+      "marginal": [
+        0.539382772915707,
+        0.35052970981114695,
+        0.30032243205895903,
+        0.32980193459235374,
+        0.2998618148318747,
+        0.27821280515891295,
+        0.281437125748503,
+        0.2542607093505297
+      ],
+      "joint": [
+        0.539382772915707,
+        0.2303086135421465,
+        0.08060801473975127,
+        0.03408567480423768,
+        0.01243666513127591,
+        0.004145555043758636,
+        0.0032243205895900505,
+        0.0013818516812528787
+      ],
+      "scored_positions": 2171,
+      "expected_tokens_per_round": 1.90557346844772
+    },
+    "hidden_first=1,embed_prenormed=0,hidden_post_norm=1": {
+      "marginal": [
+        0.6563795485951175,
+        0.43436204514048826,
+        0.3542146476278213,
+        0.353754030400737,
+        0.32842008291110086,
+        0.2915707047443574,
+        0.2920313219714417,
+        0.25656379548595115
+      ],
+      "joint": [
+        0.6563795485951175,
+        0.3205895900506679,
+        0.14140948871487793,
+        0.06632888070013819,
+        0.03362505757715339,
+        0.010133578995854445,
+        0.007369875633348687,
+        0.0032243205895900505
+      ],
+      "scored_positions": 2171,
+      "expected_tokens_per_round": 2.239060340856748
+    },
+    "hidden_first=1,embed_prenormed=1,hidden_post_norm=0": {
+      "marginal": [
+        0.7425149700598802,
+        0.6632888070013818,
+        0.6628281897742976,
+        0.6628281897742976,
+        0.6642100414555504,
+        0.6637494242284662,
+        0.6577614002763703,
+        0.6669737448180562
+      ],
+      "joint": [
+        0.7425149700598802,
+        0.5439889451865499,
+        0.4435743896821741,
+        0.37448180561953015,
+        0.32980193459235374,
+        0.2943344081068632,
+        0.2685398433901428,
+        0.25011515430677106
+      ],
+      "scored_positions": 2171,
+      "expected_tokens_per_round": 4.247351450944265
+    },
+    "hidden_first=1,embed_prenormed=1,hidden_post_norm=1": {
+      "marginal": [
+        0.776600644864118,
+        0.6946107784431138,
+        0.6927683095347766,
+        0.6789497927222478,
+        0.6812528788576693,
+        0.6794104099493321,
+        0.6669737448180562,
+        0.6734223859972363
+      ],
+      "joint": [
+        0.776600644864118,
+        0.5822201750345463,
+        0.49193919852602486,
+        0.42330723169046525,
+        0.3767848917549516,
+        0.3403961308152925,
+        0.3146015660985721,
+        0.2938737908797789
+      ],
+      "scored_positions": 2171,
+      "expected_tokens_per_round": 4.59972362966375
+    }
+  },
+  "chosen_wiring": "hidden_first=1,embed_prenormed=1,hidden_post_norm=1",
+  "costs": {
+    "decode_s": 0.03175710066655787,
+    "verify_block_s": [
+      0.03175710066655787,
+      0.040300618083468485,
+      0.04911989233308608,
+      0.05902288883286625,
+      0.06871173958340175,
+      0.08172894791641738,
+      0.08871909375011455,
+      0.10213091666688949,
+      0.11594285758352878
+    ],
+    "mtp_chain_s": [
+      0.0,
+      0.003919822916335154,
+      0.007704302082856884,
+      0.01200201733324017,
+      0.015953197916436086,
+      0.01805544791689802,
+      0.021527208333282033,
+      0.02509132641656227,
+      0.028662506916589336
+    ],
+    "context_tokens": 512,
+    "repeats": 12
+  },
+  "speedup_by_depth": [
+    {
+      "speculated": 0,
+      "expected_tokens_per_round": 1.0,
+      "round_over_decode": 1.0,
+      "speedup": 1.0
+    },
+    {
+      "speculated": 1,
+      "expected_tokens_per_round": 1.7766006448641178,
+      "round_over_decode": 1.3924583816422014,
+      "speedup": 1.2758734252214252
+    },
+    {
+      "speculated": 2,
+      "expected_tokens_per_round": 2.358820819898664,
+      "round_over_decode": 1.7893382337570334,
+      "speedup": 1.318264359078664
+    },
+    {
+      "speculated": 3,
+      "expected_tokens_per_round": 2.850760018424689,
+      "round_over_decode": 2.2365047398958526,
+      "speedup": 1.2746496654227706
+    },
+    {
+      "speculated": 4,
+      "expected_tokens_per_round": 3.2740672501151544,
+      "round_over_decode": 2.666015968800171,
+      "speedup": 1.228074883433138
+    },
+    {
+      "speculated": 5,
+      "expected_tokens_per_round": 3.650852141870106,
+      "round_over_decode": 3.1421129051114653,
+      "speedup": 1.1619099160730486
+    },
+    {
+      "speculated": 6,
+      "expected_tokens_per_round": 3.9912482726853984,
+      "round_over_decode": 3.471548087495675,
+      "speedup": 1.1497027182373347
+    },
+    {
+      "speculated": 7,
+      "expected_tokens_per_round": 4.3058498387839705,
+      "round_over_decode": 4.006103844908751,
+      "speedup": 1.074822322505733
+    },
+    {
+      "speculated": 8,
+      "expected_tokens_per_round": 4.59972362966375,
+      "round_over_decode": 4.553481314885784,
+      "speedup": 1.0101553759816242
+    }
+  ],
+  "speedup": {
+    "speculated": 2,
+    "expected_tokens_per_round": 2.358820819898664,
+    "round_over_decode": 1.7893382337570334,
+    "speedup": 1.318264359078664
+  }
+}
