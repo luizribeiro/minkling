@@ -24,6 +24,11 @@
       "index": 2,
       "attention": "sliding",
       "mlp": "moe"
+    },
+    {
+      "index": 5,
+      "attention": "global",
+      "mlp": "moe"
     }
   ],
   "tensors": [
@@ -454,6 +459,238 @@
     },
     {
       "name": "layer2.v_sconv_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.attn_sconv_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.gate_logits",
+      "shape": [
+        8,
+        258
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.gate_scores_biased",
+      "shape": [
+        8,
+        256
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.h",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.input",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.input_layernorm_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.k_norm_out",
+      "shape": [
+        1,
+        8,
+        8,
+        128
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.k_proj_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.k_sconv_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.mask",
+      "shape": [
+        1,
+        32,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.mlp_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.mlp_sconv_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.o_proj_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.post_attention_ln_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.q_norm_out",
+      "shape": [
+        1,
+        32,
+        8,
+        128
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.q_proj_out",
+      "shape": [
+        1,
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.r_proj_out",
+      "shape": [
+        1,
+        8,
+        32,
+        16
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.routed_out",
+      "shape": [
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.sdpa_out",
+      "shape": [
+        1,
+        32,
+        8,
+        128
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.shared_gammas",
+      "shape": [
+        8,
+        2
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.shared_out",
+      "shape": [
+        8,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.topk_idx",
+      "shape": [
+        8,
+        6
+      ],
+      "dtype": "int32"
+    },
+    {
+      "name": "layer5.topk_w",
+      "shape": [
+        8,
+        6
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.v_proj_out",
+      "shape": [
+        1,
+        8,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "layer5.v_sconv_out",
       "shape": [
         1,
         8,

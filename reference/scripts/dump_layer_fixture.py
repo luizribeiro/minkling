@@ -75,9 +75,10 @@ MOE_GLOBAL_SCALE = 0.35
 PREFILL = 8
 CONTINUE = 3
 
-# Layers below `dense_mlp_idx` are dense and the rest are MoE. Both are sliding,
-# which is what the two captured layers of the activation dump are; log scaling
-# is a global layer's and the attention fixture pins it there.
+# Layers below `dense_mlp_idx` are dense and the rest are MoE. Both cases here
+# are sliding: what a global layer does differently sits in attention, where the
+# activation dump covers one against real weights and the attention fixture pins
+# log scaling.
 DENSE_LAYER = 0
 MOE_LAYER = 1
 CASES = {"dense": DENSE_LAYER, "moe": MOE_LAYER}

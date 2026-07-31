@@ -471,7 +471,7 @@ mod tests {
     /// magnitude, which puts it slightly above the ceiling. The same bound, for
     /// the same reason, as the trained masks.
     ///
-    /// Worst observed when this landed: 2.2e-3 on layer 0. The weakest mutation
+    /// Worst observed when this landed: 2.8e-3 on layer 5. The weakest mutation
     /// these tests rely on catching, the conventional `1/sqrt(head_dim)` scale,
     /// moves the answer by 1.0 — over two decades above this bound.
     const TRAINED_TOLERANCE: f32 = 6e-3;

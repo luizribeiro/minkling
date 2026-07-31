@@ -525,6 +525,35 @@ mod tests {
         );
     }
 
+    /// The captured layers cover both attention configurations, so the trained
+    /// cases are a global layer's band as well as a sliding layer's window. The
+    /// dump script refuses a set that stops covering both; stated again here
+    /// because a fixture that quietly lost its global layer would leave every
+    /// test below still passing over sliding layers alone.
+    #[test]
+    fn the_trained_cases_cover_a_sliding_and_a_global_layer() {
+        let trained = Case::trained();
+        let (global, sliding): (Vec<&Case>, Vec<&Case>) =
+            trained.iter().partition(|case| case.sliding == 0);
+
+        // A global layer's band outruns a sliding layer's, which is the whole
+        // of why branch 4 is reachable on one and not the other.
+        let narrowest = global
+            .iter()
+            .map(|case| case.rel_extent)
+            .min()
+            .expect("a captured layer is global");
+        let widest = sliding
+            .iter()
+            .map(|case| case.rel_extent)
+            .max()
+            .expect("a captured layer is sliding");
+        assert!(
+            narrowest > widest,
+            "a global band of {narrowest} does not outrun a sliding one of {widest}"
+        );
+    }
+
     /// A sliding layer sets `rel_extent` to its own `sliding_window_size`, so
     /// the band ends exactly where the window does and nothing is ever in
     /// context and outside the band. Branch 4 is a global layer's alone.

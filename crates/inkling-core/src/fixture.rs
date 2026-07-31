@@ -18,9 +18,10 @@ const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../reference/fixtures
 pub const ACTIVATIONS: &str = "layer_activations.safetensors";
 
 /// The decoder layers that pass kept, and so the layers every trained case is
-/// cut from. Which two comes from the checkpoint — the dump script refuses a
-/// pair that does not cover both a dense and a MoE MLP.
-pub const CAPTURED_LAYERS: [usize; 2] = [0, 2];
+/// cut from. Which three comes from the checkpoint — the dump script refuses a
+/// set that does not cover both a dense and a MoE MLP, and both a sliding and a
+/// global attention.
+pub const CAPTURED_LAYERS: [usize; 3] = [0, 2, 5];
 
 pub fn open(file: &str) -> Checkpoint {
     let path = PathBuf::from(DIR).join(file);

@@ -168,13 +168,16 @@ def instrument(capture, model):
 
 
 def check_layer_coverage(config, layer_indices):
-    """Which layer is dense and which is MoE comes from the checkpoint, so a
-    hard-coded pair can quietly stop covering the router — the one piece the
-    fixture exists to pin — without anything looking wrong."""
-    if {config.layer_is_dense(i) for i in layer_indices} != {True, False}:
-        raise SystemExit(
-            f"layers {list(layer_indices)} do not cover both a dense and a MoE MLP"
-        )
+    """Which layer is dense and which is MoE, and which is sliding and which is
+    global, both come from the checkpoint, so a hard-coded set can quietly stop
+    covering the router or the full-attention path — the pieces the fixture
+    exists to pin — without anything looking wrong."""
+    for both, holds in (
+        ("a dense and a MoE MLP", config.layer_is_dense),
+        ("a sliding and a global attention", config.layer_is_sliding),
+    ):
+        if {holds(i) for i in layer_indices} != {True, False}:
+            raise SystemExit(f"layers {list(layer_indices)} do not cover both {both}")
 
 
 def token_ids(processor):

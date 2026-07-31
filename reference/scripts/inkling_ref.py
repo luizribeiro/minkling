@@ -16,9 +16,10 @@ from mlx_vlm import load
 # layer, and a bundle that names a layer the others do not is a fixture the
 # Rust side cannot open.
 #
-# `check_layer_coverage` refuses a set that stops covering what the fixtures
-# exist to pin.
-CAPTURED_LAYERS = (0, 2)
+# Layer 0 is dense and sliding, 2 is MoE and sliding, 5 is MoE and global. That
+# covers both MLPs and both attention configurations; `check_layer_coverage`
+# refuses a set that stops doing so.
+CAPTURED_LAYERS = (0, 2, 5)
 
 
 def gib(n_bytes):

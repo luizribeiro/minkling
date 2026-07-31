@@ -109,11 +109,15 @@ fn opening_does_not_fault_in_the_weights() {
 /// one, and 6e-3 is the same bound, for the same reason, as the recorded
 /// attention step and the trained masks. Worst observed when this landed:
 /// 2.6e-3 on layer 0, against a mask flattened to no learned bias at 1.4e-1.
+/// Layer 5, the global one, sits at 2.4e-3.
 ///
 /// What this settles is the wiring; the synthetic cases settle the arithmetic.
-/// It cannot settle everything: both captured layers are sliding ones, and at
-/// eight tokens their 512-token window caps nothing, so a port that read a
-/// sliding layer's config fields as a global layer's would agree here.
+/// One of the three captured layers is global, so which of the two sets of head
+/// fields a layer reads is settled here too. What eight tokens cannot settle is
+/// what a global layer does differently: nothing is far enough back to be capped
+/// by a window or to fall outside the 1024-token band, so a port that handed a
+/// global layer a window would agree here. Only a sequence past the band settles
+/// that.
 const ATTENTION_TOLERANCE: f32 = 6e-3;
 
 fn text_config(dir: &Path) -> TextConfig {
@@ -448,6 +452,13 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
 /// factor of two in hand. Against the weakest mutation this bound has to catch,
 /// layer 0's two residual-path convolutions exchanged, at 4.9e-1 — a factor of
 /// thirty above it.
+///
+/// Layer 5 comes in an order of magnitude lower, at 5.5e-4, and that is the same
+/// account read the other way rather than a better port. Activations grow with
+/// depth: its residual peaks at 13248 where layer 0's peaks at 65, while its
+/// `mlp_sconv_out` peaks at 1664 — 11% of the output's 14912 against layer 0's
+/// 76%. The convolution's amplified error is the same error; it is a tenth of
+/// the tensor it is measured against.
 const LAYER_TOLERANCE: f32 = 1.5e-2;
 
 /// One decoder layer's tensors outside its attention and its MLP: a weight for
