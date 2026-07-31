@@ -6,6 +6,8 @@
 //! whole feature axis, so summation order alone moves the last bits — and the
 //! tests bound the disagreement instead of demanding equality.
 
+use std::fmt::Debug;
+
 /// Root-mean-square normalisation over the last axis, `x * rsqrt(mean(x²) +
 /// eps) * weight`, with one row per `weight.len()` values of `x`.
 pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
@@ -48,6 +50,21 @@ fn inverse_rms(row: &[f32], eps: f32) -> f32 {
     (sum / row.len() as f64 + f64::from(eps)).sqrt().recip() as f32
 }
 
+/// The three projections a SwiGLU feed-forward network multiplies through,
+/// wherever their weights live.
+///
+/// The same seam [`crate::attention::Projections`] is, over the three that make
+/// an MLP rather than the five that make an attention layer: a dense layer's
+/// are `3 x [16384, 4096]`, which is 1.61 GB of float32 a decode step, and a
+/// backend holding them may never decode any of it.
+///
+/// `Debug` because [`DenseMlp`] derives it.
+pub trait MlpProjections: Debug {
+    fn gate_proj(&self) -> &dyn Projection;
+    fn up_proj(&self) -> &dyn Projection;
+    fn down_proj(&self) -> &dyn Projection;
+}
+
 /// A dense layer's feed-forward network: a SwiGLU MLP times a learned
 /// `global_scale`.
 ///
@@ -56,12 +73,39 @@ fn inverse_rms(row: &[f32], eps: f32) -> f32 {
 /// it is not 1.
 #[derive(Debug, Clone, Copy)]
 pub struct DenseMlp<'a> {
-    dim: usize,
-    hidden_dim: usize,
-    gate_proj: &'a [f32],
-    up_proj: &'a [f32],
-    down_proj: &'a [f32],
+    projections: Held<'a>,
     global_scale: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Held<'a> {
+    /// Weights decoded to float32 and multiplied here, which is the path every
+    /// other one is checked against.
+    Decoded(Decoded<'a>),
+    /// A backend holding the weights itself, which may never decode them.
+    Backend(&'a dyn MlpProjections),
+}
+
+/// Three decoded weights with the widths they map between settled.
+#[derive(Debug, Clone, Copy)]
+struct Decoded<'a> {
+    gate_proj: DenseProjection<'a>,
+    up_proj: DenseProjection<'a>,
+    down_proj: DenseProjection<'a>,
+}
+
+impl MlpProjections for Decoded<'_> {
+    fn gate_proj(&self) -> &dyn Projection {
+        &self.gate_proj
+    }
+
+    fn up_proj(&self) -> &dyn Projection {
+        &self.up_proj
+    }
+
+    fn down_proj(&self) -> &dyn Projection {
+        &self.down_proj
+    }
 }
 
 impl<'a> DenseMlp<'a> {
@@ -82,43 +126,94 @@ impl<'a> DenseMlp<'a> {
         assert_eq!(up_proj.len(), gate_proj.len(), "up against gate");
         assert_eq!(down_proj.len(), gate_proj.len(), "down against gate");
 
-        Self {
+        let hidden_dim = gate_proj.len() / dim;
+        Self::over(
+            Held::Decoded(Decoded {
+                gate_proj: DenseProjection::new(dim, gate_proj),
+                up_proj: DenseProjection::new(dim, up_proj),
+                down_proj: DenseProjection::new(hidden_dim, down_proj),
+            }),
             dim,
-            hidden_dim: gate_proj.len() / dim,
-            gate_proj,
-            up_proj,
-            down_proj,
+            hidden_dim,
             global_scale,
+        )
+    }
+
+    /// The same MLP over three projections a backend answers for, mapping from
+    /// `dim` through `hidden_dim` and back.
+    ///
+    /// Both widths are the caller's to state rather than the projections' to
+    /// report, for the reason [`AttentionConfig`](crate::AttentionConfig)'s
+    /// `hidden` is: they are what the three are checked against, and a width
+    /// read off one of the weights being checked would agree with itself.
+    pub fn backend(
+        dim: usize,
+        hidden_dim: usize,
+        projections: &'a dyn MlpProjections,
+        global_scale: f32,
+    ) -> Self {
+        Self::over(Held::Backend(projections), dim, hidden_dim, global_scale)
+    }
+
+    /// Whether the three are one MLP's of these two widths, which has to be
+    /// settled here: the activation zips `gate` against `up`, so an `up_proj`
+    /// narrower than `gate_proj` would truncate the answer rather than fail, and
+    /// a `down_proj` that maps back to another width would only show up in the
+    /// residual add a layer later.
+    fn over(projections: Held<'a>, dim: usize, hidden_dim: usize, global_scale: f32) -> Self {
+        let mlp = Self {
+            projections,
+            global_scale,
+        };
+        let three = mlp.projections();
+        for (name, projection, from, to) in [
+            ("gate_proj", three.gate_proj(), dim, hidden_dim),
+            ("up_proj", three.up_proj(), dim, hidden_dim),
+            ("down_proj", three.down_proj(), hidden_dim, dim),
+        ] {
+            assert_eq!(projection.in_dim(), from, "the width {name} maps from");
+            assert_eq!(projection.out_dim(), to, "the width {name} maps to");
+        }
+        mlp
+    }
+
+    fn projections(&self) -> &dyn MlpProjections {
+        match &self.projections {
+            Held::Decoded(decoded) => decoded,
+            Held::Backend(projections) => *projections,
         }
     }
 
     /// The width this maps between, which for a layer's own MLP is the hidden
     /// size and for one expert of a bank is the same.
     pub fn dim(&self) -> usize {
-        self.dim
+        self.projections().gate_proj().in_dim()
     }
 
     /// `[rows, dim]` in, `[rows, dim]` out.
+    ///
+    /// Every row at once rather than a row at a time. The arithmetic is
+    /// identical — a projection multiplies each row against every weight row
+    /// independently — and it is three calls for the whole batch rather than
+    /// three per row, which is what a backend where a call is a dispatch needs.
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
+        let three = self.projections();
         assert_eq!(
-            x.len() % self.dim,
+            x.len() % self.dim(),
             0,
             "{} values are not whole rows of {}",
             x.len(),
-            self.dim
+            self.dim()
         );
 
-        let mut out = Vec::with_capacity(x.len());
-        for row in x.chunks_exact(self.dim) {
-            let mut gate = linear(row, self.gate_proj, self.dim);
-            swiglu(&mut gate, &linear(row, self.up_proj, self.dim));
-            out.extend(
-                linear(&gate, self.down_proj, self.hidden_dim)
-                    .iter()
-                    .map(|y| y * self.global_scale),
-            );
-        }
-        out
+        let mut gate = three.gate_proj().forward(x);
+        swiglu(&mut gate, &three.up_proj().forward(x));
+        three
+            .down_proj()
+            .forward(&gate)
+            .iter()
+            .map(|y| y * self.global_scale)
+            .collect()
     }
 }
 
@@ -350,6 +445,43 @@ mod tests {
         fn forward(&self) -> Vec<f32> {
             self.with(&self.gate_proj, &self.up_proj, self.global_scale)
         }
+
+        fn hidden_dim(&self) -> usize {
+            self.gate_proj.len() / self.dim
+        }
+
+        /// The same three weights as a backend's, cut to `hidden_dim` of the
+        /// width between — which at the full width is this MLP and at any other
+        /// is three projections that agree with each other and not with the
+        /// layer.
+        fn handed(&self, hidden_dim: usize) -> Handed<'_> {
+            let between = hidden_dim * self.dim;
+            Handed(Decoded {
+                gate_proj: DenseProjection::new(self.dim, &self.gate_proj[..between]),
+                up_proj: DenseProjection::new(self.dim, &self.up_proj[..between]),
+                down_proj: DenseProjection::new(hidden_dim, &self.down_proj[..between]),
+            })
+        }
+    }
+
+    /// An [`MlpProjections`] that is not this module's — the three answered by
+    /// something the MLP cannot see inside, which is the whole of what a backend
+    /// is from here.
+    #[derive(Debug)]
+    struct Handed<'a>(Decoded<'a>);
+
+    impl MlpProjections for Handed<'_> {
+        fn gate_proj(&self) -> &dyn Projection {
+            self.0.gate_proj()
+        }
+
+        fn up_proj(&self) -> &dyn Projection {
+            self.0.up_proj()
+        }
+
+        fn down_proj(&self) -> &dyn Projection {
+            self.0.down_proj()
+        }
     }
 
     #[test]
@@ -489,6 +621,51 @@ mod tests {
 
         let unscaled = mlp.with(&mlp.gate_proj, &mlp.up_proj, 1.0);
         assert!(deviation(&unscaled, &mlp.output) > TOLERANCE);
+    }
+
+    /// The seam: an MLP whose three projections are answered by a backend is the
+    /// same MLP.
+    ///
+    /// Exact rather than bounded, because the backend here multiplies the same
+    /// weights through the same [`linear`] — what changes is only who was asked.
+    #[test]
+    fn an_mlp_whose_projections_come_from_a_backend_is_the_same_mlp() {
+        let mlp = Mlp::load(&fixture::open(FIXTURE));
+        let handed = mlp.handed(mlp.hidden_dim());
+
+        assert_eq!(
+            DenseMlp::backend(mlp.dim, mlp.hidden_dim(), &handed, mlp.global_scale)
+                .forward(&mlp.input),
+            mlp.forward()
+        );
+    }
+
+    /// Three projections that agree with each other but not with the layer are
+    /// refused, which is the mistake only a stated width catches: they are
+    /// another MLP's, and every check they could be put to among themselves
+    /// passes.
+    #[test]
+    #[should_panic(expected = "the width gate_proj maps to")]
+    fn three_projections_of_another_mlps_width_are_refused() {
+        let mlp = Mlp::load(&fixture::open(FIXTURE));
+        let handed = mlp.handed(mlp.hidden_dim() / 2);
+
+        DenseMlp::backend(mlp.dim, mlp.hidden_dim(), &handed, mlp.global_scale);
+    }
+
+    /// And a `down_proj` that maps back to another width is refused too, where
+    /// the two that come before it are this layer's. `silu(gate) * up` is a zip
+    /// and the residual add is another, so a width that disagreed would truncate
+    /// an answer rather than fail — a layer later, and somewhere else.
+    #[test]
+    #[should_panic(expected = "the width down_proj maps to")]
+    fn a_down_projection_that_maps_back_to_another_width_is_refused() {
+        let mlp = Mlp::load(&fixture::open(FIXTURE));
+        let mut handed = mlp.handed(mlp.hidden_dim());
+        handed.0.down_proj =
+            DenseProjection::new(mlp.hidden_dim(), &mlp.down_proj[..mlp.down_proj.len() / 2]);
+
+        DenseMlp::backend(mlp.dim, mlp.hidden_dim(), &handed, mlp.global_scale);
     }
 
     /// `silu` is not symmetric in its two operands, so exchanging the
