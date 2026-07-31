@@ -25,12 +25,20 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-Keep the budget small: a decode step is about 9 s on the CPU path against
-mlx-vlm's 32 ms, and the timings go to stderr so stdout stays pipeable. The
-prompt reaches the tokenizer as it stands, so the model *continues* it rather
+Keep the budget small: a decode step is about 8.4 s against mlx-vlm's 32 ms, and
+the timings go to stderr so stdout stays pipeable. The prompt reaches the
+tokenizer as it stands, so the model *continues* it rather
 than answering it. A chat turn is written out in full —
 `<|message_user|><|content_text|>…<|end_message|><|message_model|>` — rather than
 applied by a template this does not implement.
+
+`lm_head` runs on the GPU — one dispatch against MXFP4 codes it never decodes,
+1.4 ms where the same multiply costs the CPU 687 ms — and `--backend cpu` puts
+it back. That is worth 0.6 s of a 9.0 s token and not the several seconds the
+ratio suggests: a decode step is dequantisation, at about 4.9 GB/s of it, and
+the head is 3.3 GB of the 44 GB it decodes while the 42 layers below are the
+other 41. Both backends generate the same tokens, and the CPU one stays the
+oracle every kernel here is validated against.
 
 Or the same model behind an OpenAI-compatible endpoint, loaded once:
 
