@@ -91,27 +91,32 @@ dependency of the engine.
 
 Two patches are needed before it loads Inkling-Small at all:
 
-- `inkling-config.py.patch` — mlx-vlm reads `intermediate_size` as the dense FFN
-  width, but Inkling calls the dense width `dense_intermediate_size` and uses
+- `03-config-field-names.patch` — mlx-vlm reads `intermediate_size` as the dense
+  FFN width, but Inkling calls the dense width `dense_intermediate_size` and uses
   `intermediate_size` for the per-expert width. Unpatched, both are wrong for
   Inkling-Small, and Inkling-975B's two dense layers load at 3072 instead of
   24576.
-- `inkling-inkling.py.patch` — the MXFP4 quant carries identity
+- `04-drop-identity-expert-scales.patch` — the MXFP4 quant carries identity
   `switch_mlp.{gate,out}_scale` tensors with no counterpart in the model, which
   abort a strict load. Dropped, with a guard that refuses any non-identity value.
+
+The other three — a model-type remap, submodule configs exported for the dump
+scripts, and a tap on the MoE router — are what the fixtures are captured
+through rather than what makes the checkpoint load.
 
 ## Architecture notes
 
 42 layers, hidden 4096, 256 routed experts (top-6) plus 2 shared, 276B total /
 12B active. No RoPE — position comes from depthwise causal short convolutions
-(kernel 4, on q/k/v and on the attention/MLP inputs) plus a learned relative
-logit bias over a 1024-token extent.
+(kernel 4, on the key and value inside attention and on what attention and the
+MLP produced, before each residual add) plus a learned relative logit bias over
+a 1024-token extent.
 
 Three properties drive the design:
 
 **Attention is 5:1 local:global.** Layers 5, 11, 17, 23, 29, 35 and 41 are full
 attention; the other 35 are capped at a 512-token window. Only the 7 global
-layers grow with sequence length, so KV costs 28 KiB/token plus a fixed 73 MiB
+layers grow with sequence length, so KV costs 28 KiB/token plus a fixed 70 MiB
 per sequence — a 1M-token context fits in under 30 GiB. This is what makes deep
 batching plausible on one machine.
 
