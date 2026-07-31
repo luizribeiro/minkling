@@ -66,7 +66,9 @@ pub struct Checkpoint {
 /// The dtype, shape and undecoded bytes of one tensor.
 ///
 /// The bytes are exactly as they sit in the file: MXFP4 blocks stay packed and
-/// bf16 stays 16-bit. Decoding belongs to the layer that knows what it wants.
+/// bf16 stays 16-bit. Decoding that needs more than these bytes — MXFP4, which
+/// wants the block scales stored beside them — belongs to the layer that knows
+/// what it wants; widening a float dtype needs nothing else and lives here.
 #[derive(Debug, Clone, Copy)]
 pub struct TensorView<'a> {
     dtype: Dtype,
@@ -85,6 +87,33 @@ impl<'a> TensorView<'a> {
 
     pub fn data(&self) -> &'a [u8] {
         self.data
+    }
+
+    /// A `BF16` or `F32` tensor's values, widened to f32. `None` for anything
+    /// else, which for an Inkling checkpoint means a packed MXFP4 tensor —
+    /// those decode through [`crate::quant`], which needs their scales too.
+    ///
+    /// Widening bfloat16 is exact and needs no table: it is an f32 with the low
+    /// sixteen mantissa bits dropped, so putting them back is a shift.
+    pub fn to_f32(&self) -> Option<Vec<f32>> {
+        match self.dtype {
+            Dtype::F32 => Some(
+                self.data
+                    .chunks_exact(size_of::<f32>())
+                    .map(|b| f32::from_le_bytes(b.try_into().expect("chunked into floats")))
+                    .collect(),
+            ),
+            Dtype::BF16 => Some(
+                self.data
+                    .chunks_exact(size_of::<u16>())
+                    .map(|b| {
+                        let bits = u16::from_le_bytes(b.try_into().expect("chunked into halves"));
+                        f32::from_bits(u32::from(bits) << 16)
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -340,6 +369,40 @@ mod tests {
         assert_eq!(ids.dtype(), Dtype::I32);
         assert_eq!(ids.shape(), [1, 8]);
         assert_eq!(ids.data().len(), 8 * 4);
+    }
+
+    /// Widening bfloat16 is a shift, and every way to get it wrong — the byte
+    /// order, the shift's direction, half a nibble out — still produces finite
+    /// numbers of a plausible size. The exponent and mantissa fields have to
+    /// land where f32 keeps them, and the sign has to survive.
+    #[test]
+    fn bfloat16_widens_by_restoring_the_mantissa_bits_it_dropped() {
+        // 1.0, -2.5, +0, -0, the smallest normal 2^-126, and 1 + 2^-7 — the
+        // next value up, whose set bit is the last of bfloat16's seven.
+        let halves: [u16; 6] = [0x3f80, 0xc020, 0x0000, 0x8000, 0x0080, 0x3f81];
+        let data: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let view = TensorView {
+            dtype: Dtype::BF16,
+            shape: &[6],
+            data: &data,
+        };
+
+        let got = view.to_f32().expect("bfloat16 widens");
+        assert_eq!(
+            got,
+            [1.0, -2.5, 0.0, -0.0, f32::MIN_POSITIVE, 1.0 + 2f32.powi(-7)]
+        );
+        assert_eq!(got[3].to_bits(), (-0.0f32).to_bits(), "the sign of zero");
+    }
+
+    /// A packed MXFP4 tensor means nothing without the scales stored beside it,
+    /// so it is refused here rather than read as raw bytes.
+    #[test]
+    fn a_packed_tensor_does_not_widen() {
+        let ckpt = fixture::open("mxfp4_dequant.safetensors");
+        let packed = ckpt.tensor("dense_ffn.weight").expect("a packed slice");
+        assert_eq!(packed.dtype(), Dtype::U32);
+        assert!(packed.to_f32().is_none());
     }
 
     #[test]

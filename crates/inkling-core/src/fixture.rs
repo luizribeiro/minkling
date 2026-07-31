@@ -36,13 +36,11 @@ pub fn layer_tensor<'a>(ckpt: &'a Checkpoint, layer: usize, name: &str) -> Tenso
 }
 
 /// A fixture tensor's values. Every dump casts to float32 before saving, so a
-/// comparison never has to reason about the reference's dtype choices.
+/// comparison never has to reason about the reference's dtype choices, and
+/// anything else in a fixture is a dump that stopped doing that.
 pub fn f32s(view: &TensorView<'_>) -> Vec<f32> {
     assert_eq!(view.dtype(), Dtype::F32);
-    view.data()
-        .chunks_exact(size_of::<f32>())
-        .map(|b| f32::from_le_bytes(b.try_into().expect("chunked into floats")))
-        .collect()
+    view.to_f32().expect("float32 widens")
 }
 
 /// The worst absolute disagreement with a reference tensor, as a fraction of
