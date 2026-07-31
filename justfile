@@ -29,5 +29,9 @@ prefill-bench model="models/Inkling-Small-mxfp4" *args:
 dump-activations model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_activations.py {{ model }}
 
+# Regenerate the committed MXFP4 slices the Rust dequantiser is tested against
+dump-quant-fixture model="models/Inkling-Small-mxfp4":
+    reference/.venv/bin/python reference/scripts/dump_quant_fixture.py {{ model }}
+
 fetch repo="thinkingmachines/Inkling-Small":
     hf download {{ repo }}

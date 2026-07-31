@@ -1,0 +1,116 @@
+{
+  "quantization": {
+    "group_size": 32,
+    "bits": 4,
+    "mode": "mxfp4"
+  },
+  "checkpoint": {
+    "path": "models/Inkling-Small-mxfp4",
+    "total_size": 140271331492,
+    "quantized": {
+      "tensors": 458,
+      "scale_bytes": [
+        0,
+        110,
+        111,
+        112,
+        113,
+        114,
+        115,
+        116,
+        117,
+        118,
+        119,
+        120,
+        121,
+        122,
+        123,
+        124,
+        125,
+        126,
+        127,
+        128,
+        129,
+        130
+      ],
+      "groups_where_the_backends_would_disagree": 0
+    }
+  },
+  "dequantized_by": "mx.dequantize on the cpu stream",
+  "slices": [
+    {
+      "name": "routed_expert",
+      "tensor": "language_model.model.layers.3.mlp.switch_mlp.gate_proj",
+      "slice": "[0:2, 0:32]",
+      "shape": [
+        2,
+        32,
+        512
+      ],
+      "dequantized_shape": [
+        2,
+        32,
+        4096
+      ],
+      "scale_byte_range": [
+        122,
+        124
+      ],
+      "values_metal_would_flush_to_zero": 0
+    },
+    {
+      "name": "dense_ffn",
+      "tensor": "language_model.model.layers.0.mlp.gate_proj",
+      "slice": "[0:64]",
+      "shape": [
+        64,
+        512
+      ],
+      "dequantized_shape": [
+        64,
+        4096
+      ],
+      "scale_byte_range": [
+        110,
+        126
+      ],
+      "values_metal_would_flush_to_zero": 0
+    },
+    {
+      "name": "vocab_padding",
+      "tensor": "language_model.lm_head",
+      "slice": "[200026:200090]",
+      "shape": [
+        64,
+        512
+      ],
+      "dequantized_shape": [
+        64,
+        4096
+      ],
+      "scale_byte_range": [
+        0,
+        125
+      ],
+      "values_metal_would_flush_to_zero": 0
+    },
+    {
+      "name": "code_grid",
+      "tensor": null,
+      "slice": null,
+      "shape": [
+        1,
+        1024
+      ],
+      "dequantized_shape": [
+        1,
+        8192
+      ],
+      "scale_byte_range": [
+        0,
+        255
+      ],
+      "values_metal_would_flush_to_zero": 32
+    }
+  ]
+}
