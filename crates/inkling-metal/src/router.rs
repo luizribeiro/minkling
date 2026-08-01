@@ -273,10 +273,17 @@ impl<'a> LayerRouter<'a> {
         let mut bias = self.bias.borrow_mut();
         let mut chosen = self.device.zeroed::<u32>(self.assignments(tokens))?;
 
+        // **The row is bound whole and the routed part of it is ranked.** The
+        // two shared experts are on for every token and take no part in a
+        // selection, so the `n_shared` logits after the routed ones are read by
+        // the weighting behind this and by nothing here.
+        let moves = size_of::<f32>() * self.config.n_routed * (tokens + 1)
+            + size_of::<u32>() * chosen.len();
         batch.add(
             &self.router.kernel,
             &[shape.arg(), logits.arg(), bias.arg(), chosen.arg()],
             Grid::new(tokens * THREADS_PER_GROUP, THREADS_PER_GROUP),
+            moves,
         )?;
         Ok(chosen)
     }
@@ -337,6 +344,13 @@ impl<'a> LayerRouter<'a> {
             shared: self.device.zeroed::<f32>(tokens * n_shared)?,
         };
 
+        // **The row is bound whole and eight of it are read.** The `top_k` the
+        // selection gathered and the `n_shared` after the routed experts are
+        // every logit this kernel touches: the ranking that needed all 256 went
+        // with the dispatch before it, and this one reads the indices it left.
+        let moves = size_of::<f32>()
+            * (tokens * (top_k + n_shared) + weights.routed.len() + weights.shared.len())
+            + size_of::<u32>() * picked.len();
         batch.add(
             &self.weights.kernel,
             &[
@@ -348,6 +362,7 @@ impl<'a> LayerRouter<'a> {
                 weights.shared.arg(),
             ],
             Grid::new(tokens, THREADS_PER_WEIGHING),
+            moves,
         )?;
         Ok(weights)
     }
@@ -642,6 +657,63 @@ mod tests {
     /// catching, the shared logits read off the front of the row, moves the
     /// routed weights by 2.3e-1 — six decades above.
     const TOLERANCE: f32 = 1e-6;
+
+    /// What the bandwidth column divides by, against what the two kernels read.
+    ///
+    /// **Both are bound a 258-wide row and neither reads all of it**, which is
+    /// the distinction a declared figure exists to make: a dispatch is charged
+    /// what it moves and not what it was bound. Ranking needs every one of the
+    /// 256 routed scores and none of the two shared ones, which are on for every
+    /// token; the softmax behind it reads the `top_k` the ranking named and the
+    /// `n_shared` after them, which is eight.
+    #[test]
+    fn the_two_dispatches_declare_what_each_of_them_reads_of_a_row() {
+        let Some(device) = device() else { return };
+        let kernels = Kernels::compile(&device);
+        let bias = correction_bias();
+        let layer = kernels.layer(&device, &bias);
+        let logits = gate_logits(TOKENS, 0);
+        let width = CONFIG.n_routed + CONFIG.n_shared;
+
+        let mut selecting = device.buffer(&logits).expect("the logits upload");
+        let selection = crate::testing::moved(&device, |batch| {
+            layer
+                .encode(batch, &mut selecting)
+                .expect("the selection encodes");
+        });
+        let mut weighing = device.buffer(&logits).expect("the logits upload");
+        let mut picked = device
+            .buffer(&vec![0u32; TOKENS * CONFIG.top_k])
+            .expect("the selection uploads");
+        let weighting = crate::testing::moved(&device, |batch| {
+            layer
+                .encode_weights(batch, &mut weighing, &mut picked)
+                .expect("the weighting encodes");
+        });
+
+        assert_eq!(
+            selection as usize,
+            size_of::<f32>() * CONFIG.n_routed * (TOKENS + 1)
+                + size_of::<u32>() * TOKENS * CONFIG.top_k,
+            "the routed part of each row, the bias it is corrected by, and the experts it named"
+        );
+        let whole_row = size_of::<f32>() * (TOKENS * width + CONFIG.n_routed)
+            + size_of::<u32>() * TOKENS * CONFIG.top_k;
+        assert!(
+            (selection as usize) < whole_row,
+            "the selection was charged the two shared logits it never ranks"
+        );
+        let spanned = CONFIG.top_k + CONFIG.n_shared;
+        assert_eq!(
+            weighting as usize,
+            size_of::<f32>() * 2 * TOKENS * spanned + size_of::<u32>() * TOKENS * CONFIG.top_k,
+            "eight logits gathered, the indices that named them, and eight weights out"
+        );
+        assert!(
+            weighting * 10 < selection,
+            "the weighting was charged a row it reads eight of: {weighting} against {selection}"
+        );
+    }
 
     /// A router with `bias` and no gate of its own — the layer's weight is not
     /// what any of this is about.

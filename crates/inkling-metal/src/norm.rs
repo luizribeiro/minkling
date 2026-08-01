@@ -288,6 +288,9 @@ impl<'a> LayerNorm<'a> {
         // uniform: a threadgroup either runs a group or returns from one, and
         // never splits over the question.
         let grid = Grid::new(rows * landing.groups * THREADS_PER_GROUP, THREADS_PER_GROUP);
+        // The rows in, the same rows out, the one weight every row of every call
+        // reads, and a scale for each row.
+        let moves = size_of::<f32>() * (2 * x.len() + self.width + rows);
         batch.add(
             &self.norm.kernel,
             &[
@@ -298,6 +301,7 @@ impl<'a> LayerNorm<'a> {
                 landing.out.arg(),
             ],
             grid,
+            moves,
         )
     }
 }
@@ -503,6 +507,39 @@ mod tests {
         eprintln!(
             "worst deviation from mlx over {} cases: {worst:e}",
             NORM_CASES.len()
+        );
+    }
+
+    /// What the bandwidth column divides by, against what the kernel reads: the
+    /// rows in, the same rows out, the one weight every row of every call
+    /// reduces against, and a scale a row.
+    #[test]
+    fn a_dispatch_declares_the_rows_and_the_weight_it_reads() {
+        let Some(device) = device() else { return };
+        const WIDTH: usize = 128;
+        const ROWS: usize = 3;
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let layer =
+            LayerNorm::new(&device, &norm, &vec![1.0; WIDTH], 1e-6).expect("the weight uploads");
+        let mut x = device
+            .buffer(&vec![0.5f32; ROWS * WIDTH])
+            .expect("the rows upload");
+
+        let moved = crate::testing::moved(&device, |batch| {
+            layer.encode(batch, &mut x).expect("the dispatch encodes");
+        });
+
+        assert_eq!(
+            moved as usize,
+            size_of::<f32>() * (2 * ROWS * WIDTH + WIDTH + ROWS)
+        );
+        // **The weight is one row and not one a row.** Every row of a call
+        // reduces against the same `width` values, so a figure that charged
+        // them per row would scale with the call and read as a kernel three
+        // times further from the machine than it is.
+        assert!(
+            (moved as usize) < size_of::<f32>() * (2 * ROWS * WIDTH + ROWS * WIDTH),
+            "the weight was charged once a row"
         );
     }
 

@@ -117,6 +117,12 @@ impl MoeCombine {
         ];
         let mut shape = batch.device().inline(&fields)?;
         let mut out = batch.device().zeroed::<f32>(tokens * hidden)?;
+        let moves = size_of::<f32>()
+            * (weights.routed.len()
+                + weights.shared.len()
+                + routed.len()
+                + shared.len()
+                + out.len());
         batch.add(
             &self.kernel,
             &[
@@ -128,6 +134,7 @@ impl MoeCombine {
                 out.arg(),
             ],
             Grid::new(tokens * hidden, THREADS_PER_GROUP),
+            moves,
         )?;
         Ok(out)
     }
@@ -302,6 +309,47 @@ mod tests {
     /// Reading the shared rows the routed way is what a kernel written once for
     /// both banks would do, and against a single token it would agree — so this
     /// runs the five the case above does.
+    #[test]
+    fn a_dispatch_declares_both_banks_rows_and_the_weights_that_scale_them() {
+        let Some(device) = device() else { return };
+        let kernel = MoeCombine::new(&device).expect("the combine compiles");
+        let mut weights = RoutingWeights {
+            routed: device
+                .buffer(&[0.5f32; TOKENS * CONFIG.top_k])
+                .expect("the weights upload"),
+            shared: device
+                .buffer(&[0.5f32; TOKENS * CONFIG.n_shared])
+                .expect("the weights upload"),
+        };
+        let mut routed = device
+            .buffer(&rows(TOKENS * CONFIG.top_k, 1))
+            .expect("the rows upload");
+        let mut shared = device
+            .buffer(&rows(TOKENS * CONFIG.n_shared, 7))
+            .expect("the rows upload");
+
+        let moved = crate::testing::moved(&device, |batch| {
+            kernel
+                .encode(batch, TOKENS, &mut weights, &mut routed, &mut shared)
+                .expect("the combine encodes");
+        });
+
+        let assignments = TOKENS * (CONFIG.top_k + CONFIG.n_shared);
+        assert_eq!(
+            moved as usize,
+            size_of::<f32>() * (assignments + assignments * HIDDEN + TOKENS * HIDDEN)
+        );
+        // **Eight rows in and one out.** This is where a token's experts stop
+        // being eight rows, so a figure that charged the output per assignment
+        // rather than per token would be describing a sum nobody takes.
+        assert!(
+            (moved as usize) < size_of::<f32>() * 2 * assignments * (HIDDEN + 1),
+            "the summed row was charged once an assignment"
+        );
+    }
+
+    /// What the bandwidth column divides by, against what the kernel reads:
+    /// both banks' rows, both banks' weights, and one row a token out.
     #[test]
     fn reading_the_shared_rows_token_major_changes_the_answer() {
         let Some(device) = device() else { return };

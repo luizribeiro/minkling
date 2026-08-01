@@ -649,6 +649,7 @@ impl<'a> PackedBank<'a> {
         let elements = rows * self.out_dim;
         let kernel = &self.matmul.kernel;
         let grid = Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP);
+        let moves = self.moves(rows, x.len());
         batch.add(
             kernel,
             &[
@@ -660,9 +661,31 @@ impl<'a> PackedBank<'a> {
                 out.arg(),
             ],
             grid,
+            moves,
         )?;
 
         Ok(Pending { out: Some(out) })
+    }
+
+    /// What one dispatch of `rows` rows over `values` of input moves.
+    ///
+    /// **A row is a whole weight.** Each output row goes through one expert and
+    /// every element of that row reads a different `in_dim`-long slice of it, so
+    /// `rows` rows read `rows` weights whichever experts they name. That is what
+    /// makes this the kernel a decode step's bandwidth is mostly about: six
+    /// routed rows of a `[2048, 4096]` bank are 27 MB of packed bytes for six
+    /// rows of output.
+    ///
+    /// The weight is charged as the bytes it is packed into rather than the
+    /// values it holds — a code is half a byte and a group of 32 codes shares
+    /// one scale byte — because the whole of this kernel is that nothing decodes
+    /// it on the way. Beside it, the input, the output, and the one expert index
+    /// a row is read through, which a bank's own dispatch leaves on the device
+    /// and a projection's travels in the command buffer.
+    fn moves(&self, rows: usize, values: usize) -> usize {
+        let elements = rows * self.out_dim * self.in_dim;
+        let weight = elements * BITS / u8::BITS as usize + elements / GROUP_SIZE;
+        weight + size_of::<f32>() * (values + rows * self.out_dim) + size_of::<u32>() * rows
     }
 }
 
@@ -1167,6 +1190,46 @@ mod tests {
             }
             out
         }
+    }
+
+    /// What the bandwidth column divides by, against what the kernel reads.
+    ///
+    /// **A row is a whole weight and the weight is never decoded**, which are
+    /// the two things this figure has to get right: every element of an output
+    /// row reads a different slice of the expert that row goes through, and what
+    /// it reads is packed — half a byte a code, plus one scale byte for every
+    /// 32 of them. A figure that charged the decoded float32 would be eight
+    /// times high and would put this kernel past the machine's bandwidth
+    /// rather than at a third of it.
+    #[test]
+    fn a_dispatch_declares_the_packed_bytes_it_reads_rather_than_the_values() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        const IN_DIM: usize = 128;
+        const OUT_DIM: usize = 8;
+        const ROWS: usize = 3;
+        let case = Case::seeded(1, IN_DIM, OUT_DIM, ROWS);
+        let projection = case.upload(&device, &matmul);
+
+        let moved = crate::testing::moved(&device, |batch| {
+            projection
+                .encode(batch, &case.x)
+                .expect("the dispatch encodes");
+        });
+
+        let elements = ROWS * OUT_DIM * IN_DIM;
+        assert_eq!(
+            moved as usize,
+            elements / 2
+                + elements / GROUP_SIZE
+                + size_of::<f32>() * (ROWS * IN_DIM + ROWS * OUT_DIM)
+                + size_of::<u32>() * ROWS,
+            "codes, scales, the rows in, the rows out, and an expert a row"
+        );
+        assert!(
+            (moved as usize) < elements * size_of::<f32>(),
+            "a decoded weight was charged for one nothing decodes"
+        );
     }
 
     /// Everything a dispatch needs, so that no test opens a device twice.

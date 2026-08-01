@@ -612,6 +612,19 @@ impl<'a> LayerAttention<'a> {
         // uniform: a threadgroup either runs a query or returns from one, and
         // never splits over the question.
         let grid = Grid::new(heads * queries * THREADS_PER_GROUP, THREADS_PER_GROUP);
+        // **The spans are bound whole and read to `step.keys`**, which is the
+        // difference between what this dispatch binds and what it moves: a
+        // layer's keys and values have room for a thousand and an eight-token
+        // sequence has eight. The band is the same distinction again — the
+        // projection is `[rel_extent, d_rel]` and a call reaches the distances
+        // its keys span. Beside them the queries in and the same shape out, the
+        // relative features, and a scale for each query.
+        let moves = size_of::<f32>()
+            * (2 * step.q.len()
+                + 2 * kv_heads * step.keys * head_dim
+                + step.rel.len()
+                + step.keys.min(self.rel_extent) * self.config.d_rel
+                + queries);
         batch.add(
             &self.attention.kernel,
             &[
@@ -625,6 +638,7 @@ impl<'a> LayerAttention<'a> {
                 out.arg(),
             ],
             grid,
+            moves,
         )?;
         Ok(out)
     }
@@ -1094,6 +1108,21 @@ mod tests {
                 .expect("the dispatch completes")
         }
 
+        /// What the bandwidth column divides by, against what the kernel reads:
+        /// the queries in and the same shape out, the keys and values this call
+        /// reaches, the relative features, the band's coefficients for the
+        /// distances those keys span, and a scale a query.
+        fn moves(&self) -> usize {
+            let rel_extent = self.proj.len() / self.config.d_rel;
+            size_of::<f32>()
+                * (2 * self.q.len()
+                    + self.k.len()
+                    + self.v.len()
+                    + self.rel.len()
+                    + self.keys.min(rel_extent) * self.config.d_rel
+                    + self.queries)
+        }
+
         fn wrapped<'d>(
             &self,
             device: &'d Device,
@@ -1290,6 +1319,33 @@ mod tests {
     /// reference's own masks. Without it every claim above holds of whichever
     /// branches happen to be live, and the mutations below would be measuring an
     /// empty set.
+    #[test]
+    fn a_dispatch_declares_the_keys_it_reaches_rather_than_the_span_it_binds() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let case = decode_shaped(16);
+        let layer = case.wrapped(&device, &attention);
+        layer.hold(0, case.keys).expect("the span reserves");
+
+        let moved = crate::testing::moved(&device, |batch| {
+            layer.encode(batch, case.step()).expect("the step encodes");
+        });
+
+        assert_eq!(moved as usize, case.moves());
+        // The span the layer holds has room for 64 keys and this call reaches
+        // sixteen. A figure taken off what was bound would be charging the step
+        // for keys no sequence has yet.
+        assert!(
+            (moved as usize) < size_of::<f32>() * 2 * LEAST_KEYS * case.config.kv_channels(),
+            "the whole reserved span was charged for the keys a call reaches"
+        );
+    }
+
+    /// What the bandwidth column divides by, against what the kernel reads.
+    ///
+    /// **A span is bound whole and read to the keys there are**, which is the
+    /// distinction a declared figure exists to make: a layer keeps room for at
+    /// least 64 keys from its first step, and an eight-token sequence has eight.
     #[test]
     fn the_cases_reach_the_branches_they_were_placed_to_reach() {
         let mut reached = Vec::new();

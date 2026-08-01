@@ -180,6 +180,28 @@ pub struct Dispatches {
     pub calls: u64,
     /// What it was executing them for, summed.
     pub elapsed: Duration,
+    /// The bytes they said they move between memory and the GPU, summed.
+    ///
+    /// Declared by each dispatch rather than derived from what it bound: a
+    /// bank's dispatch binds all 256 experts and reads six of them, and a
+    /// layer's attention binds a span with room for a thousand keys and reads
+    /// the eight there are. What a buffer *is* is not what a dispatch *moves*,
+    /// and only the caller knows the difference.
+    pub bytes: u64,
+}
+
+impl Dispatches {
+    /// What this kernel moved per second of the device's own time — the figure
+    /// a memory bandwidth is compared against.
+    ///
+    /// Zero for a kernel the device reported no time for, which is a kernel
+    /// nobody sampled rather than an infinitely fast one.
+    pub fn bytes_per_second(&self) -> f64 {
+        match self.elapsed.as_secs_f64() {
+            0.0 => 0.0,
+            elapsed => self.bytes as f64 / elapsed,
+        }
+    }
 }
 
 /// What the calling thread has spent, and where.
@@ -270,7 +292,7 @@ pub fn ran_on_the_gpu(elapsed: Duration) {
 /// submission holding a thousand of them costs a handful of lookups: a backend
 /// that has timestamps for each one sums them by kernel first, which is the
 /// grain this is read at anyway.
-pub fn dispatched(kernel: &str, calls: u64, elapsed: Duration) {
+pub fn dispatched(kernel: &str, calls: u64, elapsed: Duration, bytes: u64) {
     ACCOUNTS.with_borrow_mut(|accounts| {
         let account = match accounts.kernels.get_mut(kernel) {
             Some(account) => account,
@@ -278,6 +300,7 @@ pub fn dispatched(kernel: &str, calls: u64, elapsed: Duration) {
         };
         account.calls += calls;
         account.elapsed += elapsed;
+        account.bytes += bytes;
     });
 }
 
@@ -401,6 +424,7 @@ impl Profile {
                         Dispatches {
                             calls: account.calls / u64::from(steps),
                             elapsed: account.elapsed / steps,
+                            bytes: account.bytes / u64::from(steps),
                         },
                     )
                 })
@@ -591,8 +615,8 @@ mod tests {
         timed(Op::Submit, || {
             spin(SPIN);
             ran_on_the_gpu(SPIN / 2);
-            dispatched("packed_matmul", 3, SPIN / 4);
-            dispatched("rms_norm", 1, SPIN / 8);
+            dispatched("packed_matmul", 3, SPIN / 4, 3_000);
+            dispatched("rms_norm", 1, SPIN / 8, 1_000);
         });
 
         let profile = take();
@@ -610,9 +634,9 @@ mod tests {
     #[test]
     fn a_kernel_dispatched_from_several_command_buffers_is_one_row() {
         fresh();
-        dispatched("packed_matmul", 26, SPIN);
-        dispatched("rms_norm", 2, 3 * SPIN);
-        dispatched("packed_matmul", 4, SPIN);
+        dispatched("packed_matmul", 26, SPIN, 26);
+        dispatched("rms_norm", 2, 3 * SPIN, 2);
+        dispatched("packed_matmul", 4, SPIN, 4);
 
         let profile = take();
         assert_eq!(
@@ -622,19 +646,40 @@ mod tests {
                     "rms_norm",
                     Dispatches {
                         calls: 2,
-                        elapsed: 3 * SPIN
+                        elapsed: 3 * SPIN,
+                        bytes: 2
                     }
                 ),
                 (
                     "packed_matmul",
                     Dispatches {
                         calls: 30,
-                        elapsed: 2 * SPIN
+                        elapsed: 2 * SPIN,
+                        bytes: 30
                     }
                 ),
             ],
             "heaviest first, and one row a kernel"
         );
+    }
+
+    /// What a row is read for: the bytes a kernel moved against the seconds it
+    /// took to move them, which is the figure this machine's 819 GB/s is a
+    /// ceiling on. A kernel nobody timed is nought and not a division by one.
+    #[test]
+    fn a_kernels_bandwidth_is_what_it_moved_over_what_it_took() {
+        let moved = Dispatches {
+            calls: 2,
+            elapsed: Duration::from_millis(4),
+            bytes: 8_000_000,
+        };
+        assert_eq!(moved.bytes_per_second(), 2e9);
+
+        let untimed = Dispatches {
+            bytes: 8_000_000,
+            ..Dispatches::default()
+        };
+        assert_eq!(untimed.bytes_per_second(), 0.0);
     }
 
     /// A profile with nothing sampled has no kernel rows at all rather than a
@@ -686,7 +731,7 @@ mod tests {
     fn a_profile_divides_its_kernel_rows_by_the_steps_too() {
         fresh();
         for _ in 0..2 {
-            dispatched("packed_matmul", 26, SPIN);
+            dispatched("packed_matmul", 26, SPIN, 1_024);
         }
 
         let each = take().per_step(2);
@@ -696,7 +741,8 @@ mod tests {
                 "packed_matmul",
                 Dispatches {
                     calls: 26,
-                    elapsed: SPIN
+                    elapsed: SPIN,
+                    bytes: 1_024
                 }
             )]
         );

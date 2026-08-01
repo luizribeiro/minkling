@@ -185,6 +185,8 @@ pub(crate) struct Sampled {
     kernels: Vec<String>,
     /// Which of those each pass ran, in the order the passes were encoded.
     passes: Vec<usize>,
+    /// What each of those said it moves, in the same order.
+    moved: Vec<usize>,
 }
 
 impl Sampled {
@@ -202,6 +204,7 @@ impl Sampled {
             attachment,
             kernels: Vec::new(),
             passes: Vec::new(),
+            moved: Vec::new(),
         }
     }
 
@@ -240,6 +243,17 @@ impl Sampled {
         self.passes.push(kernel);
     }
 
+    /// What the pass that just encoded moves between memory and the GPU, from
+    /// the caller that is the only one able to say — see
+    /// [`Batch::add`](crate::kernel::Batch::add).
+    ///
+    /// Separate from [`Sampled::ran`] because it happens after the dispatch is
+    /// encoded rather than before the pass is opened, and one pass has exactly
+    /// one of each.
+    pub(crate) fn moved(&mut self, bytes: usize) {
+        self.moved.push(bytes);
+    }
+
     /// Charge what the device reported to the kernels that ran, once the
     /// command buffer has completed.
     ///
@@ -262,7 +276,7 @@ impl Sampled {
         let bytes = resolved.to_vec();
         let stamps: &[MTLCounterResultTimestamp] = as_timestamps(&bytes);
 
-        let mut totals = vec![(0u64, Duration::ZERO); self.kernels.len()];
+        let mut totals = vec![Charge::default(); self.kernels.len()];
         for (pass, kernel) in self.passes.iter().enumerate() {
             let Some([started, ended]) = stamps.get(2 * pass..2 * pass + 2) else {
                 continue;
@@ -272,14 +286,24 @@ impl Sampled {
                 continue;
             }
             let ticks = ended.saturating_sub(started) as f64;
-            totals[*kernel].0 += 1;
-            totals[*kernel].1 += Duration::from_nanos((ticks * self.nanos_per_tick) as u64);
+            let total = &mut totals[*kernel];
+            total.calls += 1;
+            total.elapsed += Duration::from_nanos((ticks * self.nanos_per_tick) as u64);
+            total.bytes += self.moved.get(pass).copied().unwrap_or_default() as u64;
         }
 
-        for (kernel, (calls, elapsed)) in self.kernels.iter().zip(totals) {
-            profile::dispatched(kernel, calls, elapsed);
+        for (kernel, total) in self.kernels.iter().zip(totals) {
+            profile::dispatched(kernel, total.calls, total.elapsed, total.bytes);
         }
     }
+}
+
+/// One kernel's share of one command buffer, on the way to the profile.
+#[derive(Debug, Default, Clone, Copy)]
+struct Charge {
+    calls: u64,
+    elapsed: Duration,
+    bytes: u64,
 }
 
 /// The resolved bytes as the timestamps they are.
@@ -431,7 +455,7 @@ mod tests {
 
         let mut encoded = 0;
         let err = loop {
-            match batch.add(&kernel, &empty.args(), Grid::new(0, 64)) {
+            match batch.add(&kernel, &empty.args(), Grid::new(0, 64), 0) {
                 Ok(()) => encoded += 1,
                 Err(err) => break err,
             }
@@ -465,7 +489,7 @@ mod tests {
         let mut empty = Empty::new(&device);
         let mut run = || {
             device
-                .run(&kernel, &empty.args(), Grid::new(0, 64))
+                .run(&kernel, &empty.args(), Grid::new(0, 64), 0)
                 .expect("the dispatch completes");
         };
 

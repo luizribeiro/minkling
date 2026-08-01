@@ -72,9 +72,15 @@ impl Device {
     /// A [`Batch`] of one, which is what a caller with a single dispatch wants
     /// and what everything here did before there was a second one to put beside
     /// it.
-    pub fn run(&self, kernel: &Kernel, args: &[Arg<'_>], grid: Grid) -> Result<(), MetalError> {
+    pub fn run(
+        &self,
+        kernel: &Kernel,
+        args: &[Arg<'_>],
+        grid: Grid,
+        moves: usize,
+    ) -> Result<(), MetalError> {
         let mut batch = self.batch()?;
-        batch.add(kernel, args, grid)?;
+        batch.add(kernel, args, grid, moves)?;
         batch.wait()
     }
 
@@ -165,7 +171,32 @@ impl<'a> Batch<'a> {
     /// An [`Arg::Inline`] is the exception and is why the two are separate
     /// variants: `setBytes:` copies, so those bytes are the command buffer's
     /// own by the time this returns and the caller's may go.
-    pub fn add(&mut self, kernel: &Kernel, args: &[Arg<'_>], grid: Grid) -> Result<(), MetalError> {
+    ///
+    /// `moves` is what this dispatch reads and writes, in bytes, and it is the
+    /// caller's to state because nothing here can work it out. **What is bound
+    /// is an upper bound and a loose one**: a bank binds 256 experts and reads
+    /// six, a layer's attention binds a span with room for a thousand keys and
+    /// reads the eight there are, the weighting binds a 258-wide row of logits
+    /// and reads eight of it, and a packed weight is bound as the bytes it is
+    /// packed into rather than the values it holds. Only the call knows which.
+    ///
+    /// **Everything that scales with the call, wherever it travels.** A list of
+    /// experts or a scale a row is small enough to go in the command buffer
+    /// rather than in an allocation — see [`Device::inline`] — and that is a
+    /// question about where the bytes are, not about whether they are read. The
+    /// one thing left out is the fixed shape struct a dispatch carries, which
+    /// is a few dozen bytes whatever the call is.
+    ///
+    /// It is charged beside the device's own clock, and the two together are
+    /// what say how far a kernel is from the memory it waits on — which is the
+    /// ranking [`crate::sampling`] exists to produce.
+    pub fn add(
+        &mut self,
+        kernel: &Kernel,
+        args: &[Arg<'_>],
+        grid: Grid,
+        moves: usize,
+    ) -> Result<(), MetalError> {
         if grid.threads_per_group > kernel.max_threads_per_group() {
             return Err(MetalError::ThreadgroupTooLarge {
                 entry: kernel.entry.clone(),
@@ -212,6 +243,9 @@ impl<'a> Batch<'a> {
 
         self.entry.get_or_insert_with(|| kernel.entry.clone());
         self.dispatches += 1;
+        if let Some(samples) = &mut self.samples {
+            samples.moved(moves);
+        }
         Ok(())
     }
 
@@ -411,7 +445,7 @@ mod tests {
 
     use super::*;
     use crate::buffer::Buffer;
-    use crate::testing::{SAXPY, SAXPY_ENTRY, device};
+    use crate::testing::{SAXPY, SAXPY_ENTRY, device, saxpy_moves};
 
     /// Long enough that a dispatch over it spans several threadgroups, and not
     /// a multiple of the threadgroup size, so the tail group runs threads the
@@ -506,7 +540,7 @@ mod tests {
         let grid = Grid::new(LEN, THREADS_PER_GROUP);
         assert!(grid.groups() > 1, "one threadgroup proves nothing");
         device
-            .run(&kernel, &saxpy.args(), grid)
+            .run(&kernel, &saxpy.args(), grid, saxpy_moves(LEN))
             .expect("the dispatch completes");
 
         assert_eq!(saxpy.out.to_vec(), saxpy.on_the_cpu());
@@ -524,7 +558,12 @@ mod tests {
         let mut saxpy = Saxpy::new(&device, short);
 
         device
-            .run(&kernel, &saxpy.args(), Grid::new(LEN, THREADS_PER_GROUP))
+            .run(
+                &kernel,
+                &saxpy.args(),
+                Grid::new(LEN, THREADS_PER_GROUP),
+                saxpy_moves(LEN),
+            )
             .expect("the dispatch completes");
 
         assert_eq!(saxpy.out.as_slice()[short], 0.0);
@@ -541,7 +580,12 @@ mod tests {
         let mut saxpy = Saxpy::new(&device, LEN);
 
         device
-            .run(&kernel, &saxpy.args(), Grid::new(0, THREADS_PER_GROUP))
+            .run(
+                &kernel,
+                &saxpy.args(),
+                Grid::new(0, THREADS_PER_GROUP),
+                saxpy_moves(0),
+            )
             .expect("an empty dispatch completes");
 
         assert_eq!(saxpy.out.to_vec(), vec![0.0; LEN]);
@@ -603,7 +647,7 @@ mod tests {
         let too_many = kernel.max_threads_per_group() + 1;
 
         let err = device
-            .run(&kernel, &[], Grid::new(LEN, too_many))
+            .run(&kernel, &[], Grid::new(LEN, too_many), saxpy_moves(LEN))
             .expect_err("the threadgroup is too large");
 
         assert!(matches!(err, MetalError::ThreadgroupTooLarge { asked, .. } if asked == too_many));
@@ -621,7 +665,12 @@ mod tests {
         let args: Vec<Arg<'_>> = buffers.iter_mut().map(Buffer::arg).collect();
 
         let err = device
-            .run(&kernel, &args, Grid::new(LEN, THREADS_PER_GROUP))
+            .run(
+                &kernel,
+                &args,
+                Grid::new(LEN, THREADS_PER_GROUP),
+                saxpy_moves(LEN),
+            )
             .expect_err("one buffer too many");
 
         assert!(matches!(err, MetalError::TooManyArguments { most, .. } if most == ARGUMENT_SLOTS));
@@ -640,7 +689,12 @@ mod tests {
         let mut batch = device.batch().expect("a command buffer opens");
         for saxpy in [&mut first, &mut second] {
             batch
-                .add(&kernel, &saxpy.args(), Grid::new(LEN, THREADS_PER_GROUP))
+                .add(
+                    &kernel,
+                    &saxpy.args(),
+                    Grid::new(LEN, THREADS_PER_GROUP),
+                    saxpy_moves(LEN),
+                )
                 .expect("the dispatch encodes");
         }
         batch.wait().expect("the batch completes");
@@ -669,7 +723,12 @@ mod tests {
         let mut chained = Saxpy::new(&device, LEN);
         let mut batch = device.batch().expect("a command buffer opens");
         batch
-            .add(&kernel, &saxpy.args(), Grid::new(LEN, THREADS_PER_GROUP))
+            .add(
+                &kernel,
+                &saxpy.args(),
+                Grid::new(LEN, THREADS_PER_GROUP),
+                saxpy_moves(LEN),
+            )
             .expect("the dispatch encodes");
         let args = [
             chained.alpha.arg(),
@@ -679,7 +738,12 @@ mod tests {
             chained.out.arg(),
         ];
         batch
-            .add(&kernel, &args, Grid::new(LEN, THREADS_PER_GROUP))
+            .add(
+                &kernel,
+                &args,
+                Grid::new(LEN, THREADS_PER_GROUP),
+                saxpy_moves(LEN),
+            )
             .expect("the dispatch encodes");
         batch.wait().expect("the batch completes");
 
@@ -713,7 +777,12 @@ mod tests {
         let mut batch = device.batch().expect("a command buffer opens");
         for saxpy in [&mut first, &mut second] {
             batch
-                .add(&kernel, &saxpy.args(), Grid::new(LEN, THREADS_PER_GROUP))
+                .add(
+                    &kernel,
+                    &saxpy.args(),
+                    Grid::new(LEN, THREADS_PER_GROUP),
+                    saxpy_moves(LEN),
+                )
                 .expect("the dispatch encodes");
         }
         batch.wait().expect("the batch completes");
@@ -767,7 +836,12 @@ mod tests {
 
         profile::take();
         device
-            .run(&kernel, &saxpy.args(), Grid::new(LEN, THREADS_PER_GROUP))
+            .run(
+                &kernel,
+                &saxpy.args(),
+                Grid::new(LEN, THREADS_PER_GROUP),
+                saxpy_moves(LEN),
+            )
             .expect("the dispatch completes");
 
         assert!(!device.timing_each_dispatch());
@@ -795,19 +869,25 @@ mod tests {
         // Warm: the first dispatch of a fresh pipeline pays for the driver's
         // first look at these buffers, which a decode loop pays once.
         for _ in 0..2 {
-            device.run(&kernel, &saxpy.args(), grid).expect("it runs");
+            device
+                .run(&kernel, &saxpy.args(), grid, saxpy_moves(LEN))
+                .expect("it runs");
         }
 
         let started = Instant::now();
         for _ in 0..DISPATCHES {
-            device.run(&kernel, &saxpy.args(), grid).expect("it runs");
+            device
+                .run(&kernel, &saxpy.args(), grid, saxpy_moves(LEN))
+                .expect("it runs");
         }
         let apart = started.elapsed();
 
         let started = Instant::now();
         let mut batch = device.batch().expect("a command buffer opens");
         for _ in 0..DISPATCHES {
-            batch.add(&kernel, &saxpy.args(), grid).expect("it encodes");
+            batch
+                .add(&kernel, &saxpy.args(), grid, saxpy_moves(LEN))
+                .expect("it encodes");
         }
         batch.wait().expect("the batch completes");
         let together = started.elapsed();

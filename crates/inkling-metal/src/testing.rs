@@ -1,8 +1,10 @@
 //! What the tests here need before they can assert anything.
 
 use inkling_core::moe::MoeConfig;
+use inkling_core::profile;
 
 use crate::device::{Device, MetalError};
+use crate::kernel::Batch;
 
 /// The checkpoint's own routing shape, so that a kernel is exercised over the
 /// row it will actually read: 256 routed experts, two shared, six per token.
@@ -101,3 +103,41 @@ kernel void saxpy(
 "#;
 
 pub const SAXPY_ENTRY: &str = "saxpy";
+
+/// What the dispatches `encode` encoded declared they move, in bytes.
+///
+/// **A declared figure is the one number in the profile nothing else checks.**
+/// The device's clock is the device's, the call counts are the model's shape,
+/// and both are wrong loudly; a byte count that dropped a factor would move a
+/// whole column of the bandwidth table and read as a finding. So each kernel
+/// has a case asserting its own against what its source reads, and this is what
+/// those cases go through.
+///
+/// Sampling has to be on for the figure to reach the profile at all — it is
+/// charged per timed pass — so this switches it on and off around the batch.
+pub fn moved(device: &Device, encode: impl FnOnce(&mut Batch<'_>)) -> u64 {
+    device
+        .time_each_dispatch(true)
+        .expect("the device times a dispatch");
+    profile::take();
+
+    let mut batch = device.batch().expect("a command buffer opens");
+    encode(&mut batch);
+    batch.wait().expect("the batch completes");
+
+    device.time_each_dispatch(false).expect("sampling stops");
+    profile::take()
+        .kernels()
+        .iter()
+        .map(|(_, dispatches)| dispatches.bytes)
+        .sum()
+}
+
+/// What one saxpy over `len` elements moves: `x` and `y` read, `out` written.
+///
+/// Here rather than at each case because every dispatch has to declare what it
+/// moves — see [`Batch::add`](crate::kernel::Batch::add) — and a test kernel's
+/// answer is the same wherever it is asked.
+pub fn saxpy_moves(len: usize) -> usize {
+    3 * size_of::<f32>() * len
+}

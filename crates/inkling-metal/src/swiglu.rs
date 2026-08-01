@@ -90,10 +90,13 @@ impl SwiGlu {
         let elements = gate.len();
         let fields = [extent(elements, "the elements of an activation")];
         let mut count = batch.device().inline(&fields)?;
+        // The gate is read and written back where it was, so it crosses twice
+        // and the pair is three passes over `elements` rather than two.
         batch.add(
             &self.kernel,
             &[count.arg(), gate.arg(), up.arg()],
             Grid::new(elements, THREADS_PER_GROUP),
+            3 * size_of::<f32>() * elements,
         )
     }
 }
@@ -177,6 +180,31 @@ mod tests {
         assert!(
             got.iter().any(|y| *y < 0.0) && got.iter().any(|y| *y > 0.0),
             "an activation of one sign would not exercise silu's knee"
+        );
+    }
+
+    /// What the bandwidth column divides by, against what the kernel reads:
+    /// `gate` and `up` in, `gate` out over the top of itself.
+    #[test]
+    fn a_dispatch_declares_the_three_passes_it_makes() {
+        let Some(device) = device() else { return };
+        let kernel = SwiGlu::new(&device).expect("the swiglu compiles");
+        let mut gate = device.buffer(&values(0)).expect("the gate uploads");
+        let mut up = device.buffer(&values(97)).expect("the up uploads");
+
+        let moved = crate::testing::moved(&device, |batch| {
+            kernel
+                .encode(batch, &mut gate, &mut up)
+                .expect("the dispatch encodes")
+        });
+
+        assert_eq!(moved as usize, 3 * size_of::<f32>() * LEN);
+        // **Three passes and not two.** The gate is read and then written back
+        // over itself, which is the crossing an elementwise kernel writing into
+        // one of its inputs is easy to charge once.
+        assert!(
+            moved as usize > 2 * size_of_val(gate.as_slice()),
+            "the gate was charged for reading or for writing but not both"
         );
     }
 

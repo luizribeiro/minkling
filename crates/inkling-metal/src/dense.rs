@@ -215,10 +215,13 @@ impl<'a> DenseWeight<'a> {
         let elements = rows * self.out_dim;
         let kernel = &self.matmul.kernel;
         let grid = Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP);
+        let moves = self.in_dim * self.out_dim * BF16_BYTES
+            + size_of::<f32>() * (x.len() + rows * self.out_dim);
         batch.add(
             kernel,
             &[shape.arg(), x.arg(), resident.arg(), out.arg()],
             grid,
+            moves,
         )?;
         Ok(Pending::holding(out))
     }
@@ -445,6 +448,14 @@ mod tests {
                 .expect("the case's shapes pair")
         }
 
+        /// What the bandwidth column divides by, against what the kernel reads:
+        /// the one weight, still bfloat16 where it lies, the rows in and the
+        /// rows out.
+        fn moves(&self, rows: usize) -> usize {
+            self.in_dim * self.out_dim * BF16_BYTES
+                + size_of::<f32>() * rows * (self.in_dim + self.out_dim)
+        }
+
         /// The same multiply against the widened weight, through the `linear`
         /// the CPU path runs — which is the oracle for everything below.
         fn on_the_cpu(&self) -> Vec<f32> {
@@ -507,6 +518,28 @@ mod tests {
     }
 
     /// The kernel against the CPU it replaces, at the gate's own shape.
+    #[test]
+    fn a_dispatch_declares_the_bfloat16_weight_it_reads_where_it_lies() {
+        let Some(device) = device() else { return };
+        let matmul = DenseMatmul::new(&device).expect("the dense matmul compiles");
+        const ROWS: usize = 2;
+        let case = Case::noisy(64, 8, ROWS);
+        let weight = case.upload(&device, &matmul);
+
+        let moved = crate::testing::moved(&device, |batch| {
+            weight.encode(batch, &case.x).expect("the dispatch encodes");
+        });
+
+        assert_eq!(moved as usize, case.moves(ROWS));
+        assert!(
+            (moved as usize) < case.in_dim * case.out_dim * size_of::<f32>(),
+            "a widened weight was charged for one the kernel reads two bytes at a time"
+        );
+    }
+
+    /// What the bandwidth column divides by, against what the kernel reads. The
+    /// gate is the one weight in the model the quantiser left in bfloat16, and
+    /// it is read as the two bytes it is rather than widened first.
     #[test]
     fn the_kernel_reproduces_the_cpu_at_the_gates_shape() {
         let Some(device) = device() else { return };

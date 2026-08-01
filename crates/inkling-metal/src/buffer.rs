@@ -549,7 +549,12 @@ mod tests {
             out.arg(),
         ];
         device
-            .run(&kernel, &args, crate::kernel::Grid::new(wrapped_len, 64))
+            .run(
+                &kernel,
+                &args,
+                crate::kernel::Grid::new(wrapped_len, 64),
+                crate::testing::saxpy_moves(wrapped_len),
+            )
             .expect("the dispatch completes");
 
         let got = &out.as_slice()[offset..][..len];
@@ -609,6 +614,7 @@ mod tests {
                 &kernel,
                 &[alpha.arg(), count.arg(), rows.arg(), y.arg(), out.arg()],
                 Grid::new(len, 64),
+                crate::testing::saxpy_moves(len),
             )
             .expect("the dispatch completes");
 
@@ -690,6 +696,7 @@ mod tests {
                     &kernel,
                     &[alpha.arg(), count.arg(), x.arg(), y.arg(), out.arg()],
                     Grid::new(LEN, 64),
+                    crate::testing::saxpy_moves(LEN),
                 )
                 .expect("the dispatch encodes");
         }

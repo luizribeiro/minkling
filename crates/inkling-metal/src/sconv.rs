@@ -271,6 +271,15 @@ impl<'a> LayerConv<'a> {
                 "a residual against what it is added to"
             );
         }
+        // The sequence in and out, the kernel every timestep reads, the window
+        // the call before this one left, the window this one leaves — and the
+        // residual, where there is one to add. The scale and the shape are in
+        // the command buffer rather than in memory, so they are not traffic.
+        let moves = size_of::<f32>()
+            * (2 * x.len()
+                + self.channels * self.taps
+                + 2 * (self.taps - 1) * self.channels
+                + carried.as_ref().map_or(0, |_| x.len()));
         let fields = [
             extent(rows, "the rows of a call"),
             extent(self.channels, "the channels of a convolution"),
@@ -318,6 +327,7 @@ impl<'a> LayerConv<'a> {
                 carried,
             ],
             Grid::new(threads, THREADS_PER_GROUP),
+            moves,
         )?;
         self.reading.set(1 - self.reading.get());
         Ok(())
@@ -583,6 +593,49 @@ mod tests {
     /// The three chunkings straddle the window in both directions — shorter than
     /// it, exactly one timestep, and longer — which are the same three that
     /// module drives.
+    #[test]
+    fn a_dispatch_declares_the_window_it_carries_beside_the_rows_it_convolves() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let fx = Synthetic::load();
+        let layer = fx.wrapped(&device, &conv, &fx.weight);
+        let sequence = fx.sequence(&fx.input, 0);
+        let mut x = device.buffer(sequence).expect("the rows upload");
+
+        let plain = crate::testing::moved(&device, |batch| {
+            layer
+                .encode(batch, &mut x, None, 1.0)
+                .expect("the dispatch encodes");
+        });
+        layer.restart();
+        let mut x = device.buffer(sequence).expect("the rows upload");
+        let mut residual = device.buffer(sequence).expect("the residual uploads");
+        let carrying = crate::testing::moved(&device, |batch| {
+            layer
+                .encode(batch, &mut x, Some(&mut residual), 1.0)
+                .expect("the dispatch encodes");
+        });
+
+        let window = (fx.kernel_size - 1) * fx.channels;
+        assert_eq!(
+            plain as usize,
+            size_of::<f32>() * (2 * sequence.len() + fx.channels * fx.kernel_size + 2 * window),
+            "the rows in and out, the taps, and the window either side of the call"
+        );
+        assert_eq!(
+            carrying as usize - plain as usize,
+            size_of_val(sequence),
+            "a residual is one more pass over the rows"
+        );
+    }
+
+    /// What the bandwidth column divides by, against what the kernel reads.
+    ///
+    /// **The window either side is the part a bytes-bound derived from the
+    /// call's shape would miss**: this kernel reads the `K-1` inputs the call
+    /// before it left and writes the `K-1` this one leaves, which is state no
+    /// argument of the call names. The residual is the other term, and it is
+    /// there on a layer's two convolutions and absent on attention's two.
     #[test]
     fn streaming_a_sequence_matches_feeding_it_whole_on_the_device() {
         let Some(device) = device() else { return };

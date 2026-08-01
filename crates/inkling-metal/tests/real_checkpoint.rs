@@ -792,6 +792,18 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
     );
 }
 
+/// What this machine's memory will hand a kernel per second, as the ceiling the
+/// achieved column is a fraction of.
+///
+/// **Written down rather than measured, and it is the one number in the table
+/// that is.** Metal has no API that answers it: an M3 Ultra's 819 GB/s is the
+/// part's stated figure, and no kernel reaches it — M2's isolated matmul,
+/// which is the closest thing here to a pure streaming read, measured 284 to
+/// 424. So a row at 40% of this is not 40% of what is achievable; what the
+/// column is for is telling a kernel that is near the machine from one that is
+/// a decade off it.
+const MEMORY_BANDWIDTH: f64 = 819e9;
+
 /// A decode step's rows, and the kernels underneath them where the device was
 /// asked which of its dispatches owns which of the milliseconds.
 ///
@@ -844,15 +856,19 @@ fn decode_step_table(run: &OnTheDevice) -> String {
     let sampled = run.profile.dispatched();
     let executing = |part: Duration| 100.0 * part.as_secs_f64() / sampled.as_secs_f64();
     table.push(format!(
-        "  {:<18}{:>7}{:>12}{:>8}",
-        "kernel", "calls", "device", "share"
+        "  {:<18}{:>7}{:>12}{:>8}{:>11}{:>11}{:>8}",
+        "kernel", "calls", "device", "share", "moved", "achieved", "of peak"
     ));
     for (kernel, dispatches) in &kernels {
+        let achieved = dispatches.bytes_per_second();
         table.push(format!(
-            "  {kernel:<18}{:>7}{:>12}{:>7.1}%",
+            "  {kernel:<18}{:>7}{:>12}{:>7.1}%{:>11}{:>11}{:>7.0}%",
             dispatches.calls,
             format!("{:.2?}", dispatches.elapsed),
-            executing(dispatches.elapsed)
+            executing(dispatches.elapsed),
+            format!("{:.2} MB", dispatches.bytes as f64 / 1e6),
+            format!("{:.0} GB/s", achieved / 1e9),
+            100.0 * achieved / MEMORY_BANDWIDTH,
         ));
     }
     table.push(format!(
@@ -954,11 +970,31 @@ fn which_kernels_own_a_decode_step() {
         return;
     }
 
+    // The unsampled step first, because what the rows below are worth is how
+    // close they sum to the device time of a step nobody was asking about.
+    let unsampled = OnTheDevice::generate(&dir, &device).profile.gpu();
     let run = OnTheDevice::generating(&dir, &device, true);
     eprintln!("{}", decode_step_table(&run));
+    eprintln!(
+        "  against {unsampled:.2?} of device time with nothing sampling, so the rows carry \
+         {:+.1}% of asking",
+        100.0 * (run.profile.dispatched().as_secs_f64() / unsampled.as_secs_f64() - 1.0)
+    );
 
     let kernels = run.profile.kernels();
     assert!(!kernels.is_empty(), "nothing was sampled");
+    // **The bytes are declared and not derived**, so a formula that dropped a
+    // factor would move the whole bandwidth column and nothing would say so.
+    // What checks it is a figure this repo has from somewhere else entirely: a
+    // token reads six of each MoE layer's 256 experts and both shared ones plus
+    // every layer's own projections, which the checkpoint's shapes put at 5.9 GB
+    // of packed bytes.
+    let moved: u64 = kernels.iter().map(|(_, each)| each.bytes).sum();
+    assert!(
+        (5e9..7e9).contains(&(moved as f64)),
+        "a decode step moved {:.2} GB, where the checkpoint's active weights are 5.9",
+        moved as f64 / 1e9
+    );
     // Every dispatch the step encoded came back with a pair of timestamps. A
     // device that dropped one writes `MTLCounterErrorValue` and this side
     // charges it nothing, which would be a row quietly short rather than a
