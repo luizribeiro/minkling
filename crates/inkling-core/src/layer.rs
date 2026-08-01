@@ -71,6 +71,17 @@ pub trait Experts {
         let _ = x;
         (None, self.shared(gathered))
     }
+
+    /// Whether this holds the layer's gate, which is what
+    /// [`Experts::gated_shared`] will answer with.
+    ///
+    /// Asked *before* the layer is stood up rather than inferred from that
+    /// answer, because the weight has to be widened to be multiplied here and
+    /// widening it is the cost being avoided — 4.2 MB a layer, 169 MB over the
+    /// stack. A layer whose backend says yes never widens its gate at all.
+    fn gates(&self) -> bool {
+        false
+    }
 }
 
 /// The [`Experts`] a dense layer needs, which is none.

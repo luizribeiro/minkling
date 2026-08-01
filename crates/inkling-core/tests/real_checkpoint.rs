@@ -20,7 +20,7 @@ use inkling_core::layer::{
     DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts,
 };
 use inkling_core::model::{ModelCache, ModelWeights};
-use inkling_core::moe::{GateWeights, Gathered, MoeConfig, SparseMoe};
+use inkling_core::moe::{Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
 use inkling_core::ops::{DenseMlp, DenseProjection, top_k};
 use inkling_core::quant::{Scratch, dequantize};
 use inkling_core::tokenizer::{Tokenizer, TokenizerError};
@@ -351,7 +351,7 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     let moe = SparseMoe::new(
         MoeConfig::for_layer(&config, layer).expect("a MoE layer has a router"),
         GateWeights {
-            gate_weight: &gate_weight,
+            gate: Gate::Widened(&gate_weight),
             correction_bias: &correction_bias,
             global_scale,
         },
@@ -420,7 +420,7 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     let flat = SparseMoe::new(
         moe.config(),
         GateWeights {
-            gate_weight: &gate_weight,
+            gate: Gate::Widened(&gate_weight),
             correction_bias: &unbiased,
             global_scale,
         },
@@ -578,7 +578,7 @@ impl<'a> Mlp<'a> {
             Self::Sparse(sparse) => LayerMlp::Sparse(SparseMoe::new(
                 sparse.config,
                 GateWeights {
-                    gate_weight: &sparse.gate_weight,
+                    gate: Gate::Widened(&sparse.gate_weight),
                     correction_bias: &sparse.correction_bias,
                     global_scale: sparse.global_scale,
                 },

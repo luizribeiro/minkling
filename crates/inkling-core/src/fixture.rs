@@ -23,7 +23,7 @@ use crate::checkpoint::{Checkpoint, Dtype, TensorView};
 use crate::config::{Config, TextConfig};
 use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use crate::model::{Model, ModelWeights};
-use crate::moe::{ExpertBank, GateWeights, Gathered, MoeConfig, SparseMoe};
+use crate::moe::{ExpertBank, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
 use crate::ops::{DenseMlp, DenseProjection};
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../reference/fixtures");
@@ -373,7 +373,7 @@ impl LayerTensors {
             } => LayerMlp::Sparse(SparseMoe::new(
                 *config,
                 GateWeights {
-                    gate_weight,
+                    gate: Gate::Widened(gate_weight),
                     correction_bias,
                     global_scale: *global_scale,
                 },

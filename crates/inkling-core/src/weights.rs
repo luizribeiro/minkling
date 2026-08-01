@@ -47,7 +47,7 @@
 //! `Result` through forty-two layers of a forward pass would say otherwise.
 //! What [`CheckpointWeights::open`] can check before the pass starts, it does.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 
 use crate::attention::{
     AttentionConfig, AttentionProjections, AttentionWeights, DecodedProjections, Projections,
@@ -58,7 +58,7 @@ use crate::generate::Generator;
 use crate::head::LmHead;
 use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 use crate::model::{Model, ModelWeights};
-use crate::moe::{ExpertBank, GateWeights, Gathered, MoeConfig, SparseMoe};
+use crate::moe::{ExpertBank, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
 use crate::ops::{DenseMlp, MlpProjections, Projection, linear};
 use crate::profile::{self, Op};
 use crate::quant::{BITS, QuantError, Scratch, dequantize_blocks_into};
@@ -216,7 +216,7 @@ impl<'a> Packed<'a> {
 /// which no matmul reads and which [`CheckpointWeights`] widens once.
 #[derive(Debug, Clone, Copy)]
 pub struct Bf16<'a> {
-    bytes: &'a [u8],
+    view: TensorView<'a>,
     out_dim: usize,
     in_dim: usize,
 }
@@ -243,7 +243,7 @@ impl<'a> Bf16<'a> {
             });
         };
         Ok(Self {
-            bytes: view.data(),
+            view,
             out_dim,
             in_dim,
         })
@@ -261,7 +261,14 @@ impl<'a> Bf16<'a> {
 
     /// The bytes themselves, row-major, as the checkpoint holds them.
     pub fn bytes(&self) -> &'a [u8] {
-        self.bytes
+        self.view.data()
+    }
+
+    /// The same tensor widened, for a caller that multiplies against float32
+    /// because it has no kernel that reads these bytes.
+    pub fn to_f32(&self) -> Vec<f32> {
+        let _timed = profile::scope(Op::Decode);
+        self.view.to_f32().expect("a bfloat16 tensor widens")
     }
 }
 
@@ -451,7 +458,7 @@ pub struct CheckpointWeights<'a> {
     projections: Option<Box<dyn ProjectionBackend + 'a>>,
     embed_norm: Option<Vec<f32>>,
     norm: Vec<f32>,
-    layers: Vec<Widened>,
+    layers: Vec<Widened<'a>>,
     layer_scratch: RefCell<Vec<f32>>,
     expert_scratch: RefCell<Vec<f32>>,
 }
@@ -471,7 +478,7 @@ pub struct CheckpointWeights<'a> {
 /// layers, beside 169 MB of routers' gates — one tensor is 95% of it, and it is
 /// the one [`GateWeights`] describes.
 #[derive(Debug)]
-struct Widened {
+struct Widened<'a> {
     input_layernorm: Vec<f32>,
     post_attention_layernorm: Vec<f32>,
     attn_sconv: Vec<f32>,
@@ -487,18 +494,31 @@ struct Widened {
     /// The router's own two, and `None` on a dense layer — which has no router
     /// to hold them, the way it has no `switch_mlp` for
     /// [`CheckpointWeights::expert_banks`] to name.
-    router: Option<WidenedRouter>,
+    router: Option<WidenedRouter<'a>>,
 }
 
-/// The two tensors a router reads, widened beside the layer's own.
+/// The two tensors a router reads.
+///
+/// **The gate is not widened with the rest, and is the reason there is a cell
+/// here at all.** It is 4.2 MB of float32 a layer against 9.8 MB for every
+/// other bfloat16 tensor in the whole stack, and a backend that multiplies
+/// against the checkpoint's own bytes never asks for it — see
+/// [`Gate::Backend`]. The CPU path asks on its first step and never again.
 #[derive(Debug)]
-struct WidenedRouter {
-    gate_weight: Vec<f32>,
+struct WidenedRouter<'a> {
+    gate: Bf16<'a>,
+    widened: OnceCell<Vec<f32>>,
     correction_bias: Vec<f32>,
 }
 
-impl Widened {
-    fn open(ckpt: &Checkpoint, config: &TextConfig, layer: usize) -> Result<Self, WeightsError> {
+impl<'a> WidenedRouter<'a> {
+    fn widened(&self) -> &[f32] {
+        self.widened.get_or_init(|| self.gate.to_f32())
+    }
+}
+
+impl<'a> Widened<'a> {
+    fn open(ckpt: &'a Checkpoint, config: &TextConfig, layer: usize) -> Result<Self, WeightsError> {
         let module = layer_module(layer);
         let of = |name: &str| widened(ckpt, &format!("{module}.{name}"));
         Ok(Self {
@@ -515,7 +535,8 @@ impl Widened {
             router: match config.layer_is_dense(layer) {
                 true => None,
                 false => Some(WidenedRouter {
-                    gate_weight: of("mlp.gate_weight")?,
+                    gate: Bf16::open(ckpt, &format!("{module}.mlp.gate_weight"))?,
+                    widened: OnceCell::new(),
                     correction_bias: of("mlp.e_score_correction_bias")?,
                 }),
             },
@@ -523,7 +544,7 @@ impl Widened {
     }
 
     /// The router's tensors, of a layer that has one.
-    fn router(&self, layer: usize) -> &WidenedRouter {
+    fn router(&self, layer: usize) -> &WidenedRouter<'a> {
         self.router
             .as_ref()
             .unwrap_or_else(|| panic!("layer {layer} routes to experts and has no gate"))
@@ -626,7 +647,7 @@ impl<'a> CheckpointWeights<'a> {
 
         let layers = (0..config.num_hidden_layers)
             .map(|layer| Widened::open(ckpt, config, layer))
-            .collect::<Result<Vec<Widened>, WeightsError>>()?;
+            .collect::<Result<Vec<Widened<'a>>, WeightsError>>()?;
 
         Ok(Self {
             layers,
@@ -843,7 +864,7 @@ impl<'a> CheckpointWeights<'a> {
     /// attention's, or left to whoever answers for them; a MoE layer decodes
     /// nothing at all and leaves both banks alone until a token routes into
     /// them.
-    fn mlp<'s>(&'s self, layer: usize, scratch: &mut Scratch<'s>) -> Mlp<'s> {
+    fn mlp<'s>(&'s self, layer: usize, scratch: &mut Scratch<'s>, gated: bool) -> Mlp<'s> {
         let module = layer_module(layer);
         let widened = &self.layers[layer];
         let global_scale = widened.global_scale;
@@ -870,7 +891,12 @@ impl<'a> CheckpointWeights<'a> {
         let router = widened.router(layer);
         Mlp::Sparse(Box::new(Sparse {
             config,
-            gate_weight: &router.gate_weight,
+            gate: match gated {
+                true => Gate::Backend {
+                    hidden: self.config.hidden_size,
+                },
+                false => Gate::Widened(router.widened()),
+            },
             correction_bias: &router.correction_bias,
             global_scale,
             routed,
@@ -907,8 +933,12 @@ impl ModelWeights for CheckpointWeights<'_> {
         let mut scratch = Scratch::new(&mut buffer);
         let widened = &self.layers[index];
 
+        let experts = self
+            .experts
+            .as_ref()
+            .and_then(|backend| backend.layer(index));
         let attention = self.attention(index, &mut scratch);
-        let mlp = self.mlp(index, &mut scratch);
+        let mlp = self.mlp(index, &mut scratch, experts.is_some_and(Experts::gates));
         let weights = DecoderWeights {
             attention,
             input_layernorm: &widened.input_layernorm,
@@ -918,11 +948,7 @@ impl ModelWeights for CheckpointWeights<'_> {
         };
         let config = AttentionConfig::for_layer(self.config, index);
         let layer = DecoderLayer::new(config, weights, mlp.view());
-        match self
-            .experts
-            .as_ref()
-            .and_then(|backend| backend.layer(index))
-        {
+        match experts {
             Some(experts) => layer.forward(cache, x, experts),
             None => layer.forward(cache, x, &mlp),
         }
@@ -940,7 +966,7 @@ enum Mlp<'a> {
 /// `InklingSparseMoE`'s gate, and the two banks it routes to left packed.
 struct Sparse<'a> {
     config: MoeConfig,
-    gate_weight: &'a [f32],
+    gate: Gate<'a>,
     correction_bias: &'a [f32],
     global_scale: f32,
     routed: PackedExperts<'a>,
@@ -955,7 +981,7 @@ impl Mlp<'_> {
             Self::Sparse(moe) => LayerMlp::Sparse(SparseMoe::new(
                 moe.config,
                 GateWeights {
-                    gate_weight: moe.gate_weight,
+                    gate: moe.gate,
                     correction_bias: moe.correction_bias,
                     global_scale: moe.global_scale,
                 },

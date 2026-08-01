@@ -60,15 +60,33 @@ impl MoeConfig {
 /// The gate's tensors, as the checkpoint stores them.
 #[derive(Debug, Clone, Copy)]
 pub struct GateWeights<'a> {
-    /// `[n_routed + n_shared, hidden]` row-major, the routed experts first and
-    /// the shared ones last.
-    pub gate_weight: &'a [f32],
+    /// Where the `[n_routed + n_shared, hidden]` projection multiplies.
+    pub gate: Gate<'a>,
     /// `[n_routed]`, added to the sigmoid of the routed logits before the
     /// top-k, and nowhere else.
     pub correction_bias: &'a [f32],
     /// The layer's learned output scale, which multiplies every weight
     /// alongside `route_scale`.
     pub global_scale: f32,
+}
+
+/// Where the router's gate multiplies, which is the same seam
+/// [`AttentionProjections`](crate::attention::AttentionProjections) and
+/// [`DenseMlp`] are — over the one weight in the model that is not packed.
+#[derive(Debug, Clone, Copy)]
+pub enum Gate<'a> {
+    /// `[n_routed + n_shared, hidden]` row-major and widened to float32, the
+    /// routed experts first and the shared ones last. Multiplied here.
+    Widened(&'a [f32]),
+    /// Held by whatever runs the layer's experts, which answers with the logits
+    /// beside the shared bank's rows — see
+    /// [`Experts::gated_shared`](crate::layer::Experts::gated_shared).
+    ///
+    /// Only the width it maps from is carried, because that is the only thing
+    /// about it this side still needs: a backend reading the checkpoint's own
+    /// bfloat16 means the tensor is never widened at all, and the 4.2 MB of
+    /// float32 a layer that would take is the point.
+    Backend { hidden: usize },
 }
 
 /// Which experts a token reads and with what weight: `[tokens, top_k]` routed
@@ -276,20 +294,27 @@ impl<'a> SparseMoe<'a> {
             config.n_routed
         );
         assert_eq!(
-            weights.gate_weight.len() % experts,
-            0,
-            "{} gate weights are not whole rows of {experts} experts",
-            weights.gate_weight.len()
-        );
-        assert_eq!(
             weights.correction_bias.len(),
             config.n_routed,
             "one correction bias per routed expert"
         );
 
+        let hidden = match weights.gate {
+            Gate::Widened(weight) => {
+                assert_eq!(
+                    weight.len() % experts,
+                    0,
+                    "{} gate weights are not whole rows of {experts} experts",
+                    weight.len()
+                );
+                weight.len() / experts
+            }
+            Gate::Backend { hidden } => hidden,
+        };
+
         Self {
             config,
-            hidden: weights.gate_weight.len() / experts,
+            hidden,
             weights,
         }
     }
@@ -303,8 +328,18 @@ impl<'a> SparseMoe<'a> {
     }
 
     /// `[tokens, hidden]` in, `[tokens, n_routed + n_shared]` gate logits out.
+    ///
+    /// A panic where the gate is a backend's, and reachable only through a
+    /// backend that claims to hold one and then answers with no logits — which
+    /// is a contradiction rather than a case, since nothing here has the weight
+    /// to fall back to.
     pub fn gate(&self, x: &[f32]) -> Vec<f32> {
-        linear(x, self.weights.gate_weight, self.hidden)
+        match self.weights.gate {
+            Gate::Widened(weight) => linear(x, weight, self.hidden),
+            Gate::Backend { .. } => {
+                panic!("the gate is the experts' backend's, and it answered with no logits")
+            }
+        }
     }
 
     /// The routing one row of gate logits per token implies.
@@ -790,7 +825,7 @@ mod tests {
 
         fn moe(&self) -> SparseMoe<'_> {
             self.with(GateWeights {
-                gate_weight: &self.gate_weight,
+                gate: Gate::Widened(&self.gate_weight),
                 correction_bias: &self.correction_bias,
                 global_scale: self.global_scale,
             })
@@ -919,6 +954,61 @@ mod tests {
             .flat_map(|row| row.iter().rev().copied())
             .collect();
         assert_ne!(case.forward_gated(Some(elsewhere)), case.forward());
+    }
+
+    /// A gate a backend holds is a width and no values, and a layer stood up
+    /// that way routes from what the backend answered.
+    ///
+    /// **The width is the whole of what is left here, and that is the point.**
+    /// A `[258, 4096]` gate is 4.2 MB of float32 a layer and 169 MB over the
+    /// stack, so a backend multiplying against the checkpoint's own bfloat16
+    /// means nothing widens it — but the layer still has to know how wide a row
+    /// of its input is, and that is the one thing this carries.
+    #[test]
+    fn a_layer_whose_gate_a_backend_holds_routes_from_the_logits_it_answered() {
+        let case = Case::load("main");
+        let logits = case.moe().gate(&case.x);
+        let moe = SparseMoe::new(
+            case.config,
+            GateWeights {
+                gate: Gate::Backend {
+                    hidden: case.hidden,
+                },
+                ..case.moe().weights
+            },
+        );
+
+        assert_eq!(moe.hidden(), case.hidden, "the width comes off the gate");
+        let got = moe.forward(
+            &case.x,
+            |gathered| case.routed.gathered(gathered),
+            |_, gathered| (Some(logits), case.shared.gathered(gathered)),
+        );
+        assert_eq!(got, case.forward());
+    }
+
+    /// The contradiction that arm admits: a backend that says it holds the gate
+    /// and then answers with no logits. There is no weight on this side to fall
+    /// back to — not widening it is the whole reason the arm exists — so it is
+    /// a panic rather than a quiet second reading of the router.
+    #[test]
+    #[should_panic(expected = "the gate is the experts' backend's")]
+    fn a_backend_that_holds_the_gate_and_answers_with_nothing_is_refused() {
+        let case = Case::load("main");
+        SparseMoe::new(
+            case.config,
+            GateWeights {
+                gate: Gate::Backend {
+                    hidden: case.hidden,
+                },
+                ..case.moe().weights
+            },
+        )
+        .forward(
+            &case.x,
+            |gathered| case.routed.gathered(gathered),
+            |_, gathered| (None, case.shared.gathered(gathered)),
+        );
     }
 
     /// The first trap. `e_score_correction_bias` ranks the experts and then
@@ -1241,7 +1331,7 @@ mod tests {
             SparseMoe::new(
                 self.config,
                 GateWeights {
-                    gate_weight: &self.gate_weight,
+                    gate: Gate::Widened(&self.gate_weight),
                     correction_bias: &self.correction_bias,
                     global_scale: self.global_scale,
                 },
