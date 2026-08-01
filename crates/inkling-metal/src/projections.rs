@@ -21,16 +21,17 @@
 //!
 //! **Two submissions a layer, whatever is in them.** `q`, `k`, `v` and `r`
 //! consume the same normed hidden state and nothing of each other, so they are
-//! one command buffer, and `o_proj` — which multiplies what the attention step
-//! made of them — is the second. A feed-forward network is the same shape over
-//! gate, up and then down. That is worth 26 ms of a decode step at 206 µs a
-//! submission, and it is the whole of what [`Batch`](crate::Batch) is for.
+//! one command buffer, and the attention step with `o_proj` behind it is the
+//! second. A feed-forward network is the same shape over gate, up and then down.
+//! That is worth 26 ms of a decode step at 206 µs a submission, and it is the
+//! whole of what [`Batch`](crate::Batch) is for.
 //!
-//! **The norm that makes their input is in the first of those two.** It is a
-//! sixth dispatch a layer and no submission at all, and what it produces stays
-//! in a device buffer the four read — see [`LayerProjections::normed_qkvr`],
-//! which is the first place in this engine where an activation is formed and
-//! consumed without the CPU seeing it.
+//! **The two dispatches that cost no submission are at either end of that
+//! pair.** The norm that makes the four projections' input is in the first, and
+//! the attention step that makes `o_proj`'s is in the second, and what each
+//! produces stays in a device buffer its consumer reads — see
+//! [`LayerProjections::normed_qkvr`] and [`LayerProjections::attend`], which are
+//! where an activation is formed and consumed without the CPU seeing it.
 
 use inkling_core::attention::{AttentionConfig, AttentionStep, Projections, Qkvr};
 use inkling_core::ops::{MlpProjections, Projection};

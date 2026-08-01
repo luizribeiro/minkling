@@ -105,7 +105,7 @@ impl Device {
 /// projection against packed weights adds 105 µs of its own. So a decode step's
 /// dispatches, each submitted alone, were 94 ms of round trip — most of the 163
 /// ms the step took then — and what shares an input should share a command
-/// buffer. A step now encodes 539 dispatches into 209 of these, and what it
+/// buffer. A step now encodes 581 dispatches into 209 of these, and what it
 /// spends waiting for them is 79% of it, of which the device is executing for a
 /// third.
 ///

@@ -7,8 +7,10 @@
 //! the two dense layers hold where the other forty hold experts. Between them
 //! they are every weight this engine has a kernel for, and each layer's input
 //! layernorm goes over with its projections because they are the only thing
-//! that reads it. What is left on the CPU is the attention step itself, each
-//! layer's second norm, the convolutions and the routers.
+//! that reads it — as does the band its attention step contracts against, which
+//! is the one handover that is an operation rather than a weight. What is left
+//! on the CPU is each layer's second norm, the convolutions, the two head norms
+//! inside attention, and the routers.
 //!
 //! Nothing downstream branches on the choice — not the generation loop, not the
 //! server, not the head's own arithmetic — which is what makes "the CPU path
@@ -40,7 +42,7 @@ use inkling_metal::{
 use crate::LABEL;
 use crate::args::Backend;
 
-/// What a Metal-backed run holds for its whole life: the device, and the three
+/// What a Metal-backed run holds for its whole life: the device, and the four
 /// compiled kernels everything on it shares.
 ///
 /// None of them is about a weight. No kernel's source names a shape, so one of
