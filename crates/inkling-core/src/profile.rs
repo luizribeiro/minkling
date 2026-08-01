@@ -87,8 +87,10 @@ pub enum Op {
     Residual,
     /// The mup divide and the argmax over the vocabulary.
     Sample,
-    /// A dispatch's buffers: the shape, the input copied over and the output
-    /// allocated, and the bindings encoded.
+    /// A dispatch's buffers: the input copied over and the output allocated,
+    /// and the bindings encoded. A shape and the scalars beside it are in the
+    /// command buffer rather than in an allocation, so what is charged here for
+    /// them is the copy and not a `newBufferWithLength:`.
     Encode,
     /// A command buffer committed and waited for. This is the round trip
     /// [`Profile::gpu`] is the inner part of.

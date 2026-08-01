@@ -30,11 +30,11 @@ pub enum Command {
 /// and a flag can be printed back where a feature has to be remembered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    /// Every weight decoded on the way through, a row at a time — 8.90 s a
+    /// Every weight decoded on the way through, a row at a time — 9.0 s a
     /// token. The path every fixture in the tree pins.
     Cpu,
     /// `lm_head`, the experts and every layer's own projections multiplied on
-    /// the GPU against codes that are never decoded, which is 0.078 s a token.
+    /// the GPU against codes that are never decoded, which is 0.075 s a token.
     ///
     /// The default, because the two produce the same tokens and this is the
     /// faster of them. Asking for it explicitly is still worth allowing: a
@@ -349,7 +349,7 @@ mod tests {
     }
 
     /// A budget nobody named still has to be one a caller can wait out. At
-    /// 8.9 s a token on the CPU path an unbounded default would be a hang.
+    /// 9.0 s a token on the CPU path an unbounded default would be a hang.
     #[test]
     fn a_generation_that_names_no_budget_gets_the_default() {
         assert_eq!(

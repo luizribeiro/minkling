@@ -25,7 +25,7 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 78 ms against mlx-vlm's 32 ms, and the timings go to
+A decode step is about 75 ms against mlx-vlm's 32 ms, and the timings go to
 stderr so stdout stays pipeable. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
@@ -34,7 +34,7 @@ rather than applied by a template this does not implement.
 **Every matmul in the model runs on the GPU, and no weight one of them reads is
 ever decoded to memory** — the MXFP4 ones in registers a nibble at a time, the
 routers' bfloat16 gates by a shift — and `--backend cpu` puts them all back:
-0.078 s a token against the CPU's 9.1. The experts were the first two thirds of
+0.075 s a token against the CPU's 9.0. The experts were the first two thirds of
 that. A token reads 6 of each MoE layer's 256 experts and both of its shared
 ones, which is 32 GB of float32 the CPU path decodes to multiply against and 4.3
 GB of packed bytes the GPU path indexes into and never decodes at all. The rest
@@ -61,8 +61,8 @@ inferred.** Every operation a forward pass runs opens a scope charged the time
 inside it that no scope inside *it* claimed, so the rows of a decode step sum to
 the step and what they leave over is a number rather than a shrug:
 
-    submit and wait     167    79%      of which the device executed for 25 ms
-    dispatch encode     749    13%
+    submit and wait     167    81%      of which the device executed for 25 ms
+    dispatch encode     749    10%
     readback            329     3%
     everything else                     6%
 
@@ -77,6 +77,17 @@ never their own time. Four fifths of a step is a round trip, and the device is
 executing for two fifths of that — so the rest is 167 command buffers submitted
 and waited for around work that was already done. Every activation op left is
 3.8% of a step together.
+
+**A dispatch's shape is not an allocation.** Each of the 749 took its dimensions,
+its offsets and the expert its rows go through in small `MTLBuffer`s of its own —
+1374 a step, made and freed between two steps that wanted the same values — where
+`setBytes:` puts the same bytes in the command buffer as the dispatch is encoded.
+That took the encode row from 9.35 ms to 7.28 ms, measured against the commit
+before it and alternating between the two over seven pairs, with the wait row and
+the device's own clock where they were. It stays a *copy* per dispatch rather than
+a buffer the layer holds, which is what lets two calls of different heights share
+a command buffer — and 994 allocations are left in that row, every one of them an
+output or a row gathered for a bank.
 
 Multiplies that share an input share a command buffer, and so do multiplies that
 share nothing: the four projections a layer's normed hidden state feeds, the norm

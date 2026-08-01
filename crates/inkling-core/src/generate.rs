@@ -56,7 +56,7 @@
 //!
 //! [`Generator::stream`] hands each id to a sink as it is decided rather than
 //! returning them all at the end, and that is a decision the price of a step
-//! forces: a decode step costs 8.9 s on the CPU path, so a caller that waits for
+//! forces: a decode step costs 9.0 s on the CPU path, so a caller that waits for
 //! the last one waits minutes for the first. Nothing here writes anything —
 //! whether a token becomes text, a line on a terminal or a chunk on a socket is
 //! the sink's, and [`crate::detokenize`] is what makes a token's worth of text
@@ -184,8 +184,8 @@ impl<'a> Generator<'a> {
     ///
     /// The prompt is prefilled by the first step rather than by a step of its
     /// own, so that step's cost is a prefill's and every later one's is a
-    /// decode's. Against this checkpoint those are 1.04 s and 0.078 s on the
-    /// device path and 8.9 s a decode step on the CPU's — the two
+    /// decode's. Against this checkpoint those are 1.10 s and 0.075 s on the
+    /// device path and 9.0 s a decode step on the CPU's — the two
     /// regimes are worth telling apart in anything that reports timings, and a
     /// mean over the steps of one call describes neither.
     ///

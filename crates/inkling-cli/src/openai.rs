@@ -7,7 +7,7 @@
 //!
 //! # Streaming is the path, not a mode
 //!
-//! A decode step is 0.078 s on the device path and 8.9 s on the CPU's, so a
+//! A decode step is 0.075 s on the device path and 9.0 s on the CPU's, so a
 //! client that cannot see the reply until it is finished is looking at a hung
 //! server for as long as the reply takes. Everything here is built around the
 //! token that just arrived; the collected form is the same tokens, added up.

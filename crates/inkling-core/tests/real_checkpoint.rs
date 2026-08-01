@@ -1529,8 +1529,8 @@ fn a_head_of_the_wrong_shape_is_refused_when_it_is_handed_over() {
 ///
 /// The two regimes are one call apart — a prompt against fresh caches, or one
 /// token against caches carrying everything before it — and they are not the
-/// same price. Measured when this landed: 7 tokens prefilled in 54.7 s, the 8th
-/// decoded in 9.2 s.
+/// same price. Measured when this landed: 7 tokens prefilled in 53.7 s, the 8th
+/// decoded in 9.0 s.
 ///
 /// The routed experts are why, and not the matmuls. A layer's five projections
 /// and the head are decoded whichever regime it is — 9.0 GB and 3.3 GB, fixed —
@@ -1602,7 +1602,7 @@ fn prefilling_then_decoding_matches_one_prefill_against_real_weights() {
 /// How many tokens the generation case decodes, which is the whole of what the
 /// fixture recorded.
 ///
-/// A decoded token costs the CPU path 9.2 s, so eight of them and the prefill
+/// A decoded token costs the CPU path 9.0 s, so eight of them and the prefill
 /// under them is about two minutes — spent deliberately, and the reason the
 /// fixture records exactly this many rather than a length a test would have to
 /// be trimmed to.
