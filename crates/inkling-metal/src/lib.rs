@@ -23,7 +23,8 @@
 //! kernel here that carries state from one call to the next. [`swiglu`] is the
 //! smallest of them and is here for what it lets the two matmuls either side of
 //! it do rather than for its own arithmetic, and [`router`] is the one that
-//! decides which weights another dispatch will read.
+//! decides which weights another dispatch will read and what the rows they
+//! produce are worth.
 
 pub mod attention;
 pub mod buffer;
@@ -50,6 +51,6 @@ pub use kernel::{Grid, Kernel};
 pub use matmul::{MatmulError, PackedBank, PackedMatmul, PackedProjection};
 pub use norm::{LayerNorm, RmsNorm};
 pub use projections::{DenseFfn, LayerDevice, LayerKernels, LayerProjections, ModelLayers};
-pub use router::{LayerRouter, Router};
+pub use router::{LayerRouter, Router, RouterWeights, RoutingWeights};
 pub use sconv::{LayerConv, ShortConvolution};
 pub use swiglu::SwiGlu;

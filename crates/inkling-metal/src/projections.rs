@@ -936,7 +936,7 @@ mod tests {
 
     use crate::dense::DenseMatmul;
     use crate::matmul::testing::{Case, pack};
-    use crate::router::Router;
+    use crate::router::{Router, RouterWeights};
     use crate::testing::device;
 
     /// The packed tensors `just dump-quant-fixture` cut out of the checkpoint
@@ -1332,11 +1332,13 @@ mod tests {
         let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
         let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
         let router = Router::new(&device).expect("the router compiles");
+        let weighing = RouterWeights::new(&device).expect("the weighting compiles");
         let experts = ExpertKernels {
             matmul: kernels.matmul(),
             dense: &dense,
             swiglu: &swiglu,
             router: &router,
+            weights: &weighing,
         };
         let projections = ModelLayers::wrap(
             &device,

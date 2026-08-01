@@ -32,7 +32,8 @@ use inkling_core::{
 };
 use inkling_metal::{
     DenseMatmul, DenseWeight, Device, ExpertKernels, LayerKernels, LayerProjections, LayerRouter,
-    MetalError, ModelLayers, PackedBank, PackedMatmul, PackedProjection, Router, SwiGlu,
+    MetalError, ModelLayers, PackedBank, PackedMatmul, PackedProjection, Router, RouterWeights,
+    SwiGlu,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -574,6 +575,7 @@ impl OnTheDevice {
         let dense = DenseMatmul::new(device).expect("the dense matmul compiles");
         let swiglu = SwiGlu::new(device).expect("the swiglu compiles");
         let router = Router::new(device).expect("the router compiles");
+        let weighing = RouterWeights::new(device).expect("the weighting compiles");
         let config = fixture::config(dir).text_config;
         let ckpt = Checkpoint::open(dir).expect("checkpoint opens");
         let ids = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
@@ -598,6 +600,7 @@ impl OnTheDevice {
                 dense: &dense,
                 swiglu: &swiglu,
                 router: &router,
+                weights: &weighing,
             },
             &packed,
             &banks,
@@ -916,10 +919,17 @@ fn the_router_selects_the_experts_the_cpu_selects_over_a_real_gate() {
         .multiply(&normed_state())
         .expect("the dispatch completes");
 
-    let got = LayerRouter::new(&device, &kernel, moe_config, &correction_bias)
-        .expect("the router stands up")
-        .select(&logits)
-        .expect("the dispatch completes");
+    let weighing = RouterWeights::new(&device).expect("the weighting compiles");
+    let router = LayerRouter::new(
+        &device,
+        &kernel,
+        &weighing,
+        moe_config,
+        &correction_bias,
+        of("global_scale")[0],
+    )
+    .expect("the router stands up");
+    let got = router.select(&logits).expect("the dispatch completes");
 
     let want = SparseMoe::new(
         moe_config,

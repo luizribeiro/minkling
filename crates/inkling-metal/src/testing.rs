@@ -1,6 +1,47 @@
 //! What the tests here need before they can assert anything.
 
+use inkling_core::moe::MoeConfig;
+
 use crate::device::{Device, MetalError};
+
+/// The checkpoint's own routing shape, so that a kernel is exercised over the
+/// row it will actually read: 256 routed experts, two shared, six per token.
+///
+/// Here rather than in one of the modules that route because two of them do —
+/// the selection and the weighting are separate kernels over one row of logits,
+/// and a case that disagreed with another about the shape would be measuring a
+/// layer neither of them runs.
+pub const ROUTING: MoeConfig = MoeConfig {
+    n_routed: 256,
+    n_shared: 2,
+    top_k: 6,
+    route_scale: 8.0,
+};
+
+/// The trained `global_scale` of the layer the activation capture covers, which
+/// is not 1 — so a router that dropped it answers 142 times hot rather than
+/// identically, which is the largest single error any of the four ways of
+/// misreading this gate produces.
+pub const GLOBAL_SCALE: f32 = 0.007_042_432_7;
+
+/// `[tokens, n_routed + n_shared]` gate logits, spread over both signs and over
+/// the range where `sigmoid` is not saturated — so that the correction bias
+/// decides part of the ranking, the logits decide the rest, and every one of the
+/// eight weights is a number the softmax has something to do with.
+pub fn gate_logits(tokens: usize, seed: usize) -> Vec<f32> {
+    let width = ROUTING.n_routed + ROUTING.n_shared;
+    (0..tokens * width)
+        .map(|i| ((i * 37 + seed) % 401) as f32 / 40.0 - 5.0)
+        .collect()
+}
+
+/// A correction bias that is not all one value, so that a router which dropped
+/// it would rank differently.
+pub fn correction_bias() -> Vec<f32> {
+    (0..ROUTING.n_routed)
+        .map(|i| ((i * 53) % 97) as f32 / 400.0 - 0.12)
+        .collect()
+}
 
 /// The default device, or `None` with a reported skip.
 ///

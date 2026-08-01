@@ -62,7 +62,7 @@ use crate::dense::{DenseMatmul, DenseWeight};
 use crate::device::Device;
 use crate::kernel::Batch;
 use crate::matmul::{MatmulError, PackedBank, PackedMatmul, Pending};
-use crate::router::{LayerRouter, Router};
+use crate::router::{LayerRouter, Router, RouterWeights};
 use crate::swiglu::SwiGlu;
 
 /// One `SwitchGLU`'s three banks on the device: `[experts, hidden_dim, dim]`
@@ -318,12 +318,12 @@ fn chosen(gathered: Gathered<'_>) -> Vec<u32> {
         .collect()
 }
 
-/// The four kernels a MoE layer dispatches through, compiled once for the whole
+/// The five kernels a MoE layer dispatches through, compiled once for the whole
 /// model.
 ///
-/// Held together because that is what they are: none of the four names a shape,
+/// Held together because that is what they are: none of the five names a shape,
 /// so one pipeline each serves all forty layers, and a layer standing itself up
-/// needs all four. Borrowed rather than owned because the first of them is not
+/// needs all five. Borrowed rather than owned because the first of them is not
 /// the experts' — `crate::matmul` is the same kernel every projection and the
 /// head dispatch through, and a second compilation of it would be a second
 /// pipeline for one source string.
@@ -336,6 +336,10 @@ pub struct ExpertKernels<'a> {
     pub swiglu: &'a SwiGlu,
     /// The top-k over what the gate produced.
     pub router: &'a Router,
+    /// The softmax over the eight logits that top-k picked out — the other half
+    /// of the router, and a second entry point rather than a second half of the
+    /// first.
+    pub weights: &'a RouterWeights,
 }
 
 /// One MoE layer's two banks and the router that chooses between them.
@@ -508,7 +512,14 @@ impl<'a> LayerExperts<'a> {
             routed,
             shared,
             gate,
-            router: LayerRouter::new(device, kernels.router, config, &banks.correction_bias)?,
+            router: LayerRouter::new(
+                device,
+                kernels.router,
+                kernels.weights,
+                config,
+                &banks.correction_bias,
+                banks.global_scale,
+            )?,
         })
     }
 }
@@ -614,7 +625,7 @@ mod tests {
 
     use crate::dense::testing::narrowed;
     use crate::matmul::testing::{Case, Noise, pack};
-    use crate::testing::device;
+    use crate::testing::{GLOBAL_SCALE, device};
 
     /// Narrow enough to run three banks of it in a unit test, and wide enough
     /// that a reduction over it cancels: the checkpoint's widths are 4096 and
@@ -648,6 +659,56 @@ mod tests {
         (0..CONFIG.n_routed)
             .map(|i| (i as f32 - 1.0) / 8.0)
             .collect()
+    }
+
+    /// Every kernel a MoE layer dispatches through, compiled once for a case.
+    ///
+    /// Held together for the reason [`ExpertKernels`] holds them: a layer needs
+    /// all five, none of them names a shape, and a case that compiled them one
+    /// at a time would say five times what it says once.
+    struct Kernels {
+        matmul: PackedMatmul,
+        dense: DenseMatmul,
+        swiglu: SwiGlu,
+        router: Router,
+        weights: RouterWeights,
+    }
+
+    impl Kernels {
+        fn compile(device: &Device) -> Self {
+            Self {
+                matmul: PackedMatmul::new(device).expect("the packed matmul compiles"),
+                dense: DenseMatmul::new(device).expect("the dense matmul compiles"),
+                swiglu: SwiGlu::new(device).expect("the swiglu compiles"),
+                router: Router::new(device).expect("the router compiles"),
+                weights: RouterWeights::new(device).expect("the weighting compiles"),
+            }
+        }
+
+        /// One synthetic layer: two banks, a gate, and the router that chooses
+        /// and weights between them.
+        fn layer<'a>(
+            &'a self,
+            device: &'a Device,
+            routed: ExpertBanks<'a>,
+            shared: ExpertBanks<'a>,
+            seed: u32,
+        ) -> LayerExperts<'a> {
+            LayerExperts {
+                routed,
+                shared,
+                gate: gate(device, &self.dense, seed),
+                router: LayerRouter::new(
+                    device,
+                    &self.router,
+                    &self.weights,
+                    CONFIG,
+                    &correction_bias(),
+                    GLOBAL_SCALE,
+                )
+                .expect("the router stands up"),
+            }
+        }
     }
 
     /// What a call cost the device: `(dispatches, submissions, allocations)`,
@@ -897,23 +958,20 @@ mod tests {
     #[test]
     fn the_whole_layer_costs_three_fewer_submissions_than_its_four_parts_apart() {
         let Some(device) = device() else { return };
-        let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
-        let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
-        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
-        let kernel = Router::new(&device).expect("the router compiles");
-        let bias = correction_bias();
+        let kernels = Kernels::compile(&device);
         let banks = Banks::new();
-        let layer = LayerExperts {
-            routed: banks
-                .upload(&device, &matmul, &swiglu, &banks.gate, &banks.up)
-                .expect("the three banks pair"),
-            shared: banks
-                .upload(&device, &matmul, &swiglu, &banks.gate, &banks.up)
-                .expect("the three banks pair"),
-            gate: gate(&device, &dense, 0x5eed_6666),
-            router: LayerRouter::new(&device, &kernel, CONFIG, &bias)
-                .expect("the router stands up"),
+        let upload = || {
+            banks
+                .upload(
+                    &device,
+                    &kernels.matmul,
+                    &kernels.swiglu,
+                    &banks.gate,
+                    &banks.up,
+                )
+                .expect("the three banks pair")
         };
+        let layer = kernels.layer(&device, upload(), upload(), 0x5eed_6666);
 
         // Two tokens, and the shape `SparseMoe::shared_rows` hands the shared
         // bank: every token once per shared expert, expert-major — which is `x`
@@ -983,17 +1041,13 @@ mod tests {
     #[test]
     fn two_layers_built_from_different_banks_do_not_answer_alike() {
         let Some(device) = device() else { return };
-        let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
-        let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
-        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
-        let kernel = Router::new(&device).expect("the router compiles");
-        let bias = correction_bias();
+        let kernels = Kernels::compile(&device);
         let banks = Banks::new();
         let layer = |routed: &Case| {
             let bank = |case: &Case, in_dim, out_dim| {
                 PackedBank::upload(
                     &device,
-                    &matmul,
+                    &kernels.matmul,
                     EXPERTS,
                     in_dim,
                     out_dim,
@@ -1002,25 +1056,16 @@ mod tests {
                 )
                 .expect("the case's shapes pair")
             };
-            LayerExperts {
-                routed: ExpertBanks::new(
-                    bank(routed, DIM, HIDDEN_DIM),
+            let three = |gate: &Case| {
+                ExpertBanks::new(
+                    bank(gate, DIM, HIDDEN_DIM),
                     bank(&banks.up, DIM, HIDDEN_DIM),
                     bank(&banks.down, HIDDEN_DIM, DIM),
-                    &swiglu,
+                    &kernels.swiglu,
                 )
-                .expect("the banks pair"),
-                shared: ExpertBanks::new(
-                    bank(&banks.gate, DIM, HIDDEN_DIM),
-                    bank(&banks.up, DIM, HIDDEN_DIM),
-                    bank(&banks.down, HIDDEN_DIM, DIM),
-                    &swiglu,
-                )
-                .expect("the banks pair"),
-                gate: gate(&device, &dense, 0x5eed_5555),
-                router: LayerRouter::new(&device, &kernel, CONFIG, &bias)
-                    .expect("the router stands up"),
-            }
+                .expect("the banks pair")
+            };
+            kernels.layer(&device, three(routed), three(&banks.gate), 0x5eed_5555)
         };
 
         // Two layers whose routed banks differ, which is what a stack holds and

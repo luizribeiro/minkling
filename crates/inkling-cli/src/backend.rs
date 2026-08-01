@@ -37,7 +37,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
 use inkling_metal::{
-    DenseMatmul, Device, ExpertKernels, LayerKernels, ModelLayers, PackedProjection, Router, SwiGlu,
+    DenseMatmul, Device, ExpertKernels, LayerKernels, ModelLayers, PackedProjection, Router,
+    RouterWeights, SwiGlu,
 };
 
 use crate::LABEL;
@@ -51,10 +52,11 @@ use crate::args::Backend;
 /// checkpoint, so that a machine this cannot run on says so in a millisecond
 /// rather than after mapping 130 GiB.
 ///
-/// The three a layer does not reach are the experts': the dense matmul is the
+/// The four a layer does not reach are the experts': the dense matmul is the
 /// router's gate, which is the single weight the quantiser left in bfloat16; the
-/// router is the top-k over what that gate produced; and the SwiGLU is the
-/// activation between a bank's two halves. The last two are no weight at all.
+/// router is the top-k over what that gate produced and the softmax over the
+/// eight logits it picked out; and the SwiGLU is the activation between a bank's
+/// two halves. All but the first are no weight at all.
 #[derive(Debug)]
 pub struct Gpu {
     device: Device,
@@ -62,6 +64,7 @@ pub struct Gpu {
     dense: DenseMatmul,
     swiglu: SwiGlu,
     router: Router,
+    weights: RouterWeights,
 }
 
 impl Gpu {
@@ -71,16 +74,18 @@ impl Gpu {
         let dense = DenseMatmul::new(&device).context("compiling the dense matmul")?;
         let swiglu = SwiGlu::new(&device).context("compiling the swiglu")?;
         let router = Router::new(&device).context("compiling the router")?;
+        let weights = RouterWeights::new(&device).context("compiling the router's weighting")?;
         Ok(Self {
             device,
             kernels,
             dense,
             swiglu,
             router,
+            weights,
         })
     }
 
-    /// The four a MoE layer dispatches through, which is three of this and the
+    /// The five a MoE layer dispatches through, which is four of this and the
     /// packed matmul every projection in the model shares.
     fn expert_kernels(&self) -> ExpertKernels<'_> {
         ExpertKernels {
@@ -88,6 +93,7 @@ impl Gpu {
             dense: &self.dense,
             swiglu: &self.swiglu,
             router: &self.router,
+            weights: &self.weights,
         }
     }
 }

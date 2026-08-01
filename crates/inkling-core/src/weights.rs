@@ -636,6 +636,15 @@ pub struct LayerBanks<'a> {
     /// widened once here for a backend that ranks, as it already is for the one
     /// that does not.
     pub correction_bias: Vec<f32>,
+    /// The layer's learned output scale, which multiplies every routing weight
+    /// alongside [`MoeConfig::route_scale`] — see
+    /// [`GateWeights::global_scale`].
+    ///
+    /// Here because a backend that weights the selection it made needs both
+    /// scales and only one of them is in [`LayerBanks::config`]. Layer 2's is
+    /// 0.00704, so a backend that took `route_scale` alone would run every
+    /// expert 142 times too hot.
+    pub global_scale: f32,
 }
 
 /// One layer's own projections, still packed, from
@@ -792,6 +801,7 @@ impl<'a> CheckpointWeights<'a> {
                     shared,
                     gate_weight: router.gate,
                     correction_bias: router.correction_bias.clone(),
+                    global_scale: self.layers[layer].global_scale,
                 }
             })
             .collect()
