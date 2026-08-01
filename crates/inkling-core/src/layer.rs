@@ -55,6 +55,22 @@ pub trait Experts {
 
     /// The always-on shared bank, over every token, once per shared expert.
     fn shared(&self, gathered: Gathered<'_>) -> Vec<f32>;
+
+    /// The same shared bank, and — where this backend holds the router's gate —
+    /// the `[tokens, n_routed + n_shared]` logits for `x` beside it.
+    ///
+    /// **One call because a backend that dispatches both can put them in one
+    /// command buffer.** The gate's output decides what weight each of these
+    /// rows is scaled by and not which rows there are, so the bank does not
+    /// wait for it — see [`SparseMoe::forward`]. Forty gates submitted on their
+    /// own would be 8 ms of round trip on a step whose whole gate term is 28.
+    ///
+    /// The default holds no gate and answers `None`, which leaves the layer's
+    /// own weight to be multiplied where it always was.
+    fn gated_shared(&self, x: &[f32], gathered: Gathered<'_>) -> (Option<Vec<f32>>, Vec<f32>) {
+        let _ = x;
+        (None, self.shared(gathered))
+    }
 }
 
 /// The [`Experts`] a dense layer needs, which is none.
@@ -99,7 +115,7 @@ impl LayerMlp<'_> {
                 .forward(
                     x,
                     |gathered| experts.routed(gathered),
-                    |gathered| experts.shared(gathered),
+                    |x, gathered| experts.gated_shared(x, gathered),
                 )
                 .total(),
         }

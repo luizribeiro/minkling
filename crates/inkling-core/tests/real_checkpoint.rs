@@ -377,7 +377,7 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     let got = moe.forward(
         &x,
         |gathered| through_bank(&routed, gathered),
-        |gathered| through_bank(&shared, gathered),
+        |_, gathered| (None, through_bank(&shared, gathered)),
     );
 
     let mut worst = 0.0f32;
@@ -405,7 +405,7 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     let exchanged = moe.forward(
         &x,
         |gathered| vec![0.0; gathered.rows().len()],
-        |gathered| through_bank_reversed(&shared, gathered),
+        |_, gathered| (None, through_bank_reversed(&shared, gathered)),
     );
     let deviation = deviation(&exchanged.shared, &recorded("shared_out"));
     assert!(
