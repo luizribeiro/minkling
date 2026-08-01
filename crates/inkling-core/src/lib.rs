@@ -23,7 +23,7 @@ pub use attention::{
     Attention, AttentionCache, AttentionConfig, AttentionProjections, AttentionWeights,
     DecodedProjections, LogScaling, Projections, Sdpa, merge_heads, split_heads,
 };
-pub use checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
+pub use checkpoint::{BF16_BYTES, BF16_SHIFT, Checkpoint, CheckpointError, Dtype, TensorView};
 pub use config::{Config, TextConfig};
 pub use detokenize::{Utf8Stream, char_byte, piece_bytes};
 pub use embed::Embed;
@@ -43,6 +43,6 @@ pub use quant::{Dequantized, QuantError, Scratch};
 pub use sconv::{ConvState, ShortConv};
 pub use tokenizer::{Detokenizer, Tokenizer, TokenizerError};
 pub use weights::{
-    CheckpointWeights, ExpertBackend, LayerBanks, LayerPacked, Packed, PackedAttention,
+    Bf16, CheckpointWeights, ExpertBackend, LayerBanks, LayerPacked, Packed, PackedAttention,
     PackedExperts, PackedMlp, PackedRows, ProjectionBackend, WeightsError,
 };

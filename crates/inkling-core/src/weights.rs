@@ -95,6 +95,12 @@ pub enum WeightsError {
     #[error("{name} is {dtype:?}, which is not a float dtype")]
     NotFloat { name: String, dtype: Dtype },
 
+    #[error("{name} is {dtype:?}, not the bfloat16 its bytes would be read as")]
+    NotBf16 { name: String, dtype: Dtype },
+
+    #[error("{name} is {shape:?}, which is not a matrix")]
+    NotAMatrix { name: String, shape: Vec<usize> },
+
     #[error("{name} holds {got} values, not {expected}")]
     WrongLength {
         name: String,
@@ -194,6 +200,68 @@ impl<'a> Packed<'a> {
         let mut values = vec![0.0; self.slice_len()];
         self.decode_slice_into(index, &mut values)?;
         Ok(values)
+    }
+}
+
+/// An `[out_dim, in_dim]` tensor the checkpoint stores as bfloat16, left where
+/// it is mapped.
+///
+/// [`Packed`] above is every weight a matmul reads *but one*. The routers'
+/// gates are `[258, 4096]` bfloat16 — the quantiser left them alone, at 2.1 MB
+/// a layer — so a backend that wants to multiply against one is handed this
+/// instead: the bytes as the checkpoint holds them, for a kernel that widens
+/// each value where it multiplies rather than widening the tensor into memory.
+///
+/// The other bfloat16 tensors a layer holds are norms and convolution kernels,
+/// which no matmul reads and which [`CheckpointWeights`] widens once.
+#[derive(Debug, Clone, Copy)]
+pub struct Bf16<'a> {
+    bytes: &'a [u8],
+    out_dim: usize,
+    in_dim: usize,
+}
+
+impl<'a> Bf16<'a> {
+    /// One bfloat16 matrix of this checkpoint.
+    ///
+    /// The dtype is checked here because it is what the bytes *mean*: a backend
+    /// handed a float32 tensor under this type would read each half of a float
+    /// as a value, which is a weight of the right length and of no relation to
+    /// the one asked for.
+    pub fn open(ckpt: &'a Checkpoint, name: &str) -> Result<Self, WeightsError> {
+        let view = ckpt.tensor(name)?;
+        if view.dtype() != Dtype::BF16 {
+            return Err(WeightsError::NotBf16 {
+                name: name.to_string(),
+                dtype: view.dtype(),
+            });
+        }
+        let &[out_dim, in_dim] = view.shape() else {
+            return Err(WeightsError::NotAMatrix {
+                name: name.to_string(),
+                shape: view.shape().to_vec(),
+            });
+        };
+        Ok(Self {
+            bytes: view.data(),
+            out_dim,
+            in_dim,
+        })
+    }
+
+    /// The width a row of the input has to be.
+    pub fn in_dim(&self) -> usize {
+        self.in_dim
+    }
+
+    /// How many rows the weight holds, which is the width it maps to.
+    pub fn out_dim(&self) -> usize {
+        self.out_dim
+    }
+
+    /// The bytes themselves, row-major, as the checkpoint holds them.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 }
 
@@ -1004,6 +1072,12 @@ mod tests {
     use crate::fixture;
     use crate::quant::GROUP_SIZE;
 
+    /// The MoE fixture, which carries the one thing no other committed fixture
+    /// does: the trained `[258, 4096]` gate of the captured layer, as bfloat16
+    /// rather than widened. It is the shape and the dtype [`Bf16`] exists for.
+    const GATE_FIXTURE: &str = "moe.safetensors";
+    const GATE: &str = "trained.gate_weight";
+
     /// The synthetic stack's config, read for its shape rather than its
     /// contents: any real `TextConfig` settles the question below.
     const FIXTURE_CONFIG: &str = "stack.json";
@@ -1028,6 +1102,57 @@ mod tests {
         config.tie_word_embeddings = true;
         assert_eq!(head_module(&config), EMBED_TOKENS);
         assert_ne!(LM_HEAD, EMBED_TOKENS);
+    }
+
+    /// A bfloat16 weight is its two axes and the checkpoint's own bytes, and it
+    /// is those bytes rather than a copy of them — which is the whole of what a
+    /// backend that wraps a mapping needs to be true.
+    ///
+    /// The lengths are the claim about the axes. `[258, 4096]` of bfloat16 is
+    /// 2.11 MB, and a reader that took the shape the other way round would
+    /// still describe a tensor of exactly that many bytes.
+    #[test]
+    fn a_bfloat16_weight_is_the_checkpoints_own_bytes_under_its_two_axes() {
+        let ckpt = fixture::open(GATE_FIXTURE);
+        let gate = Bf16::open(&ckpt, GATE).expect("the fixture holds the trained gate");
+
+        assert_eq!(
+            gate.out_dim(),
+            258,
+            "the routed experts and the shared pair"
+        );
+        assert_eq!(gate.in_dim(), 4096, "the hidden width");
+        assert_eq!(
+            gate.bytes().len(),
+            gate.out_dim() * gate.in_dim() * 2,
+            "two bytes a value"
+        );
+        assert_eq!(
+            gate.bytes().as_ptr(),
+            fixture::tensor(&ckpt, GATE).data().as_ptr(),
+            "the bytes were copied rather than addressed"
+        );
+    }
+
+    /// The dtype is what the bytes *mean*, so it is checked rather than
+    /// assumed: the fixture's `x` is float32 of exactly the shape a gate could
+    /// have, and read as bfloat16 it would be a weight of twice the rows with
+    /// each half of a float standing in for a value.
+    #[test]
+    fn a_weight_that_is_not_bfloat16_is_refused() {
+        let ckpt = fixture::open(GATE_FIXTURE);
+        let err = Bf16::open(&ckpt, "x").expect_err("x is float32");
+
+        assert!(
+            matches!(
+                err,
+                WeightsError::NotBf16 {
+                    dtype: Dtype::F32,
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     /// 64 rows of `layers.0.mlp.gate_proj`, which is a projection the engine

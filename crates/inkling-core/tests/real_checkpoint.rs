@@ -25,7 +25,8 @@ use inkling_core::ops::{DenseMlp, DenseProjection, top_k};
 use inkling_core::quant::{Scratch, dequantize};
 use inkling_core::tokenizer::{Tokenizer, TokenizerError};
 use inkling_core::weights::{
-    CheckpointWeights, Packed, PackedExperts, expert_scratch_floats, layer_scratch_floats,
+    Bf16, CheckpointWeights, Packed, PackedExperts, WeightsError, expert_scratch_floats,
+    layer_scratch_floats,
 };
 use inkling_core::{Checkpoint, Dtype, TensorView, TextConfig};
 
@@ -52,6 +53,35 @@ fn mxfp4_checkpoint_spans_thirty_shards() {
 
     assert_eq!(ckpt.num_shards(), 30);
     assert_eq!(ckpt.tensor_names().count(), 1508);
+}
+
+/// The gate a backend multiplies against, and the tensor beside it that is
+/// bfloat16 too and is not a weight.
+///
+/// Every committed fixture that carries bfloat16 at all carries the gate, so
+/// the *other* refusal has to be stated here: `input_layernorm.weight` is
+/// `[4096]` of exactly the dtype [`Bf16`] takes, and a backend handed it would
+/// be handed a matmul's worth of bytes with no second axis to make rows of.
+#[test]
+fn a_bfloat16_tensor_that_is_not_a_matrix_is_not_a_weight() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let module = "language_model.model.layers.2";
+
+    let gate = Bf16::open(&ckpt, &format!("{module}.mlp.gate_weight")).expect("the gate is one");
+    assert_eq!((gate.out_dim(), gate.in_dim()), (258, 4096));
+
+    let norm = format!("{module}.input_layernorm.weight");
+    assert_eq!(
+        checkpoint_tensor(&ckpt, &norm).dtype(),
+        Dtype::BF16,
+        "a norm of another dtype would settle nothing"
+    );
+    let err = Bf16::open(&ckpt, &norm).expect_err("a norm is not a matrix");
+    assert!(
+        matches!(err, WeightsError::NotAMatrix { ref shape, .. } if shape == &[4096]),
+        "{err}"
+    );
 }
 
 #[test]

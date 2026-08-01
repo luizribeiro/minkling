@@ -63,6 +63,17 @@ pub struct Checkpoint {
     owners: BTreeMap<String, usize>,
 }
 
+/// Bytes one bfloat16 value occupies.
+pub const BF16_BYTES: usize = size_of::<u16>();
+
+/// Where a bfloat16's bits sit in the float32 it widens to, which is the whole
+/// of the format: an f32 with the low sixteen mantissa bits dropped.
+///
+/// Named rather than only used, because a kernel that widens the same bytes
+/// where it multiplies needs these two facts too — and a second reading of the
+/// format living in a source string is one that can drift from this one.
+pub const BF16_SHIFT: u32 = 16;
+
 /// The dtype, shape and undecoded bytes of one tensor.
 ///
 /// The bytes are exactly as they sit in the file: MXFP4 blocks stay packed and
@@ -105,10 +116,10 @@ impl<'a> TensorView<'a> {
             ),
             Dtype::BF16 => Some(
                 self.data
-                    .chunks_exact(size_of::<u16>())
+                    .chunks_exact(BF16_BYTES)
                     .map(|b| {
                         let bits = u16::from_le_bytes(b.try_into().expect("chunked into halves"));
-                        f32::from_bits(u32::from(bits) << 16)
+                        f32::from_bits(u32::from(bits) << BF16_SHIFT)
                     })
                     .collect(),
             ),
