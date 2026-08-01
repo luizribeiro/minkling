@@ -37,7 +37,7 @@ pub mod sconv;
 mod testing;
 
 pub use attention::{AttentionError, FusedAttention, LayerAttention, Step};
-pub use buffer::{Arg, Buffer, Bytes, Element, Landing, Mapped};
+pub use buffer::{Arg, Buffer, Bytes, Element, Inline, Landing, Mapped};
 pub use dense::{DenseMatmul, DenseWeight};
 pub use device::{Device, MetalError};
 pub use experts::{ExpertBanks, LayerExperts, ModelExperts};

@@ -1,5 +1,6 @@
 //! Source string to compute pipeline, and pipeline to result.
 
+use std::ptr::NonNull;
 use std::time::Duration;
 
 use inkling_core::profile::{self, Op};
@@ -147,6 +148,10 @@ impl Batch<'_> {
     /// A command buffer retains what is bound into it, so nothing is freed
     /// under a running dispatch — but a caller that wants to *read* an output
     /// still holds the buffer it reads.
+    ///
+    /// An [`Arg::Inline`] is the exception and is why the two are separate
+    /// variants: `setBytes:` copies, so those bytes are the command buffer's
+    /// own by the time this returns and the caller's may go.
     pub fn add(&mut self, kernel: &Kernel, args: &[Arg<'_>], grid: Grid) -> Result<(), MetalError> {
         if grid.threads_per_group > kernel.max_threads_per_group() {
             return Err(MetalError::ThreadgroupTooLarge {
@@ -165,9 +170,10 @@ impl Batch<'_> {
 
         self.encoder.setComputePipelineState(&kernel.pipeline);
         for (slot, arg) in args.iter().enumerate() {
-            // SAFETY: the buffer outlives the encoding through `Arg`'s borrow,
-            // offset 0 is within every allocation, and `slot` is inside the
-            // argument table by the check above.
+            // SAFETY: the memory outlives the encoding through `Arg`'s borrow,
+            // offset 0 is within every allocation, `Inline`'s length is the
+            // slice's own and is inside the 4 KiB `setBytes:` takes, and `slot`
+            // is inside the argument table by the check above.
             //
             // What is *not* checked is that a slot's element type is the one
             // the source declared for it, or that the kernel indexes inside the
@@ -175,8 +181,16 @@ impl Batch<'_> {
             // string is the only thing that says — and both stay the kernel
             // author's to get right, the way the body of any `unsafe fn` is.
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(arg.raw()), 0, slot)
+                match arg {
+                    Arg::Bound(buffer) => {
+                        self.encoder.setBuffer_offset_atIndex(Some(buffer), 0, slot)
+                    }
+                    Arg::Inline(bytes) => self.encoder.setBytes_length_atIndex(
+                        NonNull::from(*bytes).cast(),
+                        bytes.len(),
+                        slot,
+                    ),
+                }
             };
         }
         self.encoder.dispatchThreadgroups_threadsPerThreadgroup(

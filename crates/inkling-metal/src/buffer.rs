@@ -260,7 +260,7 @@ impl<T: Element> Buffer<T> {
     /// slice of the same bytes from outliving the call that writes them, and
     /// what keeps one buffer from being bound to two slots that write.
     pub fn arg(&mut self) -> Arg<'_> {
-        Arg(&self.raw)
+        Arg::Bound(&self.raw)
     }
 }
 
@@ -344,21 +344,88 @@ impl Landing<'_> {
     }
 }
 
-/// A buffer bound to a kernel argument slot, from [`Buffer::arg`].
+/// What fills one of a kernel's argument slots: an allocation the dispatch
+/// reads, or bytes copied into the command buffer as it is encoded.
+///
+/// The second is what a dispatch's shape is. A shape is a dozen `uint`s that
+/// describe one call and are read once, so what an allocation would buy it is a
+/// lifetime it has no use for at a price a step pays 749 times.
 #[derive(Debug)]
-pub struct Arg<'a>(&'a ProtocolObject<dyn MTLBuffer>);
+pub enum Arg<'a> {
+    /// An allocation, from [`Buffer::arg`]. The command buffer retains it, so it
+    /// outlives the encoding whatever the caller does.
+    Bound(&'a ProtocolObject<dyn MTLBuffer>),
+    /// Bytes `setBytes:length:atIndex:` copies where the GPU will read them,
+    /// from [`Inline::arg`]. **Copied as the dispatch is encoded**, which is
+    /// what makes them safe to overwrite immediately afterwards and what lets
+    /// two calls of different shapes share a command buffer.
+    Inline(&'a [u8]),
+}
 
-impl Arg<'_> {
-    pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        self.0
+/// The most bytes `setBytes:length:atIndex:` takes, which every Apple GPU
+/// family states as 4 KiB.
+const INLINE_BYTES: usize = 4096;
+
+/// Values a dispatch reads and no dispatch writes, put where it can read them:
+/// in the command buffer when they fit, and in an allocation when they do not.
+///
+/// **One type, not a threshold repeated at every call site.** A shape is always
+/// a few dozen bytes, but an expert list is one `uint` a row — six of them on a
+/// decode step and 4614 on a 769-token prefill — so the same argument is inline
+/// at one call and an allocation at the next, and nothing above here wants to
+/// know which.
+#[derive(Debug)]
+pub enum Inline<'a, T> {
+    Bytes(&'a [T]),
+    Buffered(Buffer<T>),
+}
+
+impl Device {
+    /// `values` where a dispatch can read them, without an allocation if they
+    /// are small enough to travel in the command buffer.
+    ///
+    /// For arguments a kernel declares `constant` or `device const` and nothing
+    /// else: what this hands out is a *copy* taken at encode time, so a slot the
+    /// kernel writes through would be writing bytes nobody reads back.
+    pub fn inline<'v, T: Element>(&self, values: &'v [T]) -> Result<Inline<'v, T>, MetalError> {
+        match (1..=INLINE_BYTES).contains(&size_of_val(values)) {
+            true => Ok(Inline::Bytes(values)),
+            // Both the values too wide for the command buffer and the empty
+            // slice, which the device refuses to allocate for — the refusal
+            // this has always answered a dispatch over nothing with.
+            false => self.buffer(values).map(Inline::Buffered),
+        }
+    }
+}
+
+impl<T: Element> Inline<'_, T> {
+    /// The values in one of a kernel's argument slots.
+    ///
+    /// Exclusive for the reason [`Buffer::arg`] is, and only for the reason
+    /// [`Buffer::arg`] is: the allocated arm is a buffer like any other. The
+    /// inline arm needs nothing of the borrow.
+    pub fn arg(&mut self) -> Arg<'_> {
+        match self {
+            Self::Bytes(values) => Arg::Inline(
+                // SAFETY: `Element` says `T` carries no padding, so every byte
+                // of the slice is initialised, and `u8` is aligned for any
+                // address. The bytes are read for the length of the borrow and
+                // copied out of it by `setBytes:`.
+                unsafe {
+                    std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(*values))
+                },
+            ),
+            Self::Buffered(buffer) => buffer.arg(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::page;
+    use super::{INLINE_BYTES, Inline, page};
     use crate::device::MetalError;
-    use crate::testing::device;
+    use crate::kernel::Grid;
+    use crate::testing::{SAXPY, SAXPY_ENTRY, device};
 
     /// Pages of this process's own, standing in for a checkpoint's mapping: the
     /// one thing [`Device::wrap`] needs that a `Vec` cannot give is that the
@@ -512,6 +579,141 @@ mod tests {
             unsafe { device.wrap::<u8>(odd) }.is_ok(),
             "bytes always line up"
         );
+    }
+
+    /// `alpha * x + y` over `x` handed to the kernel through [`Device::inline`],
+    /// with everything else bound the way it always was.
+    ///
+    /// The two lengths are what the case is about: `x` is the one argument here
+    /// wide enough to fall either side of the threshold, so the same call is a
+    /// `setBytes:` at one length and an allocation at the other, and both have
+    /// to be the same arithmetic.
+    fn saxpy_over(len: usize) -> (Vec<f32>, bool) {
+        let device = device().expect("the caller checked");
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        let x: Vec<f32> = (0..len).map(|i| i as f32 * 0.125 - 7.0).collect();
+        let y: Vec<f32> = (0..len).map(|i| 3.0 - i as f32 * 0.0625).collect();
+
+        let alpha = [2.5f32];
+        let count = [len as u32];
+        let mut alpha = device.inline(&alpha).expect("a scalar");
+        let mut count = device.inline(&count).expect("a count");
+        let mut rows = device.inline(&x).expect("the rows");
+        let inlined = matches!(rows, Inline::Bytes(_));
+        let mut y = device.buffer(&y).expect("the addend uploads");
+        let mut out = device.zeroed::<f32>(len).expect("the output allocates");
+        device
+            .run(
+                &kernel,
+                &[alpha.arg(), count.arg(), rows.arg(), y.arg(), out.arg()],
+                Grid::new(len, 64),
+            )
+            .expect("the dispatch completes");
+
+        (out.to_vec(), inlined)
+    }
+
+    /// The whole of what an inline argument has to be: the same answer the same
+    /// values in an allocation give.
+    /// The widest call that still travels in the command buffer, which is the
+    /// side of the threshold an inclusive range is the difference between.
+    #[test]
+    fn a_dispatch_reads_inline_values_the_way_it_reads_an_allocation() {
+        let Some(_) = device() else { return };
+        let len = INLINE_BYTES / size_of::<f32>();
+
+        let (got, inlined) = saxpy_over(len);
+
+        assert!(inlined, "{len} floats travel in the command buffer");
+        let want: Vec<f32> = (0..len)
+            .map(|i| 2.5 * (i as f32 * 0.125 - 7.0) + (3.0 - i as f32 * 0.0625))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// And one value more is an allocation instead, read whole rather than
+    /// truncated to what would have fitted.
+    ///
+    /// One more rather than twice as many, because what the two cases either
+    /// side of the threshold settle is where it falls. Not a boundary anything
+    /// contrives: an expert list is one `uint` a row, so a decode step's is six
+    /// and a 769-token prefill's is 4614.
+    #[test]
+    fn one_value_past_the_command_buffer_is_allocated_instead() {
+        let Some(_) = device() else { return };
+        let len = INLINE_BYTES / size_of::<f32>() + 1;
+
+        let (got, inlined) = saxpy_over(len);
+
+        assert!(!inlined, "{len} floats are past the inline threshold");
+        assert_eq!(got.len(), len);
+        assert_eq!(
+            got[len - 1],
+            2.5 * ((len - 1) as f32 * 0.125 - 7.0) + (3.0 - (len - 1) as f32 * 0.0625),
+            "the last value the allocation carried"
+        );
+    }
+
+    /// **What separates an inline argument from a resident one written in
+    /// place**, and the reason a shape is the first and not the second: the
+    /// bytes are copied as the dispatch is encoded, so two dispatches of one
+    /// command buffer can be encoded from storage that no longer holds either
+    /// value by the time the GPU runs them.
+    ///
+    /// A resident shape buffer would have the second dispatch's write reach the
+    /// first, which is exactly the pair a layer's projections are — and the
+    /// pair a batching scheduler will make of two sequences of different
+    /// heights.
+    #[test]
+    fn two_dispatches_of_one_command_buffer_keep_the_inline_values_each_was_encoded_with() {
+        let Some(device) = device() else { return };
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        const LEN: usize = 256;
+        let values: Vec<f32> = (0..LEN).map(|i| i as f32 * 0.5 - 3.0).collect();
+        let mut x = device.buffer(&values).expect("the rows upload");
+        let mut y = device.zeroed::<f32>(LEN).expect("the addend allocates");
+        let mut first = device.zeroed::<f32>(LEN).expect("an output allocates");
+        let mut second = device.zeroed::<f32>(LEN).expect("an output allocates");
+
+        let mut batch = device.batch().expect("a command buffer opens");
+        for (scalar, out) in [(2.0f32, &mut first), (10.0f32, &mut second)] {
+            // Both scalars live only to the end of this iteration, which is
+            // before the batch is submitted and long before it completes.
+            let alpha = [scalar];
+            let count = [LEN as u32];
+            let mut alpha = device.inline(&alpha).expect("a scalar");
+            let mut count = device.inline(&count).expect("a count");
+            batch
+                .add(
+                    &kernel,
+                    &[alpha.arg(), count.arg(), x.arg(), y.arg(), out.arg()],
+                    Grid::new(LEN, 64),
+                )
+                .expect("the dispatch encodes");
+        }
+        batch.wait().expect("the batch completes");
+
+        let scaled = |by: f32| values.iter().map(|v| by * v).collect::<Vec<f32>>();
+        assert_eq!(first.to_vec(), scaled(2.0));
+        assert_eq!(
+            second.to_vec(),
+            scaled(10.0),
+            "the second overwrote the first"
+        );
+    }
+
+    /// A dispatch over no values stays the refusal it has always been rather
+    /// than becoming a binding of nothing, which the kernel would read as a
+    /// pointer it may not follow.
+    #[test]
+    fn inlining_no_values_is_refused_the_way_allocating_none_is() {
+        let Some(device) = device() else { return };
+
+        let err = device
+            .inline::<f32>(&[])
+            .expect_err("a dispatch over nothing is refused");
+
+        assert!(matches!(err, MetalError::Allocation { bytes: 0 }), "{err}");
     }
 
     #[test]
