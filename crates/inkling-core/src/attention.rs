@@ -256,6 +256,22 @@ pub trait Projections: Debug {
             r: self.r_proj().forward(x),
         }
     }
+
+    /// The same four, over the layer's input layernorm applied to `x`.
+    ///
+    /// One step further out than [`Projections::qkvr`], and the same bargain:
+    /// the normed hidden state is consumed by these four and by nothing else, so
+    /// a backend that can produce it where they will read it never has to hand
+    /// it back. Where a norm is a loop over a slice this default is the whole
+    /// story; where it is a dispatch it is a value that stays on the device
+    /// between two of them.
+    ///
+    /// It is the *first* of a layer's two norms and not both, because the second
+    /// feeds an MLP whose router still multiplies its gate here — the seam moves
+    /// as far as the next thing that has to come back, and no further.
+    fn normed_qkvr(&self, x: &[f32], weight: &[f32], eps: f32) -> Qkvr {
+        self.qkvr(&rms_norm(x, weight, eps))
+    }
 }
 
 /// What the four projections of one call produced, each `[rows, out_dim]`.
@@ -394,6 +410,13 @@ impl Projections for AttentionProjections<'_> {
     fn qkvr(&self, x: &[f32]) -> Qkvr {
         self.held().qkvr(x)
     }
+
+    /// Delegated for the same reason, one step further out: the default would
+    /// normalise here and hand the result down, which is the crossing a backend
+    /// that overrode this said it did not need.
+    fn normed_qkvr(&self, x: &[f32], weight: &[f32], eps: f32) -> Qkvr {
+        self.held().normed_qkvr(x, weight, eps)
+    }
 }
 
 /// One attention layer's tensors: the five projections wherever they multiply,
@@ -499,9 +522,27 @@ impl<'a> Attention<'a> {
 
     /// `[queries, hidden]` in and out, continuing from `cache` and leaving this
     /// call's keys, values and convolution windows behind in it.
-    pub fn forward(&self, cache: &mut AttentionCache, x: &[f32]) -> Vec<f32> {
+    ///
+    /// `norm` is the layer's input layernorm weight, applied to `x` on the way
+    /// into the four projections — and `None` says `x` arrives normalised
+    /// already, which is what every recorded attention case is: the reference's
+    /// capture starts at `input_layernorm_out`, and the synthetic cases were
+    /// driven through `InklingAttention` directly.
+    ///
+    /// Here rather than in the layer above for the reason
+    /// [`Projections::normed_qkvr`] gives: the normed state is these four
+    /// projections' input and nothing else's, so whoever multiplies them should
+    /// be the one who decides where it is formed.
+    pub fn forward(&self, cache: &mut AttentionCache, x: &[f32], norm: Option<&[f32]>) -> Vec<f32> {
         let log_scaling = self.config.log_scaling;
-        self.attend(cache, x, QueryOffset::Cached, log_scaling, log_scaling)
+        self.attend(
+            cache,
+            x,
+            norm,
+            QueryOffset::Cached,
+            log_scaling,
+            log_scaling,
+        )
     }
 
     /// [`Attention::forward`], with the query offset and log scaling's two
@@ -516,6 +557,7 @@ impl<'a> Attention<'a> {
         &self,
         cache: &mut AttentionCache,
         x: &[f32],
+        input_layernorm: Option<&[f32]>,
         query_offset: QueryOffset,
         on_queries: Option<LogScaling>,
         on_biases: Option<LogScaling>,
@@ -531,8 +573,13 @@ impl<'a> Attention<'a> {
         let cached = cache.keys.len() / (self.sdpa.kv_heads * head_dim);
         let offset = query_offset.of(cached);
 
-        let projected = self.weights.projections.qkvr(x);
-        let norm = |x: &[f32], weight| rms_norm(x, weight, self.config.rms_norm_eps);
+        let eps = self.config.rms_norm_eps;
+        let projections = &self.weights.projections;
+        let projected = match input_layernorm {
+            Some(weight) => projections.normed_qkvr(x, weight, eps),
+            None => projections.qkvr(x),
+        };
+        let norm = |x: &[f32], weight| rms_norm(x, weight, eps);
 
         // The key is normed after its convolution, not before, and the value is
         // convolved and never normed.
@@ -1166,7 +1213,7 @@ mod tests {
         /// mutated into.
         fn run(&self, weights: AttentionWeights<'_>) -> Vec<f32> {
             let attention = Attention::new(self.config, weights);
-            attention.forward(&mut attention.cache(), &self.x)
+            attention.forward(&mut attention.cache(), &self.x, None)
         }
 
         /// The prefill and the continuation, against one cache, as the dump
@@ -1192,8 +1239,15 @@ mod tests {
             let attention = self.attention();
             let cache = &mut attention.cache();
             (
-                attention.attend(cache, &self.x, query_offset, on_queries, on_biases),
-                attention.attend(cache, &self.continue_x, query_offset, on_queries, on_biases),
+                attention.attend(cache, &self.x, None, query_offset, on_queries, on_biases),
+                attention.attend(
+                    cache,
+                    &self.continue_x,
+                    None,
+                    query_offset,
+                    on_queries,
+                    on_biases,
+                ),
             )
         }
 
@@ -1492,7 +1546,7 @@ mod tests {
     fn the_continuation_attends_over_the_cached_prefill() {
         for layer in Layer::all() {
             let attention = layer.attention();
-            let fresh = attention.forward(&mut attention.cache(), &layer.continue_x);
+            let fresh = attention.forward(&mut attention.cache(), &layer.continue_x, None);
             let deviation = deviation(&fresh, &layer.continue_out);
             assert!(
                 deviation > TOLERANCE,

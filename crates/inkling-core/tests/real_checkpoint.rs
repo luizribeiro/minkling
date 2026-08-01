@@ -214,7 +214,8 @@ fn attention_reproduces_the_reference_layers_against_real_weights() {
         let layer_config = AttentionConfig::for_layer(&config, layer);
 
         let attention = Attention::new(layer_config, weights.view(config.hidden_size));
-        let against_reference = deviation(&attention.forward(&mut attention.cache(), &x), &want);
+        let against_reference =
+            deviation(&attention.forward(&mut attention.cache(), &x, None), &want);
         assert!(
             against_reference <= ATTENTION_TOLERANCE,
             "layer {layer}: deviation {against_reference:e}"
@@ -229,7 +230,7 @@ fn attention_reproduces_the_reference_layers_against_real_weights() {
         let mut unbiased = weights.view(config.hidden_size);
         unbiased.rel_proj = &flat;
         let unbiased = Attention::new(layer_config, unbiased);
-        let flattened = deviation(&unbiased.forward(&mut unbiased.cache(), &x), &want);
+        let flattened = deviation(&unbiased.forward(&mut unbiased.cache(), &x, None), &want);
         assert!(
             flattened > ATTENTION_TOLERANCE,
             "layer {layer}: a flat band deviates by only {flattened:e}"

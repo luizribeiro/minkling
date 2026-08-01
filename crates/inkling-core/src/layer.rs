@@ -31,6 +31,8 @@
 //! `reference/fixtures/layer_activations.safetensors`. The trained layers are
 //! checkpoint-sized and are left to `tests/real_checkpoint.rs`.
 
+use std::borrow::Cow;
+
 use crate::attention::{Attention, AttentionCache, AttentionConfig, AttentionWeights};
 use crate::moe::{Gathered, SparseMoe};
 use crate::ops::{DenseMlp, rms_norm};
@@ -230,10 +232,11 @@ impl<'a> DecoderLayer<'a> {
             self.hidden
         );
 
-        let normed = rms_norm(x, self.input_layernorm, self.rms_norm_eps);
-        let attended = self.attention.forward(&mut cache.attention, &normed);
+        let attended = self
+            .attention
+            .forward(&mut cache.attention, x, Some(self.input_layernorm));
         let h = add(
-            residual.of(x, &normed),
+            &residual.around_attention(x, self.input_layernorm, self.rms_norm_eps),
             &self
                 .attn_sconv
                 .forward(&mut cache.attn_sconv, &attended, None),
@@ -265,6 +268,21 @@ impl Residual {
         match self {
             Self::PreNorm => pre_norm,
             Self::Normed => normed,
+        }
+    }
+
+    /// What the *first* residual is added to, which cannot be [`Residual::of`]:
+    /// the value the attention layer normalised is no longer formed here — see
+    /// [`Attention::forward`] — so the slip this names has to normalise the
+    /// input again to be able to take it.
+    ///
+    /// Which is the shape of the finding rather than a workaround. A value the
+    /// engine does not compute is one a mistake has to go out of its way to
+    /// reach, and the norm below runs on no path but this one.
+    fn around_attention<'a>(&self, x: &'a [f32], weight: &[f32], eps: f32) -> Cow<'a, [f32]> {
+        match self {
+            Self::PreNorm => Cow::Borrowed(x),
+            Self::Normed => Cow::Owned(rms_norm(x, weight, eps)),
         }
     }
 }
