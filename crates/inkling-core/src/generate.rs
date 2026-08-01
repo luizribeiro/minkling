@@ -72,6 +72,7 @@ use std::ops::ControlFlow;
 use crate::head::LmHead;
 use crate::model::{Model, ModelCache, ModelWeights};
 use crate::ops::{Projection, top_k};
+use crate::profile::{self, Op};
 
 /// The id a greedy sampler takes.
 ///
@@ -80,6 +81,7 @@ use crate::ops::{Projection, top_k};
 /// top two logits bfloat16 cannot tell apart resolves the same way here as it
 /// does in a comparison against the oracle.
 pub fn greedy(logits: &[f32]) -> usize {
+    let _timed = profile::scope(Op::Sample);
     *top_k(logits, 1).first().expect("logits to sample from")
 }
 

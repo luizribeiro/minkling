@@ -8,9 +8,12 @@
 
 use std::fmt::Debug;
 
+use crate::profile::{self, Op};
+
 /// Root-mean-square normalisation over the last axis, `x * rsqrt(mean(x²) +
 /// eps) * weight`, with one row per `weight.len()` values of `x`.
 pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    let _timed = profile::scope(Op::RmsNorm);
     assert_eq!(
         x.len() % weight.len(),
         0,
@@ -228,6 +231,7 @@ impl<'a> DenseMlp<'a> {
 /// `y = x @ wᵀ`, for `[rows, in_dim]` against the `[out, in]` row-major weight
 /// `nn.Linear` stores. None of Inkling's projections carries a bias.
 pub fn linear(x: &[f32], weight: &[f32], in_dim: usize) -> Vec<f32> {
+    let _timed = profile::scope(Op::Linear);
     assert_eq!(
         x.len() % in_dim,
         0,
@@ -367,6 +371,7 @@ pub fn softmax(row: &mut [f32]) {
 /// has to join them, and a second spelling of which operand the activation goes
 /// on is the one mistake this whole comment exists to prevent.
 pub fn swiglu(gate: &mut [f32], up: &[f32]) {
+    let _timed = profile::scope(Op::Swiglu);
     // A zip over unequal lengths is a truncation and not a panic, which for two
     // projections of a width that disagreed would be an answer of the shorter
     // one's shape rather than an error. [`DenseMlp::new`] settles this at

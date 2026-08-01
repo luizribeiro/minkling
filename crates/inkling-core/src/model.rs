@@ -199,6 +199,7 @@ impl<'a> Model<'a> {
 mod tests {
     use super::*;
     use crate::fixture::{self, LayerTensors, Stack, deviation};
+    use crate::profile::{self, Op};
 
     /// The synthetic stack is float32 end to end, so only summation order
     /// separates it from MLX — the same bound, for the same reason, as the
@@ -398,6 +399,75 @@ mod tests {
                 deviation > TOLERANCE,
                 "{}: the norm moves the answer by only {deviation:e}",
                 want.what
+            );
+        }
+    }
+
+    /// What a forward pass is made of, counted rather than described.
+    ///
+    /// [`crate::profile`] exists to say where a step's time goes, and it can
+    /// only say it about operations something opened a scope around. This is
+    /// what says the scopes are where they are claimed to be: a stack of five
+    /// layers runs four RMSNorms and four short convolutions a layer, one mask
+    /// and one attention step, and a residual add for each of its two residuals
+    /// — plus the embedding's own norm, and one more add on each layer that
+    /// routes, where the routed and shared halves are summed.
+    ///
+    /// Exact counts rather than "was reached", because the mistake worth
+    /// catching is a scope on the wrong side of a loop. One opened per row of a
+    /// call, or per expert rather than per layer, would still charge the right
+    /// op and would make every figure in the table depend on a shape the table
+    /// does not print.
+    ///
+    /// The set is exact too, which makes this fail when an op is instrumented
+    /// that this stack reaches — deliberately, because a row appearing in the
+    /// table is a change to what the table means.
+    #[test]
+    fn a_forward_pass_opens_one_scope_per_operation_it_runs() {
+        let stack = Stack::load();
+        let layers = stack.config.num_hidden_layers as u64;
+        let routed = (0..stack.config.num_hidden_layers)
+            .filter(|layer| !stack.config.layer_is_dense(*layer))
+            .count() as u64;
+
+        profile::take();
+        stack
+            .model()
+            .forward(&mut ModelCache::new(&stack.config), &stack.ids, &stack);
+        let profile = profile::take();
+
+        for (op, want) in [
+            (Op::RmsNorm, 1 + 4 * layers),
+            (Op::Sconv, 4 * layers),
+            (Op::Mask, layers),
+            (Op::Sdpa, layers),
+            (Op::Residual, 2 * layers + routed),
+            (Op::Router, routed),
+            (Op::Gather, 4 * routed),
+        ] {
+            assert_eq!(profile.calls(op), want, "{op}");
+        }
+
+        // The stack decodes nothing — its weights are the fixture's, already
+        // float32 — and it neither dispatches nor samples, so the ops it does
+        // not reach are as much of the claim as the ones it does.
+        let reached: Vec<Op> = profile.rows().iter().map(|(op, ..)| *op).collect();
+        for op in Op::ALL {
+            assert_eq!(
+                reached.contains(&op),
+                matches!(
+                    op,
+                    Op::RmsNorm
+                        | Op::Sconv
+                        | Op::Mask
+                        | Op::Sdpa
+                        | Op::Residual
+                        | Op::Router
+                        | Op::Gather
+                        | Op::Linear
+                        | Op::Swiglu
+                ),
+                "{op}"
             );
         }
     }

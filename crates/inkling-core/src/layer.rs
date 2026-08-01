@@ -34,6 +34,7 @@
 use crate::attention::{Attention, AttentionCache, AttentionConfig, AttentionWeights};
 use crate::moe::{Gathered, SparseMoe};
 use crate::ops::{DenseMlp, rms_norm};
+use crate::profile::{self, Op};
 use crate::sconv::{ConvState, ShortConv};
 
 /// How a layer reaches the experts its router chose.
@@ -269,6 +270,7 @@ impl Residual {
 }
 
 fn add(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let _timed = profile::scope(Op::Residual);
     assert_eq!(a.len(), b.len(), "a residual against what it is added to");
     a.iter().zip(b).map(|(a, b)| a + b).collect()
 }

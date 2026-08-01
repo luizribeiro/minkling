@@ -24,6 +24,7 @@ use std::fmt::Debug;
 use crate::config::TextConfig;
 use crate::mask::{BandedMask, is_masked};
 use crate::ops::{DenseProjection, Projection, rms_norm, softmax};
+use crate::profile::{self, Op};
 use crate::sconv::{ConvState, ShortConv};
 
 /// The softmax attention step, over `[heads, queries, head_dim]` queries and
@@ -80,6 +81,7 @@ impl Sdpa {
     /// head_dim]` and `mask` is the additive `[heads, queries, keys]` the banded
     /// mask produced. Out comes `[heads, queries, head_dim]`.
     pub fn forward(&self, q: &[f32], k: &[f32], v: &[f32], mask: &[f32]) -> Vec<f32> {
+        let _timed = profile::scope(Op::Sdpa);
         let query_stride = self.heads * self.head_dim;
         assert_eq!(
             q.len() % query_stride,

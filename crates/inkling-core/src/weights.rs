@@ -54,6 +54,7 @@ use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp
 use crate::model::{Model, ModelWeights};
 use crate::moe::{ExpertBank, GateWeights, Gathered, MoeConfig, SparseMoe};
 use crate::ops::{DenseMlp, MlpProjections, Projection, linear};
+use crate::profile::{self, Op};
 use crate::quant::{BITS, QuantError, Scratch, dequantize_blocks_into};
 
 /// Where the language model's tensors live in a multimodal checkpoint.
@@ -252,9 +253,11 @@ impl Projection for PackedRows<'_> {
         let mut weight = self.decoded.borrow_mut();
         let mut out = vec![0.0; rows * self.out_dim];
         for col in 0..self.out_dim {
-            self.packed
-                .decode_slice_into(col, &mut weight)
-                .unwrap_or_else(|err| panic!("row {col} of the projection decodes: {err}"));
+            profile::timed(Op::Decode, || {
+                self.packed
+                    .decode_slice_into(col, &mut weight)
+                    .unwrap_or_else(|err| panic!("row {col} of the projection decodes: {err}"))
+            });
             for (row, value) in linear(x, &weight, in_dim).into_iter().enumerate() {
                 out[row * self.out_dim + col] = value;
             }
@@ -354,6 +357,7 @@ fn decode_expert<'s>(
     what: &str,
     scratch: &mut Scratch<'s>,
 ) -> &'s [f32] {
+    let _timed = profile::scope(Op::Decode);
     let run = scratch.take(packed.slice_len());
     packed
         .decode_slice_into(expert, run)
@@ -618,12 +622,14 @@ impl<'a> CheckpointWeights<'a> {
     }
 
     fn widened(&self, name: &str) -> Vec<f32> {
+        let _timed = profile::scope(Op::Decode);
         widened(self.ckpt, name).unwrap_or_else(|err| panic!("{err}"))
     }
 
     /// One packed tensor of this checkpoint, decoded whole into `scratch` and
     /// valid for as long as the run it was given.
     fn decoded<'s>(&self, name: &str, scratch: &mut Scratch<'s>) -> &'s [f32] {
+        let _timed = profile::scope(Op::Decode);
         let packed = Packed::open(self.ckpt, name).unwrap_or_else(|err| panic!("{err}"));
         let run = scratch.take(packed.len());
         packed
@@ -729,6 +735,7 @@ fn layer_module(layer: usize) -> String {
 
 impl ModelWeights for CheckpointWeights<'_> {
     fn embedding_row(&self, id: usize) -> Vec<f32> {
+        let _timed = profile::scope(Op::Embedding);
         self.embed_tokens
             .decode_slice(id)
             .unwrap_or_else(|err| panic!("embedding row {id} decodes: {err}"))

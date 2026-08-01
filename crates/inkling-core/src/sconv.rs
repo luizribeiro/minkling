@@ -10,6 +10,8 @@
 //! cases are float32 throughout, and by the trained weights in that bundle
 //! against the activation pairs in `layer_activations.safetensors`.
 
+use crate::profile::{self, Op};
+
 /// A depthwise causal convolution with a residual add: one kernel per channel,
 /// no bias, no mixing across channels.
 #[derive(Debug, Clone, Copy)]
@@ -99,6 +101,7 @@ impl<'a> ShortConv<'a> {
     /// and it is what lets a padded batch position stay inert without the
     /// padding leaking into the convolution's window.
     pub fn forward(&self, state: &mut ConvState, x: &[f32], mask: Option<&[bool]>) -> Vec<f32> {
+        let _timed = profile::scope(Op::Sconv);
         assert_eq!(state.channels, self.channels, "state is for another conv");
         assert_eq!(
             x.len() % self.channels,

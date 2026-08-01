@@ -53,6 +53,7 @@
 
 use crate::config::TextConfig;
 use crate::ops::Projection;
+use crate::profile::{self, Op};
 
 /// `_logits_from_norm`: the muP divide, the projection, and the cut at the
 /// unpadded vocabulary.
@@ -121,7 +122,9 @@ impl LmHead {
         );
         self.expects(weights);
 
-        let scaled: Vec<f32> = h.iter().map(|x| x / self.mup).collect();
+        let scaled = profile::timed(Op::Sample, || {
+            h.iter().map(|x| x / self.mup).collect::<Vec<f32>>()
+        });
         weights.forward(&scaled)
     }
 }

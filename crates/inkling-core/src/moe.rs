@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 
 use crate::config::TextConfig;
 use crate::ops::{self, DenseMlp, linear, softmax};
+use crate::profile::{self, Op};
 
 /// The shapes and scalars `InklingSparseMoE.__init__` reads.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -181,6 +182,7 @@ pub struct MoeOutput {
 
 impl MoeOutput {
     pub fn total(&self) -> Vec<f32> {
+        let _timed = profile::scope(Op::Residual);
         assert_eq!(self.routed.len(), self.shared.len(), "halves");
         self.routed
             .iter()
@@ -335,7 +337,7 @@ impl<'a> SparseMoe<'a> {
         routed: impl FnOnce(Gathered<'_>) -> Vec<f32>,
         shared: impl FnOnce(Gathered<'_>) -> Vec<f32>,
     ) -> MoeOutput {
-        let routing = self.route(&self.gate(x));
+        let routing = profile::timed(Op::Router, || self.route(&self.gate(x)));
         MoeOutput {
             routed: self.combine(x, &routing.routed_batches(), routed),
             shared: self.combine(x, &routing.shared_batches(), shared),
@@ -423,14 +425,17 @@ impl<'a> SparseMoe<'a> {
         );
 
         let assignments = batches.iter().map(|batch| batch.tokens.len()).sum();
-        let mut experts = Vec::with_capacity(assignments);
-        let mut rows = Vec::with_capacity(assignments * self.hidden);
-        for batch in batches {
-            for (token, _) in &batch.tokens {
-                experts.push(batch.expert);
-                rows.extend_from_slice(&x[token * self.hidden..][..self.hidden]);
+        let (experts, rows) = profile::timed(Op::Gather, || {
+            let mut experts = Vec::with_capacity(assignments);
+            let mut rows = Vec::with_capacity(assignments * self.hidden);
+            for batch in batches {
+                for (token, _) in &batch.tokens {
+                    experts.push(batch.expert);
+                    rows.extend_from_slice(&x[token * self.hidden..][..self.hidden]);
+                }
             }
-        }
+            (experts, rows)
+        });
 
         let got = apply(Gathered::new(self.hidden, &experts, &rows));
         assert_eq!(
@@ -440,17 +445,19 @@ impl<'a> SparseMoe<'a> {
             got.len(),
         );
 
-        let mut out = vec![0.0; x.len()];
-        let mut answered = got.chunks_exact(self.hidden);
-        for batch in batches {
-            for (token, weight) in &batch.tokens {
-                let y = answered.next().expect("a row per assignment");
-                for (out, y) in out[token * self.hidden..][..self.hidden].iter_mut().zip(y) {
-                    *out += weight * y;
+        profile::timed(Op::Gather, || {
+            let mut out = vec![0.0; x.len()];
+            let mut answered = got.chunks_exact(self.hidden);
+            for batch in batches {
+                for (token, weight) in &batch.tokens {
+                    let y = answered.next().expect("a row per assignment");
+                    for (out, y) in out[token * self.hidden..][..self.hidden].iter_mut().zip(y) {
+                        *out += weight * y;
+                    }
                 }
             }
-        }
-        out
+            out
+        })
     }
 }
 

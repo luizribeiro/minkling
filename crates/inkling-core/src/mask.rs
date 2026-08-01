@@ -13,6 +13,8 @@
 //! reach; the trained cases that reach them read `long_activations.safetensors`
 //! and skip when it has not been generated.
 
+use crate::profile::{self, Op};
+
 /// The additive constant a masked position carries.
 ///
 /// A magnitude rather than an infinity: a row that is masked end to end still
@@ -83,6 +85,7 @@ impl<'a> BandedMask<'a> {
         q_offset: usize,
         keys: usize,
     ) -> Vec<f32> {
+        let _timed = profile::scope(Op::Mask);
         let stride = batch * heads * self.d_rel;
         assert_eq!(
             rel.len() % stride,
