@@ -21,7 +21,8 @@ pub mod fixture;
 
 pub use attention::{
     Attention, AttentionCache, AttentionConfig, AttentionProjections, AttentionStep,
-    AttentionWeights, DecodedProjections, LogScaling, Projections, Sdpa, merge_heads, split_heads,
+    AttentionWeights, Convolved, DecodedProjections, LayerStep, LogScaling, Projections, Sdpa,
+    merge_heads, split_heads,
 };
 pub use checkpoint::{BF16_BYTES, BF16_SHIFT, Checkpoint, CheckpointError, Dtype, TensorView};
 pub use config::{Config, TextConfig};

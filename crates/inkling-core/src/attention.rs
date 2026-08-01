@@ -311,6 +311,126 @@ pub trait Projections: Debug {
     fn attend(&self, step: AttentionStep<'_>) -> Vec<f32> {
         self.o_proj().forward(&step.on_the_cpu())
     }
+
+    /// The whole of one attention layer in one call — the input layernorm, the
+    /// four projections, the two short convolutions, the two head norms, the
+    /// attention step and `o_proj` — or `None` where this backend does not hold
+    /// the layer's state.
+    ///
+    /// **This is where the seam stops moving outwards, and the reason it had to
+    /// get this far is the cache.** [`Projections::normed_qkvr`] and
+    /// [`Projections::attend`] are the two ends of a layer's attention and each
+    /// is a value that never crosses back; what is between them —
+    /// [`ShortConv`] on the key and the value, and an RMSNorm over each head of
+    /// the query and the key — is four small operations whose inputs and outputs
+    /// are read by nobody else either. A backend answering both ends and not the
+    /// middle has to close and wait for the first before the second's inputs
+    /// exist, which is a round trip a layer takes for four operations that are
+    /// 2% of a step between them.
+    ///
+    /// And it cannot be closed by handing over those four alone, because two of
+    /// them write to state that outlives the call: the convolutions' windows and
+    /// the keys and values already attended over. Whoever runs them has to be
+    /// whoever holds that state, which is why this takes the [`AttentionCache`]
+    /// rather than the values in it — see [`AttentionCache::keys`], which is
+    /// what a sequence still carries when a backend holds the rest.
+    ///
+    /// `None` rather than a default that does the work, because the work is
+    /// [`Attention::attend`]'s and a default here would be a second spelling of
+    /// it. The CPU path answers `None` and stays the oracle.
+    fn layer(&self, cache: &mut AttentionCache, step: LayerStep<'_>) -> Option<Vec<f32>> {
+        let _ = (cache, step);
+        None
+    }
+}
+
+/// Everything one attention layer runs, from the hidden state it is handed to
+/// the `[queries, hidden]` `o_proj` returns.
+///
+/// The shapes are carried by the [`Sdpa`] and the band by the [`BandedMask`], as
+/// [`AttentionStep`] carries them; what this adds is the four operations between
+/// them and the two weights each needs. The state they read and write is not
+/// here — it is the [`AttentionCache`] handed beside this.
+#[derive(Debug, Clone, Copy)]
+pub struct LayerStep<'a> {
+    pub sdpa: Sdpa,
+    pub mask: BandedMask<'a>,
+    /// `[queries, hidden]`, before the layer's input layernorm.
+    pub x: &'a [f32],
+    /// The layer's input layernorm weight, or `None` where `x` arrives
+    /// normalised already — which is what every recorded attention case is.
+    pub input_layernorm: Option<&'a [f32]>,
+    /// The `rms_norm_eps` all three of the norms here share.
+    pub eps: f32,
+    /// `[head_dim]`, over each head of the query.
+    pub q_norm: &'a [f32],
+    /// `[head_dim]`, over each head of the key — *after* its convolution.
+    pub k_norm: &'a [f32],
+    pub k_sconv: ShortConv<'a>,
+    pub v_sconv: ShortConv<'a>,
+    /// One `tau` per query, multiplying the query itself, or `None` on a layer
+    /// with no log scaling.
+    ///
+    /// Separate from [`LayerStep::bias_taus`] because the reference applies the
+    /// same `tau` to both and they are separable — see [`Attention::attend`],
+    /// which drives them apart to show that neither alone reproduces mlx-vlm.
+    pub q_taus: Option<&'a [f32]>,
+    /// One `tau` per query, multiplying that query's biases, or `None`.
+    pub bias_taus: Option<&'a [f32]>,
+    /// Where this call's queries sit: query `i` is at absolute position
+    /// `i + q_offset`.
+    pub q_offset: usize,
+}
+
+/// What the four operations between a layer's projections and its attention
+/// step produce.
+#[derive(Debug, Clone)]
+pub struct Convolved {
+    /// `[heads, queries, head_dim]`, normed over each head's channels and
+    /// scaled by the query's own `tau`.
+    pub q: Vec<f32>,
+    /// `[queries, kv_heads * head_dim]`, convolved and *then* normed over each
+    /// head's channels, which is the order the reference caches it in.
+    pub k: Vec<f32>,
+    /// `[queries, kv_heads * head_dim]`, convolved and never normed.
+    pub v: Vec<f32>,
+}
+
+impl LayerStep<'_> {
+    /// The two short convolutions and the two head norms, on the CPU.
+    ///
+    /// Here rather than spelled out by each of the two callers, because they are
+    /// the same four operations: [`Attention::attend`] runs them on the path a
+    /// backend declined, and a backend that has taken [`Projections::layer`]
+    /// runs them until it has a kernel for each. The windows they advance are
+    /// `cache`'s; the keys and values they produce are the caller's to put
+    /// wherever it holds them.
+    pub fn convolved(&self, cache: &mut AttentionCache, projected: &Qkvr) -> Convolved {
+        let (heads, head_dim) = (self.sdpa.heads(), self.sdpa.head_dim());
+        let norm = |x: &[f32], weight| rms_norm(x, weight, self.eps);
+
+        let (k_state, v_state) = cache.convolutions();
+        let k = self.k_sconv.forward(k_state, &projected.k, None);
+        let v = self.v_sconv.forward(v_state, &projected.v, None);
+        let mut q = split_heads(&norm(&projected.q, self.q_norm), heads, head_dim);
+
+        // Both tensors log scaling touches are `[heads, queries, stride]` with
+        // the query minor, so cycling over the queries walks their rows in
+        // order.
+        if let Some(taus) = self.q_taus {
+            for (q, tau) in q.chunks_exact_mut(head_dim).zip(taus.iter().cycle()) {
+                for q in q {
+                    *q *= tau;
+                }
+            }
+        }
+
+        Convolved {
+            q,
+            k: norm(&k, self.k_norm),
+            v,
+        }
+    }
 }
 
 /// Everything the attention step reads, once the projections, the two short
@@ -536,6 +656,13 @@ impl Projections for AttentionProjections<'_> {
     fn attend(&self, step: AttentionStep<'_>) -> Vec<f32> {
         self.held().attend(step)
     }
+
+    /// Delegated for the last time, and the one whose default is a refusal
+    /// rather than a computation: a backend that holds the layer's state says so
+    /// here, and one that does not leaves [`Attention::attend`] to run it.
+    fn layer(&self, cache: &mut AttentionCache, step: LayerStep<'_>) -> Option<Vec<f32>> {
+        self.held().layer(cache, step)
+    }
 }
 
 /// One attention layer's tensors: the five projections wherever they multiply,
@@ -559,12 +686,24 @@ pub struct AttentionWeights<'a> {
 /// `[keys, kv_heads * head_dim]`, so a call appends to them and splits into
 /// heads once at the end. What is cached is the *normed* key and the
 /// *convolved* value, which is where the reference caches them too.
+///
+/// **Where they are held is not the same question as how many there are**, and
+/// this is the only place the two come apart. A backend answering
+/// [`Projections::layer`] keeps the span in device memory across steps rather
+/// than handing it back to be copied over again, so on that path the two vectors
+/// below stay empty and [`AttentionCache::seen`] is the whole of what a sequence
+/// carries here. That count is what says whether a resident span belongs to
+/// *this* sequence: a cache that has seen nothing is a sequence starting, and
+/// one that disagrees with what a backend is holding is two sequences
+/// interleaved through one layer.
 #[derive(Debug, Clone)]
 pub struct AttentionCache {
     k_sconv: ConvState,
     v_sconv: ConvState,
     keys: Vec<f32>,
     values: Vec<f32>,
+    /// How many keys the sequence has seen, wherever they are.
+    cached: usize,
 }
 
 impl AttentionCache {
@@ -581,7 +720,39 @@ impl AttentionCache {
             v_sconv: ConvState::new(channels, kernel_size),
             keys: Vec::new(),
             values: Vec::new(),
+            cached: 0,
         }
+    }
+
+    /// How many keys the sequence has seen, which is also where this call's
+    /// queries sit.
+    ///
+    /// Named apart from the vector above because it answers a different question
+    /// from the one that vector holds the answer to: this counts the sequence's
+    /// keys wherever they are, and stays right on the path where that vector is
+    /// empty.
+    pub fn seen(&self) -> usize {
+        self.cached
+    }
+
+    /// The two convolution windows inside attention, for a backend answering
+    /// [`Projections::layer`] that runs the convolutions itself.
+    ///
+    /// Handed out mutably because a convolution's window *is* written by the
+    /// call that reads it — see [`ShortConv::forward`] — and there is no reading
+    /// of it that leaves it alone.
+    pub fn convolutions(&mut self) -> (&mut ConvState, &mut ConvState) {
+        (&mut self.k_sconv, &mut self.v_sconv)
+    }
+
+    /// Record `rows` keys and values a backend appended to a span it holds
+    /// itself.
+    ///
+    /// The count and nothing else, because the values are not here. What this
+    /// keeps true is that [`AttentionCache::keys`] answers the same question on
+    /// both paths.
+    pub fn appended(&mut self, rows: usize) {
+        self.cached += rows;
     }
 }
 
@@ -688,41 +859,47 @@ impl<'a> Attention<'a> {
             x.len(),
             self.hidden
         );
-        let (heads, head_dim) = (self.sdpa.heads, self.sdpa.head_dim);
-        let cached = cache.keys.len() / (self.sdpa.kv_heads * head_dim);
-        let offset = query_offset.of(cached);
+        let head_dim = self.sdpa.head_dim;
+        let queries = x.len() / self.hidden;
+        let offset = query_offset.of(cache.seen());
+
+        // The queries are scaled where they are formed and the biases are not,
+        // because the biases are not formed here: whoever answers the step forms
+        // them, and a `tau` per query is what says by how much.
+        let taus = |log: Option<LogScaling>| -> Option<Vec<f32>> {
+            log.map(|log| (0..queries).map(|i| log.tau(offset + i)).collect())
+        };
+        let (q_taus, bias_taus) = (taus(on_queries), taus(on_biases));
 
         let eps = self.config.rms_norm_eps;
         let projections = &self.weights.projections;
+        let step = LayerStep {
+            sdpa: self.sdpa,
+            mask: self.mask,
+            x,
+            input_layernorm,
+            eps,
+            q_norm: self.weights.q_norm,
+            k_norm: self.weights.k_norm,
+            k_sconv: self.k_sconv,
+            v_sconv: self.v_sconv,
+            q_taus: q_taus.as_deref(),
+            bias_taus: bias_taus.as_deref(),
+            q_offset: offset,
+        };
+        if let Some(out) = projections.layer(cache, step) {
+            return out;
+        }
+
         let projected = match input_layernorm {
             Some(weight) => projections.normed_qkvr(x, weight, eps),
             None => projections.qkvr(x),
         };
-        let norm = |x: &[f32], weight| rms_norm(x, weight, eps);
+        let Convolved { q, k, v } = step.convolved(cache, &projected);
 
-        // The key is normed after its convolution, not before, and the value is
-        // convolved and never normed.
-        let k = self.k_sconv.forward(&mut cache.k_sconv, &projected.k, None);
-        let v = self.v_sconv.forward(&mut cache.v_sconv, &projected.v, None);
-        let mut q = split_heads(&norm(&projected.q, self.weights.q_norm), heads, head_dim);
-        let rel = projected.r;
-
-        cache.keys.extend(norm(&k, self.weights.k_norm));
+        cache.keys.extend(k);
         cache.values.extend(v);
-
-        let queries = x.len() / self.hidden;
-        if let Some(log) = on_queries {
-            for (q, tau) in q.chunks_exact_mut(head_dim).zip(taus(log, queries, offset)) {
-                for q in q {
-                    *q *= tau;
-                }
-            }
-        }
-        // The queries are scaled here and the biases are not, because the
-        // biases are not formed here: whoever answers the step forms them, and
-        // a `tau` per query is what says by how much.
-        let biases: Option<Vec<f32>> =
-            on_biases.map(|log| (0..queries).map(|i| log.tau(offset + i)).collect());
+        cache.appended(queries);
 
         projections.attend(AttentionStep {
             sdpa: self.sdpa,
@@ -730,8 +907,8 @@ impl<'a> Attention<'a> {
             q: &q,
             k: &split_heads(&cache.keys, self.sdpa.kv_heads, head_dim),
             v: &split_heads(&cache.values, self.sdpa.kv_heads, head_dim),
-            rel: &rel,
-            taus: biases.as_deref(),
+            rel: &projected.r,
+            taus: bias_taus.as_deref(),
             q_offset: offset,
         })
     }
@@ -764,15 +941,6 @@ impl QueryOffset {
             Self::Ignored => 0,
         }
     }
-}
-
-/// One `tau` per query of a call, repeated for as many heads as ask for it.
-///
-/// Both tensors log scaling touches are `[heads, queries, stride]` with the
-/// query minor, so cycling over the queries walks their rows in order.
-fn taus(log: LogScaling, queries: usize, offset: usize) -> impl Iterator<Item = f32> {
-    let taus: Vec<f32> = (0..queries).map(|i| log.tau(offset + i)).collect();
-    taus.into_iter().cycle()
 }
 
 /// `[rows, heads * head_dim]` — the layout a projection produces — as `[heads,

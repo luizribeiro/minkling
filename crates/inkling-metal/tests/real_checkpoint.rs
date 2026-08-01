@@ -23,12 +23,13 @@ use inkling_core::ops::linear;
 use inkling_core::profile::{self, Op, Profile};
 use inkling_core::quant::{BITS, dequantize_blocks_into};
 use inkling_core::{
-    Bf16, Checkpoint, CheckpointWeights, Dtype, Ending, ModelCache, Packed as CorePacked,
-    TensorView,
+    AttentionCache, AttentionStep, BandedMask, Bf16, Checkpoint, CheckpointWeights, Dtype, Ending,
+    LayerStep, ModelCache, Packed as CorePacked, Projections, Sdpa, ShortConv, TensorView,
+    split_heads,
 };
 use inkling_metal::{
-    DenseMatmul, DenseWeight, Device, FusedAttention, MetalError, ModelExperts, ModelProjections,
-    PackedBank, PackedMatmul, PackedProjection, RmsNorm,
+    DenseMatmul, DenseWeight, Device, FusedAttention, LayerProjections, MetalError, ModelExperts,
+    ModelProjections, PackedBank, PackedMatmul, PackedProjection, RmsNorm,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -46,6 +47,14 @@ const ROUTED_EXPERTS: &str = "language_model.model.layers.2.mlp.switch_mlp.gate_
 const ROUTER_GATE: &str = "language_model.model.layers.2.mlp.gate_weight";
 
 const HIDDEN: usize = 4096;
+
+/// The layer whose whole attention is driven below.
+///
+/// A *global* one — layers 5, 11, 17 and up are full attention — because its
+/// band reaches every key an eight-token sequence has, where a sliding layer's
+/// 512-token window covers all of them and covers nothing else. The layer's MLP
+/// is not reached here; what is wrapped is its five attention projections.
+const LAYER: usize = 5;
 
 const CODES_PER_WORD: usize = u32::BITS as usize / BITS;
 
@@ -445,6 +454,24 @@ const GENERATED: usize = 8;
 /// fails here. What the number still does not measure is how much memory the
 /// machine is using — the pages are in the unified buffer cache either way, and
 /// what changed is whose they are.
+///
+/// **The keys and values are the first thing under this bound that grows with
+/// the sequence**, and the first that is allocated rather than mapped. Each
+/// layer keeps a `[kv_heads, capacity, head_dim]` float32 span of each — 4 KB a
+/// key slot a layer for the pair at Inkling's shape — so the 64 slots a span
+/// starts with are 21 MB across the stack whatever the prompt is, and a
+/// generation past 64 tokens doubles that and doubles it again. It is not new
+/// memory: what it replaces is the same span in a `Vec<f32>` the CPU path grew
+/// beside a copy of all of it made onto the device on every layer of every
+/// step. Measured over the same eight-token generation the peak went 0.13 GiB
+/// to 0.14, which is the 64 slots minus the 16 keys' worth of vector.
+///
+/// So the bound now covers a *span*, and what it can no longer be read as is a
+/// claim about a long context: at 4096 tokens the two spans are 1.4 GiB and
+/// this fails — correctly, because at that point the resident set is the KV
+/// cache and the number a bound should hold is the cache's own, not this one.
+/// Eight tokens is what this case generates and 1 GiB is four decades of
+/// headroom over what they cost.
 const RESIDENT_BOUND: u64 = 1 << 30;
 
 /// What one decode step dispatches, and how many command buffers it submits
@@ -805,6 +832,166 @@ fn where_a_decode_step_spends_its_time() {
         accounted > step / 2,
         "only {accounted:.2?} of a {step:.2?} step is accounted for"
     );
+}
+
+/// The four tensors one layer's attention reads that are not projections,
+/// widened out of the checkpoint.
+///
+/// `CheckpointWeights` widens these for the layer it stands up and does not hand
+/// them out — the CPU path reads them through `AttentionWeights` and the device
+/// path through `LayerStep` — so a case that drives a layer's attention from
+/// outside the stack opens them itself.
+struct HeadTensors {
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    k_sconv: Vec<f32>,
+    v_sconv: Vec<f32>,
+}
+
+impl HeadTensors {
+    fn open(ckpt: &Checkpoint, layer: usize) -> Self {
+        let of = |name: &str| {
+            ckpt.tensor(&format!(
+                "language_model.model.layers.{layer}.self_attn.{name}"
+            ))
+            .unwrap_or_else(|err| panic!("the checkpoint holds {name}: {err}"))
+            .to_f32()
+            .unwrap_or_else(|| panic!("{name} widens"))
+        };
+        Self {
+            q_norm: of("q_norm.weight"),
+            k_norm: of("k_norm.weight"),
+            k_sconv: of("k_sconv.conv.weight"),
+            v_sconv: of("v_sconv.conv.weight"),
+        }
+    }
+
+    /// One call's step, over the layer these came from.
+    fn step<'a>(
+        &'a self,
+        layer: &'a inkling_core::LayerPacked<'_>,
+        x: &'a [f32],
+        q_offset: usize,
+    ) -> LayerStep<'a> {
+        let shape = layer.config;
+        let channels = shape.kv_channels();
+        LayerStep {
+            sdpa: Sdpa::new(shape.heads, shape.kv_heads, shape.head_dim),
+            mask: BandedMask::new(shape.d_rel, &layer.rel_proj, shape.sliding),
+            x,
+            input_layernorm: Some(&layer.input_layernorm),
+            eps: shape.rms_norm_eps,
+            q_norm: &self.q_norm,
+            k_norm: &self.k_norm,
+            k_sconv: ShortConv::new(channels, &self.k_sconv),
+            v_sconv: ShortConv::new(channels, &self.v_sconv),
+            // The floor is 128000 tokens, so nothing eight rows can reach makes
+            // a `tau` that is not exactly 1 — and both paths would scale alike
+            // anyway, the queries being scaled before either hands them over.
+            q_taus: None,
+            bias_taus: None,
+            q_offset,
+        }
+    }
+}
+
+/// One layer's whole attention against its own pieces run apart, driven a chunk
+/// at a time through one cache.
+///
+/// **The claim the seam rests on, and it has to be made on a real layer.**
+/// `LayerProjections::layer` answers everything between a hidden state and
+/// `o_proj` — five projections whose widths have to pair with each other, with
+/// two convolutions of the key's own channel count, with two head norms of the
+/// head's, and with a band of the layer's `d_rel`. The hermetic cases in
+/// `projections::tests` are cut from three fixture tensors that map from 4096 to
+/// 64, 64 and 2, and no assignment of those to five slots is a layer: there is
+/// nothing there for `o_proj` to map back from. So the shape this is about is
+/// the checkpoint's, and this is where the checkpoint is.
+///
+/// What it is measured against is the same five projections and the same four
+/// operations with the keys held *here* — which is the path
+/// `Attention::attend` takes when a backend answers `None`. Exact equality
+/// rather than a tolerance: both run the same kernels over the same floats, and
+/// the only thing that differs is whether the span was copied over for the call
+/// or left where the layer put it. A stride that reached the arithmetic would
+/// show in the last bits.
+///
+/// Four chunks — a five-token prefill and three single decodes — because a
+/// prefill alone would say nothing about the cache and a decode alone nothing
+/// about a call with rows to convolve against each other.
+#[test]
+fn a_layers_whole_attention_matches_its_pieces_run_apart() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = fixture::config(&dir).text_config;
+    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+
+    let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
+    let norm = RmsNorm::new(&device).expect("the norm compiles");
+    let step = FusedAttention::new(&device).expect("the attention step compiles");
+    let packed = weights.layer_projections();
+    let layer = &packed[LAYER];
+    let five = LayerProjections::wrap(
+        &device,
+        &matmul,
+        &norm,
+        &step,
+        &layer.attention,
+        &layer.input_layernorm,
+        &layer.rel_proj,
+        layer.config,
+    )
+    .expect("the layer wraps");
+
+    let shape = layer.config;
+    let heads = HeadTensors::open(&ckpt, LAYER);
+
+    // The reference's own normed state, which is eight rows of the width every
+    // one of these projections maps from.
+    let x = normed_state();
+    let fresh = || AttentionCache::new(shape, config.sconv_kernel_size);
+    let (mut resident, mut apart) = (fresh(), fresh());
+    let (mut keys, mut values) = (Vec::new(), Vec::new());
+    let (mut at, mut last) = (0, Vec::new());
+
+    for rows in [5, 1, 1, 1] {
+        let call = &x[at * HIDDEN..(at + rows) * HIDDEN];
+        let step = heads.step(layer, call, at);
+
+        let fused = five
+            .layer(&mut resident, step)
+            .expect("the layer answers for itself");
+
+        let projected = five.normed_qkvr(call, &layer.input_layernorm, shape.rms_norm_eps);
+        let convolved = step.convolved(&mut apart, &projected);
+        keys.extend(convolved.k);
+        values.extend(convolved.v);
+        let whole = five.attend(AttentionStep {
+            sdpa: step.sdpa,
+            mask: step.mask,
+            q: &convolved.q,
+            k: &split_heads(&keys, shape.kv_heads, shape.head_dim),
+            v: &split_heads(&values, shape.kv_heads, shape.head_dim),
+            rel: &projected.r,
+            taus: None,
+            q_offset: at,
+        });
+
+        assert_eq!(fused, whole, "{rows} rows at offset {at}");
+        at += rows;
+        assert_eq!(resident.seen(), at, "the sequence's count");
+        last = fused;
+    }
+
+    // And what the sequence carried is load-bearing. The same last row through a
+    // layer that has seen nothing attends over itself alone, out of empty
+    // convolution windows and at position zero — a different answer rather than
+    // a near one, which is what says the two paths above agreed about something.
+    let alone = five
+        .layer(&mut fresh(), heads.step(layer, &x[(at - 1) * HIDDEN..], 0))
+        .expect("the layer answers for itself");
+    assert_ne!(alone, last, "the sequence's own state did not reach it");
 }
 
 /// The other shape in the model, which the head does not cover: one expert of a

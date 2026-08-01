@@ -181,6 +181,126 @@ pub struct Step<'a> {
     pub q_offset: usize,
 }
 
+/// Key slots a layer's span starts with, and the least it is ever grown to.
+///
+/// A span is `[kv_heads, capacity, head_dim]` float32, which at Inkling's shape
+/// is 4 KB a slot a layer for each of the two tensors — so 64 slots is 21 MB
+/// across the stack and buys a decode loop 64 steps between reallocations.
+const LEAST_KEYS: usize = 64;
+
+/// One attention layer's keys and values, kept on the device between steps.
+///
+/// **What this replaces is a copy of the whole span, per layer, per step.** The
+/// keys a decode step attends over are the keys the step before it attended
+/// over and one more; handed to [`LayerAttention::encode`] as a slice, all of
+/// them are allocated and copied onto the device again — 53 µs a layer at 16
+/// keys, and a cost that grows with the context where nothing else in a decode
+/// step does. Held here, a step copies the one key it made.
+///
+/// The span is `[kv_heads, capacity, head_dim]` and grows by powers of two, so
+/// what a call appends is `kv_heads` writes of `head_dim` floats at a stride
+/// rather than an append to a contiguous tail. That stride is why the kernel
+/// takes `key_stride` beside `keys`.
+///
+/// It is **one sequence's**, and nothing here makes it more than that: the layer
+/// holds one span, so two sequences interleaved through the same layer would
+/// overwrite each other's keys. [`LayerAttention::hold`] is where that is
+/// refused rather than discovered — a sequence's own [`AttentionCache`] carries
+/// how many keys it has seen, and a span holding a different number is not its.
+#[derive(Debug)]
+struct KeyValues {
+    keys: Buffer<f32>,
+    values: Buffer<f32>,
+    kv_heads: usize,
+    head_dim: usize,
+    /// Key slots each head has room for, which is the stride between heads.
+    capacity: usize,
+    /// How many of them the sequence in flight has filled.
+    held: usize,
+}
+
+impl KeyValues {
+    fn new(device: &Device, kv_heads: usize, head_dim: usize) -> Result<Self, MetalError> {
+        Ok(Self {
+            keys: device.zeroed(kv_heads * LEAST_KEYS * head_dim)?,
+            values: device.zeroed(kv_heads * LEAST_KEYS * head_dim)?,
+            capacity: LEAST_KEYS,
+            held: 0,
+            kv_heads,
+            head_dim,
+        })
+    }
+
+    /// The span a sequence starts from, which is no keys.
+    ///
+    /// The slots are not cleared. Nothing reads past `held` — the kernel's loop
+    /// bound is `keys` — so what a previous sequence left in them is memory
+    /// nobody indexes rather than values that could leak into an answer.
+    fn restart(&mut self) {
+        self.held = 0;
+    }
+
+    /// Room for `keys` keys a head, growing the span if there is not.
+    ///
+    /// Powers of two, so a decode loop reallocates a logarithmic number of times
+    /// over a generation and copies each key a constant number of times. What is
+    /// copied is the prefix each head has filled, which is what makes the growth
+    /// invisible to the sequence.
+    fn reserve(&mut self, device: &Device, keys: usize) -> Result<(), MetalError> {
+        if keys <= self.capacity {
+            return Ok(());
+        }
+        let capacity = keys.next_power_of_two().max(LEAST_KEYS);
+        let mut grown = [
+            device.zeroed::<f32>(self.kv_heads * capacity * self.head_dim)?,
+            device.zeroed::<f32>(self.kv_heads * capacity * self.head_dim)?,
+        ];
+        let filled = self.held * self.head_dim;
+        for (grown, held) in grown.iter_mut().zip([&self.keys, &self.values]) {
+            let (grown, held) = (grown.as_mut_slice(), held.as_slice());
+            for kv in 0..self.kv_heads {
+                let (to, from) = (kv * capacity, kv * self.capacity);
+                grown[to * self.head_dim..][..filled]
+                    .copy_from_slice(&held[from * self.head_dim..][..filled]);
+            }
+        }
+        let [keys, values] = grown;
+        (self.keys, self.values, self.capacity) = (keys, values, capacity);
+        Ok(())
+    }
+
+    /// Append `[rows, kv_heads * head_dim]` keys and values, split into heads on
+    /// the way in.
+    ///
+    /// The split is the write's own indexing rather than a pass over a tensor:
+    /// what the projections produce is head-major within a row and what the
+    /// kernel reads is key-major within a head, and a copy that walks the first
+    /// can address the second.
+    fn append(&mut self, k: &[f32], v: &[f32]) {
+        let stride = self.kv_heads * self.head_dim;
+        assert_eq!(k.len(), v.len(), "values against keys");
+        assert_eq!(k.len() % stride, 0, "{} values are not keys", k.len());
+        let rows = k.len() / stride;
+        assert!(
+            self.held + rows <= self.capacity,
+            "{rows} keys past a span reserved for {}",
+            self.capacity
+        );
+
+        for (span, rows_of) in [(&mut self.keys, k), (&mut self.values, v)] {
+            let span = span.as_mut_slice();
+            for (t, row) in rows_of.chunks_exact(stride).enumerate() {
+                for kv in 0..self.kv_heads {
+                    let at = (kv * self.capacity + self.held + t) * self.head_dim;
+                    span[at..][..self.head_dim]
+                        .copy_from_slice(&row[kv * self.head_dim..][..self.head_dim]);
+                }
+            }
+        }
+        self.held += rows;
+    }
+}
+
 /// One attention layer's mask projection on the device, and the step through it.
 ///
 /// The projection is `[d_rel, rel_extent]` — 64 KB on a global layer — and is
@@ -204,6 +324,12 @@ pub struct LayerAttention<'a> {
     /// buffer to a dispatch borrows it exclusively, and the projection belongs
     /// to the layer rather than to the call.
     proj: RefCell<Buffer<f32>>,
+    /// The keys and values this layer has attended over, kept across steps.
+    ///
+    /// Behind a cell for the reason the projection is, and holding the same
+    /// relation to the layer: it belongs to the layer rather than to the call,
+    /// and a call binds it.
+    span: RefCell<KeyValues>,
     config: AttentionConfig,
     rel_extent: usize,
 }
@@ -253,6 +379,7 @@ impl<'a> LayerAttention<'a> {
         let rel_extent = proj.len() / config.d_rel;
         Ok(Self {
             proj: RefCell::new(device.buffer(&by_distance(proj, config.d_rel, rel_extent))?),
+            span: RefCell::new(KeyValues::new(device, config.kv_heads, config.head_dim)?),
             rel_extent,
             device,
             attention,
@@ -293,8 +420,84 @@ impl<'a> LayerAttention<'a> {
     /// is [`merge_heads`](inkling_core::merge_heads) done by choosing an output
     /// index — so the transpose between the attention step and `o_proj` is not
     /// an operation anything performs.
+    ///
+    /// The keys and values are copied over for the call, which is what a caller
+    /// holding the whole span in its own memory has to do.
+    /// [`LayerAttention::encode_over`] is what a caller that let this layer keep
+    /// them reaches for.
     pub fn encode(&self, batch: &mut Batch<'_>, step: Step<'_>) -> Result<Buffer<f32>, MetalError> {
         let _timed = profile::scope(Op::Encode);
+        let span = self.config.kv_channels();
+        assert_eq!(
+            step.k.len() % span,
+            0,
+            "{} key values are not whole keys of {span}",
+            step.k.len()
+        );
+        assert_eq!(step.v.len(), step.k.len(), "values against keys");
+        let keys = step.k.len() / span;
+
+        let mut q = self.device.buffer(step.q)?;
+        let mut k = self.device.buffer(step.k)?;
+        let mut v = self.device.buffer(step.v)?;
+        let mut rel = self.device.buffer(step.rel)?;
+        self.encoding(
+            batch,
+            Encoding {
+                q: &mut q,
+                k: &mut k,
+                v: &mut v,
+                rel: &mut rel,
+                keys,
+                key_stride: keys,
+                taus: step.taus,
+                q_offset: step.q_offset,
+            },
+        )
+    }
+
+    /// The step over a query and a relative-feature row a dispatch already left
+    /// on the device, against the keys and values this layer is holding.
+    ///
+    /// **The other half of the residency**, and the half that grows with the
+    /// context: [`LayerAttention::encode`] above copies the whole cached span
+    /// over on every call, which at 16 keys is 53 µs a layer and at 1024 keys is
+    /// two megabytes. Here the span is where it was left, and what the call
+    /// carries is where in it the sequence's keys stop.
+    pub fn encode_over(
+        &self,
+        batch: &mut Batch<'_>,
+        q: &mut Buffer<f32>,
+        rel: &mut Buffer<f32>,
+        taus: Option<&[f32]>,
+        q_offset: usize,
+    ) -> Result<Buffer<f32>, MetalError> {
+        let _timed = profile::scope(Op::Encode);
+        let mut span = self.span.borrow_mut();
+        let span = &mut *span;
+        let (keys, key_stride) = (span.held, span.capacity);
+        self.encoding(
+            batch,
+            Encoding {
+                q,
+                k: &mut span.keys,
+                v: &mut span.values,
+                rel,
+                keys,
+                key_stride,
+                taus,
+                q_offset,
+            },
+        )
+    }
+
+    /// The dispatch itself, which is the same whichever of the two put the
+    /// buffers where they are.
+    fn encoding(
+        &self,
+        batch: &mut Batch<'_>,
+        step: Encoding<'_>,
+    ) -> Result<Buffer<f32>, MetalError> {
         let (heads, kv_heads) = (self.config.heads, self.config.kv_heads);
         let head_dim = self.config.head_dim;
 
@@ -313,15 +516,6 @@ impl<'a> LayerAttention<'a> {
             }
             None => Cow::Owned(vec![1.0; queries]),
         };
-        let span = kv_heads * head_dim;
-        assert_eq!(
-            step.k.len() % span,
-            0,
-            "{} key values are not whole keys of {span}",
-            step.k.len()
-        );
-        let keys = step.k.len() / span;
-        assert_eq!(step.v.len(), step.k.len(), "values against keys");
         assert_eq!(
             step.rel.len(),
             queries * heads * self.config.d_rel,
@@ -334,17 +528,14 @@ impl<'a> LayerAttention<'a> {
             extent(kv_heads, "the KV heads of a layer"),
             extent(head_dim, "the channels of a head"),
             extent(queries, "the queries of a call"),
-            extent(keys, "the keys of a call"),
+            extent(step.keys, "the keys of a call"),
+            extent(step.key_stride, "the keys a span has room for"),
             extent(step.q_offset, "the offset of a call"),
             extent(self.config.d_rel, "the relative features of a layer"),
             extent(self.rel_extent, "the band of a layer"),
             extent(self.config.sliding, "the window of a layer"),
             (1.0 / head_dim as f32).to_bits(),
         ])?;
-        let mut q = self.device.buffer(step.q)?;
-        let mut k = self.device.buffer(step.k)?;
-        let mut v = self.device.buffer(step.v)?;
-        let mut rel = self.device.buffer(step.rel)?;
         let mut taus = self.device.buffer(&taus)?;
         let mut proj = self.proj.borrow_mut();
         let mut out = self.device.zeroed::<f32>(queries * heads * head_dim)?;
@@ -358,10 +549,10 @@ impl<'a> LayerAttention<'a> {
             &self.attention.kernel,
             &[
                 shape.arg(),
-                q.arg(),
-                k.arg(),
-                v.arg(),
-                rel.arg(),
+                step.q.arg(),
+                step.k.arg(),
+                step.v.arg(),
+                step.rel.arg(),
                 proj.arg(),
                 taus.arg(),
                 out.arg(),
@@ -370,6 +561,52 @@ impl<'a> LayerAttention<'a> {
         )?;
         Ok(out)
     }
+
+    /// How many keys this layer is holding, which says which sequence's they
+    /// are.
+    pub fn held(&self) -> usize {
+        self.span.borrow().held
+    }
+
+    /// Take the span for a sequence that has seen `keys` keys, with room for
+    /// `queries` more.
+    ///
+    /// **This is where one span serving two sequences is refused.** A sequence
+    /// that has seen nothing is one starting, and the span is emptied for it; a
+    /// sequence that has seen keys the span is not holding is a second sequence
+    /// interleaved through the same layer, which would otherwise read the
+    /// first's keys under its own offset and answer plausibly.
+    pub fn hold(&self, keys: usize, queries: usize) -> Result<(), MetalError> {
+        let mut span = self.span.borrow_mut();
+        if keys == 0 {
+            span.restart();
+        }
+        assert_eq!(
+            span.held, keys,
+            "a sequence at {keys} keys against a span holding {}",
+            span.held
+        );
+        span.reserve(self.device, keys + queries)
+    }
+
+    /// Append `[rows, kv_heads * head_dim]` keys and values to the span.
+    pub fn append(&self, k: &[f32], v: &[f32]) {
+        self.span.borrow_mut().append(k, v);
+    }
+}
+
+/// What the dispatch reads, once both callers have put it where it is.
+struct Encoding<'a> {
+    q: &'a mut Buffer<f32>,
+    k: &'a mut Buffer<f32>,
+    v: &'a mut Buffer<f32>,
+    rel: &'a mut Buffer<f32>,
+    /// Keys the sequence has, which is the kernel's loop bound.
+    keys: usize,
+    /// Key slots a head has room for, which is the stride between two heads.
+    key_stride: usize,
+    taus: Option<&'a [f32]>,
+    q_offset: usize,
 }
 
 /// The checkpoint's `[d_rel, rel_extent]` projection as `[rel_extent, d_rel]`,
@@ -414,6 +651,7 @@ struct Shape {
     uint head_dim;
     uint queries;
     uint keys;
+    uint key_stride;
     uint q_offset;
     uint d_rel;
     uint rel_extent;
@@ -529,9 +767,13 @@ kernel void fused_attention(
     const float scale = as_type<float>(shape.scale_bits);
     const float tau = taus[i];
 
+    // `key_stride` rather than `keys`: a span the layer keeps between steps has
+    // room for more keys than the sequence has put in it, so what separates one
+    // KV head's keys from the next is the slots allocated and not the slots
+    // filled. A call handed the span whole passes the same number twice.
     device const float *q_row = q + (ulong)slot * shape.head_dim;
-    device const float *keys_of = k + (ulong)kv * shape.keys * shape.head_dim;
-    device const float *values_of = v + (ulong)kv * shape.keys * shape.head_dim;
+    device const float *keys_of = k + (ulong)kv * shape.key_stride * shape.head_dim;
+    device const float *values_of = v + (ulong)kv * shape.key_stride * shape.head_dim;
     device const float *rel_row = rel + ((ulong)i * shape.heads + head) * shape.d_rel;
 
     for (uint d = local; d < shape.head_dim; d += threads) {
@@ -1474,6 +1716,181 @@ mod tests {
             );
             assert!(each < Duration::from_millis(20), "{keys} keys: {each:?}");
         }
+    }
+
+    /// A layer whose span grows past what it starts with, and a sequence long
+    /// enough to make it: `LEAST_KEYS` slots and a few more.
+    ///
+    /// Narrow heads and a small band, because what this is about is the span
+    /// rather than the arithmetic — the arithmetic is settled above against
+    /// mlx-vlm's own masks.
+    fn streaming(keys: usize) -> (Case, Vec<f32>, Vec<f32>) {
+        let (heads, kv_heads, d_rel, extent) = (4, 2, 8, 256);
+        let config = AttentionConfig {
+            hidden: heads * HEAD_DIM,
+            heads,
+            kv_heads,
+            head_dim: HEAD_DIM,
+            d_rel,
+            sliding: 0,
+            rms_norm_eps: 1e-6,
+            log_scaling: None,
+        };
+        // `[keys, kv_heads * head_dim]`, which is the layout the projections
+        // produce and the span is appended from.
+        let (k, v) = (
+            values(keys * kv_heads * HEAD_DIM, 2),
+            values(keys * kv_heads * HEAD_DIM, 3),
+        );
+        let case = Case {
+            name: format!("a sequence of {keys} keys"),
+            proj: values(d_rel * extent, 4),
+            q: Vec::new(),
+            k: Vec::new(),
+            v: Vec::new(),
+            rel: Vec::new(),
+            taus: None,
+            config,
+            queries: 1,
+            keys,
+            q_offset: 0,
+            mask: None,
+        };
+        (case, k, v)
+    }
+
+    /// One call through the span the layer keeps: the keys appended, the query
+    /// and the relative features handed over as buffers, and the answer read
+    /// back.
+    fn through_the_span(
+        device: &Device,
+        layer: &LayerAttention<'_>,
+        held: usize,
+        k: &[f32],
+        v: &[f32],
+        q: &[f32],
+        rel: &[f32],
+    ) -> Vec<f32> {
+        let rows = k.len() / (layer.config().kv_channels());
+        layer.hold(held, rows).expect("the span grows");
+        layer.append(k, v);
+
+        let mut batch = device.batch().expect("a command buffer opens");
+        let mut q = device.buffer(q).expect("the query uploads");
+        let mut rel = device.buffer(rel).expect("the features upload");
+        let out = layer
+            .encode_over(&mut batch, &mut q, &mut rel, None, held)
+            .expect("the step encodes");
+        batch.wait().expect("the batch completes");
+        out.to_vec()
+    }
+
+    /// **The claim the residency rests on.** A sequence fed to a layer a chunk
+    /// at a time, against the same keys and values handed over whole on every
+    /// call, which is what [`LayerAttention::encode`] still does for a caller
+    /// holding its own copy of the span.
+    ///
+    /// Exact equality rather than a tolerance, because it has to be: the kernel
+    /// reads the same floats in the same order either way, and the only thing
+    /// the span changes is the stride between one KV head's keys and the next.
+    /// A difference of even a bit would mean the stride reached the arithmetic.
+    ///
+    /// The chunks straddle the growth: the span starts with `LEAST_KEYS` slots
+    /// and the sequence outruns them, so the reallocation and the copy of every
+    /// key already there are on the path this measures.
+    #[test]
+    fn a_span_the_layer_keeps_answers_the_span_handed_over_whole() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let keys = LEAST_KEYS + 6;
+        let (case, k, v) = streaming(keys);
+        let layer = case.wrapped(&device, &attention);
+        let (heads, kv_heads) = (case.config.heads, case.config.kv_heads);
+        let (head_dim, d_rel) = (case.config.head_dim, case.config.d_rel);
+        let channels = kv_heads * head_dim;
+
+        // A prefill that fills most of the span, then decode steps that outrun
+        // it — which is the shape a generation has and the one that reallocates
+        // mid-sequence.
+        let chunks: Vec<usize> = std::iter::once(LEAST_KEYS - 3)
+            .chain(std::iter::repeat_n(1, 9))
+            .collect();
+        assert_eq!(chunks.iter().sum::<usize>(), keys);
+
+        let mut held = 0;
+        for (chunk, rows) in chunks.iter().enumerate() {
+            let (q, rel) = (
+                values(heads * rows * head_dim, 5 + chunk),
+                values(rows * heads * d_rel, 9 + chunk),
+            );
+            let span = held * channels..(held + rows) * channels;
+            let streamed =
+                through_the_span(&device, &layer, held, &k[span.clone()], &v[span], &q, &rel);
+            held += rows;
+            assert_eq!(layer.held(), held);
+
+            let whole = layer
+                .forward(Step {
+                    q: &q,
+                    k: &split_heads(&k[..held * channels], kv_heads, head_dim),
+                    v: &split_heads(&v[..held * channels], kv_heads, head_dim),
+                    rel: &rel,
+                    taus: None,
+                    q_offset: held - rows,
+                })
+                .expect("the dispatch completes");
+            assert_eq!(streamed, whole, "chunk {chunk} of {}", case.name);
+        }
+        assert!(held > LEAST_KEYS, "the span never had to grow");
+    }
+
+    /// A sequence that has seen nothing is a sequence starting, and the span is
+    /// emptied for it — so what the last sequence left behind cannot reach this
+    /// one's answer.
+    ///
+    /// The two sequences are given different keys, which is what makes a span
+    /// that carried over a wrong answer rather than the same one.
+    #[test]
+    fn a_sequence_that_has_seen_no_keys_starts_the_span_over() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let (case, k, v) = streaming(8);
+        let layer = case.wrapped(&device, &attention);
+        let (heads, head_dim) = (case.config.heads, case.config.head_dim);
+        let channels = case.config.kv_channels();
+        let (q, rel) = (
+            values(heads * head_dim, 5),
+            values(heads * case.config.d_rel, 9),
+        );
+
+        let first = &k[..4 * channels];
+        let got = through_the_span(&device, &layer, 0, first, &v[..4 * channels], &q, &rel);
+        assert_eq!(layer.held(), 4);
+
+        // A second sequence over the same four keys, after the first has left
+        // its own behind.
+        let alone = through_the_span(&device, &layer, 0, first, &v[..4 * channels], &q, &rel);
+        assert_eq!(layer.held(), 4, "the span started over");
+        assert_eq!(alone, got);
+    }
+
+    /// And a sequence whose count the span does not match is two sequences
+    /// through one layer, which is refused where it is asked for rather than
+    /// answered over the other one's keys.
+    #[test]
+    #[should_panic(expected = "a sequence at 7 keys against a span holding 4")]
+    fn a_span_holding_another_sequences_keys_is_refused() {
+        let Some(device) = device() else {
+            panic!("a sequence at 7 keys against a span holding 4")
+        };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let (case, k, v) = streaming(8);
+        let layer = case.wrapped(&device, &attention);
+        let channels = case.config.kv_channels();
+
+        layer.hold(0, 4).expect("the span grows");
+        layer.append(&k[..4 * channels], &v[..4 * channels]);
+        layer.hold(7, 1).expect("the span grows");
     }
 
     /// The two shapes a wrapped layer refuses, both of which the kernel would

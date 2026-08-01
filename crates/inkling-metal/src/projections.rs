@@ -33,7 +33,10 @@
 //! [`LayerProjections::normed_qkvr`] and [`LayerProjections::attend`], which are
 //! where an activation is formed and consumed without the CPU seeing it.
 
-use inkling_core::attention::{AttentionConfig, AttentionStep, Projections, Qkvr};
+use inkling_core::attention::{
+    AttentionCache, AttentionConfig, AttentionStep, LayerStep, Projections, Qkvr, Sdpa,
+};
+use inkling_core::mask::BandedMask;
 use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::weights::{LayerPacked, Packed, PackedAttention, PackedMlp, ProjectionBackend};
 
@@ -104,6 +107,38 @@ impl<'a> LayerProjections<'a> {
             r_proj: whole(device, matmul, &packed.r_proj)?,
             o_proj: whole(device, matmul, &packed.o_proj)?,
         })
+    }
+
+    /// That the step being asked for is over the shape this layer was wrapped
+    /// for.
+    ///
+    /// The shape is checked rather than taken, for the reason
+    /// [`LayerProjections::normed_qkvr`] checks its norm: the step carries the
+    /// widths its caller derived and this holds the widths it was wrapped for,
+    /// and the two are separate copies of one fact. A step paired with another
+    /// layer's band is buffers of a plausible size read under the wrong shape,
+    /// which is a wrong answer rather than a panic.
+    fn shaped_for(&self, sdpa: Sdpa, mask: BandedMask<'_>) {
+        let wrapped = self.attention.config();
+        assert_eq!(
+            [
+                sdpa.heads(),
+                sdpa.kv_heads(),
+                sdpa.head_dim(),
+                mask.d_rel(),
+                mask.rel_extent(),
+                mask.sliding(),
+            ],
+            [
+                wrapped.heads,
+                wrapped.kv_heads,
+                wrapped.head_dim,
+                wrapped.d_rel,
+                self.attention.rel_extent(),
+                wrapped.sliding,
+            ],
+            "the layer's step against the shape wrapped for it"
+        );
     }
 }
 
@@ -210,26 +245,7 @@ impl Projections for LayerProjections<'_> {
     /// layer's band is buffers of a plausible size read under the wrong shape,
     /// which is a wrong answer rather than a panic.
     fn attend(&self, step: AttentionStep<'_>) -> Vec<f32> {
-        let wrapped = self.attention.config();
-        assert_eq!(
-            [
-                step.sdpa.heads(),
-                step.sdpa.kv_heads(),
-                step.sdpa.head_dim(),
-                step.mask.d_rel(),
-                step.mask.rel_extent(),
-                step.mask.sliding(),
-            ],
-            [
-                wrapped.heads,
-                wrapped.kv_heads,
-                wrapped.head_dim,
-                wrapped.d_rel,
-                self.attention.rel_extent(),
-                wrapped.sliding,
-            ],
-            "the layer's step against the shape wrapped for it"
-        );
+        self.shaped_for(step.sdpa, step.mask);
 
         let [out] = together(self.q_proj.device(), |batch| {
             let mut attended = self.attention.encode(
@@ -247,6 +263,54 @@ impl Projections for LayerProjections<'_> {
         })
         .unwrap_or_else(|err| panic!("the layer's attention step did not run: {err}"));
         out
+    }
+
+    /// The whole layer, over a span of keys and values this layer keeps.
+    ///
+    /// **What the residency buys here is the copy that grows with the
+    /// context.** [`LayerProjections::attend`] above is handed the whole cached
+    /// span as a slice and allocates and copies all of it onto the device on
+    /// every layer of every step, where every key but the newest was already
+    /// there. Held by [`LayerAttention`](crate::LayerAttention), a step copies
+    /// the key it made — and the `[keys, kv_heads * head_dim]` to `[kv_heads,
+    /// keys, head_dim]` transpose the CPU path runs over the whole span
+    /// alongside it becomes the indexing of that one write.
+    ///
+    /// The two short convolutions and the two head norms still run here, on the
+    /// values the first command buffer came back with, so this is still the
+    /// layer's two submissions. What it establishes is the seam they need: a
+    /// kernel for each of the four would otherwise have nowhere to leave a
+    /// window or a key.
+    fn layer(&self, cache: &mut AttentionCache, step: LayerStep<'_>) -> Option<Vec<f32>> {
+        self.shaped_for(step.sdpa, step.mask);
+        let queries = step.x.len() / self.input_layernorm.width();
+        self.attention
+            .hold(cache.seen(), queries)
+            .unwrap_or_else(|err| panic!("the layer's span did not grow: {err}"));
+
+        let projected = match step.input_layernorm {
+            Some(weight) => self.normed_qkvr(step.x, weight, step.eps),
+            None => self.qkvr(step.x),
+        };
+        let convolved = step.convolved(cache, &projected);
+        self.attention.append(&convolved.k, &convolved.v);
+        cache.appended(queries);
+
+        let device = self.q_proj.device();
+        let [out] = together(device, |batch| {
+            let mut q = device.buffer(&convolved.q)?;
+            let mut rel = device.buffer(&projected.r)?;
+            let mut attended = self.attention.encode_over(
+                batch,
+                &mut q,
+                &mut rel,
+                step.bias_taus,
+                step.q_offset,
+            )?;
+            Ok([self.o_proj.encode_over(batch, &mut attended)?])
+        })
+        .unwrap_or_else(|err| panic!("the layer's attention step did not run: {err}"));
+        Some(out)
     }
 
     fn q_proj(&self) -> &dyn Projection {
