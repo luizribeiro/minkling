@@ -37,6 +37,7 @@ pub mod matmul;
 pub mod norm;
 pub mod projections;
 pub mod router;
+pub mod sampling;
 pub mod sconv;
 pub mod swiglu;
 

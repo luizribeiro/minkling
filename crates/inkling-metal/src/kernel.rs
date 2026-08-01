@@ -4,6 +4,7 @@ use std::ptr::NonNull;
 use std::time::Duration;
 
 use inkling_core::profile::{self, Op};
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
@@ -14,6 +15,7 @@ use objc2_metal::{
 
 use crate::buffer::Arg;
 use crate::device::{Device, MetalError};
+use crate::sampling::Sampled;
 
 /// Entries in one compute function's buffer argument table. Every Apple GPU
 /// family states 31, and binding past it raises an Objective-C exception —
@@ -82,16 +84,14 @@ impl Device {
             .queue()
             .commandBuffer()
             .ok_or(MetalError::NoCommandBuffer)?;
-        let encoder = commands
-            .computeCommandEncoder()
-            .ok_or(MetalError::NoCommandEncoder)?;
+        let samples = self.timestamps().as_ref().map(Sampled::open);
         Ok(Batch {
             device: self,
             commands,
-            encoder,
+            encoder: None,
+            samples,
             entry: None,
             dispatches: 0,
-            ended: false,
         })
     }
 }
@@ -133,13 +133,17 @@ impl Device {
 pub struct Batch<'a> {
     device: &'a Device,
     commands: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    /// The open compute pass, if one is open. One pass holds every dispatch in
+    /// the batch — unless the device is timing each of them, which it can only
+    /// do at the ends of a pass, and then a dispatch is a pass.
+    encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+    /// The timestamps those passes take, when there are passes to take them at.
+    samples: Option<Sampled>,
     /// The first kernel encoded, for the error a failure comes back as. A
     /// command buffer fails as a whole and Metal does not say which dispatch
     /// inside it did, so naming the first is as precise as this can be.
     entry: Option<String>,
     dispatches: usize,
-    ended: bool,
 }
 
 impl<'a> Batch<'a> {
@@ -177,7 +181,8 @@ impl<'a> Batch<'a> {
             });
         }
 
-        self.encoder.setComputePipelineState(&kernel.pipeline);
+        let encoder = self.encoder(kernel)?;
+        encoder.setComputePipelineState(&kernel.pipeline);
         for (slot, arg) in args.iter().enumerate() {
             // SAFETY: the memory outlives the encoding through `Arg`'s borrow,
             // offset 0 is within every allocation, `Inline`'s length is the
@@ -191,10 +196,8 @@ impl<'a> Batch<'a> {
             // author's to get right, the way the body of any `unsafe fn` is.
             unsafe {
                 match arg {
-                    Arg::Bound(buffer) => {
-                        self.encoder.setBuffer_offset_atIndex(Some(buffer), 0, slot)
-                    }
-                    Arg::Inline(bytes) => self.encoder.setBytes_length_atIndex(
+                    Arg::Bound(buffer) => encoder.setBuffer_offset_atIndex(Some(buffer), 0, slot),
+                    Arg::Inline(bytes) => encoder.setBytes_length_atIndex(
                         NonNull::from(*bytes).cast(),
                         bytes.len(),
                         slot,
@@ -202,7 +205,7 @@ impl<'a> Batch<'a> {
                 }
             };
         }
-        self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
             one_dimensional(grid.groups()),
             one_dimensional(grid.threads_per_group),
         );
@@ -210,6 +213,44 @@ impl<'a> Batch<'a> {
         self.entry.get_or_insert_with(|| kernel.entry.clone());
         self.dispatches += 1;
         Ok(())
+    }
+
+    /// The pass this dispatch goes in: the one the batch already has, or a new
+    /// one of its own where the device is timing each dispatch.
+    ///
+    /// **A pass of its own is not a command buffer of its own.** The passes
+    /// still go into the one submission the batch is, so a sampled step makes
+    /// the same round trips an unsampled one does; what it adds is a boundary
+    /// between dispatches that Metal's serial dispatch type already puts a
+    /// barrier at.
+    fn encoder(
+        &mut self,
+        kernel: &Kernel,
+    ) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>, MetalError> {
+        let sampled = match &self.samples {
+            None => None,
+            Some(samples) => Some(samples.pass()?.retain()),
+        };
+        match sampled {
+            Some(pass) => {
+                self.end();
+                self.encoder = Some(
+                    self.commands
+                        .computeCommandEncoderWithDescriptor(&pass)
+                        .ok_or(MetalError::NoCommandEncoder)?,
+                );
+                self.samples.as_mut().expect("sampling").ran(&kernel.entry);
+            }
+            None if self.encoder.is_none() => {
+                self.encoder = Some(
+                    self.commands
+                        .computeCommandEncoder()
+                        .ok_or(MetalError::NoCommandEncoder)?,
+                );
+            }
+            None => {}
+        }
+        Ok(self.encoder.as_ref().expect("a pass is open"))
     }
 
     /// Submit everything encoded and wait for all of it.
@@ -231,6 +272,9 @@ impl<'a> Batch<'a> {
         self.commands.waitUntilCompleted();
         self.device.counted(self.dispatches);
         profile::ran_on_the_gpu(self.executed());
+        if let Some(samples) = &self.samples {
+            samples.charge();
+        }
 
         match self.commands.error() {
             None => Ok(()),
@@ -255,12 +299,11 @@ impl<'a> Batch<'a> {
         )
     }
 
-    /// The encoder closed, which has to happen before the buffer is committed
-    /// and exactly once.
+    /// The open pass closed, which has to happen before the buffer is committed
+    /// and before another pass opens, and exactly once for each.
     fn end(&mut self) {
-        if !self.ended {
-            self.encoder.endEncoding();
-            self.ended = true;
+        if let Some(encoder) = self.encoder.take() {
+            encoder.endEncoding();
         }
     }
 }
@@ -358,7 +401,7 @@ fn one_dimensional(width: usize) -> MTLSize {
 
 /// What an `NSError` has to say, which for a compile failure is the compiler's
 /// own output — file, line, column, caret and all.
-fn diagnostic(err: &NSError) -> String {
+pub(crate) fn diagnostic(err: &NSError) -> String {
     err.localizedDescription().to_string()
 }
 
@@ -647,6 +690,89 @@ mod tests {
             .map(|(x, y)| ALPHA * x + y)
             .collect();
         assert_eq!(chained.out.to_vec(), want);
+    }
+
+    /// **A timed dispatch is a pass of its own and not a command buffer of its
+    /// own**, which is the whole design of [`crate::sampling`]: a step that
+    /// sampled by submitting each dispatch alone would be measuring an engine
+    /// nobody runs. Same arithmetic, same one submission, and a row a kernel
+    /// with the device's own clock in it.
+    #[test]
+    fn a_sampled_batch_times_each_dispatch_without_submitting_each_one() {
+        let Some(device) = device() else { return };
+        if device.time_each_dispatch(true).is_err() {
+            eprintln!("skipping: this device does not sample at a stage boundary");
+            return;
+        }
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        let mut first = Saxpy::new(&device, LEN);
+        let mut second = Saxpy::new(&device, LEN);
+
+        let submissions = device.submissions();
+        profile::take();
+        let mut batch = device.batch().expect("a command buffer opens");
+        for saxpy in [&mut first, &mut second] {
+            batch
+                .add(&kernel, &saxpy.args(), Grid::new(LEN, THREADS_PER_GROUP))
+                .expect("the dispatch encodes");
+        }
+        batch.wait().expect("the batch completes");
+        let profile = profile::take();
+
+        assert_eq!(
+            first.out.to_vec(),
+            first.on_the_cpu(),
+            "the same arithmetic"
+        );
+        assert_eq!(second.out.to_vec(), second.on_the_cpu());
+        assert_eq!(device.submissions() - submissions, 1, "one command buffer");
+
+        let rows = profile.kernels();
+        assert_eq!(rows.len(), 1, "one kernel ran: {rows:?}");
+        assert_eq!(rows[0].0, SAXPY_ENTRY);
+        assert_eq!(rows[0].1.calls, 2, "both dispatches were timed");
+        assert!(rows[0].1.elapsed > Duration::ZERO, "{rows:?}");
+        eprintln!(
+            "{:.2?} over two sampled passes, inside a command buffer the device clocked at {:.2?}",
+            profile.dispatched(),
+            profile.gpu()
+        );
+    }
+
+    /// A batch nobody encoded anything into opens no pass at all now that a
+    /// pass is opened where a dispatch asks for one, and it still submits: a
+    /// caller whose work turned out to be empty gets an empty command buffer
+    /// rather than a refusal.
+    #[test]
+    fn a_batch_of_no_dispatches_submits() {
+        let Some(device) = device() else { return };
+
+        let submissions = device.submissions();
+        device
+            .batch()
+            .expect("a command buffer opens")
+            .wait()
+            .expect("the batch completes");
+
+        assert_eq!(device.submissions() - submissions, 1);
+    }
+
+    /// Sampling switched off leaves the batch as it was — one pass for every
+    /// dispatch in it, and no rows.
+    #[test]
+    fn an_unsampled_batch_has_no_kernel_rows() {
+        let Some(device) = device() else { return };
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        let mut saxpy = Saxpy::new(&device, LEN);
+
+        profile::take();
+        device
+            .run(&kernel, &saxpy.args(), Grid::new(LEN, THREADS_PER_GROUP))
+            .expect("the dispatch completes");
+
+        assert!(!device.timing_each_dispatch());
+        assert!(profile::take().kernels().is_empty());
+        assert_eq!(saxpy.out.to_vec(), saxpy.on_the_cpu());
     }
 
     /// What the granularity question rests on: a submission costs the same

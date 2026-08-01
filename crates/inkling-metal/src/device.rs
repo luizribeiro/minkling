@@ -1,10 +1,14 @@
 //! The GPU this process runs against, and everything that can go wrong there.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
+use objc2_metal::{
+    MTLCommandQueue, MTLCounterSamplingPoint, MTLCreateSystemDefaultDevice, MTLDevice,
+};
+
+use crate::sampling::Timestamps;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetalError {
@@ -54,6 +58,15 @@ pub enum MetalError {
 
     #[error("{entry} did not complete: {diagnostic}")]
     Execution { entry: String, diagnostic: String },
+
+    #[error("this Metal device does not sample timestamps at the boundaries of a compute pass")]
+    NoDispatchTiming,
+
+    #[error("the Metal device would not open a counter sample buffer: {0}")]
+    NoCounterSampleBuffer(String),
+
+    #[error("one command buffer cannot have more than {most} of its dispatches timed")]
+    TooManySampledDispatches { most: usize },
 }
 
 /// The default Metal device and one command queue onto it.
@@ -68,6 +81,10 @@ pub struct Device {
     dispatches: Cell<u64>,
     submissions: Cell<u64>,
     allocations: Cell<u64>,
+    /// The GPU's clock, while somebody is asking each dispatch what it cost on
+    /// it. `None` — nobody is — is the default, because sampling is not free:
+    /// see [`crate::sampling`].
+    timestamps: RefCell<Option<Timestamps>>,
 }
 
 impl Device {
@@ -82,7 +99,51 @@ impl Device {
             dispatches: Cell::new(0),
             submissions: Cell::new(0),
             allocations: Cell::new(0),
+            timestamps: RefCell::new(None),
         })
+    }
+
+    /// Whether this device timestamps the two ends of a compute pass, which is
+    /// what [`Device::time_each_dispatch`] rests on.
+    pub fn times_a_pass(&self) -> bool {
+        self.raw
+            .supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary)
+    }
+
+    /// Whether this device timestamps between two dispatches of *one* compute
+    /// pass, which no Apple silicon GPU does and which would make timing a
+    /// dispatch cost nothing but the sample.
+    ///
+    /// Asked rather than assumed, and asked separately from
+    /// [`Device::times_a_pass`], because the difference between the two is the
+    /// whole overhead of what this backend does instead — see
+    /// [`crate::sampling`].
+    pub fn times_a_dispatch_inside_a_pass(&self) -> bool {
+        self.raw
+            .supportsCounterSampling(MTLCounterSamplingPoint::AtDispatchBoundary)
+    }
+
+    /// Ask the device what each dispatch costs it, or stop asking.
+    ///
+    /// Off by default and switched on for a measurement rather than left on:
+    /// a timed dispatch is a compute pass of its own, and what that costs is
+    /// reported beside what it measures rather than absorbed into it.
+    pub fn time_each_dispatch(&self, sampling: bool) -> Result<(), MetalError> {
+        let timestamps = match sampling {
+            false => None,
+            true => Some(Timestamps::of(self)?),
+        };
+        *self.timestamps.borrow_mut() = timestamps;
+        Ok(())
+    }
+
+    /// Whether [`Device::time_each_dispatch`] is on.
+    pub fn timing_each_dispatch(&self) -> bool {
+        self.timestamps.borrow().is_some()
+    }
+
+    pub(crate) fn timestamps(&self) -> std::cell::Ref<'_, Option<Timestamps>> {
+        self.timestamps.borrow()
     }
 
     /// How many buffers this device has been asked to allocate.

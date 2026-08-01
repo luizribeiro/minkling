@@ -47,7 +47,9 @@ tokenizers = { version = "0.23", default-features = false, features = [ "fancy-r
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
   "std",
+  "NSData",
   "NSError",
+  "NSRange",
   "NSString",
 ] }
 objc2-metal = { version = "0.3", default-features = false, features = [
@@ -65,7 +67,9 @@ objc2-metal = { version = "0.3", default-features = false, features = [
   "MTLCommandEncoder",
   "MTLCommandQueue",
   "MTLComputeCommandEncoder",
+  "MTLComputePass",
   "MTLComputePipeline",
+  "MTLCounters",
   "MTLDevice",
   "MTLLibrary",
   "MTLResource",
