@@ -572,7 +572,21 @@ struct OnTheDevice {
 }
 
 impl OnTheDevice {
+    /// The run every case here starts from, with the device's own clock left
+    /// where it is.
     fn generate(dir: &Path, device: &Device) -> Self {
+        Self::generating(dir, device, false)
+    }
+
+    /// The same run, with each dispatch timed on the device if `sampling`.
+    ///
+    /// **Sampling is a parameter rather than a setting**, because the only way
+    /// to say what it costs is to run the same thing both ways — see
+    /// `what_timing_each_dispatch_costs`.
+    fn generating(dir: &Path, device: &Device, sampling: bool) -> Self {
+        device
+            .time_each_dispatch(sampling)
+            .expect("the device times a dispatch");
         let kernels = LayerKernels::compile(device).expect("the layer kernels compile");
         let matmul = kernels.matmul();
         let dense = DenseMatmul::new(device).expect("the dense matmul compiles");
@@ -778,35 +792,13 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
     );
 }
 
-/// Where a decode step's time actually goes, as a table.
+/// A decode step's rows, and the kernels underneath them where the device was
+/// asked which of its dispatches owns which of the milliseconds.
 ///
-/// **This is the measurement the next several commits are ordered by**, and
-/// what makes it worth a case of its own is that every prediction this project
-/// has made about its own cost has been wrong: `lm_head` was 7.6% of a step
-/// rather than the 54% its parameter count implied, and the bandwidth model
-/// that said a packed matmul would be memory-bound died against a kernel
-/// running at 4% of the bandwidth.
-///
-/// Three numbers frame the rows. **The wall time** of a decode step is what
-/// there is to divide up. **The rows** are self time — see
-/// [`inkling_core::profile`] — so they sum to what is accounted for and the
-/// remainder is what nothing here has a scope around. And **the GPU's own
-/// clock** sits inside `submit and wait` rather than beside it: the device
-/// timestamps each command buffer, so the difference between that figure and
-/// the row it is inside is the part of every round trip that was not the GPU
-/// executing.
-///
-/// Nothing asserts a share. What is asserted is that the accounting adds up —
-/// the rows cannot exceed the wall time they were measured inside, and what
-/// they leave over stays small enough for the table to be a description of the
-/// step rather than of a fraction of it.
-#[test]
-#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
-fn where_a_decode_step_spends_its_time() {
-    let Some(dir) = checkpoint_dir() else { return };
-    let Some(device) = device() else { return };
-
-    let run = OnTheDevice::generate(&dir, &device);
+/// One table rather than two, because the second half only means anything
+/// against the first: a kernel's device time is a share of what the device
+/// executed for, which is a share of the wait, which is a share of the step.
+fn decode_step_table(run: &OnTheDevice) -> String {
     let step = run.each_decode_step();
     let (dispatches, submissions, allocations) = run.per_decode_step();
     let accounted = run.profile.total();
@@ -840,7 +832,70 @@ fn where_a_decode_step_spends_its_time() {
         100.0 * run.profile.gpu().as_secs_f64()
             / run.profile.elapsed(Op::Submit).as_secs_f64().max(f64::MIN),
     ));
-    eprintln!("{}", table.join("\n"));
+
+    let kernels = run.profile.kernels();
+    if kernels.is_empty() {
+        return table.join("\n");
+    }
+    // Of the passes rather than of the command buffer, because what is left
+    // over is the pass boundaries the sampling itself adds — an artefact of
+    // asking, printed on its own line rather than folded into a kernel's share
+    // of a step nobody runs.
+    let sampled = run.profile.dispatched();
+    let executing = |part: Duration| 100.0 * part.as_secs_f64() / sampled.as_secs_f64();
+    table.push(format!(
+        "  {:<18}{:>7}{:>12}{:>8}",
+        "kernel", "calls", "device", "share"
+    ));
+    for (kernel, dispatches) in &kernels {
+        table.push(format!(
+            "  {kernel:<18}{:>7}{:>12}{:>7.1}%",
+            dispatches.calls,
+            format!("{:.2?}", dispatches.elapsed),
+            executing(dispatches.elapsed)
+        ));
+    }
+    table.push(format!(
+        "  the passes account for {sampled:.2?} of the {:.2?} the command buffers reported, and \
+         the {:.2?} between them is what a pass boundary a dispatch costs",
+        run.profile.gpu(),
+        run.profile.gpu().saturating_sub(sampled),
+    ));
+    table.join("\n")
+}
+
+/// Where a decode step's time actually goes, as a table.
+///
+/// **This is the measurement the next several commits are ordered by**, and
+/// what makes it worth a case of its own is that every prediction this project
+/// has made about its own cost has been wrong: `lm_head` was 7.6% of a step
+/// rather than the 54% its parameter count implied, and the bandwidth model
+/// that said a packed matmul would be memory-bound died against a kernel
+/// running at 4% of the bandwidth.
+///
+/// Three numbers frame the rows. **The wall time** of a decode step is what
+/// there is to divide up. **The rows** are self time — see
+/// [`inkling_core::profile`] — so they sum to what is accounted for and the
+/// remainder is what nothing here has a scope around. And **the GPU's own
+/// clock** sits inside `submit and wait` rather than beside it: the device
+/// timestamps each command buffer, so the difference between that figure and
+/// the row it is inside is the part of every round trip that was not the GPU
+/// executing.
+///
+/// Nothing asserts a share. What is asserted is that the accounting adds up —
+/// the rows cannot exceed the wall time they were measured inside, and what
+/// they leave over stays small enough for the table to be a description of the
+/// step rather than of a fraction of it.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn where_a_decode_step_spends_its_time() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    let run = OnTheDevice::generate(&dir, &device);
+    let step = run.each_decode_step();
+    let accounted = run.profile.total();
+    eprintln!("{}", decode_step_table(&run));
 
     assert!(
         accounted <= step,
@@ -866,6 +921,126 @@ fn where_a_decode_step_spends_its_time() {
     assert!(
         accounted > step / 2,
         "only {accounted:.2?} of a {step:.2?} step is accounted for"
+    );
+}
+
+/// **Which kernels own the milliseconds the device executes for**, which is the
+/// question the `submit and wait` row above cannot answer.
+///
+/// A decode step is 1077 dispatches across nine distinct kernels, and until this
+/// landed the only figure any of them had was the 26 ms the pair of command
+/// buffers reported between them. This project's record on dividing that number
+/// up by reasoning is poor and written down: `lm_head` was predicted at 54% of a
+/// step and measured at 7.6%, the 4.9 GB/s dequantisation model stopped
+/// describing the step the moment a different kernel dominated it, and M9's
+/// premise about which dispatches forced a submission was wrong about which two
+/// they were.
+///
+/// **What a row is.** Each dispatch runs as a compute pass of its own — the only
+/// grain this hardware samples at, see `inkling_metal::sampling` — and a row
+/// is the sum of those passes' spans for one kernel. Those spans are the
+/// dispatch's own execution and *not* what the pass boundary around it costs:
+/// against an unsampled command buffer of the same dispatches, a span
+/// over-reports by around a microsecond and the boundary's own cost lands in the
+/// gap between passes, which is the `between passes` row. So the ranking is the
+/// finding and the absolute figures carry that bias, stated rather than hidden.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn which_kernels_own_a_decode_step() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    if !device.times_a_pass() {
+        eprintln!("skipping: this device does not sample at a stage boundary");
+        return;
+    }
+
+    let run = OnTheDevice::generating(&dir, &device, true);
+    eprintln!("{}", decode_step_table(&run));
+
+    let kernels = run.profile.kernels();
+    assert!(!kernels.is_empty(), "nothing was sampled");
+    // Every dispatch the step encoded came back with a pair of timestamps. A
+    // device that dropped one writes `MTLCounterErrorValue` and this side
+    // charges it nothing, which would be a row quietly short rather than a
+    // failure — so the count is what says the table describes the whole step.
+    let (dispatches, ..) = run.per_decode_step();
+    assert_eq!(
+        kernels.iter().map(|(_, each)| each.calls).sum::<u64>(),
+        dispatches,
+        "a decode step's dispatches were not all timed"
+    );
+    assert!(
+        run.profile.dispatched() <= run.profile.gpu(),
+        "the passes claim {:.2?} of a command buffer the device clocked at {:.2?}",
+        run.profile.dispatched(),
+        run.profile.gpu()
+    );
+}
+
+/// **What asking costs**, over seven alternating pairs.
+///
+/// The instrumentation must not change what it measures, and on this hardware it
+/// does: a dispatch can only be timed by being a compute pass of its own, and a
+/// pass boundary is not free. So the honest thing is to run the same step both
+/// ways rather than to claim the difference is small — and the reason
+/// `Device::time_each_dispatch` is off unless somebody asks for it.
+///
+/// Alternating rather than one run each, because T1 established that this
+/// machine's own state moves a decode step by more than the effect a single pair
+/// would be measuring.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn what_timing_each_dispatch_costs() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    if !device.times_a_pass() {
+        eprintln!("skipping: this device does not sample at a stage boundary");
+        return;
+    }
+    const PAIRS: usize = 7;
+    assert!(
+        !device.timing_each_dispatch(),
+        "a device that has just opened is already sampling"
+    );
+
+    let mut off = Vec::new();
+    let mut on = Vec::new();
+    let mut dispatches = 0;
+    for _ in 0..PAIRS {
+        for (sampling, taken) in [(false, &mut off), (true, &mut on)] {
+            let run = OnTheDevice::generating(&dir, &device, sampling);
+            dispatches = run.per_decode_step().0;
+            taken.push((run.each_decode_step(), run.profile.gpu()));
+        }
+    }
+
+    let mean = |taken: &[(Duration, Duration)], of: fn(&(Duration, Duration)) -> Duration| {
+        taken.iter().map(of).sum::<Duration>() / taken.len() as u32
+    };
+    let (step_off, step_on) = (mean(&off, |run| run.0), mean(&on, |run| run.0));
+    let (gpu_off, gpu_on) = (mean(&off, |run| run.1), mean(&on, |run| run.1));
+    eprintln!(
+        "over {PAIRS} alternating pairs, a decode step\n  unsampled {step_off:.2?}, of which the \
+         device executed for {gpu_off:.2?}\n  sampled   {step_on:.2?}, of which the device \
+         executed for {gpu_on:.2?}\n  timing each dispatch costs {:.2?} a step and {:.2?} of \
+         device time, which is {:.0} µs a dispatch\n  the pairs: {:.2?}",
+        step_on.saturating_sub(step_off),
+        gpu_on.saturating_sub(gpu_off),
+        1e6 * (gpu_on.saturating_sub(gpu_off)).as_secs_f64() / dispatches as f64,
+        off.iter()
+            .zip(&on)
+            .map(|(off, on)| (off.0, on.0))
+            .collect::<Vec<(Duration, Duration)>>(),
+    );
+
+    assert!(
+        step_on >= step_off,
+        "sampling made the step faster, which is a measurement of something else"
+    );
+    assert!(
+        off.iter().zip(&on).all(|(off, on)| on.0 > off.0),
+        "a pair moved the other way, so the mean is describing this machine's own state: \
+         {off:.2?} against {on:.2?}"
     );
 }
 
