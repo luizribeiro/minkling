@@ -413,7 +413,55 @@ impl<'a> PackedBank<'a> {
         experts: &[u32],
         x: &[f32],
     ) -> Result<Pending, MatmulError> {
+        assert_eq!(
+            x.len(),
+            experts.len() * self.in_dim,
+            "{} values are not {} rows of {}",
+            x.len(),
+            experts.len(),
+            self.in_dim
+        );
+        if experts.is_empty() {
+            return Ok(Pending { out: None });
+        }
         let _timed = profile::scope(Op::Encode);
+        let mut x = self.device.buffer(x)?;
+        self.encoding(batch, experts, &mut x)
+    }
+
+    /// The same multiply over rows a dispatch already left on the device.
+    ///
+    /// **What the engine is heading towards.** [`PackedBank::encode`] above
+    /// takes a `&[f32]`, and that signature is a claim the way
+    /// [`linear`](inkling_core::ops::linear)'s is: it says the rows are in this
+    /// process's memory, which for anything a kernel produced means they were
+    /// copied off the device to be copied back on. An activation that is only
+    /// ever read by another kernel never has to make that crossing, and the four
+    /// projections that consume one normed hidden state are the first four
+    /// callers that can say so.
+    ///
+    /// The input is borrowed exclusively for the encoding and not for the batch,
+    /// which is what lets one buffer feed several dispatches of the same command
+    /// buffer: Metal retains what is bound into it, so the binding outlives the
+    /// borrow.
+    pub fn encode_over(
+        &self,
+        batch: &mut Batch<'_>,
+        experts: &[u32],
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
+        let _timed = profile::scope(Op::Encode);
+        self.encoding(batch, experts, x)
+    }
+
+    /// One dispatch encoded, without the scope its two callers each open — so
+    /// that the profile counts a dispatch once however it was reached.
+    fn encoding(
+        &self,
+        batch: &mut Batch<'_>,
+        experts: &[u32],
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
         assert_eq!(
             x.len(),
             experts.len() * self.in_dim,
@@ -446,7 +494,6 @@ impl<'a> PackedBank<'a> {
         let mut resident = self.resident.borrow_mut();
         let resident = &mut *resident;
         let mut chosen = self.device.buffer(experts)?;
-        let mut x = self.device.buffer(x)?;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
 
         let elements = rows * self.out_dim;
@@ -479,8 +526,10 @@ impl<'a> PackedBank<'a> {
 pub struct PackedProjection<'a> {
     bank: PackedBank<'a>,
     /// The expert each row goes through, which for a bank of one is row after
-    /// row of zero. Sized to the call and keeping its allocation, because a
-    /// decode step asks for one row and a prefill for eight.
+    /// row of zero. Grown to the tallest call and never shrunk — a call reads
+    /// the prefix it needs — because a decode step asks for one row where the
+    /// prefill before it asked for eight, and the list is the same zeros either
+    /// way.
     chosen: RefCell<Vec<u32>>,
 }
 
@@ -541,17 +590,38 @@ impl<'a> PackedProjection<'a> {
 
     /// The same multiply, encoded into `batch` rather than submitted on its own.
     pub fn encode(&self, batch: &mut Batch<'_>, x: &[f32]) -> Result<Pending, MatmulError> {
+        let rows = self.rows(x.len());
+        let chosen = self.chosen.borrow();
+        self.bank.encode(batch, &chosen[..rows], x)
+    }
+
+    /// The same multiply over rows a dispatch already left on the device — see
+    /// [`PackedBank::encode_over`].
+    pub fn encode_over(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
+        let rows = self.rows(x.len());
+        let chosen = self.chosen.borrow();
+        self.bank.encode_over(batch, &chosen[..rows], x)
+    }
+
+    /// How many rows of this projection's width `values` is, with the list of
+    /// experts grown to name one for each of them.
+    fn rows(&self, values: usize) -> usize {
+        let in_dim = self.bank.in_dim();
         assert_eq!(
-            x.len() % self.bank.in_dim(),
+            values % in_dim,
             0,
-            "{} values are not whole rows of {}",
-            x.len(),
-            self.bank.in_dim()
+            "{values} values are not whole rows of {in_dim}"
         );
-        let rows = x.len() / self.bank.in_dim();
+        let rows = values / in_dim;
         let mut chosen = self.chosen.borrow_mut();
-        chosen.resize(rows, 0);
-        self.bank.encode(batch, &chosen, x)
+        if chosen.len() < rows {
+            chosen.resize(rows, 0);
+        }
+        rows
     }
 
     pub(crate) fn device(&self) -> &Device {
@@ -1354,6 +1424,40 @@ mod tests {
             batched_one,
             projection.multiply(one).expect("the dispatch completes")
         );
+    }
+
+    /// Rows a dispatch left on the device multiply to what the same rows handed
+    /// over as a slice do — and one buffer feeds two dispatches of one command
+    /// buffer.
+    ///
+    /// The seam `LayerProjections::normed_qkvr` rests on, stated on the matmul
+    /// alone. Four projections read one normed hidden state there, so what has
+    /// to hold is both halves of this: that a buffer is the same input a copy
+    /// would have been, and that binding it to a second dispatch of the same
+    /// batch does not disturb the first — which is what a caller has to believe
+    /// when `Buffer::arg` says a binding is exclusive.
+    #[test]
+    fn a_multiply_over_a_device_buffer_answers_what_the_same_rows_as_a_slice_do() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let case = Case::noisy(IN_DIM, OUT_DIM, 2);
+        let projection = case.upload(&device, &matmul);
+        let mut rows = device.buffer(&case.x).expect("the rows upload");
+
+        let [first, second] = together(&device, |batch| {
+            Ok([
+                projection.encode_over(batch, &mut rows)?,
+                projection.encode_over(batch, &mut rows)?,
+            ])
+        })
+        .expect("both dispatches complete");
+
+        let want = projection
+            .multiply(&case.x)
+            .expect("the dispatch completes");
+        assert_eq!(first.len(), 2 * OUT_DIM);
+        assert_eq!(first, want, "a buffer against the slice it was filled from");
+        assert_eq!(second, want, "the second dispatch read a disturbed buffer");
     }
 
     /// A batch that happens to be empty is the caller's business rather than an
