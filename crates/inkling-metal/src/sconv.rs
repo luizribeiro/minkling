@@ -238,14 +238,15 @@ impl<'a> LayerConv<'a> {
         );
         landing.fits(rows, self.channels / landing.groups);
 
-        let mut shape = self.device.buffer(&[
+        let fields = [
             extent(rows, "the rows of a call"),
             extent(self.channels, "the channels of a convolution"),
             extent(self.taps, "the taps of a kernel"),
             extent(landing.groups, "the groups of a row"),
             extent(landing.stride, "the rows a group has room for"),
             extent(landing.base, "where a call's rows start"),
-        ])?;
+        ];
+        let mut shape = self.device.inline(&fields)?;
         let mut weight = self.weight.borrow_mut();
         let mut windows = self.windows.borrow_mut();
         let [first, second] = &mut *windows;

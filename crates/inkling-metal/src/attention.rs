@@ -589,7 +589,7 @@ impl<'a> LayerAttention<'a> {
             step.rel.len()
         );
 
-        let mut shape = self.device.buffer(&[
+        let fields = [
             extent(heads, "the heads of a layer"),
             extent(kv_heads, "the KV heads of a layer"),
             extent(head_dim, "the channels of a head"),
@@ -601,8 +601,9 @@ impl<'a> LayerAttention<'a> {
             extent(self.rel_extent, "the band of a layer"),
             extent(self.config.sliding, "the window of a layer"),
             (1.0 / head_dim as f32).to_bits(),
-        ])?;
-        let mut taus = self.device.buffer(&taus)?;
+        ];
+        let mut shape = self.device.inline(&fields)?;
+        let mut scaled = self.device.inline(&taus)?;
         let mut proj = self.proj.borrow_mut();
         let mut out = self.device.zeroed::<f32>(queries * heads * head_dim)?;
 
@@ -620,7 +621,7 @@ impl<'a> LayerAttention<'a> {
                 step.v.arg(),
                 step.rel.arg(),
                 proj.arg(),
-                taus.arg(),
+                scaled.arg(),
                 out.arg(),
             ],
             grid,

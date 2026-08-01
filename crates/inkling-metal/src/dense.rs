@@ -37,9 +37,9 @@ use inkling_core::checkpoint::{BF16_BYTES, BF16_SHIFT};
 use inkling_core::profile::{self, Op};
 use inkling_core::weights::Bf16;
 
-use crate::buffer::{Buffer, Bytes};
+use crate::buffer::Bytes;
 use crate::device::{Device, MetalError};
-use crate::kernel::{Batch, Grid, Kernel};
+use crate::kernel::{Batch, Grid, Kernel, extent};
 use crate::matmul::{MatmulError, Pending};
 
 const ENTRY: &str = "dense_matmul";
@@ -185,7 +185,8 @@ impl<'a> DenseWeight<'a> {
         );
 
         let rows = x.len() / self.in_dim;
-        let mut shape = self.shape(rows)?;
+        let fields = self.shape(rows);
+        let mut shape = self.device.inline(&fields)?;
         let mut resident = self.resident.borrow_mut();
         let mut input = self.device.buffer(x)?;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
@@ -201,21 +202,16 @@ impl<'a> DenseWeight<'a> {
         Ok(Pending::holding(out))
     }
 
-    /// The scalars the kernel's `Shape` struct declares, in its order, in a
-    /// buffer of this call's own — which is where they have to live for two
-    /// multiplies of different heights to share a command buffer.
-    fn shape(&self, rows: usize) -> Result<Buffer<u32>, MetalError> {
-        let shape: [u32; SHAPE_FIELDS] = [
-            rows,
-            self.in_dim,
-            self.out_dim,
-            self.resident.borrow().offset(),
+    /// The scalars the kernel's `Shape` struct declares, in its order — of this
+    /// call's own, which is what two multiplies of different heights sharing a
+    /// command buffer needs them to be.
+    fn shape(&self, rows: usize) -> [u32; SHAPE_FIELDS] {
+        [
+            extent(rows, "the rows of a call"),
+            extent(self.in_dim, "the width a weight maps from"),
+            extent(self.out_dim, "the width a weight maps to"),
+            extent(self.resident.borrow().offset(), "where a weight starts"),
         ]
-        .map(|extent| {
-            u32::try_from(extent)
-                .unwrap_or_else(|_| panic!("{extent} is wider than a kernel's uint"))
-        });
-        self.device.buffer(&shape)
     }
 }
 

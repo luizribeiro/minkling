@@ -265,16 +265,17 @@ impl<'a> LayerNorm<'a> {
         };
         landing.fits(rows, self.width);
 
-        let mut shape = self.device.buffer(&[
+        let fields = [
             extent(rows, "rows of a call"),
             extent(landing.groups, "the groups of a row"),
             extent(self.width, "the width of a norm"),
             extent(landing.stride, "the rows a group has room for"),
             extent(landing.base, "where a call's rows start"),
             self.eps.to_bits(),
-        ])?;
+        ];
+        let mut shape = self.device.inline(&fields)?;
         let mut weight = self.weight.borrow_mut();
-        let mut scale = self.device.buffer(&scale)?;
+        let mut scales = self.device.inline(&scale)?;
 
         // A threadgroup to each group of each row, which is what makes the pair
         // the threadgroup's own position and so what makes the barriers inside
@@ -287,7 +288,7 @@ impl<'a> LayerNorm<'a> {
                 shape.arg(),
                 x.arg(),
                 weight.arg(),
-                scale.arg(),
+                scales.arg(),
                 landing.out.arg(),
             ],
             grid,

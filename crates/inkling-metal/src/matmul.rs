@@ -49,7 +49,7 @@ use inkling_core::weights::Packed;
 
 use crate::buffer::{Buffer, Bytes};
 use crate::device::{Device, MetalError};
-use crate::kernel::{Batch, Grid, Kernel};
+use crate::kernel::{Batch, Grid, Kernel, extent};
 
 const ENTRY: &str = "packed_matmul";
 
@@ -168,7 +168,10 @@ pub struct PackedBank<'a> {
 /// held one could not have two calls of different heights encoded into one
 /// command buffer — the second would overwrite what the first is waiting to be
 /// read with — and a batch that could not hold two multiplies against one bank
-/// would be a rule nothing states.
+/// would be a rule nothing states. What that rules out is a *resident* shape,
+/// not an allocated one: [`Device::inline`](crate::Device::inline) copies a
+/// call's shape into the command buffer as the dispatch is encoded, which costs
+/// no allocation and is still the call's own.
 #[derive(Debug)]
 struct Resident<'a> {
     codes: Bytes<'a>,
@@ -385,31 +388,21 @@ impl<'a> PackedBank<'a> {
         self.out_dim
     }
 
-    /// The scalars the kernel's `Shape` struct declares, in its order, in a
-    /// buffer of this call's own.
-    ///
-    /// The kernel reads them as `uint`, so this is where a shape too large to
-    /// describe has to stop. Unreachable through any real weight — four billion
-    /// rows of anything is decades past the 348 GiB one allocation can hold — and
-    /// a truncation would not fail: it would dispatch a grid for the wrong shape
-    /// over buffers of the right one.
-    fn shape(&self, rows: usize) -> Result<Buffer<u32>, MetalError> {
+    /// The scalars the kernel's `Shape` struct declares, in its order — the
+    /// caller's to hold, because they are read where the dispatch is encoded and
+    /// an array made here would be gone by then.
+    fn shape(&self, rows: usize) -> [u32; SHAPE_FIELDS] {
         let resident = self.resident.borrow();
         let stride = self.out_dim * self.in_dim;
-        let shape: [u32; SHAPE_FIELDS] = [
-            rows,
-            self.in_dim,
-            self.out_dim,
-            resident.codes.offset(),
-            resident.scales.offset(),
-            stride / CODES_PER_BYTE,
-            stride / GROUP_SIZE,
+        [
+            extent(rows, "the rows of a call"),
+            extent(self.in_dim, "the width a bank maps from"),
+            extent(self.out_dim, "the width a bank maps to"),
+            extent(resident.codes.offset(), "where a bank's codes start"),
+            extent(resident.scales.offset(), "where a bank's scales start"),
+            extent(stride / CODES_PER_BYTE, "the packed bytes of an expert"),
+            extent(stride / GROUP_SIZE, "the scale bytes of an expert"),
         ]
-        .map(|extent| {
-            u32::try_from(extent)
-                .unwrap_or_else(|_| panic!("{extent} is wider than a kernel's uint"))
-        });
-        self.device.buffer(&shape)
     }
 
     /// `[rows, in_dim]` in, `[rows, out_dim]` out, row `i` multiplied against
@@ -516,10 +509,11 @@ impl<'a> PackedBank<'a> {
 
         // The shape is read out of `resident` and so is built before it is
         // borrowed mutably for the binding below.
-        let mut shape = self.shape(rows)?;
+        let fields = self.shape(rows);
+        let mut shape = self.device.inline(&fields)?;
         let mut resident = self.resident.borrow_mut();
         let resident = &mut *resident;
-        let mut chosen = self.device.buffer(experts)?;
+        let mut chosen = self.device.inline(experts)?;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
 
         let elements = rows * self.out_dim;
@@ -1365,6 +1359,79 @@ mod tests {
         assert_eq!(row(0), row(2), "one expert, one input, twice");
         assert_ne!(row(0), row(1), "the expert index is read off the row");
         assert_ne!(row(0), row(3), "the input row is read off the row");
+    }
+
+    /// The one argument a real call sends past the inline threshold.
+    ///
+    /// A shape is a few dozen bytes and always travels in the command buffer;
+    /// an expert list is one `uint` a row, so a decode step's six do and a
+    /// prefill's do not — 4614 of them for a 769-token prompt. This drives 1025,
+    /// one past the 1024 that fill the 4 KiB `setBytes:` takes, so the fallback
+    /// is exercised through the caller that reaches it rather than through a
+    /// kernel of the test's own.
+    ///
+    /// Every row's answer is checked against the expert it named run alone, and
+    /// the two experts disagree — so a list read short, truncated at the
+    /// threshold or bound at the wrong length lands the wrong expert's answer in
+    /// the tail rather than a near miss.
+    #[test]
+    fn a_gathered_dispatch_takes_an_expert_list_too_wide_for_the_command_buffer() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        const EXPERTS: usize = 2;
+        const NARROW_OUT: usize = 3;
+        const ROWS: usize = 1025;
+
+        let case = Case::noisy(GROUP_SIZE, EXPERTS * NARROW_OUT, EXPERTS);
+        let bank = PackedBank::upload(
+            &device,
+            &matmul,
+            EXPERTS,
+            GROUP_SIZE,
+            NARROW_OUT,
+            &case.packed(),
+            &case.scales,
+        )
+        .expect("the bank's shapes pair");
+
+        let chosen: Vec<u32> = (0..ROWS).map(|row| (row % EXPERTS) as u32).collect();
+        let x: Vec<f32> = chosen
+            .iter()
+            .flat_map(|expert| case.x[*expert as usize * GROUP_SIZE..][..GROUP_SIZE].to_vec())
+            .collect();
+
+        let got = bank.multiply(&chosen, &x).expect("the dispatch completes");
+
+        assert_eq!(got.len(), ROWS * NARROW_OUT);
+        let codes_per_expert = NARROW_OUT * GROUP_SIZE / CODES_PER_BYTE;
+        let packed = case.packed();
+        let alone: Vec<Vec<f32>> = (0..EXPERTS)
+            .map(|at| {
+                PackedProjection::upload(
+                    &device,
+                    &matmul,
+                    GROUP_SIZE,
+                    NARROW_OUT,
+                    &packed[at * codes_per_expert..][..codes_per_expert],
+                    &case.scales[at * NARROW_OUT..][..NARROW_OUT],
+                )
+                .expect("one expert's shapes pair")
+                .multiply(&case.x[at * GROUP_SIZE..][..GROUP_SIZE])
+                .expect("the dispatch completes")
+            })
+            .collect();
+        assert_ne!(
+            alone[0], alone[1],
+            "two experts that agreed would prove nothing"
+        );
+
+        for (row, expert) in chosen.iter().enumerate() {
+            assert_eq!(
+                got[row * NARROW_OUT..][..NARROW_OUT],
+                alone[*expert as usize][..],
+                "row {row}"
+            );
+        }
     }
 
     /// An index past the bank is an offset past the buffer, and a GPU read
