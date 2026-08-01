@@ -50,24 +50,25 @@ use crate::sconv::{ConvState, ShortConv};
 /// those, and the only thing that kept them out was that whoever held the
 /// attention did not also hold the MLP.
 ///
-/// **What comes back is the first value that has to.** What the MLP produced is
-/// read by the convolution on the layer's second residual path, whose window is
-/// the one piece of a layer's state a backend running everything else still does
-/// not hold — so it crosses back, and `h` with it because the residual is added
-/// to `h` where that convolution's rows land. Everything before that is one
-/// command buffer.
+/// **What comes back is the layer**, and it is the first value that has to.
+/// The last operation a decoder layer runs is the short convolution on its
+/// second residual path, whose window is a fourth piece of state a backend has
+/// to hold to run it — and holding it is what took the whole layer over,
+/// because what that convolution reads is what the MLP produced and what it
+/// writes is what the next layer is handed. So `[tokens, hidden]` in and
+/// `[tokens, hidden]` out, and nothing between them is a value this process
+/// forms.
 pub trait DecoderDevice {
-    /// The layer as far as it goes on the device, or `None` where this backend
-    /// does not hold all of it.
-    fn run(&self, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<DecoderHalves>;
+    /// The layer, or `None` where this backend does not hold all of it.
+    fn run(&self, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<Vec<f32>>;
 }
 
-/// Everything one decoder layer runs before the first value that has to come
-/// back.
+/// Everything one decoder layer runs, described rather than run.
 ///
 /// [`LayerStep`] carries the attention layer's half, as it does for
 /// [`Projections::layer`](crate::attention::Projections::layer); what this adds
-/// is the residual path behind it and the MLP past it.
+/// is the residual path behind it, the MLP past it, and the second residual
+/// path behind that.
 #[derive(Debug, Clone, Copy)]
 pub struct DecoderStep<'a> {
     pub attention: LayerStep<'a>,
@@ -80,20 +81,14 @@ pub struct DecoderStep<'a> {
     /// [`LayerStep::eps`].
     pub eps: f32,
     pub mlp: LayerMlp<'a>,
-}
-
-/// What a decoder layer's device work left for this side: the value its second
-/// residual is added to, and what its MLP made of the normed form of that value.
-///
-/// Named halves rather than a pair because they are two `[tokens, hidden]`
-/// vectors of the same length, and exchanging them is a layer that still runs.
-#[derive(Debug, Clone)]
-pub struct DecoderHalves {
-    /// `x + attn_sconv(attention(x))`, which the reference calls `h`.
-    pub h: Vec<f32>,
-    /// What the MLP returned over `post_attention_layernorm(h)` — both banks'
-    /// rows already weighted and summed where the layer routes to experts.
-    pub projected: Vec<f32>,
+    /// The convolution on the residual path around the MLP, whose rows are
+    /// added to `h` — the value the second norm was taken of.
+    ///
+    /// The pair with [`DecoderStep::attn_sconv`] is the one thing about a layer
+    /// that can be exchanged and still run: they are separate kernels over the
+    /// same width, each carrying a window the other would read on the *next*
+    /// call. See the module documentation.
+    pub mlp_sconv: ShortConv<'a>,
 }
 
 /// How a layer reaches the experts its router chose.
@@ -351,8 +346,8 @@ impl<'a> DecoderLayer<'a> {
             Residual::PreNorm => device,
             Residual::Normed => None,
         };
-        if let Some(halves) = self.on_device(cache, x, device) {
-            return self.residual_path(cache, &halves.h, &halves.projected);
+        if let Some(out) = self.on_device(cache, x, device) {
+            return out;
         }
 
         let attended = self
@@ -370,14 +365,8 @@ impl<'a> DecoderLayer<'a> {
         self.residual_path(cache, residual.of(&h, &normed), &projected)
     }
 
-    /// The layer's second residual path, which both routes take: what the MLP
-    /// produced, convolved, added to the value before the norm that fed it.
-    ///
-    /// **This is where a layer's device work stops.** The convolution's window
-    /// is the one piece of a layer's state that a backend running everything
-    /// else still does not hold. So the seam that reached `o_proj`, then the
-    /// second norm, and now the whole of the MLP past it stops here, between one
-    /// layer and the next rather than inside either.
+    /// The layer's second residual path: what the MLP produced, convolved,
+    /// added to the value before the norm that fed it.
     fn residual_path(
         &self,
         cache: &mut DecoderCache,
@@ -392,16 +381,16 @@ impl<'a> DecoderLayer<'a> {
         )
     }
 
-    /// The layer as far as `device` takes it, with the step it needs built here
-    /// — because [`Attention::forward`] would run the attention rather than
-    /// describe it, and what it would hand back is the one value the residual
-    /// add wants.
+    /// The layer where `device` runs it, with the step it needs built here —
+    /// because [`Attention::forward`] would run the attention rather than
+    /// describe it, and what it would hand back is a value that never has to
+    /// exist on this side.
     fn on_device(
         &self,
         cache: &mut DecoderCache,
         x: &[f32],
         device: Option<&dyn DecoderDevice>,
-    ) -> Option<DecoderHalves> {
+    ) -> Option<Vec<f32>> {
         let device = device?;
         let queries = x.len() / self.hidden;
         let offset = cache.attention.seen();
@@ -414,6 +403,7 @@ impl<'a> DecoderLayer<'a> {
             post_attention_layernorm: self.post_attention_layernorm,
             eps: self.rms_norm_eps,
             mlp: self.mlp,
+            mlp_sconv: self.mlp_sconv,
         };
         device.run(cache, step)
     }

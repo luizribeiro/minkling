@@ -331,7 +331,7 @@ impl<'a> LayerRouter<'a> {
         ];
         let mut shape = self.device.inline(&fields)?;
         let scaled_by = [self.scale()];
-        let mut scale = self.device.inline(&scaled_by)?;
+        let mut scaling = self.device.inline(&scaled_by)?;
         let mut weights = RoutingWeights {
             routed: self.device.zeroed::<f32>(picked.len())?,
             shared: self.device.zeroed::<f32>(tokens * n_shared)?,
@@ -341,7 +341,7 @@ impl<'a> LayerRouter<'a> {
             &self.weights.kernel,
             &[
                 shape.arg(),
-                scale.arg(),
+                scaling.arg(),
                 logits.arg(),
                 picked.arg(),
                 weights.routed.arg(),

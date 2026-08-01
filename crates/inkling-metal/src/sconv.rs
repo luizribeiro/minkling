@@ -175,7 +175,7 @@ impl<'a> LayerConv<'a> {
     pub fn forward(&self, x: &[f32]) -> Result<Vec<f32>, MetalError> {
         let mut batch = self.device.batch()?;
         let mut input = self.device.buffer(x)?;
-        let out = self.encode(&mut batch, &mut input, None)?;
+        let out = self.encode(&mut batch, &mut input, None, 1.0)?;
         batch.wait()?;
         Ok(profile::timed(Op::Readback, || out.to_vec()))
     }
@@ -196,6 +196,7 @@ impl<'a> LayerConv<'a> {
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
         carried: Option<&mut Buffer<f32>>,
+        scale: f32,
     ) -> Result<Buffer<f32>, MetalError> {
         let rows = self.rows(x.len());
         let mut out = self.device.zeroed::<f32>(x.len())?;
@@ -203,6 +204,7 @@ impl<'a> LayerConv<'a> {
             batch,
             x,
             carried,
+            scale,
             Landing {
                 out: &mut out,
                 groups: 1,
@@ -232,11 +234,22 @@ impl<'a> LayerConv<'a> {
     /// reason this argument exists, since the add is otherwise the one operation
     /// that would force the command buffer closed between `o_proj` and the
     /// second norm.
+    ///
+    /// `scale` multiplies the rows where they are read, which is the same
+    /// convolution over a scaled input. It is here for one caller: a dense
+    /// layer's `mlp_sconv` reads what `InklingDenseMLP` produced, and that
+    /// network's trailing `global_scale` — see
+    /// [`DenseMlp::scale`](inkling_core::ops::DenseMlp::scale) — is arithmetic
+    /// its three dispatches leave over. Applying it where the rows are read
+    /// costs a multiply and no dispatch; every other convolution in the model
+    /// passes 1, a routed layer's included, because a router's two scales are
+    /// already in the weights it applied.
     pub fn encode_over(
         &self,
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
         carried: Option<&mut Buffer<f32>>,
+        scale: f32,
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
@@ -268,6 +281,8 @@ impl<'a> LayerConv<'a> {
             carried.is_some() as u32,
         ];
         let mut shape = self.device.inline(&fields)?;
+        let scaled_by = [scale];
+        let mut scaling = self.device.inline(&scaled_by)?;
         let mut weight = self.weight.borrow_mut();
         let mut windows = self.windows.borrow_mut();
         let [first, second] = &mut *windows;
@@ -294,6 +309,7 @@ impl<'a> LayerConv<'a> {
             &self.conv.kernel,
             &[
                 shape.arg(),
+                scaling.arg(),
                 x.arg(),
                 weight.arg(),
                 window.arg(),
@@ -335,12 +351,19 @@ struct Shape {
     uint carried;
 };
 
-/// One channel of one timestep of `window ++ x`, which is the padded sequence
-/// every output row is cut from and the window left behind is the tail of.
+/// One channel of one timestep of `window ++ scale * x`, which is the padded
+/// sequence every output row is cut from and the window left behind is the tail
+/// of.
+///
+/// **The scale is on `x` alone.** What the window holds is what a previous call
+/// was given, and a previous call was given rows already scaled — it is scaled
+/// where a value *enters* the sequence, once, so that the window this leaves
+/// behind is the same window `ConvState` would hold on the other side.
 inline float padded(
     device const float *x,
     device const float *window,
     constant Shape &shape,
+    constant float &scale,
     uint at,
     uint c
 ) {
@@ -348,7 +371,7 @@ inline float padded(
     if (at < lead) {
         return window[at * shape.channels + c];
     }
-    return x[(at - lead) * shape.channels + c];
+    return scale * x[(at - lead) * shape.channels + c];
 }
 
 /// A depthwise causal convolution with a residual add, one thread to a channel
@@ -372,18 +395,24 @@ inline float padded(
 /// and nothing else; the two convolutions inside attention have no block around
 /// them and clear the flag.
 ///
+/// **`scale` belongs to the layer too**, and to one kind of layer: it is what a
+/// dense layer's MLP still owes on the rows this reads. Every other call passes
+/// 1, so the multiply is exact and the answer is the one the CPU computes — see
+/// `padded`, which is where a scaled row enters the sequence.
+///
 /// The taps are walked from zero and accumulated in that order, which is the
 /// order `inkling_core::sconv` accumulates them in — and which is what makes a
 /// sequence split anywhere the same sequence, since the only thing a split
 /// changes is which call put a value in the window.
 kernel void short_conv(
     constant Shape &shape [[buffer(0)]],
-    device const float *x [[buffer(1)]],
-    device const float *weight [[buffer(2)]],
-    device const float *window [[buffer(3)]],
-    device float *out [[buffer(4)]],
-    device float *kept [[buffer(5)]],
-    device const float *carried [[buffer(6)]],
+    constant float &scale [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device const float *weight [[buffer(3)]],
+    device const float *window [[buffer(4)]],
+    device float *out [[buffer(5)]],
+    device float *kept [[buffer(6)]],
+    device const float *carried [[buffer(7)]],
     uint id [[thread_position_in_grid]]
 ) {
     const uint lead = shape.taps - 1;
@@ -399,17 +428,17 @@ kernel void short_conv(
     // of the padding either way, and decoding one token at a time is entirely
     // that case.
     if (t >= shape.rows) {
-        kept[(t - shape.rows) * shape.channels + c] = padded(x, window, shape, t, c);
+        kept[(t - shape.rows) * shape.channels + c] = padded(x, window, shape, scale, t, c);
         return;
     }
 
     device const float *taps = weight + (ulong)c * shape.taps;
     float acc = 0.0f;
     for (uint k = 0; k < shape.taps; ++k) {
-        acc += taps[k] * padded(x, window, shape, t + k, c);
+        acc += taps[k] * padded(x, window, shape, scale, t + k, c);
     }
 
-    acc += x[t * shape.channels + c];
+    acc += scale * x[t * shape.channels + c];
     if (shape.carried) {
         acc += carried[t * shape.channels + c];
     }
@@ -696,7 +725,7 @@ mod tests {
         layer.restart();
         let want = layer.forward(sequence).expect("the dispatch completes");
 
-        let without = BODY.replace("acc += x[t * shape.channels + c];", "");
+        let without = BODY.replace("acc += scale * x[t * shape.channels + c];", "");
         assert_ne!(without, BODY, "the mutation changed nothing");
         let mutant = ShortConvolution::from_source(&device, &without).expect("the mutant compiles");
         let dropped = fx.wrapped(&device, &mutant, &fx.weight);
@@ -743,7 +772,7 @@ mod tests {
         let mut residual = device.buffer(&carried).expect("the residual uploads");
         let mut batch = device.batch().expect("a command buffer opens");
         let out = layer
-            .encode(&mut batch, &mut input, Some(&mut residual))
+            .encode(&mut batch, &mut input, Some(&mut residual), 1.0)
             .expect("the convolution encodes");
         batch.wait().expect("the batch completes");
 
@@ -753,6 +782,57 @@ mod tests {
             layer.window(),
             sequence[sequence.len() - (fx.kernel_size - 1) * fx.channels..],
             "the window is the input's, whatever was carried"
+        );
+    }
+
+    /// **A scaled call is the same convolution over scaled rows**, which is what
+    /// lets a dense layer's trailing `global_scale` be a multiply where these
+    /// rows are read rather than a dispatch of its own.
+    ///
+    /// Both halves of the claim are asserted, and only one of them is exact.
+    /// The window a call leaves behind is `s * x` and nothing else, one rounding
+    /// wherever that multiply happens, so it is the tail of the scaled sequence
+    /// bit for bit — which is what keeps the *next* call the same too. The rows
+    /// are within a couple of ulps rather than equal, because `taps[k] * (s * x)`
+    /// is two multiplies Metal may contract where the CPU's pre-scaling rounds
+    /// between them. Worst observed when this landed: 6.4e-9, two decades inside
+    /// the bound.
+    ///
+    /// A scale of 1.75 rather than 2, so that the multiply is not exact in the
+    /// exponent alone and a path that dropped it is decades away rather than
+    /// a factor of two.
+    #[test]
+    fn a_scaled_call_is_the_convolution_over_rows_already_scaled() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let fx = Synthetic::load();
+        let layer = fx.wrapped(&device, &conv, &fx.weight);
+        let sequence = fx.sequence(&fx.input, 0);
+        let scale = 1.75;
+
+        let scaled: Vec<f32> = sequence.iter().map(|x| x * scale).collect();
+        layer.restart();
+        let want = layer.forward(&scaled).expect("the dispatch completes");
+        let kept = layer.window();
+
+        layer.restart();
+        let mut input = device.buffer(sequence).expect("the rows upload");
+        let mut batch = device.batch().expect("a command buffer opens");
+        let out = layer
+            .encode(&mut batch, &mut input, None, scale)
+            .expect("the convolution encodes");
+        batch.wait().expect("the batch completes");
+
+        let agreed = deviation(&out.to_vec(), &want);
+        eprintln!("a scaled call against rows already scaled: deviation {agreed:e}");
+        assert!(agreed <= TOLERANCE, "the rows: deviation {agreed:e}");
+        assert_eq!(layer.window(), kept, "the window it left behind");
+
+        layer.restart();
+        let unscaled = layer.forward(sequence).expect("the dispatch completes");
+        assert!(
+            deviation(&want, &unscaled) > TOLERANCE,
+            "a scale a call could drop and still agree"
         );
     }
 
@@ -801,6 +881,7 @@ mod tests {
                     &mut batch,
                     &mut input,
                     None,
+                    1.0,
                     Landing {
                         out: &mut span,
                         groups,

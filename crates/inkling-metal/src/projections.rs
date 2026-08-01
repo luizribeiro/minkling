@@ -19,19 +19,20 @@
 //! one expert every row goes through, and the only thing that stays packed is
 //! the weight itself.
 //!
-//! **One submission a layer, and twenty-five dispatches in one that routes** —
-//! seventeen where the two dense layers hold a feed-forward network in place of
+//! **One submission a layer, and twenty-six dispatches in one that routes** —
+//! eighteen where the two dense layers hold a feed-forward network in place of
 //! two banks. `q`, `k`, `v` and `r` consume the same normed hidden state and
 //! nothing of each other; the two short convolutions consume two of those and
 //! are consumed by the two head norms and the attention step; `o_proj` consumes
-//! what the step produced; the layer's own convolution consumes that and adds
-//! the layer's input as it writes; the second norm consumes the sum; and the
-//! MLP's first dispatches consume what the norm left. Every arrow in that is a
-//! device buffer, so the whole of a layer is one command buffer — see
-//! [`LayerDevice`], which is where an activation is formed and consumed without
-//! the CPU seeing it twenty-two times over. That is what a [`Batch`] is for: at
-//! 152 µs a marginal submission the last forty-four of them were worth 6.7 ms of
-//! a decode step.
+//! what the step produced; the layer's first convolution consumes that and adds
+//! the layer's input as it writes; the second norm consumes the sum; the MLP's
+//! dispatches consume what the norm left; and the layer's second convolution
+//! consumes what the MLP answered with and adds the sum the norm was taken of.
+//! Every arrow in that is a device buffer, so the whole of a layer is one
+//! command buffer — see [`LayerDevice`], which is where an activation is formed
+//! and consumed without the CPU seeing it twenty-five times over. That is what a
+//! [`Batch`] is for: at 152 µs a marginal submission the last forty-four of them
+//! were worth 6.7 ms of a decode step.
 //!
 //! **What took longest to reach was not the arithmetic but the state.** Four of
 //! those operations write something that outlives the call — three convolutions'
@@ -43,9 +44,7 @@
 //! carries once the rest is here.
 
 use inkling_core::attention::{AttentionCache, AttentionStep, LayerStep, Projections, Qkvr, Sdpa};
-use inkling_core::layer::{
-    DecoderCache, DecoderDevice, DecoderHalves, DecoderStep, Experts, LayerMlp,
-};
+use inkling_core::layer::{DecoderCache, DecoderDevice, DecoderStep, Experts, LayerMlp};
 use inkling_core::mask::BandedMask;
 use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::profile::{self, Op};
@@ -329,8 +328,8 @@ impl<'a> LayerProjections<'a> {
 
         let queries = q.len() / (step.sdpa.heads() * step.sdpa.head_dim());
         let (keys, values) = span.landings();
-        let mut k = self.k_sconv.encode(batch, &mut k, None)?;
-        self.v_sconv.encode_over(batch, &mut v, None, values)?;
+        let mut k = self.k_sconv.encode(batch, &mut k, None, 1.0)?;
+        self.v_sconv.encode_over(batch, &mut v, None, 1.0, values)?;
 
         let mut headed = device.zeroed::<f32>(q.len())?;
         self.q_norm.encode_over(
@@ -656,20 +655,23 @@ pub struct ModelLayers<'a> {
     layers: Vec<Option<LayerDevice<'a>>>,
 }
 
-/// One decoder layer on the device: its attention, the convolution and residual
-/// add behind that, the second norm, and its MLP.
+/// One whole decoder layer on the device: its attention, the convolution and
+/// residual add behind that, the second norm, its MLP, and the convolution and
+/// residual add behind *that*.
 ///
 /// **What this is that [`LayerProjections`] is not is the MLP**, and that is the
 /// whole of why it exists. Everything else here was already reachable from the
 /// attention — the convolution on the residual path reads what `o_proj` wrote,
 /// the add reads the layer's input, the second norm reads the add — but a
 /// backend that stopped at the norm would have closed its command buffer there
-/// for the MLP's first dispatch to open another. Holding both, it does not.
+/// for the MLP's first dispatch to open another. Holding both, it does not; and
+/// holding the MLP is what let the second residual path follow, since what that
+/// convolution reads is the one value the MLP produces.
 #[derive(Debug)]
 pub struct LayerDevice<'a> {
     attention: LayerProjections<'a>,
-    /// The convolution on the layer's residual path, which carries the layer's
-    /// input as a second addend — see [`LayerConv::encode_over`].
+    /// The convolution on the layer's first residual path, which carries the
+    /// layer's input as a second addend — see [`LayerConv::encode_over`].
     attn_sconv: LayerConv<'a>,
     /// The layer's second norm, between that add and the MLP.
     post_attention_layernorm: LayerNorm<'a>,
@@ -677,6 +679,11 @@ pub struct LayerDevice<'a> {
     /// which is the partial handover [`LayerBackend::decoder`] answers `None`
     /// for.
     mlp: Option<LayerMlpDevice<'a>>,
+    /// The convolution on the layer's second residual path, which carries `h`
+    /// as a second addend the way the first carries the layer's input — and
+    /// which is the last dispatch of the layer, so what it writes is what the
+    /// next layer is handed.
+    mlp_sconv: LayerConv<'a>,
 }
 
 /// Whichever MLP a layer index called for, on the device: `InklingDenseMLP`
@@ -725,6 +732,7 @@ impl<'a> ModelLayers<'a> {
                             .map(|ffn| LayerMlpDevice::Dense(Box::new(ffn)))
                     })
                     .transpose()?,
+                mlp_sconv: LayerConv::new(device, &kernels.conv, dim, &layer.mlp_sconv)?,
             });
         }
         for bank in banks {
@@ -800,23 +808,25 @@ impl LayerBackend for ModelLayers<'_> {
 
 /// The whole of one decoder layer in one command buffer.
 ///
-/// **Twenty-five dispatches and one submission**, where the same operations
-/// asked for a piece at a time are two submissions and three CPU rows between
-/// them. Eleven are the attention's — see [`LayerProjections::layer`], which is
-/// this one step in — and every value between them and what the MLP answers with
-/// is a buffer the next dispatch reads: what `o_proj` wrote, the convolution's
-/// rows with the layer's input already added, what the second norm made of that,
-/// the gate's logits, the experts the top-k took out of them, each bank's two
-/// halves with the activation between them, the softmax over the eight logits
-/// that selection named, and both banks' rows weighted by it.
+/// **Twenty-six dispatches and one submission**, where the same operations asked
+/// for a piece at a time are two submissions and three CPU rows between them.
+/// Eleven are the attention's — see [`LayerProjections::layer`], which is this
+/// one step in — and every value from the hidden state this is handed to the one
+/// it answers with is a buffer the next dispatch reads: what `o_proj` wrote, the
+/// first convolution's rows with the layer's input already added, what the
+/// second norm made of that, the gate's logits, the experts the top-k took out
+/// of them, each bank's two halves with the activation between them, the softmax
+/// over the eight logits that selection named, both banks' rows weighted by it,
+/// and the second convolution's rows with `h` already added.
 ///
-/// **Where it stops is where the second convolution's window is.** The rows the
-/// MLP produced are read by the short convolution on the layer's second residual
-/// path, and that convolution carries a window from one call to the next which
-/// this side does not hold — so they cross back, and `h` with them, because the
-/// residual is added to `h` where those rows land.
+/// **What a sequence carries is what decided all of it.** Four operations here
+/// write state that outlives the call — the span the step attends over and three
+/// convolutions' windows — and the last of those three is `mlp_sconv`, which is
+/// why this is the commit that took the layer whole. Everything else about the
+/// second residual path was already reachable: its input is the one value the
+/// MLP produces and its output is what the next layer is handed.
 impl DecoderDevice for LayerDevice<'_> {
-    fn run(&self, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<DecoderHalves> {
+    fn run(&self, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<Vec<f32>> {
         let mlp = self.mlp.as_ref()?;
         Some(
             self.encode(cache, step, mlp)
@@ -831,13 +841,13 @@ impl LayerDevice<'_> {
         cache: &mut DecoderCache,
         step: DecoderStep<'_>,
         mlp: &LayerMlpDevice<'_>,
-    ) -> Result<DecoderHalves, ProjectionError> {
+    ) -> Result<Vec<f32>, ProjectionError> {
         let attention = &self.attention;
         let queries = attention.beginning(cache.attention(), step.attention);
         assert_eq!(
-            step.attn_sconv.kernel_size(),
-            self.attn_sconv.taps(),
-            "the layer's residual convolution against the one wrapped for it"
+            [step.attn_sconv.kernel_size(), step.mlp_sconv.kernel_size()],
+            [self.attn_sconv.taps(), self.mlp_sconv.taps()],
+            "the layer's residual convolutions against the ones wrapped for it"
         );
         assert_eq!(
             step.post_attention_layernorm.len(),
@@ -850,11 +860,13 @@ impl LayerDevice<'_> {
             "rms_norm_eps"
         );
 
-        // The residual convolution's window is this sequence's, and it advances
-        // exactly when the span and the two windows inside attention do — which
-        // `beginning` has already started over if this sequence has seen nothing.
+        // Both residual convolutions' windows are this sequence's, and they
+        // advance exactly when the span and the two windows inside attention do
+        // — which `beginning` has already started over if this sequence has seen
+        // nothing.
         if cache.attention().seen() == 0 {
             self.attn_sconv.restart();
+            self.mlp_sconv.restart();
         }
 
         let device = attention.device();
@@ -870,60 +882,51 @@ impl LayerDevice<'_> {
             .buffer();
         let mut h = self
             .attn_sconv
-            .encode(&mut batch, &mut attended, Some(&mut x))?;
+            .encode(&mut batch, &mut attended, Some(&mut x), 1.0)?;
         let mut normed = self.post_attention_layernorm.encode(&mut batch, &mut h)?;
-        let dispatched = match mlp {
-            LayerMlpDevice::Dense(ffn) => {
-                Dispatch::Dense(ffn.encode_into(&mut batch, &mut normed)?)
-            }
-            LayerMlpDevice::Sparse(experts) => {
-                Dispatch::Sparse(experts.encode_into(&mut batch, &mut normed, queries)?)
-            }
-        };
+        let (projected, scale) = self.projected(&mut batch, &mut normed, queries, mlp, step.mlp)?;
+        let out =
+            self.mlp_sconv
+                .encode(&mut batch, &mut projected.buffer(), Some(&mut h), scale)?;
         batch.wait()?;
         cache.attention().appended(queries);
 
-        let h = profile::timed(Op::Readback, || h.to_vec());
-        Ok(DecoderHalves {
-            projected: dispatched.finished(step.mlp),
-            h,
-        })
+        Ok(profile::timed(Op::Readback, || out.to_vec()))
     }
-}
 
-/// What a layer's MLP left on the device: one `[tokens, hidden]` either way, and
-/// which MLP produced it.
-///
-/// Two arms rather than one buffer, because what is still owed on this side
-/// differs — a dense layer's trailing `global_scale` is `InklingDenseMLP`'s
-/// rather than `SwiGLUMLP`'s, where a routed layer's two scales are already in
-/// the weights its own router applied.
-enum Dispatch {
-    Dense(Pending),
-    Sparse(Pending),
-}
-
-impl Dispatch {
-    /// The `[tokens, hidden]` the MLP produced, read back and finished on this
-    /// side.
+    /// What the layer's MLP produced, and the scale its rows still carry.
     ///
-    /// **A routed layer leaves nothing here.** Its rows are already weighted:
-    /// the softmax over eight logits where three of the four ways of misreading
-    /// this gate live is a dispatch in the same command buffer as the banks it
-    /// scales — see
-    /// [`LayerRouter::encode_weights`](crate::LayerRouter::encode_weights) —
-    /// and what comes back is the sum of both banks rather than their rows.
+    /// **A dense layer's rows are not finished and a routed layer's are.**
+    /// `InklingDenseMLP` multiplies what its three projections produced by a
+    /// learned `global_scale`, outside the `SwiGLUMLP` body it shares with other
+    /// models; a routed layer's two scales are already in the weights its own
+    /// router applied — see
+    /// [`LayerRouter::encode_weights`](crate::LayerRouter::encode_weights),
+    /// where three of the four ways of misreading that gate live. So the scale
+    /// goes to the convolution that reads these rows rather than into a dispatch
+    /// of its own.
     ///
-    /// The pairing is checked rather than assumed: a `Dispatch` and the
-    /// [`LayerMlp`] that describes it are two copies of one fact, and a layer
+    /// The pairing is checked rather than assumed: what this holds and the
+    /// [`LayerMlp`] the step describes are two copies of one fact, and a layer
     /// whose MLP is not the one wrapped for it would otherwise scale a routed
     /// layer's output by a dense layer's constant.
-    fn finished(self, mlp: LayerMlp<'_>) -> Vec<f32> {
-        match (self, mlp) {
-            (Self::Dense(rows), LayerMlp::Dense(dense)) => dense.scaled(rows.take()),
-            (Self::Sparse(rows), LayerMlp::Sparse(_)) => rows.take(),
+    fn projected(
+        &self,
+        batch: &mut Batch<'_>,
+        normed: &mut Buffer<f32>,
+        queries: usize,
+        held: &LayerMlpDevice<'_>,
+        mlp: LayerMlp<'_>,
+    ) -> Result<(Pending, f32), ProjectionError> {
+        Ok(match (held, mlp) {
+            (LayerMlpDevice::Dense(ffn), LayerMlp::Dense(dense)) => {
+                (ffn.encode_into(batch, normed)?, dense.scale())
+            }
+            (LayerMlpDevice::Sparse(experts), LayerMlp::Sparse(_)) => {
+                (experts.encode_into(batch, normed, queries)?, 1.0)
+            }
             _ => panic!("the layer's MLP is not the one wrapped for it"),
-        }
+        })
     }
 }
 
@@ -1062,6 +1065,7 @@ mod tests {
             input_layernorm: layernorm(IN_DIM),
             post_attention_layernorm: layernorm(IN_DIM),
             attn_sconv: residual_sconv(),
+            mlp_sconv: residual_sconv(),
             rel_proj: rel_proj(),
             k_sconv: sconv(),
             v_sconv: sconv(),
@@ -1309,6 +1313,7 @@ mod tests {
                 input_layernorm: layernorm(IN_DIM),
                 post_attention_layernorm: layernorm(IN_DIM),
                 attn_sconv: residual_sconv(),
+                mlp_sconv: residual_sconv(),
                 rel_proj: rel_proj(),
                 k_sconv: sconv(),
                 v_sconv: sconv(),
@@ -1327,6 +1332,7 @@ mod tests {
                 input_layernorm: layernorm(IN_DIM),
                 post_attention_layernorm: layernorm(IN_DIM),
                 attn_sconv: residual_sconv(),
+                mlp_sconv: residual_sconv(),
                 rel_proj: rel_proj(),
                 k_sconv: sconv(),
                 v_sconv: sconv(),
@@ -1493,6 +1499,7 @@ mod tests {
                     down_proj: self.weight(0x88, NARROW_FFN, NARROW.hidden),
                     swiglu: self.swiglu,
                 }))),
+                mlp_sconv: self.conv(NARROW.hidden, &weights.mlp_sconv),
             }
         }
     }

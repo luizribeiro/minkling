@@ -680,6 +680,16 @@ pub struct LayerPacked<'a> {
     /// rows are added to the layer's input, which is the add that would
     /// otherwise close the command buffer in the middle of the layer.
     pub attn_sconv: Vec<f32>,
+    /// The kernel of the short convolution on the layer's *second* residual
+    /// path, widened for the same reason again.
+    ///
+    /// The last thing here to go over, and the one that took the whole layer
+    /// with it: it consumes what the MLP produced and its rows are added to `h`,
+    /// so a backend holding it holds everything between one layer's input and
+    /// the next's — and the window it carries between calls is a fourth piece of
+    /// a sequence's state that has to live where it runs. See
+    /// [`DecoderDevice`].
+    pub mlp_sconv: Vec<f32>,
     /// The `[d_rel, rel_extent]` projection the relative-position bias is
     /// contracted against, widened for the same reason `input_layernorm` is —
     /// 64 KB of bfloat16 on a global layer.
@@ -826,6 +836,7 @@ impl<'a> CheckpointWeights<'a> {
                     input_layernorm: self.layers[layer].input_layernorm.clone(),
                     post_attention_layernorm: self.layers[layer].post_attention_layernorm.clone(),
                     attn_sconv: self.layers[layer].attn_sconv.clone(),
+                    mlp_sconv: self.layers[layer].mlp_sconv.clone(),
                     rel_proj: self.layers[layer].rel_proj.clone(),
                     k_sconv: self.layers[layer].k_sconv.clone(),
                     v_sconv: self.layers[layer].v_sconv.clone(),

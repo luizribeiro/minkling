@@ -224,14 +224,21 @@ impl<'a> DenseMlp<'a> {
         self.scaled(three.down_proj().forward(&gate))
     }
 
-    /// The trailing `global_scale`, over rows the three projections produced
-    /// wherever they ran.
+    /// The trailing `global_scale` this network's rows carry.
     ///
     /// Handed out because it is the one thing in this network that a backend
     /// which dispatched all three still owes: mlx-vlm applies it in
     /// `InklingDenseMLP`, outside the `SwiGLUMLP` body it shares with other
-    /// models, so it is easy to leave out and it is not 1.
-    pub fn scaled(&self, rows: Vec<f32>) -> Vec<f32> {
+    /// models, so it is easy to leave out and it is not 1. A backend whose next
+    /// dispatch reads these rows applies it where that dispatch reads them —
+    /// see [`ShortConv`](crate::sconv::ShortConv), which is what reads them in
+    /// a layer.
+    pub fn scale(&self) -> f32 {
+        self.global_scale
+    }
+
+    /// The same scale applied here, for rows this side holds.
+    fn scaled(&self, rows: Vec<f32>) -> Vec<f32> {
         rows.iter().map(|y| y * self.global_scale).collect()
     }
 }
