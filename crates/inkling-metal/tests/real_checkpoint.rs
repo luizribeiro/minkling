@@ -27,8 +27,8 @@ use inkling_core::{
     TensorView,
 };
 use inkling_metal::{
-    DenseMatmul, DenseWeight, Device, MetalError, ModelExperts, ModelProjections, PackedBank,
-    PackedMatmul, PackedProjection, RmsNorm,
+    DenseMatmul, DenseWeight, Device, FusedAttention, MetalError, ModelExperts, ModelProjections,
+    PackedBank, PackedMatmul, PackedProjection, RmsNorm,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -458,23 +458,31 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// that pays for it doubled underneath.
 ///
 /// Per layer: the input layernorm and the four projections that consume what it
-/// produced in one submission, then `o_proj` in a second — and per MoE layer
-/// seven expert dispatches in three, being the shared bank's gate and up
-/// *together with the router's own gate*, then its down *together with the
-/// routed bank's gate and up*, then the routed bank's down. A dense layer's
-/// feed-forward network is three in two. The head is one of each.
+/// produced in one submission, then the attention step and `o_proj` in a second
+/// — and per MoE layer seven expert dispatches in three, being the shared bank's
+/// gate and up *together with the router's own gate*, then its down *together
+/// with the routed bank's gate and up*, then the routed bank's down. A dense
+/// layer's feed-forward network is three in two. The head is one of each.
 ///
-/// **Three terms here say what a submission is worth.** The layer's norm and
-/// the router's gate are each a dispatch that costs no submission, encoded into
-/// a command buffer their consumers were already going to be submitted in. The
-/// seam between the two banks is a submission the layer stopped needing at all:
-/// the shared bank's last dispatch and the routed bank's first read nothing of
-/// each other, which is visible to a backend handed the whole layer and to
-/// nothing else. Forty of them is 40 fewer round trips a step.
+/// **Four terms here say what a submission is worth.** The layer's norm, the
+/// router's gate and the attention step are each a dispatch that costs no
+/// submission, encoded into a command buffer their consumer was already going to
+/// be submitted in. The seam between the two banks is a submission no layer
+/// needs at all: the shared bank's last dispatch and the routed bank's first
+/// read nothing of each other, which is visible to a backend handed the whole
+/// layer and to nothing else. Forty of them is 40 round trips a step that are
+/// not taken.
+///
+/// **What the attention step did not buy is a submission**, and the shape here
+/// says why. The step is in the second of the layer's two command buffers and
+/// not the first, because the two short convolutions and the two head norms
+/// between `q`, `k`, `v` and it still run on the CPU — so the first buffer is
+/// closed and waited for before the step's inputs exist. Those four are what
+/// stands between 2 submissions a layer and 1.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
     (
-        6 * layers + 3 * dense + 7 * moe + 1,
+        7 * layers + 3 * dense + 7 * moe + 1,
         2 * layers + 2 * dense + 3 * moe + 1,
     )
 }
@@ -538,13 +546,14 @@ impl OnTheDevice {
         .expect("the banks wrap");
         let packed = weights.layer_projections();
         let norm = RmsNorm::new(device).expect("the norm compiles");
+        let step = FusedAttention::new(device).expect("the attention step compiles");
         let projections = ModelProjections::wrap(
             device,
             &matmul,
             &norm,
+            &step,
             &packed,
             config.num_hidden_layers,
-            config.rms_norm_eps,
         )
         .expect("the projections wrap");
 

@@ -69,6 +69,23 @@ impl<'a> BandedMask<'a> {
         }
     }
 
+    /// The three numbers a band is, which whoever forms one somewhere else has
+    /// to be able to read off it — a backend answering
+    /// [`Projections::attend`](crate::Projections::attend) holds its own copy of
+    /// each, and holds them as a shape rather than as this.
+    pub fn d_rel(&self) -> usize {
+        self.d_rel
+    }
+
+    pub fn rel_extent(&self) -> usize {
+        self.rel_extent
+    }
+
+    /// The layer's window, or zero on a global layer.
+    pub fn sliding(&self) -> usize {
+        self.sliding
+    }
+
     /// `rel` is `[batch, queries, heads, d_rel]` row-major — the shape `r_proj`
     /// produces, query-major and head-minor, before attention transposes
     /// anything. Out comes `[batch, heads, queries, keys]`.

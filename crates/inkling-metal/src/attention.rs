@@ -45,6 +45,7 @@
 //! not have to — the tensor of scores is as quadratic as the mask, and neither
 //! is formed.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 
 use inkling_core::attention::AttentionConfig;
@@ -106,6 +107,11 @@ const STAGED_VALUES: usize = 4096;
 /// Inkling's `d_rel` is 16.
 const MOST_FEATURES: usize = 128;
 
+/// What wrapping one layer's step can fail with.
+///
+/// Wrapping and not calling: everything here is a shape, settled once against
+/// the layer the checkpoint describes, so a *call* can only fail the way any
+/// dispatch fails and answers with a [`MetalError`].
 #[derive(Debug, thiserror::Error)]
 pub enum AttentionError {
     #[error(transparent)]
@@ -165,9 +171,11 @@ pub struct Step<'a> {
     /// `[queries, heads, d_rel]` — query-major and head-minor, which is what
     /// `r_proj` produces and is the opposite of everything else here.
     pub rel: &'a [f32],
-    /// One `tau` per query, which the biases of that query are multiplied by. A
-    /// layer without log scaling passes ones.
-    pub taus: &'a [f32],
+    /// One `tau` per query, which the biases of that query are multiplied by,
+    /// or `None` on a layer with no log scaling — which is what
+    /// [`AttentionStep`](inkling_core::AttentionStep) hands over and is a row of
+    /// ones by the time the kernel reads it.
+    pub taus: Option<&'a [f32]>,
     /// Where this call's queries sit: query `i` is at absolute position
     /// `i + q_offset`.
     pub q_offset: usize,
@@ -270,7 +278,7 @@ impl<'a> LayerAttention<'a> {
     /// here drive. The layer reaches for [`LayerAttention::encode`], because the
     /// projection that consumes this is a dispatch that could have been in the
     /// same command buffer.
-    pub fn forward(&self, step: Step<'_>) -> Result<Vec<f32>, AttentionError> {
+    pub fn forward(&self, step: Step<'_>) -> Result<Vec<f32>, MetalError> {
         let mut batch = self.device.batch()?;
         let out = self.encode(&mut batch, step)?;
         batch.wait()?;
@@ -285,22 +293,26 @@ impl<'a> LayerAttention<'a> {
     /// is [`merge_heads`](inkling_core::merge_heads) done by choosing an output
     /// index — so the transpose between the attention step and `o_proj` is not
     /// an operation anything performs.
-    pub fn encode(
-        &self,
-        batch: &mut Batch<'_>,
-        step: Step<'_>,
-    ) -> Result<Buffer<f32>, AttentionError> {
+    pub fn encode(&self, batch: &mut Batch<'_>, step: Step<'_>) -> Result<Buffer<f32>, MetalError> {
         let _timed = profile::scope(Op::Encode);
         let (heads, kv_heads) = (self.config.heads, self.config.kv_heads);
         let head_dim = self.config.head_dim;
 
-        let queries = step.taus.len();
+        let stride = heads * head_dim;
         assert_eq!(
-            step.q.len(),
-            heads * queries * head_dim,
-            "{} query values are not {heads} heads of {queries} rows of {head_dim}",
+            step.q.len() % stride,
+            0,
+            "{} query values are not whole calls of {stride}",
             step.q.len()
         );
+        let queries = step.q.len() / stride;
+        let taus = match step.taus {
+            Some(taus) => {
+                assert_eq!(taus.len(), queries, "a tau a query");
+                Cow::Borrowed(taus)
+            }
+            None => Cow::Owned(vec![1.0; queries]),
+        };
         let span = kv_heads * head_dim;
         assert_eq!(
             step.k.len() % span,
@@ -333,7 +345,7 @@ impl<'a> LayerAttention<'a> {
         let mut k = self.device.buffer(step.k)?;
         let mut v = self.device.buffer(step.v)?;
         let mut rel = self.device.buffer(step.rel)?;
-        let mut taus = self.device.buffer(step.taus)?;
+        let mut taus = self.device.buffer(&taus)?;
         let mut proj = self.proj.borrow_mut();
         let mut out = self.device.zeroed::<f32>(queries * heads * head_dim)?;
 
@@ -623,7 +635,9 @@ mod tests {
 
     use inkling_core::attention::LogScaling;
     use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, LONG_ACTIVATIONS, deviation};
-    use inkling_core::{BandedMask, Checkpoint, MASKED, Sdpa, merge_heads, split_heads};
+    use inkling_core::{
+        AttentionStep, BandedMask, Checkpoint, MASKED, Sdpa, merge_heads, split_heads,
+    };
 
     use super::*;
     use crate::testing::device;
@@ -710,7 +724,9 @@ mod tests {
         k: Vec<f32>,
         v: Vec<f32>,
         rel: Vec<f32>,
-        taus: Vec<f32>,
+        /// `None` on the cases whose layer has no log scaling, which is every
+        /// one but the case placed to reach it — the floor is 128000 tokens.
+        taus: Option<Vec<f32>>,
         q_offset: usize,
         queries: usize,
         keys: usize,
@@ -728,48 +744,36 @@ mod tests {
             )
         }
 
-        /// The band as `inkling_core` builds it, for the runs that want the
-        /// materialised tensor this kernel exists not to build.
-        fn banded(&self) -> BandedMask<'_> {
-            BandedMask::new(self.config.d_rel, &self.proj, self.config.sliding)
-        }
-
         fn step(&self) -> Step<'_> {
             Step {
                 q: &self.q,
                 k: &self.k,
                 v: &self.v,
                 rel: &self.rel,
-                taus: &self.taus,
+                taus: self.taus.as_deref(),
                 q_offset: self.q_offset,
             }
         }
 
-        /// The attention step on the CPU, over a mask built here — the oracle
-        /// every kernel in this tree is checked against, `[queries, heads *
-        /// head_dim]` so that it is the same tensor the kernel writes.
+        /// The same call as the seam `inkling_core` states, so that what the
+        /// kernel is checked against is that module's own step and not a second
+        /// spelling of it living here.
         fn on_the_cpu(&self) -> Vec<f32> {
-            self.through(&self.built_mask())
-        }
-
-        fn built_mask(&self) -> Vec<f32> {
-            let mut mask =
-                self.banded()
-                    .forward(&self.rel, 1, self.config.heads, self.q_offset, self.keys);
-            for (row, tau) in mask
-                .chunks_exact_mut(self.keys)
-                .zip(self.taus.iter().cycle())
-            {
-                for bias in row
-                    .iter_mut()
-                    .filter(|entry| !inkling_core::is_masked(**entry))
-                {
-                    *bias *= tau;
-                }
+            AttentionStep {
+                sdpa: self.sdpa(),
+                mask: BandedMask::new(self.config.d_rel, &self.proj, self.config.sliding),
+                q: &self.q,
+                k: &self.k,
+                v: &self.v,
+                rel: &self.rel,
+                taus: self.taus.as_deref(),
+                q_offset: self.q_offset,
             }
-            mask
+            .on_the_cpu()
         }
 
+        /// The step over a mask somebody else built, which is how mlx-vlm's own
+        /// recorded tensor is put beside a band this kernel derives.
         fn through(&self, mask: &[f32]) -> Vec<f32> {
             let out = self.sdpa().forward(&self.q, &self.k, &self.v, mask);
             merge_heads(&out, self.config.heads, self.config.head_dim)
@@ -841,7 +845,7 @@ mod tests {
                         q: values(heads * queries * HEAD_DIM, 1),
                         k: values(span, 2),
                         v: values(span, 3),
-                        taus: vec![1.0; queries],
+                        taus: None,
                         config,
                         proj,
                         rel,
@@ -898,7 +902,7 @@ mod tests {
                 rel: fixture::f32s(&rel),
                 // The floor is 128000 tokens, so no capture reaches a `tau`
                 // that is not exactly 1.
-                taus: vec![1.0; queries],
+                taus: None,
                 queries,
                 keys,
                 q_offset: recorded[0] as usize,
@@ -1236,7 +1240,7 @@ mod tests {
         );
 
         let inert = case.on_the_device(&device, &attention);
-        case.taus = taus;
+        case.taus = Some(taus);
         let scaled = case.on_the_device(&device, &attention);
         assert!(
             deviation(&scaled, &inert) > TOLERANCE,
@@ -1408,7 +1412,7 @@ mod tests {
             k: values(kv_heads * keys * head_dim, 2),
             v: values(kv_heads * keys * head_dim, 3),
             rel: values(heads * d_rel, 5),
-            taus: vec![1.0],
+            taus: None,
             queries: 1,
             keys,
             q_offset: keys - 1,

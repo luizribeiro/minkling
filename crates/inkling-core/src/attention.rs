@@ -309,23 +309,7 @@ pub trait Projections: Debug {
     /// The default builds it, and is the oracle the other side is checked
     /// against.
     fn attend(&self, step: AttentionStep<'_>) -> Vec<f32> {
-        let (heads, head_dim) = (step.sdpa.heads, step.sdpa.head_dim);
-        let mut mask = step
-            .mask
-            .forward(step.rel, 1, heads, step.q_offset, step.keys());
-
-        // An entry the mask ruled out keeps the constant it carries: scaling
-        // -1e30 would overflow, and it rules the key out at any magnitude.
-        if let Some(taus) = step.taus {
-            for (row, tau) in mask.chunks_exact_mut(step.keys()).zip(taus.iter().cycle()) {
-                for bias in row.iter_mut().filter(|entry| !is_masked(**entry)) {
-                    *bias *= tau;
-                }
-            }
-        }
-
-        let out = step.sdpa.forward(step.q, step.k, step.v, &mask);
-        self.o_proj().forward(&merge_heads(&out, heads, head_dim))
+        self.o_proj().forward(&step.on_the_cpu())
     }
 }
 
@@ -370,6 +354,35 @@ impl AttentionStep<'_> {
     /// How many queries this call is over.
     pub fn queries(&self) -> usize {
         self.q.len() / (self.sdpa.heads * self.sdpa.head_dim)
+    }
+
+    /// The step here, `[queries, heads * head_dim]` out — the layout `o_proj`
+    /// reads, and the whole of what [`Projections::attend`] hands over bar the
+    /// multiply at the end of it.
+    ///
+    /// Named apart from that default so that a backend answering the step can
+    /// be measured against the step rather than against the step and a
+    /// projection: what would otherwise separate the two answers is a matmul
+    /// each of them ran somewhere different, which is a question its own tests
+    /// already settle.
+    pub fn on_the_cpu(&self) -> Vec<f32> {
+        let (heads, head_dim) = (self.sdpa.heads, self.sdpa.head_dim);
+        let mut mask = self
+            .mask
+            .forward(self.rel, 1, heads, self.q_offset, self.keys());
+
+        // An entry the mask ruled out keeps the constant it carries: scaling
+        // -1e30 would overflow, and it rules the key out at any magnitude.
+        if let Some(taus) = self.taus {
+            for (row, tau) in mask.chunks_exact_mut(self.keys()).zip(taus.iter().cycle()) {
+                for bias in row.iter_mut().filter(|entry| !is_masked(**entry)) {
+                    *bias *= tau;
+                }
+            }
+        }
+
+        let out = self.sdpa.forward(self.q, self.k, self.v, &mask);
+        merge_heads(&out, heads, head_dim)
     }
 }
 

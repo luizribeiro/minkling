@@ -33,7 +33,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
 use inkling_metal::{
-    DenseMatmul, Device, ModelExperts, ModelProjections, PackedMatmul, PackedProjection, RmsNorm,
+    DenseMatmul, Device, FusedAttention, ModelExperts, ModelProjections, PackedMatmul,
+    PackedProjection, RmsNorm,
 };
 
 use crate::LABEL;
@@ -52,6 +53,7 @@ pub struct Gpu {
     matmul: PackedMatmul,
     dense: DenseMatmul,
     norm: RmsNorm,
+    attention: FusedAttention,
 }
 
 impl Gpu {
@@ -60,11 +62,14 @@ impl Gpu {
         let matmul = PackedMatmul::new(&device).context("compiling the packed matmul")?;
         let dense = DenseMatmul::new(&device).context("compiling the dense matmul")?;
         let norm = RmsNorm::new(&device).context("compiling the RMSNorm")?;
+        let attention =
+            FusedAttention::new(&device).context("compiling the fused attention step")?;
         Ok(Self {
             device,
             matmul,
             dense,
             norm,
+            attention,
         })
     }
 }
@@ -122,9 +127,9 @@ pub fn weights<'a>(
         &gpu.device,
         &gpu.matmul,
         &gpu.norm,
+        &gpu.attention,
         &packed,
         config.num_hidden_layers,
-        config.rms_norm_eps,
     )
     .context("giving the layers' projections to the Metal device")?;
     eprintln!(

@@ -601,6 +601,18 @@ pub struct LayerPacked<'a> {
     /// five holds the norm in front of them or the value crosses back for
     /// nobody. See [`Projections::normed_qkvr`].
     pub input_layernorm: Vec<f32>,
+    /// The `[d_rel, rel_extent]` projection the relative-position bias is
+    /// contracted against, widened for the same reason `input_layernorm` is —
+    /// 64 KB of bfloat16 on a global layer.
+    ///
+    /// Here for the same reason too, one step further along the layer: a backend
+    /// answering [`Projections::attend`] is the thing that forms the bias, and
+    /// what it forms the bias out of is this.
+    pub rel_proj: Vec<f32>,
+    /// The shapes and scalars `InklingAttention.__init__` derived for the layer,
+    /// which the tensors do not carry: which of the two sets of head counts the
+    /// layer read, and whether it has a window at all.
+    pub config: AttentionConfig,
 }
 
 /// Where a layer's own projections multiply, when it is not here.
@@ -733,6 +745,8 @@ impl<'a> CheckpointWeights<'a> {
                 LayerPacked {
                     layer,
                     input_layernorm: self.layers[layer].input_layernorm.clone(),
+                    rel_proj: self.layers[layer].rel_proj.clone(),
+                    config: AttentionConfig::for_layer(self.config, layer),
                     attention: PackedAttention {
                         q_proj: packed("self_attn.q_proj"),
                         k_proj: packed("self_attn.k_proj"),

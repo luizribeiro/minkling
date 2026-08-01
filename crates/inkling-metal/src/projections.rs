@@ -32,11 +32,12 @@
 //! which is the first place in this engine where an activation is formed and
 //! consumed without the CPU seeing it.
 
-use inkling_core::attention::{Projections, Qkvr};
+use inkling_core::attention::{AttentionConfig, AttentionStep, Projections, Qkvr};
 use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::weights::{LayerPacked, Packed, PackedAttention, PackedMlp, ProjectionBackend};
 
-use crate::device::Device;
+use crate::attention::{AttentionError, FusedAttention, LayerAttention, Step};
+use crate::device::{Device, MetalError};
 use crate::matmul::{MatmulError, PackedMatmul, PackedProjection, together};
 use crate::norm::{LayerNorm, RmsNorm};
 
@@ -61,6 +62,11 @@ pub struct LayerProjections<'a> {
     v_proj: PackedProjection<'a>,
     r_proj: PackedProjection<'a>,
     o_proj: PackedProjection<'a>,
+    /// The attention step between the four and the fifth, resident for the same
+    /// reason the norm in front of them is: what it holds is the layer's band,
+    /// and what that buys is that `o_proj` reads a buffer rather than a value
+    /// this process formed — see [`LayerProjections::attend`].
+    attention: LayerAttention<'a>,
 }
 
 impl<'a> LayerProjections<'a> {
@@ -77,16 +83,20 @@ impl<'a> LayerProjections<'a> {
     /// both ways round — `q_proj` against `o_proj`, `k_proj` against `v_proj` —
     /// so a slot filled from the wrong name is a layer that stands up, checks
     /// out and attends to the wrong thing.
+    #[expect(clippy::too_many_arguments, reason = "one layer's weights and shape")]
     pub fn wrap(
         device: &'a Device,
         matmul: &'a PackedMatmul,
         norm: &'a RmsNorm,
+        attention: &'a FusedAttention,
         packed: &PackedAttention<'a>,
         input_layernorm: &[f32],
-        eps: f32,
-    ) -> Result<Self, MatmulError> {
+        rel_proj: &[f32],
+        config: AttentionConfig,
+    ) -> Result<Self, ProjectionError> {
         Ok(Self {
-            input_layernorm: LayerNorm::new(device, norm, input_layernorm, eps)?,
+            input_layernorm: LayerNorm::new(device, norm, input_layernorm, config.rms_norm_eps)?,
+            attention: LayerAttention::new(device, attention, config, rel_proj)?,
             q_proj: whole(device, matmul, &packed.q_proj)?,
             k_proj: whole(device, matmul, &packed.k_proj)?,
             v_proj: whole(device, matmul, &packed.v_proj)?,
@@ -94,6 +104,20 @@ impl<'a> LayerProjections<'a> {
             o_proj: whole(device, matmul, &packed.o_proj)?,
         })
     }
+}
+
+/// What standing one layer's own weights up on the device can fail with, which
+/// is a multiply's failures and the attention step's.
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectionError {
+    #[error(transparent)]
+    Metal(#[from] MetalError),
+
+    #[error(transparent)]
+    Matmul(#[from] MatmulError),
+
+    #[error(transparent)]
+    Attention(#[from] AttentionError),
 }
 
 impl Projections for LayerProjections<'_> {
@@ -159,6 +183,69 @@ impl Projections for LayerProjections<'_> {
         })
         .unwrap_or_else(|err| panic!("the layer's norm and projections did not run: {err}"));
         Qkvr { q, k, v, r }
+    }
+
+    /// The attention step and `o_proj`, in one command buffer, with the mask the
+    /// step needs never built and what the step produced never leaving the
+    /// device.
+    ///
+    /// **Two tensors this process would otherwise hold do not exist.** The
+    /// additive `[heads, queries, keys]` mask is not formed at all — the kernel
+    /// derives each entry where it scores the key it belongs to — and the step's
+    /// own `[queries, heads * head_dim]` answer stays in the buffer `o_proj`
+    /// reads, which is the pattern [`LayerProjections::normed_qkvr`] establishes
+    /// at the other end of the layer.
+    ///
+    /// **It is the second of the layer's two command buffers and not the
+    /// first.** The two short convolutions and the two head norms between `q`,
+    /// `k`, `v` and this run on the CPU, so the buffer the projections went in
+    /// is closed and waited for before the step's inputs exist. Those four are
+    /// what stands between two submissions a layer and one.
+    ///
+    /// The shape is checked rather than taken, for the reason
+    /// [`LayerProjections::normed_qkvr`] checks its norm: the step carries the
+    /// widths its caller derived and this holds the widths it was wrapped for,
+    /// and the two are separate copies of one fact. A step paired with another
+    /// layer's band is buffers of a plausible size read under the wrong shape,
+    /// which is a wrong answer rather than a panic.
+    fn attend(&self, step: AttentionStep<'_>) -> Vec<f32> {
+        let wrapped = self.attention.config();
+        assert_eq!(
+            [
+                step.sdpa.heads(),
+                step.sdpa.kv_heads(),
+                step.sdpa.head_dim(),
+                step.mask.d_rel(),
+                step.mask.rel_extent(),
+                step.mask.sliding(),
+            ],
+            [
+                wrapped.heads,
+                wrapped.kv_heads,
+                wrapped.head_dim,
+                wrapped.d_rel,
+                self.attention.rel_extent(),
+                wrapped.sliding,
+            ],
+            "the layer's step against the shape wrapped for it"
+        );
+
+        let [out] = together(self.q_proj.device(), |batch| {
+            let mut attended = self.attention.encode(
+                batch,
+                Step {
+                    q: step.q,
+                    k: step.k,
+                    v: step.v,
+                    rel: step.rel,
+                    taus: step.taus,
+                    q_offset: step.q_offset,
+                },
+            )?;
+            Ok([self.o_proj.encode_over(batch, &mut attended)?])
+        })
+        .unwrap_or_else(|err| panic!("the layer's attention step did not run: {err}"));
+        out
     }
 
     fn q_proj(&self) -> &dyn Projection {
@@ -287,10 +374,10 @@ impl<'a> ModelProjections<'a> {
         device: &'a Device,
         matmul: &'a PackedMatmul,
         norm: &'a RmsNorm,
+        attention: &'a FusedAttention,
         packed: &[LayerPacked<'a>],
         layers: usize,
-        eps: f32,
-    ) -> Result<Self, MatmulError> {
+    ) -> Result<Self, ProjectionError> {
         let mut wrapped: Vec<Option<Layer<'a>>> = (0..layers).map(|_| None).collect();
         for layer in packed {
             wrapped[layer.layer] = Some(Layer {
@@ -298,9 +385,11 @@ impl<'a> ModelProjections<'a> {
                     device,
                     matmul,
                     norm,
+                    attention,
                     &layer.attention,
                     &layer.input_layernorm,
-                    eps,
+                    &layer.rel_proj,
+                    layer.config,
                 )?,
                 dense_mlp: layer
                     .dense_mlp
@@ -347,7 +436,9 @@ impl ProjectionBackend for ModelProjections<'_> {
 mod tests {
     use super::*;
     use inkling_core::Checkpoint;
+    use inkling_core::attention::Sdpa;
     use inkling_core::fixture::{self, deviation};
+    use inkling_core::mask::BandedMask;
     use inkling_core::ops::{DenseProjection, rms_norm};
 
     use crate::testing::device;
@@ -392,6 +483,35 @@ mod tests {
     /// be a different answer rather than the same one.
     fn layernorm(width: usize) -> Vec<f32> {
         (0..width).map(|i| 0.5 + (i % 13) as f32 / 16.0).collect()
+    }
+
+    /// The shape the layer's attention step is over.
+    ///
+    /// The checkpoint's own numbers rather than anything the fixture's three
+    /// tensors imply: those are whichever slices `just dump-quant-fixture` cut
+    /// out, and what this module's cases are about is which *name* fills which
+    /// slot. Whether a step reproduces the reference is the step's own tests'
+    /// question.
+    fn shape() -> AttentionConfig {
+        AttentionConfig {
+            hidden: IN_DIM,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            d_rel: 16,
+            sliding: 512,
+            rms_norm_eps: EPS,
+            log_scaling: None,
+        }
+    }
+
+    /// A band that is not all one value, for the reason the norm weight above is
+    /// not all ones.
+    fn rel_proj() -> Vec<f32> {
+        let extent = shape().sliding;
+        (0..shape().d_rel * extent)
+            .map(|i| ((i % 29) as f32 - 14.0) / 32.0)
+            .collect()
     }
 
     /// That every projection of `named` answers with the tensor it was named,
@@ -444,14 +564,17 @@ mod tests {
         let ckpt = fixture::open(fixture::MXFP4);
 
         let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let step = FusedAttention::new(&device).expect("the attention step compiles");
         for (r_proj, o_proj) in LAST_TWO {
             let five = LayerProjections::wrap(
                 &device,
                 &matmul,
                 &norm,
+                &step,
                 &attention(&ckpt, (r_proj, o_proj)),
                 &layernorm(IN_DIM),
-                EPS,
+                &rel_proj(),
+                shape(),
             )
             .expect("the five wrap");
 
@@ -527,10 +650,12 @@ mod tests {
         // from the model's own width, which is what asking the four for one
         // input needs them to share.
         let of = |name| packed(&ckpt, name);
+        let step = FusedAttention::new(&device).expect("the attention step compiles");
         let five = LayerProjections::wrap(
             &device,
             &matmul,
             &norm,
+            &step,
             &PackedAttention {
                 q_proj: of(TENSORS[0]),
                 k_proj: of(TENSORS[1]),
@@ -539,7 +664,8 @@ mod tests {
                 o_proj: of(TENSORS[0]),
             },
             &weight,
-            EPS,
+            &rel_proj(),
+            shape(),
         )
         .expect("the five wrap");
 
@@ -563,6 +689,76 @@ mod tests {
         }
     }
 
+    /// The attention step and `o_proj` in one command buffer, against building
+    /// the mask here and asking for `o_proj`.
+    ///
+    /// **The claim the second half of the seam rests on**, and the same shape of
+    /// claim the norm above makes: what the device path produces in the middle
+    /// is never seen by this process — the step's answer exists only in a buffer
+    /// between two dispatches — so the only way to say it is the right value is
+    /// to run the same `o_proj` over a step taken here and compare what came out
+    /// the far end.
+    ///
+    /// Two queries at a nonzero offset over a span that outruns neither, because
+    /// the offset is what a single query at position zero cannot expose.
+    ///
+    /// The third answer is what says the band reached the step at all: the same
+    /// call with the offset dropped, which is a layer that attends over almost
+    /// nothing because every key but the first sits at a distance the band reads
+    /// as a position that has not happened yet.
+    #[test]
+    fn a_layers_attention_step_answers_what_the_cpu_answers() {
+        let Some(device) = device() else { return };
+        let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let step = FusedAttention::new(&device).expect("the attention step compiles");
+        let ckpt = fixture::open(fixture::MXFP4);
+
+        let five = LayerProjections::wrap(
+            &device,
+            &matmul,
+            &norm,
+            &step,
+            &attention(&ckpt, LAST_TWO[0]),
+            &layernorm(IN_DIM),
+            &rel_proj(),
+            shape(),
+        )
+        .expect("the five wrap");
+
+        let config = shape();
+        let (queries, keys, offset) = (2, 40, 7);
+        let (heads, kv_heads, head_dim) = (config.heads, config.kv_heads, config.head_dim);
+        let band = rel_proj();
+        let (q, k, v) = (
+            row(heads * queries * head_dim),
+            row(kv_heads * keys * head_dim),
+            row(kv_heads * keys * head_dim),
+        );
+        let rel = row(queries * heads * config.d_rel);
+        let attending = |q_offset| AttentionStep {
+            sdpa: Sdpa::new(heads, kv_heads, head_dim),
+            mask: BandedMask::new(config.d_rel, &band, config.sliding),
+            q: &q,
+            k: &k,
+            v: &v,
+            rel: &rel,
+            taus: None,
+            q_offset,
+        };
+
+        let fused = five.attend(attending(offset));
+        let apart = five.o_proj().forward(&attending(offset).on_the_cpu());
+        let unplaced = five.o_proj().forward(&attending(0).on_the_cpu());
+
+        let agreed = deviation(&fused, &apart);
+        assert!(agreed <= TOLERANCE, "deviation {agreed:e}");
+        assert!(
+            deviation(&fused, &unplaced) > TOLERANCE,
+            "the cache's offset did not reach the answer"
+        );
+    }
+
     /// Which layer's projections answer for which layer, and which layers this
     /// answers for at all.
     ///
@@ -584,6 +780,8 @@ mod tests {
             LayerPacked {
                 layer: 0,
                 input_layernorm: layernorm(IN_DIM),
+                rel_proj: rel_proj(),
+                config: shape(),
                 attention: attention(&ckpt, LAST_TWO[0]),
                 dense_mlp: Some(PackedMlp {
                     gate_proj: packed(&ckpt, TENSORS[0]),
@@ -594,13 +792,16 @@ mod tests {
             LayerPacked {
                 layer: 2,
                 input_layernorm: layernorm(IN_DIM),
+                rel_proj: rel_proj(),
+                config: shape(),
                 attention: attention(&ckpt, LAST_TWO[1]),
                 dense_mlp: None,
             },
         ];
         let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let step = FusedAttention::new(&device).expect("the attention step compiles");
         let projections =
-            ModelProjections::wrap(&device, &matmul, &norm, &packed_layers, LAYERS, EPS)
+            ModelProjections::wrap(&device, &matmul, &norm, &step, &packed_layers, LAYERS)
                 .expect("the layers wrap");
 
         assert_eq!(projections.layers(), 2, "two of the five");
