@@ -397,11 +397,18 @@ const GENERATED: usize = 8;
 /// that the layers' own projections and input layernorms are.
 ///
 /// **32 GiB was slack and 1 GiB is a claim.** What is left resident is what the
-/// CPU still reads: the embedding rows a prompt asked for, the norms, the
-/// convolution kernels and the routers' bfloat16 gates. Everything else is
-/// pages the GPU reads where the checkpoint mapped them. The 981 MB layer
-/// scratch is still allocated and is now never written, so it never faults in
-/// either — which is the sharpest way to say what this commit did.
+/// CPU still reads: the embedding rows a prompt asked for, and every layer's
+/// bfloat16 tensors — which are now held widened rather than widened again on
+/// every step. Everything else is pages the GPU reads where the checkpoint
+/// mapped them. The 981 MB layer scratch is still allocated and is never
+/// written, so it never faults in either.
+///
+/// Holding those widened is where the bound has to be re-derived rather than
+/// waved at: 0.13 GiB became 0.30, and the 179 MB between them is arithmetic
+/// rather than a measurement. Forty routers' `[258, 4096]` gates are 169 MB of
+/// float32 — 95% of it — and the norms, convolution kernels and
+/// relative-position projections of forty-two layers are the other 9.8 MB. A
+/// factor of three is what is left in hand.
 ///
 /// A bound this tight is a regression test with a name: a path that went back
 /// to decoding a layer's projections into that scratch lands at 2.44 GiB and
@@ -736,6 +743,16 @@ fn where_a_decode_step_spends_its_time() {
     assert!(
         run.profile.gpu() < run.profile.elapsed(Op::Submit),
         "the device reported executing for longer than the wait around it"
+    );
+    // **A decode step reads no weight at all.** Every packed one is a dispatch
+    // against bytes nothing decodes, and every bfloat16 one was widened at
+    // construction — so the row that was 500 calls and 12.4 ms is not a smaller
+    // row, it is absent. A path that went back to widening a layer's norms, its
+    // convolution kernels or its router's gate per step lands at 500 again.
+    assert_eq!(
+        run.profile.calls(Op::Decode),
+        0,
+        "a decode step widened or decoded a weight"
     );
     // A table that named a third of the step would be describing something
     // else. The bound is loose because what it guards is that the scopes are

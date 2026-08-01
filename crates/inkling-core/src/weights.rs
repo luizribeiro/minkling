@@ -9,6 +9,12 @@
 //! [`CheckpointWeights::with_projections`] is. The routed experts go further
 //! still and are not decoded even here unless a token chose them.
 //!
+//! **A bfloat16 tensor is the exception, and it is held.** The bargain above is
+//! about weights that are packed, and a norm has no packed form to be left in —
+//! so the only question it poses is whether to widen it again on every step,
+//! which [`Widened`] answers once at construction. That is 179 MB for the whole
+//! stack, against the 1.1 TB the same bargain declines to hold.
+//!
 //! What that bounds is stated up front rather than observed: the scratch is
 //! sized by [`CheckpointWeights::scratch_floats`] before the pass starts, from
 //! the config alone, and [`Scratch`] panics rather than growing. At
@@ -377,8 +383,83 @@ pub struct CheckpointWeights<'a> {
     projections: Option<Box<dyn ProjectionBackend + 'a>>,
     embed_norm: Option<Vec<f32>>,
     norm: Vec<f32>,
+    layers: Vec<Widened>,
     layer_scratch: RefCell<Vec<f32>>,
     expert_scratch: RefCell<Vec<f32>>,
+}
+
+/// The tensors a layer holds that are not packed: bfloat16 in the checkpoint,
+/// float32 in the arithmetic, and widened here once.
+///
+/// **These are the weights the residency argument does not apply to.** A
+/// projection is MXFP4 and stays that way — decoding one is the thing
+/// [`crate::model`] exists to avoid — but a norm weight has no packed form to
+/// leave in place, so the choice is only whether to widen it again on every
+/// layer of every step. A decode step widened 500 of these, which is every one
+/// of them, and none had changed since the last time.
+///
+/// What that costs to hold is the whole of what it trades: 9.8 MB of norms,
+/// convolution kernels and relative-position projections across forty-two
+/// layers, beside 169 MB of routers' gates — one tensor is 95% of it, and it is
+/// the one [`GateWeights`] describes.
+#[derive(Debug)]
+struct Widened {
+    input_layernorm: Vec<f32>,
+    post_attention_layernorm: Vec<f32>,
+    attn_sconv: Vec<f32>,
+    mlp_sconv: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    k_sconv: Vec<f32>,
+    v_sconv: Vec<f32>,
+    rel_proj: Vec<f32>,
+    /// The trailing scale `InklingDenseMLP` and `InklingSparseMoE` both carry,
+    /// which every layer has one of.
+    global_scale: f32,
+    /// The router's own two, and `None` on a dense layer — which has no router
+    /// to hold them, the way it has no `switch_mlp` for
+    /// [`CheckpointWeights::expert_banks`] to name.
+    router: Option<WidenedRouter>,
+}
+
+/// The two tensors a router reads, widened beside the layer's own.
+#[derive(Debug)]
+struct WidenedRouter {
+    gate_weight: Vec<f32>,
+    correction_bias: Vec<f32>,
+}
+
+impl Widened {
+    fn open(ckpt: &Checkpoint, config: &TextConfig, layer: usize) -> Result<Self, WeightsError> {
+        let module = layer_module(layer);
+        let of = |name: &str| widened(ckpt, &format!("{module}.{name}"));
+        Ok(Self {
+            input_layernorm: of("input_layernorm.weight")?,
+            post_attention_layernorm: of("post_attention_layernorm.weight")?,
+            attn_sconv: of("attn_sconv.conv.weight")?,
+            mlp_sconv: of("mlp_sconv.conv.weight")?,
+            q_norm: of("self_attn.q_norm.weight")?,
+            k_norm: of("self_attn.k_norm.weight")?,
+            k_sconv: of("self_attn.k_sconv.conv.weight")?,
+            v_sconv: of("self_attn.v_sconv.conv.weight")?,
+            rel_proj: of("self_attn.rel_proj")?,
+            global_scale: of("mlp.global_scale")?[0],
+            router: match config.layer_is_dense(layer) {
+                true => None,
+                false => Some(WidenedRouter {
+                    gate_weight: of("mlp.gate_weight")?,
+                    correction_bias: of("mlp.e_score_correction_bias")?,
+                }),
+            },
+        })
+    }
+
+    /// The router's tensors, of a layer that has one.
+    fn router(&self, layer: usize) -> &WidenedRouter {
+        self.router
+            .as_ref()
+            .unwrap_or_else(|| panic!("layer {layer} routes to experts and has no gate"))
+    }
 }
 
 /// Where the MoE layers' experts run, when it is not here.
@@ -475,7 +556,12 @@ impl<'a> CheckpointWeights<'a> {
         let embed_tokens = table(EMBED_TOKENS, "the embedding table")?;
         let lm_head = table(head_module(config), "the head")?;
 
+        let layers = (0..config.num_hidden_layers)
+            .map(|layer| Widened::open(ckpt, config, layer))
+            .collect::<Result<Vec<Widened>, WeightsError>>()?;
+
         Ok(Self {
+            layers,
             layer_scratch: RefCell::new(vec![0.0; layer_scratch_floats(config)]),
             expert_scratch: RefCell::new(vec![0.0; expert_scratch_floats(config)]),
             head: Box::new(PackedRows::new(lm_head, LmHead::for_config(config).vocab())),
@@ -547,7 +633,7 @@ impl<'a> CheckpointWeights<'a> {
                 };
                 LayerPacked {
                     layer,
-                    input_layernorm: self.widened(&format!("{module}.input_layernorm.weight")),
+                    input_layernorm: self.layers[layer].input_layernorm.clone(),
                     attention: PackedAttention {
                         q_proj: packed("self_attn.q_proj"),
                         k_proj: packed("self_attn.k_proj"),
@@ -631,11 +717,6 @@ impl<'a> CheckpointWeights<'a> {
         self.layer_scratch.borrow().len() + self.expert_scratch.borrow().len()
     }
 
-    fn widened(&self, name: &str) -> Vec<f32> {
-        let _timed = profile::scope(Op::Decode);
-        widened(self.ckpt, name).unwrap_or_else(|err| panic!("{err}"))
-    }
-
     /// One packed tensor of this checkpoint, decoded whole into `scratch` and
     /// valid for as long as the run it was given.
     fn decoded<'s>(&self, name: &str, scratch: &mut Scratch<'s>) -> &'s [f32] {
@@ -653,15 +734,15 @@ impl<'a> CheckpointWeights<'a> {
     ///
     /// Nothing is decoded on the backend's arm, which is the whole of what this
     /// buys: 176 MB of float32 a layer that a decode step reads all of.
-    fn attention<'s>(&'s self, layer: usize, scratch: &mut Scratch<'s>) -> Attention<'s> {
+    fn attention<'s>(&'s self, layer: usize, scratch: &mut Scratch<'s>) -> AttentionWeights<'s> {
         let module = layer_module(layer);
-        let widened = |name: &str| self.widened(&format!("{module}.self_attn.{name}"));
-        Attention {
-            q_norm: widened("q_norm.weight"),
-            k_norm: widened("k_norm.weight"),
-            k_sconv: widened("k_sconv.conv.weight"),
-            v_sconv: widened("v_sconv.conv.weight"),
-            rel_proj: widened("rel_proj"),
+        let widened = &self.layers[layer];
+        AttentionWeights {
+            q_norm: &widened.q_norm,
+            k_norm: &widened.k_norm,
+            k_sconv: &widened.k_sconv,
+            v_sconv: &widened.v_sconv,
+            rel_proj: &widened.rel_proj,
             projections: match self
                 .projections
                 .as_deref()
@@ -691,12 +772,13 @@ impl<'a> CheckpointWeights<'a> {
     /// Whichever MLP the layer index called for, and the experts it can reach.
     ///
     /// A dense layer's three projections are decoded into the scratch beside its
-    /// attention's, or left to whoever answers for them; a MoE layer decodes only
-    /// its gate, which is bfloat16 and unpacked, and leaves both banks alone
-    /// until a token routes into them.
-    fn mlp<'s>(&'s self, layer: usize, module: &str, scratch: &mut Scratch<'s>) -> Mlp<'s> {
-        let widened = |name: &str| self.widened(&format!("{module}.mlp.{name}"));
-        let global_scale = widened("global_scale")[0];
+    /// attention's, or left to whoever answers for them; a MoE layer decodes
+    /// nothing at all and leaves both banks alone until a token routes into
+    /// them.
+    fn mlp<'s>(&'s self, layer: usize, scratch: &mut Scratch<'s>) -> Mlp<'s> {
+        let module = layer_module(layer);
+        let widened = &self.layers[layer];
+        let global_scale = widened.global_scale;
 
         let Some(config) = MoeConfig::for_layer(self.config, layer) else {
             let (dim, hidden_dim) = (self.config.hidden_size, self.config.dense_intermediate_size);
@@ -717,10 +799,11 @@ impl<'a> CheckpointWeights<'a> {
         };
 
         let (routed, shared) = self.banks(layer);
+        let router = widened.router(layer);
         Mlp::Sparse(Box::new(Sparse {
             config,
-            gate_weight: widened("gate_weight"),
-            correction_bias: widened("e_score_correction_bias"),
+            gate_weight: &router.gate_weight,
+            correction_bias: &router.correction_bias,
             global_scale,
             routed,
             shared,
@@ -754,29 +837,16 @@ impl ModelWeights for CheckpointWeights<'_> {
     fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: &[f32]) -> Vec<f32> {
         let mut buffer = self.layer_scratch.borrow_mut();
         let mut scratch = Scratch::new(&mut buffer);
-        let module = layer_module(index);
+        let widened = &self.layers[index];
 
         let attention = self.attention(index, &mut scratch);
-        let mlp = self.mlp(index, &module, &mut scratch);
-        let [
-            input_layernorm,
-            post_attention_layernorm,
-            attn_sconv,
-            mlp_sconv,
-        ] = [
-            "input_layernorm.weight",
-            "post_attention_layernorm.weight",
-            "attn_sconv.conv.weight",
-            "mlp_sconv.conv.weight",
-        ]
-        .map(|name| self.widened(&format!("{module}.{name}")));
-
+        let mlp = self.mlp(index, &mut scratch);
         let weights = DecoderWeights {
-            attention: attention.view(),
-            input_layernorm: &input_layernorm,
-            post_attention_layernorm: &post_attention_layernorm,
-            attn_sconv: &attn_sconv,
-            mlp_sconv: &mlp_sconv,
+            attention,
+            input_layernorm: &widened.input_layernorm,
+            post_attention_layernorm: &widened.post_attention_layernorm,
+            attn_sconv: &widened.attn_sconv,
+            mlp_sconv: &widened.mlp_sconv,
         };
         let config = AttentionConfig::for_layer(self.config, index);
         let layer = DecoderLayer::new(config, weights, mlp.view());
@@ -787,30 +857,6 @@ impl ModelWeights for CheckpointWeights<'_> {
         {
             Some(experts) => layer.forward(cache, x, experts),
             None => layer.forward(cache, x, &mlp),
-        }
-    }
-}
-
-/// One layer's attention tensors: the five projections wherever they multiply,
-/// and the small bfloat16 ones widened into vectors of their own.
-struct Attention<'a> {
-    projections: AttentionProjections<'a>,
-    q_norm: Vec<f32>,
-    k_norm: Vec<f32>,
-    k_sconv: Vec<f32>,
-    v_sconv: Vec<f32>,
-    rel_proj: Vec<f32>,
-}
-
-impl Attention<'_> {
-    fn view(&self) -> AttentionWeights<'_> {
-        AttentionWeights {
-            projections: self.projections,
-            q_norm: &self.q_norm,
-            k_norm: &self.k_norm,
-            k_sconv: &self.k_sconv,
-            v_sconv: &self.v_sconv,
-            rel_proj: &self.rel_proj,
         }
     }
 }
@@ -826,8 +872,8 @@ enum Mlp<'a> {
 /// `InklingSparseMoE`'s gate, and the two banks it routes to left packed.
 struct Sparse<'a> {
     config: MoeConfig,
-    gate_weight: Vec<f32>,
-    correction_bias: Vec<f32>,
+    gate_weight: &'a [f32],
+    correction_bias: &'a [f32],
     global_scale: f32,
     routed: PackedExperts<'a>,
     shared: PackedExperts<'a>,
@@ -841,8 +887,8 @@ impl Mlp<'_> {
             Self::Sparse(moe) => LayerMlp::Sparse(SparseMoe::new(
                 moe.config,
                 GateWeights {
-                    gate_weight: &moe.gate_weight,
-                    correction_bias: &moe.correction_bias,
+                    gate_weight: moe.gate_weight,
+                    correction_bias: moe.correction_bias,
                     global_scale: moe.global_scale,
                 },
             )),

@@ -57,8 +57,9 @@ pub enum Op {
     /// A row of the embedding table decoded for a token that asked for it.
     Embedding,
     /// A weight read: a bfloat16 tensor widened, or an MXFP4 one decoded to
-    /// float32. Every layer widens its norms, its convolution kernels and its
-    /// router's gate on every step.
+    /// float32. A layer's bfloat16 tensors are widened once, when the weights
+    /// are opened, so what is charged here on a step is the packed weights the
+    /// CPU path decodes to multiply against.
     Decode,
     /// Every RMSNorm: a layer's two, attention's query and key norms, and the
     /// final one before the head.
