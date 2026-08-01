@@ -105,22 +105,24 @@ impl Device {
 /// projection against packed weights adds 105 µs of its own. So a decode step's
 /// dispatches, each submitted alone, were 94 ms of round trip — most of the 163
 /// ms the step took then — and what shares an input should share a command
-/// buffer. A step now encodes 581 dispatches into 209 of these, and what it
-/// spends waiting for them is 79% of it, of which the device is executing for a
-/// third.
+/// buffer. A step now encodes 749 dispatches into 167 of these, and what it
+/// spends waiting for them is 79% of it, of which the device is executing for
+/// two fifths.
 ///
 /// **206 µs is what one costs alone, and it is not what one costs at the
 /// margin.** Taking 40 command buffers out of a step of 249 — the same
 /// dispatches, merged — took about 6.3 ms off the wait over seven alternating
-/// pairs, which is about 157 µs each. The larger number is what a round trip is
-/// worth in isolation; the smaller is what removing one from a stream of them
-/// is worth, and it is the one an estimate should be built on.
+/// pairs, which is about 157 µs each; taking 42 more out of the 209 that left
+/// took 7.2 ms off it, which is about 172. The larger number is what a round
+/// trip is worth in isolation; the smaller pair is what removing one from a
+/// stream of them is worth, and it is what an estimate should be built on.
 ///
 /// **The dispatches are ordered.** Metal's default dispatch type is serial, so
 /// each one here runs after the one before it and reads what it wrote. That is
 /// not what makes batching worth doing — the four projections that consume a
-/// layer's normed hidden state are independent — but it is what makes it safe
-/// to put a dependent pair in one buffer, which `gate` and `down` will want.
+/// layer's normed hidden state are independent — but it is what a layer's
+/// attention now rests on end to end: eleven dispatches where each reads what
+/// the one before it wrote, including into a span that outlives the call.
 ///
 /// Waiting is still what makes [`Buffer::as_slice`](crate::Buffer::as_slice)
 /// safe to read afterwards. What a batch removes is the *number* of waits, not

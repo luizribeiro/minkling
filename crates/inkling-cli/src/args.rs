@@ -34,7 +34,7 @@ pub enum Backend {
     /// token. The path every fixture in the tree pins.
     Cpu,
     /// `lm_head`, the experts and every layer's own projections multiplied on
-    /// the GPU against codes that are never decoded, which is 0.16 s a token.
+    /// the GPU against codes that are never decoded, which is 0.078 s a token.
     ///
     /// The default, because the two produce the same tokens and this is the
     /// faster of them. Asking for it explicitly is still worth allowing: a

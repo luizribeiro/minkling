@@ -25,7 +25,7 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 87 ms against mlx-vlm's 32 ms, and the timings go to
+A decode step is about 78 ms against mlx-vlm's 32 ms, and the timings go to
 stderr so stdout stays pipeable. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
@@ -34,7 +34,7 @@ rather than applied by a template this does not implement.
 **Every matmul in the model runs on the GPU, and no weight one of them reads is
 ever decoded to memory** — the MXFP4 ones in registers a nibble at a time, the
 routers' bfloat16 gates by a shift — and `--backend cpu` puts them all back:
-0.087 s a token against the CPU's 8.9. The experts were the first two thirds of
+0.078 s a token against the CPU's 9.1. The experts were the first two thirds of
 that. A token reads 6 of each MoE layer's 256 experts and both of its shared
 ones, which is 32 GB of float32 the CPU path decodes to multiply against and 4.3
 GB of packed bytes the GPU path indexes into and never decodes at all. The rest
@@ -50,31 +50,41 @@ gates are too — and a bank nobody routes to costs nothing to have wrapped. Not
 what those numbers stop meaning: the pages are still in the unified buffer
 cache, they are simply no longer this process's.
 
+The one thing here that is allocated rather than mapped is the keys and values,
+and it is the only part of the footprint that grows with the sequence: each
+layer keeps its own `[kv_heads, capacity, head_dim]` span of each and doubles it
+when a sequence outruns it, which at 64 slots is 21 MB across the stack and puts
+an eight-token generation at 0.14 GiB.
+
 **What a step costs is now mostly the asking, and that is measured rather than
 inferred.** Every operation a forward pass runs opens a scope charged the time
 inside it that no scope inside *it* claimed, so the rows of a decode step sum to
 the step and what they leave over is a number rather than a shrug:
 
-    submit and wait     209    79%      of which the device executed for 24 ms
-    dispatch encode     581    12%
-    readback            497     3%
+    submit and wait     167    79%      of which the device executed for 25 ms
+    dispatch encode     749    13%
+    readback            329     3%
     everything else                     6%
 
-**Four rows have left it since that table was first written, and the shape of
+**Six rows have left it since that table was first written, and the shape of
 what is left has not changed.** The routers' gates were 19% and every layer's
 bfloat16 tensors widened again on every step were 8%; the first is a dispatch now
 and the second happens once, at load. The attention step and the mask it added
-were 1.4% between them, and the two are one dispatch now. Four fifths of a step
-is a round trip, and the device is executing for a third of that — so the rest is
-209 command buffers submitted and waited for around work that was already done.
-Every activation op left is 5% of a step together.
+were 1.4% between them, and the two are one dispatch now. The two short
+convolutions inside attention and the two head norms beside them were 0.8% by
+the rows that named them, and they are four more dispatches — what they cost was
+never their own time. Four fifths of a step is a round trip, and the device is
+executing for two fifths of that — so the rest is 167 command buffers submitted
+and waited for around work that was already done. Every activation op left is
+3.8% of a step together.
 
 Multiplies that share an input share a command buffer, and so do multiplies that
 share nothing: the four projections a layer's normed hidden state feeds, the norm
-that makes it, the attention step beside the projection it feeds, each expert
-bank's gate and up, the router's own gate beside the shared bank it weights, and
-that bank's last multiply beside the routed bank's first — 581 dispatches in 209
-submissions. **What those last two have in common
+that makes it, the two convolutions and two head norms behind two of them, the
+attention step beside the projection it feeds, each expert bank's gate and up,
+the router's own gate beside the shared bank it weights, and that bank's last
+multiply beside the routed bank's first — 749 dispatches in 167 submissions.
+**What those last two have in common
 is that a seam had to be able to express them.** The gate's answer decides how
 heavily each shared expert counts and not which rows it runs; and by the time the
 shared bank's `down` is encoded, the routing that names the routed bank's rows
@@ -90,6 +100,15 @@ microseconds measured on its own and about 157 measured as the fortieth taken
 out of a stream of 249 — two numbers this project has to keep apart, since only
 the second says what merging a command buffer is worth.
 
+**A layer's attention is now one submission rather than two**, and the same
+alternating measurement says what that was worth: 209 command buffers to 167,
+7.2 ms off the wait row and 8.8 ms off the step over seven pairs. The dispatch
+count went the other way — 581 to 749, four more a layer — and cost nothing to
+encode, because what came off beside them is a copy of the whole cached span
+onto the device per layer per step. At 42 round trips the wait says a marginal
+submission is about 172 microseconds here, a little above the 157 the fortieth
+of 249 measured.
+
 **The attention step is a dispatch even though it has no weight to hand over**,
 and what it hands over instead is a tensor nobody builds. The reference adds a
 materialised `[B, H, LQ, S]` mask to its logits; the kernel derives each entry
@@ -97,17 +116,23 @@ from the backward distance where it scores the key it belongs to, so the mask an
 the scores it forces alongside it are never allocated. Over the eight-token
 context that profile is taken across, that is a wash — 42 more dispatches cost
 about the millisecond the CPU's own scores and mask cost — and it is not what the
-kernel is for. A 769-token prompt prefills in 14.0 s against 55.4 s, and the gap
-widens with the prompt: ×1.3 at 97 tokens, ×2.4 at 385, ×4.0 at 769.
+kernel is for. A 769-token prompt prefills in 13.6 s against 55.4 s, and the gap
+widens with the prompt: ×1.3 at 97 tokens, ×2.4 at 385, ×4.1 at 769.
 
-What is left on the CPU is each layer's second norm, its four short convolutions,
-the two head norms inside attention, and the router's top-k and softmax over
-eight numbers. **Those are also what stands between two submissions a layer and
-one**: the convolutions and the head norms sit between a layer's projections and
-its attention step, so the first command buffer is closed and waited for before
-the second's inputs exist. There is no matmul left outside the GPU. Both backends
-generate the same tokens, and the CPU one stays the oracle every kernel here is
-validated against.
+**Everything a layer's attention does is now one command buffer**: the input
+layernorm, the four projections that read it, the two short convolutions behind
+the key and the value, the two head norms over the query and the convolved key,
+the attention step and `o_proj` — eleven dispatches and one submission, with
+every value between them a buffer the next dispatch reads. Three of them write
+state that outlives the call — a convolution leaves its window, and between them
+the key's norm and the value's convolution leave the span the step attends over
+— so where those three ran decided where that state lives, and holding it is
+what let the rest follow.
+
+What is left on the CPU is each layer's second norm, the two short convolutions
+on its residual path, and the router's top-k and softmax over eight numbers.
+There is no matmul left outside the GPU. Both backends generate the same tokens,
+and the CPU one stays the oracle every kernel here is validated against.
 
 Or the same model behind an OpenAI-compatible endpoint, loaded once:
 

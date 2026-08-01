@@ -5,12 +5,14 @@
 //! multiplies through, the experts every MoE layer routes into, and the five
 //! attention projections every layer holds — along with the feed-forward network
 //! the two dense layers hold where the other forty hold experts. Between them
-//! they are every weight this engine has a kernel for, and each layer's input
-//! layernorm goes over with its projections because they are the only thing
-//! that reads it — as does the band its attention step contracts against, which
-//! is the one handover that is an operation rather than a weight. What is left
-//! on the CPU is each layer's second norm, the two convolutions on the residual
-//! path, the two head norms inside attention, and the routers.
+//! they are every weight this engine has a kernel for, and a layer's own small
+//! tensors go over with its projections because nothing else reads them: its
+//! input layernorm, the kernels of the two convolutions inside attention, the
+//! two head norms behind them, and the band the attention step contracts
+//! against — which is the one handover that is an operation rather than a
+//! weight. What is left
+//! on the CPU is each layer's second norm, the two convolutions on its residual
+//! path, and the routers.
 //!
 //! Nothing downstream branches on the choice — not the generation loop, not the
 //! server, not the head's own arithmetic — which is what makes "the CPU path
