@@ -44,25 +44,42 @@ which are 9 GB of float32 that *every* token reads all of.
 is the whole checkpoint but for its two ends, and they are handed to the GPU
 where the checkpoint mapped them — `newBufferWithBytesNoCopy` over all of it in
 6 ms. So the resident set goes *down* — 20.8 GiB with only the head there, 2.4
-GiB once the banks are, and 0.18 GiB once the layers' own projections are too —
-and a bank nobody routes to costs nothing to have wrapped. Note what those
+GiB once the banks are, and 0.19 GiB once the layers' own projections and norms
+are too — and a bank nobody routes to costs nothing to have wrapped. Note what those
 numbers stop meaning: the pages are still in the unified buffer cache, they are
 simply no longer this process's.
 
-**What a step costs is now mostly the asking.** A command buffer submitted and
-waited for is 206 µs whatever is in it, against the 105 µs a decode-shaped
-`[1, 4096] @ [4096, 4096]` projection takes to run — so the 457 dispatches a
-step makes are worth batching by what they depend on rather than issuing one at
-a time. Multiplies that share an input share a command buffer: the four
-projections a layer's normed hidden state feeds, and each expert bank's gate and
-up. That is 249 submissions rather than 457, and 51 ms of the 114.
+**What a step costs is now mostly the asking, and that is measured rather than
+inferred.** Every operation a forward pass runs opens a scope charged the time
+inside it that no scope inside *it* claimed, so the rows of a decode step sum to
+the step and what they leave over is a number rather than a shrug:
+
+    submit and wait     249    60%      of which the device executed for 22 ms
+    linear               40    19%      the routers' [258, 4096] gates
+    weights decoded     500     8%      every layer's bfloat16 tensors, again
+    dispatch encode     499     6%
+    readback            457     2%
+    everything else                     3%
+
+Two thirds of the step is a round trip, and the device is executing for a
+quarter of that — so the rest is 249 command buffers submitted and waited for
+around work that was already done. Every activation op this engine has, the
+attention step included, is 3% of a step together.
+
+Multiplies that share an input already share a command buffer: the four
+projections a layer's normed hidden state feeds, each expert bank's gate and up,
+and now the norm that makes that hidden state — 499 dispatches in 249
+submissions. **The norm is what a device-resident activation looks like.** Its
+output is a buffer the four projections read directly, so the normed state is
+never a `Vec<f32>` anywhere and the step costs one dispatch a layer more and not
+one submission.
 
 What is left on the CPU is the attention step itself — whose scores and softmax
 multiply activations against activations and have no weight to hand over — plus
-the two norms and four short convolutions of each layer, and the routers' own
-`[256, 4096]` gate. No weight above four megabytes among them. Both backends
-generate the same tokens, and the CPU one stays the oracle every kernel here is
-validated against.
+each layer's second norm, its four short convolutions, and the routers' own
+`[258, 4096]` gate, which is the last matmul in the model running as a loop.
+Both backends generate the same tokens, and the CPU one stays the oracle every
+kernel here is validated against.
 
 Or the same model behind an OpenAI-compatible endpoint, loaded once:
 

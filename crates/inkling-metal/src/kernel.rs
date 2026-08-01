@@ -103,9 +103,11 @@ impl Device {
 /// opening a command buffer, committing it and waiting for it is 206 µs
 /// whatever is in it, where a decode-shaped `[1, 4096] @ [4096, 4096]ᵀ`
 /// projection against packed weights adds 105 µs of its own. So a decode step's
-/// 457 dispatches, each submitted alone, were 94 ms of round trip — most of the
-/// 163 ms the step took — and what shares an input should share a command
-/// buffer. Batched into 249, the same step is 118 ms.
+/// dispatches, each submitted alone, were 94 ms of round trip — most of the 163
+/// ms the step took then — and what shares an input should share a command
+/// buffer. A step now encodes 499 dispatches into 249 of these, and what it
+/// spends waiting for them is 60% of it, of which the device is executing for a
+/// quarter.
 ///
 /// **The dispatches are ordered.** Metal's default dispatch type is serial, so
 /// each one here runs after the one before it and reads what it wrote. That is

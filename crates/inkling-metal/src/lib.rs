@@ -12,8 +12,10 @@
 //! from source, [`Buffer`]s the CPU and GPU both address, and a [`Grid`] saying
 //! how many threads to run.
 //!
-//! On top of those sits the one operation the whole engine is made of:
-//! [`matmul`], which multiplies against weights that stay MXFP4-packed.
+//! On top of those sits the operation the whole engine is made of: [`matmul`],
+//! which multiplies against weights that stay MXFP4-packed. Beside it sits
+//! [`norm`], which is the first here that consumes activations rather than a
+//! weight — and so the first whose output is worth leaving on the device.
 
 pub mod buffer;
 pub mod device;
