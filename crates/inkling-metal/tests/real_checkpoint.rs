@@ -15,11 +15,12 @@
 //! a case that has to live here, beside the kernel it is measuring.
 
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use inkling_core::fixture::{self, ACTIVATIONS, deviation, indices};
 use inkling_core::ops::linear;
+use inkling_core::profile::{self, Op, Profile};
 use inkling_core::quant::{BITS, dequantize_blocks_into};
 use inkling_core::{
     Checkpoint, CheckpointWeights, Dtype, Ending, ModelCache, Packed as CorePacked, TensorView,
@@ -431,16 +432,133 @@ fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     )
 }
 
-/// The running `(dispatches, submissions)` of the last decode step, which is the
-/// difference between the two totals either side of it.
+/// One run of the engine with every weight it has a kernel for on the device,
+/// over the prompt the activation capture recorded.
 ///
-/// The prefill is skipped: it dispatches the same kernels over more rows, and
-/// what the count is being read for is the steady state.
-fn per_decode_step(submitted: &[(u64, u64)]) -> (u64, u64) {
-    let [.., before, after] = submitted else {
-        panic!("a step per token, and more than one of them")
-    };
-    (after.0 - before.0, after.1 - before.1)
+/// Held together rather than driven twice, because standing the model up and
+/// generating from it is what both of the cases below start with and neither is
+/// about: one asks what came out, the other asks what it cost.
+struct OnTheDevice {
+    /// How many of the stack's layers had banks, projections and a dense
+    /// feed-forward network wrapped, and what wrapping all of it took.
+    expert_layers: usize,
+    /// The first layer the checkpoint has banks for, which is where the dense
+    /// ones stop.
+    first_routed: usize,
+    projection_layers: usize,
+    dense_layers: usize,
+    wrapped: Duration,
+    prompt: usize,
+    /// What each step took, the prompt's prefill first.
+    steps: Vec<Duration>,
+    /// The running `(dispatches, submissions)` each step was reached at.
+    submitted: Vec<(u64, u64)>,
+    peak: u64,
+    got: Vec<usize>,
+    /// What the **decode** steps spent, by operation. The prefill's accounts
+    /// are cleared before the first of them: it dispatches the same kernels
+    /// over more rows, and what a profile is read for is the steady state.
+    profile: Profile,
+}
+
+impl OnTheDevice {
+    fn generate(dir: &Path, device: &Device) -> Self {
+        let matmul = PackedMatmul::new(device).expect("the packed matmul compiles");
+        let config = fixture::config(dir).text_config;
+        let ckpt = Checkpoint::open(dir).expect("checkpoint opens");
+        let ids = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+
+        let weights =
+            CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
+        let started = Instant::now();
+        let head = PackedProjection::wrap_packed(
+            device,
+            &matmul,
+            &weights.head_packed(),
+            weights.head().vocab(),
+        )
+        .expect("the head wraps");
+        let banks = weights.expert_banks();
+        let experts = ModelExperts::wrap(
+            device,
+            &matmul,
+            &banks,
+            config.num_hidden_layers,
+            config.hidden_size,
+        )
+        .expect("the banks wrap");
+        let packed = weights.layer_projections();
+        let projections =
+            ModelProjections::wrap(device, &matmul, &packed, config.num_hidden_layers)
+                .expect("the projections wrap");
+
+        let mut run = Self {
+            expert_layers: experts.layers(),
+            first_routed: banks[0].layer,
+            projection_layers: projections.layers(),
+            dense_layers: projections.dense_layers(),
+            wrapped: started.elapsed(),
+            prompt: ids.len(),
+            steps: Vec::new(),
+            submitted: Vec::new(),
+            peak: fixture::resident_bytes(),
+            got: Vec::new(),
+            profile: Profile::default(),
+        };
+
+        // Once, before the loop rather than inside it — though "once" is now 6
+        // ms for 137 GB, so what that used to be defending against is gone.
+        let weights = weights
+            .with_head(Box::new(head))
+            .with_experts(Box::new(experts))
+            .with_projections(Box::new(projections));
+        let generator = weights.generator();
+
+        let mut step = Instant::now();
+        generator.stream(
+            &mut ModelCache::new(&config),
+            &ids,
+            Ending {
+                budget: GENERATED,
+                eos: None,
+            },
+            &weights,
+            |id| {
+                run.steps.push(step.elapsed());
+                run.submitted
+                    .push((device.dispatches(), device.submissions()));
+                run.peak = run.peak.max(fixture::resident_bytes());
+                run.got.push(id);
+                if run.steps.len() == 1 {
+                    profile::take();
+                }
+                step = Instant::now();
+                ControlFlow::Continue(())
+            },
+        );
+        run.profile = profile::take().per_step(run.decode_steps());
+        run
+    }
+
+    fn decode_steps(&self) -> u32 {
+        (self.steps.len() - 1) as u32
+    }
+
+    /// The prompt's prefill is the first step and every later one is a single
+    /// decode; a mean over the two describes neither.
+    fn each_decode_step(&self) -> Duration {
+        let (_, decode) = self.steps.split_first().expect("a step per token");
+        decode.iter().sum::<Duration>() / self.decode_steps()
+    }
+
+    /// The running `(dispatches, submissions)` of the last decode step, which is
+    /// the difference between the two totals either side of it.
+    fn per_decode_step(&self) -> (u64, u64) {
+        let [.., before, after] = self.submitted.as_slice() else {
+            panic!("a step per token, and more than one of them")
+        };
+        (after.0 - before.0, after.1 - before.1)
+    }
 }
 
 /// The engine, with every weight it has a kernel for on the GPU, against the
@@ -476,122 +594,141 @@ fn per_decode_step(submitted: &[(u64, u64)]) -> (u64, u64) {
 fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
     let Some(dir) = checkpoint_dir() else { return };
     let Some(device) = device() else { return };
-    let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
 
     let config = fixture::config(&dir).text_config;
-    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
-    let activations = fixture::open(ACTIVATIONS);
-    let ids = indices(&fixture::tensor(&activations, "input_ids"));
-    let oracle = indices(&fixture::tensor(&activations, "greedy_continuation"));
+    let oracle = indices(&fixture::tensor(
+        &fixture::open(ACTIVATIONS),
+        "greedy_continuation",
+    ));
     let want = &oracle[..GENERATED];
 
-    let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
-    let vocab = weights.head().vocab();
-    let started = Instant::now();
-    let head = PackedProjection::wrap_packed(&device, &matmul, &weights.head_packed(), vocab)
-        .expect("the head wraps");
-    let banks = weights.expert_banks();
-    let experts = ModelExperts::wrap(
-        &device,
-        &matmul,
-        &banks,
-        config.num_hidden_layers,
-        config.hidden_size,
-    )
-    .expect("the banks wrap");
-
-    let packed = weights.layer_projections();
-    let projections = ModelProjections::wrap(&device, &matmul, &packed, config.num_hidden_layers)
-        .expect("the projections wrap");
+    let run = OnTheDevice::generate(&dir, &device);
     eprintln!(
-        "{vocab} rows of the head, {} MoE layers' banks and {} layers' projections ({} of them \
-         dense) wrapped in {:?}",
-        experts.layers(),
-        projections.layers(),
-        projections.dense_layers(),
-        started.elapsed()
+        "the head, {} MoE layers' banks and {} layers' projections ({} of them dense) wrapped in \
+         {:?}",
+        run.expert_layers, run.projection_layers, run.dense_layers, run.wrapped
     );
     assert_eq!(
-        experts.layers(),
-        config.num_hidden_layers - banks[0].layer,
+        run.expert_layers,
+        config.num_hidden_layers - run.first_routed,
         "every layer past the dense ones has banks here"
     );
     assert_eq!(
-        projections.layers(),
-        config.num_hidden_layers,
+        run.projection_layers, config.num_hidden_layers,
         "every layer has its projections here"
     );
     assert_eq!(
-        projections.dense_layers() + experts.layers(),
+        run.dense_layers + run.expert_layers,
         config.num_hidden_layers,
         "a layer has a feed-forward network or banks, never both and never neither"
     );
 
-    // Read before the handover moves it, because what a decode step submits is
-    // decided by how many layers are dense and how many route.
-    let dense_layers = projections.dense_layers();
-
-    // Once, before the loop rather than inside it — though "once" is now 6 ms
-    // for 137 GB, so what that used to be defending against is gone.
-    let weights = weights
-        .with_head(Box::new(head))
-        .with_experts(Box::new(experts))
-        .with_projections(Box::new(projections));
-    let generator = weights.generator();
-
-    let mut steps: Vec<Duration> = Vec::new();
-    // What each step submitted, as the running totals it was reached at. A
-    // decode step's dispatch count is what the model's shape decides and its
-    // submission count is what the batching decides, and the two are the whole
-    // of the granularity question.
-    let mut submitted: Vec<(u64, u64)> = Vec::new();
-    let mut got = Vec::new();
-    let mut step = Instant::now();
-    let mut peak = fixture::resident_bytes();
-    generator.stream(
-        &mut ModelCache::new(&config),
-        &ids,
-        Ending {
-            budget: GENERATED,
-            eos: None,
-        },
-        &weights,
-        |id| {
-            steps.push(step.elapsed());
-            submitted.push((device.dispatches(), device.submissions()));
-            peak = peak.max(fixture::resident_bytes());
-            got.push(id);
-            step = Instant::now();
-            ControlFlow::Continue(())
-        },
-    );
-
-    // The prompt's prefill is the first step and every later one is a single
-    // decode; a mean over the two describes neither.
-    let (prefill, decode) = steps.split_first().expect("a step per token");
-    let each = decode.iter().sum::<Duration>() / decode.len() as u32;
-    let (dispatches, submissions) = per_decode_step(&submitted);
+    let (dispatches, submissions) = run.per_decode_step();
     eprintln!(
-        "{} tokens prefilled in {prefill:.2?}, {} decoded at {each:.2?}/token, peak RSS {:.2} GiB\
+        "{} tokens prefilled in {:.2?}, {} decoded at {:.2?}/token, peak RSS {:.2} GiB\
          \n  {dispatches} dispatches a decode step in {submissions} submissions, which at 206 µs \
          a submission is {:.1?} of round trip\
-         \n  got  {got:?}\n  want {want:?}",
-        ids.len(),
-        decode.len(),
-        peak as f64 / (1u64 << 30) as f64,
+         \n  got  {:?}\n  want {want:?}",
+        run.prompt,
+        run.steps[0],
+        run.decode_steps(),
+        run.each_decode_step(),
+        run.peak as f64 / (1u64 << 30) as f64,
         Duration::from_micros(206) * submissions as u32,
+        run.got,
     );
     assert_eq!(
         (dispatches, submissions),
-        per_step(config.num_hidden_layers as u64, dense_layers as u64),
+        per_step(config.num_hidden_layers as u64, run.dense_layers as u64),
         "a decode step's dispatches, and the command buffers they went in"
     );
 
-    let agreed = got.iter().zip(want).take_while(|(a, b)| a == b).count();
-    assert_eq!(got, want, "{agreed} of {GENERATED} tokens agree");
+    let agreed = run.got.iter().zip(want).take_while(|(a, b)| a == b).count();
+    assert_eq!(run.got, want, "{agreed} of {GENERATED} tokens agree");
     assert!(
-        peak < RESIDENT_BOUND,
-        "peak RSS {peak} bytes is over the bound of {RESIDENT_BOUND}"
+        run.peak < RESIDENT_BOUND,
+        "peak RSS {} bytes is over the bound of {RESIDENT_BOUND}",
+        run.peak
+    );
+}
+
+/// Where a decode step's time actually goes, as a table.
+///
+/// **This is the measurement the next several commits are ordered by**, and
+/// what makes it worth a case of its own is that every prediction this project
+/// has made about its own cost has been wrong: `lm_head` was 7.6% of a step
+/// rather than the 54% its parameter count implied, and the bandwidth model
+/// that said a packed matmul would be memory-bound died against a kernel
+/// running at 4% of the bandwidth.
+///
+/// Three numbers frame the rows. **The wall time** of a decode step is what
+/// there is to divide up. **The rows** are self time — see
+/// [`inkling_core::profile`] — so they sum to what is accounted for and the
+/// remainder is what nothing here has a scope around. And **the GPU's own
+/// clock** sits inside `submit and wait` rather than beside it: the device
+/// timestamps each command buffer, so the difference between that figure and
+/// the row it is inside is the part of every round trip that was not the GPU
+/// executing.
+///
+/// Nothing asserts a share. What is asserted is that the accounting adds up —
+/// the rows cannot exceed the wall time they were measured inside, and what
+/// they leave over stays small enough for the table to be a description of the
+/// step rather than of a fraction of it.
+#[test]
+fn where_a_decode_step_spends_its_time() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    let run = OnTheDevice::generate(&dir, &device);
+    let step = run.each_decode_step();
+    let (dispatches, submissions) = run.per_decode_step();
+    let accounted = run.profile.total();
+
+    let share = |part: Duration| 100.0 * part.as_secs_f64() / step.as_secs_f64();
+    let mut table = vec![format!(
+        "a {step:.2?} decode step, {dispatches} dispatches in {submissions} submissions\n  \
+         {:<18}{:>7}{:>12}{:>8}",
+        "operation", "calls", "self time", "share"
+    )];
+    for (op, calls, elapsed) in run.profile.rows() {
+        table.push(format!(
+            "  {:<18}{calls:>7}{:>12}{:>7.1}%",
+            op.name(),
+            format!("{elapsed:.2?}"),
+            share(elapsed)
+        ));
+    }
+    table.push(format!(
+        "  {:<18}{:>7}{:>12}{:>7.1}%",
+        "unaccounted",
+        "",
+        format!("{:.2?}", step.saturating_sub(accounted)),
+        share(step.saturating_sub(accounted))
+    ));
+    table.push(format!(
+        "  of which the device reported executing for {:.2?} ({:.1}% of the step, {:.1}% of the \
+         submissions)",
+        run.profile.gpu(),
+        share(run.profile.gpu()),
+        100.0 * run.profile.gpu().as_secs_f64()
+            / run.profile.elapsed(Op::Submit).as_secs_f64().max(f64::MIN),
+    ));
+    eprintln!("{}", table.join("\n"));
+
+    assert!(
+        accounted <= step,
+        "the rows sum to {accounted:.2?} inside a {step:.2?} step"
+    );
+    assert!(
+        run.profile.gpu() < run.profile.elapsed(Op::Submit),
+        "the device reported executing for longer than the wait around it"
+    );
+    // A table that named a third of the step would be describing something
+    // else. The bound is loose because what it guards is that the scopes are
+    // still where the ops are, not the share any of them holds.
+    assert!(
+        accounted > step / 2,
+        "only {accounted:.2?} of a {step:.2?} step is accounted for"
     );
 }
 
