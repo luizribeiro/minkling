@@ -34,7 +34,7 @@
 use std::borrow::Cow;
 
 use crate::attention::{Attention, AttentionCache, AttentionConfig, AttentionWeights};
-use crate::moe::{Gathered, SparseMoe};
+use crate::moe::{BankRows, Gathered, Rows, SparseMoe};
 use crate::ops::{DenseMlp, rms_norm};
 use crate::profile::{self, Op};
 use crate::sconv::{ConvState, ShortConv};
@@ -56,24 +56,40 @@ pub trait Experts {
     /// The always-on shared bank, over every token, once per shared expert.
     fn shared(&self, gathered: Gathered<'_>) -> Vec<f32>;
 
-    /// The same shared bank, and — where this backend holds the router's gate —
-    /// the `[tokens, n_routed + n_shared]` logits for `x` beside it.
+    /// Both banks and, where this backend holds the router's gate, the
+    /// `[tokens, n_routed + n_shared]` logits for `x` that route the first of
+    /// them — the whole layer in one call.
     ///
-    /// **One call because a backend that dispatches both can put them in one
-    /// command buffer.** The gate's output decides what weight each of these
-    /// rows is scaled by and not which rows there are, so the bank does not
-    /// wait for it — see [`SparseMoe::forward`]. Forty gates submitted on their
-    /// own would be 8 ms of round trip on a step whose whole gate term is 28.
+    /// **One call because what is adjacent inside a layer is what a backend can
+    /// merge, and only a backend handed the layer can see what is adjacent.**
+    /// [`SparseMoe::forward`] states the two orderings that decide it: the
+    /// shared bank does not wait for the gate, and the routing that names the
+    /// routed bank's rows is computed from logits the gate hands over before
+    /// either bank has finished. On this machine a submission is 206
+    /// microseconds around work that is already done, and a MoE layer is 4 of
+    /// them out of a step's 249.
     ///
-    /// The default holds no gate and answers `None`, which leaves the layer's
-    /// own weight to be multiplied where it always was.
-    fn gated_shared(&self, x: &[f32], gathered: Gathered<'_>) -> (Option<Vec<f32>>, Vec<f32>) {
+    /// The default holds no gate and runs the two banks in the order the layer
+    /// names them, which is what a backend that decodes an expert at a time
+    /// wants and what leaves the layer's own weight to be multiplied where it
+    /// always was.
+    fn banks(
+        &self,
+        x: &[f32],
+        shared: Gathered<'_>,
+        route: &mut dyn FnMut(Option<&[f32]>) -> Rows,
+    ) -> BankRows {
         let _ = x;
-        (None, self.shared(gathered))
+        let shared = self.shared(shared);
+        let routed = route(None);
+        BankRows {
+            routed: self.routed(routed.gathered()),
+            shared,
+        }
     }
 
-    /// Whether this holds the layer's gate, which is what
-    /// [`Experts::gated_shared`] will answer with.
+    /// Whether this holds the layer's gate, which is what [`Experts::banks`]
+    /// will answer with.
     ///
     /// Asked *before* the layer is stood up rather than inferred from that
     /// answer, because the weight has to be widened to be multiplied here and
@@ -123,11 +139,7 @@ impl LayerMlp<'_> {
         match self {
             Self::Dense(mlp) => mlp.forward(x),
             Self::Sparse(moe) => moe
-                .forward(
-                    x,
-                    |gathered| experts.routed(gathered),
-                    |x, gathered| experts.gated_shared(x, gathered),
-                )
+                .forward(x, |x, shared, route| experts.banks(x, shared, route))
                 .total(),
         }
     }

@@ -579,7 +579,7 @@ pub struct LayerBanks<'a> {
     /// what it produces weights what the shared bank produces, and does not
     /// decide what the shared bank runs, so a backend holding both can multiply
     /// them in one command buffer. See
-    /// [`Experts::gated_shared`](crate::layer::Experts::gated_shared).
+    /// [`Experts::banks`].
     pub gate_weight: Bf16<'a>,
 }
 

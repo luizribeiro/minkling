@@ -45,7 +45,7 @@
 //! buffers it would avoid touching are shared storage the CPU addresses anyway.
 
 use inkling_core::layer::Experts;
-use inkling_core::moe::Gathered;
+use inkling_core::moe::{BankRows, Gathered, Rows};
 use inkling_core::ops::swiglu;
 use inkling_core::weights::{ExpertBackend, LayerBanks, PackedExperts};
 
@@ -168,42 +168,63 @@ impl<'a> ExpertBanks<'a> {
     /// `x @ gate^T` and `x @ up^T` read the same rows and nothing of each other,
     /// so they are submitted together, and `silu(gate) * up` through `down`
     /// follows because it is what they produced.
-    pub fn forward(&self, gathered: Gathered<'_>) -> Result<Vec<f32>, MatmulError> {
-        let (out, []) = self.forward_beside(gathered, |_| Ok([]))?;
-        Ok(out)
-    }
-
-    /// The same three dispatches, with `beside` encoded into the first of the
-    /// two command buffers they take.
     ///
-    /// **A dispatch that reads what these rows were gathered from costs no
-    /// submission at all.** The first command buffer here is opened for `gate`
-    /// and `up`, which read the hidden state and nothing this bank produces —
-    /// so anything else with the same input can be put in beside them, and the
-    /// router's gate is exactly that: 206 microseconds a submission is what
-    /// forty of them would otherwise cost a step.
-    pub fn forward_beside<const N: usize>(
-        &self,
-        gathered: Gathered<'_>,
-        beside: impl FnOnce(&mut Batch<'_>) -> Result<[Pending; N], MatmulError>,
-    ) -> Result<(Vec<f32>, [Vec<f32>; N]), MatmulError> {
+    /// One bank on its own, which is what a caller with a single bank in hand
+    /// wants — and what [`LayerExperts`] measures its own schedule against,
+    /// since a layer that runs both banks answers what running each of them
+    /// answers.
+    pub fn forward(&self, gathered: Gathered<'_>) -> Result<Vec<f32>, MatmulError> {
         let chosen = chosen(gathered);
-
-        let mut batch = self.gate_proj.device().batch()?;
-        let alongside = beside(&mut batch)?;
-        let gate = self
-            .gate_proj
-            .encode(&mut batch, &chosen, gathered.rows())?;
-        let up = self.up_proj.encode(&mut batch, &chosen, gathered.rows())?;
+        let mut batch = self.device().batch()?;
+        let glu = self.encode_glu(&mut batch, &chosen, gathered.rows())?;
         batch.wait()?;
 
-        let (mut gate, up) = (gate.take(), up.take());
-        swiglu(&mut gate, &up);
-        Ok((
-            self.down_proj.multiply(&chosen, &gate)?,
-            alongside.map(Pending::take),
-        ))
+        let mut batch = self.device().batch()?;
+        let out = self.encode_down(&mut batch, &chosen, &activated(glu))?;
+        batch.wait()?;
+        Ok(out.take())
     }
+
+    pub fn device(&self) -> &'a Device {
+        self.gate_proj.device()
+    }
+
+    /// The two dispatches that read the gathered rows, encoded into `batch`.
+    ///
+    /// **A dispatch that reads what these rows were gathered from costs no
+    /// submission at all.** `gate` and `up` read the hidden state and nothing
+    /// this bank produces, so anything else with the same input can be encoded
+    /// beside them — the router's gate is exactly that, and 206 microseconds a
+    /// submission is what forty of them would otherwise cost a step.
+    pub fn encode_glu(
+        &self,
+        batch: &mut Batch<'_>,
+        chosen: &[u32],
+        rows: &[f32],
+    ) -> Result<[Pending; 2], MatmulError> {
+        Ok([
+            self.gate_proj.encode(batch, chosen, rows)?,
+            self.up_proj.encode(batch, chosen, rows)?,
+        ])
+    }
+
+    /// The third dispatch, over what the SwiGLU between them produced.
+    pub fn encode_down(
+        &self,
+        batch: &mut Batch<'_>,
+        chosen: &[u32],
+        activated: &[f32],
+    ) -> Result<Pending, MatmulError> {
+        self.down_proj.encode(batch, chosen, activated)
+    }
+}
+
+/// `silu(gate) * up`, which is what the pair [`ExpertBanks::encode_glu`]
+/// dispatched becomes before `down` reads it.
+fn activated([gate, up]: [Pending; 2]) -> Vec<f32> {
+    let (mut gate, up) = (gate.take(), up.take());
+    swiglu(&mut gate, &up);
+    gate
 }
 
 /// The expert each row goes through, as the kernel indexes them.
@@ -239,6 +260,37 @@ pub struct LayerExperts<'a> {
 }
 
 impl<'a> LayerExperts<'a> {
+    /// [`Experts::banks`]'s command buffers, with the errors a dispatch can
+    /// fail with still in hand.
+    fn encode(
+        &self,
+        x: &[f32],
+        shared: Gathered<'_>,
+        route: &mut dyn FnMut(Option<&[f32]>) -> Rows,
+    ) -> Result<BankRows, MatmulError> {
+        let shared_chosen = chosen(shared);
+
+        let mut batch = self.shared.device().batch()?;
+        let logits = self.gate.encode(&mut batch, x)?;
+        let shared_glu = self
+            .shared
+            .encode_glu(&mut batch, &shared_chosen, shared.rows())?;
+        batch.wait()?;
+
+        let shared_activated = activated(shared_glu);
+        let mut batch = self.shared.device().batch()?;
+        let shared_out = self
+            .shared
+            .encode_down(&mut batch, &shared_chosen, &shared_activated)?;
+        batch.wait()?;
+
+        let routed_rows = route(Some(&logits.take()));
+        Ok(BankRows {
+            routed: self.routed.forward(routed_rows.gathered())?,
+            shared: shared_out.take(),
+        })
+    }
+
     pub fn wrap(
         device: &'a Device,
         matmul: &'a PackedMatmul,
@@ -270,20 +322,22 @@ impl Experts for LayerExperts<'_> {
         through(&self.shared, gathered)
     }
 
-    /// The shared bank and the router's gate, in the command buffer the bank
-    /// was going to open anyway.
+    /// The whole layer — the gate, both banks, and the SwiGLU between each
+    /// bank's halves — in the four command buffers the two banks take.
     ///
-    /// **The submission count does not move.** A MoE layer is seven dispatches
-    /// where it was six, in the same four command buffers, because the gate was
-    /// encoded into one its consumers were already going to be submitted in —
-    /// which is the pattern the layer's own norm established and the reason
-    /// this method exists at all rather than a `gate` on its own.
-    fn gated_shared(&self, x: &[f32], gathered: Gathered<'_>) -> (Option<Vec<f32>>, Vec<f32>) {
-        let (out, [logits]) = self
-            .shared
-            .forward_beside(gathered, |batch| Ok([self.gate.encode(batch, x)?]))
-            .unwrap_or_else(|err| panic!("the shared bank and the gate did not run: {err}"));
-        (Some(logits), out)
+    /// **The submission count does not move.** Seven dispatches in four, the
+    /// same as the two banks asked for separately: the gate is encoded into the
+    /// buffer the shared bank's `gate` and `up` open, which is where it already
+    /// was. What changes is that this side can now see the whole layer at once,
+    /// and so can see where the routing sits in it.
+    fn banks(
+        &self,
+        x: &[f32],
+        shared: Gathered<'_>,
+        route: &mut dyn FnMut(Option<&[f32]>) -> Rows,
+    ) -> BankRows {
+        self.encode(x, shared, route)
+            .unwrap_or_else(|err| panic!("the layer's experts did not run: {err}"))
     }
 
     /// Yes, which is what keeps 4.2 MB of float32 a layer from being widened on
@@ -568,18 +622,21 @@ mod tests {
         assert_eq!(GROUP_SIZE, 32, "the case's widths are whole groups");
     }
 
-    /// The gate and the shared bank asked for together are the same two answers
-    /// as the gate and the shared bank asked for apart — **and one fewer
-    /// submission than that would take.**
+    /// The whole layer asked for at once is the same three answers as the gate,
+    /// the shared bank and the routed bank asked for apart — **in the same seven
+    /// dispatches and one fewer submission.**
     ///
-    /// Both halves are the commit. That the answers agree says the batching
-    /// changed no arithmetic; that the submission count does not move is the
-    /// whole reason for batching at all, and it is the half a test of the values
-    /// alone would let slip. A gate submitted on its own would be forty round
-    /// trips a decode step, which at 206 microseconds each is 8 ms of the 28 the
-    /// gate costs on the CPU.
+    /// Both halves are the commit. That the answers agree says the seam changed
+    /// no arithmetic; that the dispatch count does not move while the submission
+    /// count does is the whole reason for the seam at all, and it is the half a
+    /// test of the values alone would let slip.
+    ///
+    /// The saved round trip is the gate's: it reads the same hidden state the
+    /// shared bank's `gate` and `up` do, so it rides in the buffer they open. A
+    /// gate submitted on its own would be forty round trips a decode step, which
+    /// at 206 microseconds each is 8 ms of the 28 the gate costs on the CPU.
     #[test]
-    fn the_gate_and_the_shared_bank_cost_what_the_shared_bank_alone_costs() {
+    fn the_whole_layer_costs_one_fewer_submission_than_its_three_parts_apart() {
         let Some(device) = device() else { return };
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
         let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
@@ -594,32 +651,37 @@ mod tests {
             gate: gate(&device, &dense, 0x5eed_6666),
         };
 
-        // Two tokens through both shared experts, which is the shape
-        // `SparseMoe::forward` hands over: every token, once per shared expert.
-        let chosen = [0usize, 0, 1, 1];
-        let x = rows(chosen.len());
-        let gathered = Gathered::new(DIM, &chosen, &x);
+        // Two tokens, and the shape `SparseMoe::forward` hands each bank: every
+        // token once per shared expert, and one row per routed assignment,
+        // expert-ascending.
+        let x = rows(2);
+        let shared_chosen = [0usize, 0, 1, 1];
+        let shared_x = rows(shared_chosen.len());
+        let shared = Gathered::new(DIM, &shared_chosen, &shared_x);
+        let routed_chosen = [0usize, 1, 2];
+        let routed_x = rows(routed_chosen.len());
 
-        let ((logits, out), together) = spent(&device, || layer.gated_shared(&x[..DIM], gathered));
-        let (alone, apart) = spent(&device, || layer.shared(gathered));
+        let mut asked = None;
+        let (got, together) = spent(&device, || {
+            layer.banks(&x, shared, &mut |logits| {
+                asked = Some(logits.expect("the backend holds the gate").to_vec());
+                Rows::new(DIM, routed_chosen.to_vec(), routed_x.clone())
+            })
+        });
 
-        assert_eq!(out, alone, "the shared bank's rows");
-        assert_eq!(
-            logits.expect("the backend holds the gate"),
-            layer
-                .gate
-                .multiply(&x[..DIM])
-                .expect("the dispatch completes"),
-            "the gate's logits"
-        );
+        let ((logits, apart_rows), apart) = spent(&device, || {
+            let logits = layer.gate.multiply(&x).expect("the dispatch completes");
+            let shared = layer.shared(shared);
+            let routed = layer.routed(Gathered::new(DIM, &routed_chosen, &routed_x));
+            (logits, BankRows { routed, shared })
+        });
 
-        assert_eq!(
-            together.1,
-            apart.1,
-            "the gate cost {} submissions of its own",
-            together.1 - apart.1
-        );
-        assert_eq!(together.0, apart.0 + 1, "the gate is a dispatch");
+        assert_eq!(got, apart_rows, "both banks' rows");
+        assert_eq!(asked.expect("the layer was routed"), logits, "the logits");
+
+        assert_eq!(together.0, apart.0, "the same dispatches");
+        assert_eq!(together, (7, 4), "the layer's own cost");
+        assert_eq!(apart, (7, 5), "what the three parts cost apart");
     }
 
     /// Which layer's banks answer for which layer, which is the one thing a

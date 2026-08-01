@@ -80,7 +80,7 @@ pub enum Gate<'a> {
     Widened(&'a [f32]),
     /// Held by whatever runs the layer's experts, which answers with the logits
     /// beside the shared bank's rows — see
-    /// [`Experts::gated_shared`](crate::layer::Experts::gated_shared).
+    /// [`Experts::banks`](crate::layer::Experts::banks).
     ///
     /// Only the width it maps from is carried, because that is the only thing
     /// about it this side still needs: a backend reading the checkpoint's own
@@ -187,6 +187,47 @@ impl<'a> Gathered<'a> {
             Some((expert, rows))
         })
     }
+}
+
+/// The same rows, owned — which is what a [`Gathered`] borrows and what
+/// whoever built them has to hold while a bank runs them.
+///
+/// One value rather than the two vectors it holds, because the expert list and
+/// the rows are only meaningful paired: the width they were cut at is what says
+/// how many rows a flat buffer is, and losing it is how a caller ends up
+/// handing a bank someone else's shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rows {
+    dim: usize,
+    experts: Vec<usize>,
+    rows: Vec<f32>,
+}
+
+impl Rows {
+    /// `[rows, dim]` beside the expert each row goes through, checked on the
+    /// way in by building the borrowed form this promises to hand out.
+    pub fn new(dim: usize, experts: Vec<usize>, rows: Vec<f32>) -> Self {
+        Gathered::new(dim, &experts, &rows);
+        Self { dim, experts, rows }
+    }
+
+    pub fn gathered(&self) -> Gathered<'_> {
+        Gathered::new(self.dim, &self.experts, &self.rows)
+    }
+}
+
+/// What a layer's two banks answered: one row per assignment, in the order each
+/// bank's rows were handed over and before the routing has weighted any of it.
+///
+/// Named halves rather than a pair, because they are two vectors of the same
+/// type and different lengths — the shared bank has a row per token per shared
+/// expert and the routed bank a row per token per chosen expert — so exchanging
+/// them is a mistake that only the scatter downstream would notice, and only as
+/// a length.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BankRows {
+    pub routed: Vec<f32>,
+    pub shared: Vec<f32>,
 }
 
 /// The two halves `InklingSparseMoE` adds together on the way out. They are
@@ -359,40 +400,58 @@ impl<'a> SparseMoe<'a> {
     /// `[tokens, hidden]` in, the routed and shared halves of `[tokens, hidden]`
     /// out.
     ///
-    /// The experts are asked for rather than held: `routed` and `shared` are
-    /// each called once, with every row their bank has to run and the expert
-    /// each goes through, and return the `[rows, hidden]` those rows came out
-    /// as. The gathering is here so that a bank of 256 experts is asked about
-    /// only the six a token chose, and the grouping is here — see
+    /// The experts are asked for rather than held: `banks` is called once, with
+    /// every row the shared bank has to run and a way to ask what the gate's
+    /// logits route to, and answers with the `[rows, hidden]` both banks came
+    /// out as. The gathering is here so that a bank of 256 experts is asked
+    /// about only the six a token chose, and the grouping is here — see
     /// [`Gathered`] — so that a caller which decodes a 33 MB MXFP4 expert still
     /// decodes it a single time however many tokens routed to it.
     ///
-    /// **The shared bank runs before the gate has answered, and that is what
-    /// `shared` is asked two things at once for.** Which rows the shared bank
-    /// has is not the router's to say — every token goes through every shared
-    /// expert, always — so the routing decides only the weight each of those
-    /// rows is scaled by on the way back. A backend that dispatches both can
-    /// therefore put the gate's multiply in the same command buffer as the
-    /// shared bank's, which at 206 microseconds a submission is the difference
-    /// between moving the gate onto a device and paying for the privilege.
+    /// **The whole layer at once, because what is adjacent inside one is what a
+    /// backend can merge.** Two facts about the order shape everything a
+    /// backend can do with a layer. The shared bank's rows do not wait for the
+    /// gate — every token goes through every shared expert, always, so the
+    /// routing decides only the weight each row is scaled by on the way back —
+    /// which lets the gate's multiply ride in the command buffer the shared
+    /// bank already opens. And the routing that names the routed bank's rows is
+    /// computed *here*, from logits the gate handed over before either bank
+    /// finished, so the routed bank's first dispatch depends on nothing the
+    /// shared bank's last one produces. A backend handed both calls separately
+    /// cannot see that; handed the layer, it can put them in one command buffer.
     ///
-    /// It answers with `None` where it holds no gate, and then the layer's own
-    /// weight is multiplied here — which is what the CPU path does and what
-    /// every case below drives.
+    /// `route` is asked once, with the gate's logits where the backend holds
+    /// the gate and `None` where it does not — and then the layer's own weight
+    /// is multiplied here, which is what the CPU path does and what every case
+    /// below drives.
     pub fn forward(
         &self,
         x: &[f32],
-        routed: impl FnOnce(Gathered<'_>) -> Vec<f32>,
-        shared: impl FnOnce(&[f32], Gathered<'_>) -> (Option<Vec<f32>>, Vec<f32>),
+        banks: impl FnOnce(&[f32], Gathered<'_>, &mut dyn FnMut(Option<&[f32]>) -> Rows) -> BankRows,
     ) -> MoeOutput {
-        let (experts, rows) = self.shared_rows(x);
-        let (logits, answered) = shared(x, Gathered::new(self.hidden, &experts, &rows));
-        let logits = logits.unwrap_or_else(|| self.gate(x));
+        let shared_rows = self.shared_rows(x);
+        let mut routing = None;
+        let answered = banks(x, shared_rows.gathered(), &mut |logits| {
+            assert!(routing.is_none(), "the layer was routed twice");
+            let widened;
+            let logits = match logits {
+                Some(logits) => logits,
+                None => {
+                    widened = self.gate(x);
+                    &widened
+                }
+            };
+            let routed = profile::timed(Op::Router, || self.route(logits));
+            let batches = routed.routed_batches();
+            let rows = self.gather(x, &batches);
+            routing = Some((routed, batches));
+            rows
+        });
 
-        let routing = profile::timed(Op::Router, || self.route(&logits));
+        let (routing, batches) = routing.expect("the backend asked the layer what its gate routed");
         MoeOutput {
-            routed: self.combine(x, &routing.routed_batches(), routed),
-            shared: self.scatter(x.len(), &routing.shared_batches(), &answered),
+            routed: self.scatter(x.len(), &batches, &answered.routed),
+            shared: self.scatter(x.len(), &routing.shared_batches(), &answered.shared),
         }
     }
 
@@ -404,7 +463,7 @@ impl<'a> SparseMoe<'a> {
     /// [`Routing::shared_batches`], in the same order, and formed without the
     /// routing — which is the whole of what lets the gate share a command
     /// buffer with the bank its weights will scale.
-    fn shared_rows(&self, x: &[f32]) -> (Vec<usize>, Vec<f32>) {
+    fn shared_rows(&self, x: &[f32]) -> Rows {
         let _timed = profile::scope(Op::Gather);
         assert_eq!(
             x.len() % self.hidden,
@@ -421,7 +480,7 @@ impl<'a> SparseMoe<'a> {
             experts.extend(std::iter::repeat_n(expert, tokens));
             rows.extend_from_slice(x);
         }
-        (experts, rows)
+        Rows::new(self.hidden, experts, rows)
     }
 
     /// [`SparseMoe::route`], with the ways of misreading the gate named apart.
@@ -488,22 +547,9 @@ impl<'a> SparseMoe<'a> {
         routing
     }
 
-    /// Every expert's contribution to the tokens that routed to it, summed into
-    /// `[tokens, hidden]`.
-    fn combine(
-        &self,
-        x: &[f32],
-        batches: &[ExpertBatch],
-        apply: impl FnOnce(Gathered<'_>) -> Vec<f32>,
-    ) -> Vec<f32> {
-        let (experts, rows) = self.gather(x, batches);
-        let got = apply(Gathered::new(self.hidden, &experts, &rows));
-        self.scatter(x.len(), batches, &got)
-    }
-
     /// The rows a set of batches names, gathered out of the hidden state:
     /// `[assignments, hidden]` beside the expert each row goes through.
-    fn gather(&self, x: &[f32], batches: &[ExpertBatch]) -> (Vec<usize>, Vec<f32>) {
+    fn gather(&self, x: &[f32], batches: &[ExpertBatch]) -> Rows {
         let _timed = profile::scope(Op::Gather);
         assert_eq!(
             x.len() % self.hidden,
@@ -522,7 +568,7 @@ impl<'a> SparseMoe<'a> {
                 rows.extend_from_slice(&x[token * self.hidden..][..self.hidden]);
             }
         }
-        (experts, rows)
+        Rows::new(self.hidden, experts, rows)
     }
 
     /// What a bank answered, weighted and summed back into `[tokens, hidden]`.
@@ -846,11 +892,29 @@ mod tests {
         /// The same layer with the gate answered for by whoever runs the shared
         /// bank, which is what a backend holding the gate on a device does.
         fn forward_gated(&self, logits: Option<Vec<f32>>) -> MoeOutput {
-            self.moe().forward(
-                &self.x,
-                |gathered| self.routed.gathered(gathered),
-                |_, gathered| (logits, self.shared.gathered(gathered)),
-            )
+            self.moe().forward(&self.x, |_, shared, route| {
+                let shared = self.shared.gathered(shared);
+                let routed = route(logits.as_deref());
+                BankRows {
+                    routed: self.routed.gathered(routed.gathered()),
+                    shared,
+                }
+            })
+        }
+
+        /// The same layer, with the routed bank's gathered rows shown to
+        /// `inspect` on the way past — which is where what a backend is
+        /// promised about them can be read.
+        fn forward_inspecting(&self, inspect: impl FnOnce(Gathered<'_>)) -> MoeOutput {
+            self.moe().forward(&self.x, |_, shared, route| {
+                let shared = self.shared.gathered(shared);
+                let routed = route(None);
+                inspect(routed.gathered());
+                BankRows {
+                    routed: self.routed.gathered(routed.gathered()),
+                    shared,
+                }
+            })
         }
 
         fn weight_deviation(&self, routing: &Routing) -> f32 {
@@ -915,17 +979,12 @@ mod tests {
     fn the_shared_rows_are_the_ones_the_routing_would_have_gathered() {
         for case in Case::all() {
             let moe = case.moe();
-            let (experts, rows) = moe.shared_rows(&case.x);
-            let (want_experts, want_rows) = moe.gather(&case.x, &case.routing().shared_batches());
+            let rows = moe.shared_rows(&case.x);
+            let want = moe.gather(&case.x, &case.routing().shared_batches());
 
-            assert_eq!(
-                experts, want_experts,
-                "{}: the expert of each row",
-                case.name
-            );
-            assert_eq!(rows, want_rows, "{}: the rows", case.name);
+            assert_eq!(rows, want, "{}: the shared bank's rows", case.name);
             assert!(
-                experts.len() > case.config.n_shared,
+                rows.gathered().len() > case.config.n_shared,
                 "{}: a single token would not order anything",
                 case.name
             );
@@ -979,12 +1038,46 @@ mod tests {
         );
 
         assert_eq!(moe.hidden(), case.hidden, "the width comes off the gate");
-        let got = moe.forward(
-            &case.x,
-            |gathered| case.routed.gathered(gathered),
-            |_, gathered| (Some(logits), case.shared.gathered(gathered)),
-        );
+        let got = moe.forward(&case.x, |_, shared, route| {
+            let shared = case.shared.gathered(shared);
+            let routed = route(Some(&logits));
+            BankRows {
+                routed: case.routed.gathered(routed.gathered()),
+                shared,
+            }
+        });
         assert_eq!(got, case.forward());
+    }
+
+    /// A backend that runs its banks and never asks what the gate routed, which
+    /// is the one way a layer can be handed over whole and come back
+    /// incomplete: the routed half would have to be scattered under a routing
+    /// nothing computed.
+    #[test]
+    #[should_panic(expected = "the backend asked the layer what its gate routed")]
+    fn a_backend_that_never_routes_is_refused() {
+        let case = Case::load("main");
+        case.moe().forward(&case.x, |_, shared, _| BankRows {
+            routed: Vec::new(),
+            shared: case.shared.gathered(shared),
+        });
+    }
+
+    /// And a backend that asks twice, which is the same layer routed under two
+    /// answers — the second of them arriving after the rows the first named
+    /// have already been handed out.
+    #[test]
+    #[should_panic(expected = "the layer was routed twice")]
+    fn a_backend_that_routes_twice_is_refused() {
+        let case = Case::load("main");
+        case.moe().forward(&case.x, |_, shared, route| {
+            let shared = case.shared.gathered(shared);
+            route(None);
+            BankRows {
+                routed: case.routed.gathered(route(None).gathered()),
+                shared,
+            }
+        });
     }
 
     /// The contradiction that arm admits: a backend that says it holds the gate
@@ -1004,11 +1097,14 @@ mod tests {
                 ..case.moe().weights
             },
         )
-        .forward(
-            &case.x,
-            |gathered| case.routed.gathered(gathered),
-            |_, gathered| (None, case.shared.gathered(gathered)),
-        );
+        .forward(&case.x, |_, shared, route| {
+            let shared = case.shared.gathered(shared);
+            let routed = route(None);
+            BankRows {
+                routed: case.routed.gathered(routed.gathered()),
+                shared,
+            }
+        });
     }
 
     /// The first trap. `e_score_correction_bias` ranks the experts and then
@@ -1198,17 +1294,12 @@ mod tests {
         let case = Case::load("main");
         let (mut asked, mut rows) = (Vec::new(), 0);
 
-        let out = case.moe().forward(
-            &case.x,
-            |gathered| {
-                for (expert, batch) in gathered.batches() {
-                    asked.push(expert);
-                    rows += batch.len() / case.hidden;
-                }
-                case.routed.gathered(gathered)
-            },
-            |_, gathered| (None, case.shared.gathered(gathered)),
-        );
+        let out = case.forward_inspecting(|gathered| {
+            for (expert, batch) in gathered.batches() {
+                asked.push(expert);
+                rows += batch.len() / case.hidden;
+            }
+        });
 
         let mut distinct = case.topk_idx.clone();
         distinct.sort_unstable();
@@ -1229,28 +1320,21 @@ mod tests {
     fn the_gathered_rows_are_the_runs_laid_end_to_end() {
         let case = Case::load("main");
         let mut seen = None;
-        case.moe().forward(
-            &case.x,
-            |gathered| {
-                let runs: Vec<usize> = gathered
-                    .batches()
-                    .flat_map(|(expert, rows)| {
-                        std::iter::repeat_n(expert, rows.len() / gathered.dim())
-                    })
-                    .collect();
-                assert_eq!(runs, gathered.experts(), "the runs against the flat list");
+        case.forward_inspecting(|gathered| {
+            let runs: Vec<usize> = gathered
+                .batches()
+                .flat_map(|(expert, rows)| std::iter::repeat_n(expert, rows.len() / gathered.dim()))
+                .collect();
+            assert_eq!(runs, gathered.experts(), "the runs against the flat list");
 
-                let concatenated: Vec<f32> = gathered
-                    .batches()
-                    .flat_map(|(_, rows)| rows.iter().copied())
-                    .collect();
-                assert_eq!(concatenated, gathered.rows(), "the runs against the rows");
+            let concatenated: Vec<f32> = gathered
+                .batches()
+                .flat_map(|(_, rows)| rows.iter().copied())
+                .collect();
+            assert_eq!(concatenated, gathered.rows(), "the runs against the rows");
 
-                seen = Some(gathered.len());
-                case.routed.gathered(gathered)
-            },
-            |_, gathered| (None, case.shared.gathered(gathered)),
-        );
+            seen = Some(gathered.len());
+        });
 
         assert_eq!(seen, Some(case.topk_idx.len()), "one row per assignment");
     }

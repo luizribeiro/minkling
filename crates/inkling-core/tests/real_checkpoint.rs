@@ -20,7 +20,7 @@ use inkling_core::layer::{
     DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts,
 };
 use inkling_core::model::{ModelCache, ModelWeights};
-use inkling_core::moe::{Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
+use inkling_core::moe::{BankRows, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
 use inkling_core::ops::{DenseMlp, DenseProjection, top_k};
 use inkling_core::quant::{Scratch, dequantize};
 use inkling_core::tokenizer::{Tokenizer, TokenizerError};
@@ -374,11 +374,10 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
 
     let routed = packed_experts(&ckpt, layer, "switch_mlp");
     let shared = packed_experts(&ckpt, layer, "shared_experts");
-    let got = moe.forward(
-        &x,
-        |gathered| through_bank(&routed, gathered),
-        |_, gathered| (None, through_bank(&shared, gathered)),
-    );
+    let got = moe.forward(&x, |_, gathered, route| BankRows {
+        shared: through_bank(&shared, gathered),
+        routed: through_bank(&routed, route(None).gathered()),
+    });
 
     let mut worst = 0.0f32;
     for (what, got, want) in [
@@ -402,11 +401,10 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     // that paired `shared_gammas[0]` with the second of them would still add
     // two always-on experts to every token. Cheap to state here because the
     // shared bank is two experts rather than the routed bank's 256.
-    let exchanged = moe.forward(
-        &x,
-        |gathered| vec![0.0; gathered.rows().len()],
-        |_, gathered| (None, through_bank_reversed(&shared, gathered)),
-    );
+    let exchanged = moe.forward(&x, |_, gathered, route| BankRows {
+        shared: through_bank_reversed(&shared, gathered),
+        routed: vec![0.0; route(None).gathered().rows().len()],
+    });
     let deviation = deviation(&exchanged.shared, &recorded("shared_out"));
     assert!(
         deviation > MOE_TOLERANCE,
