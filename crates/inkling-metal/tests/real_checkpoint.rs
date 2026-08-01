@@ -417,8 +417,9 @@ const GENERATED: usize = 8;
 /// not join *this process's* resident set the way a `dequantize_blocks_into` of
 /// the same bytes does — so each handover has taken the peak down rather than
 /// up. Measured over the same eight-token generation: 20.77 GiB with only the
-/// head on the device, 2.44 GiB with the experts there too, and 0.19 GiB now
-/// that the layers' own projections and input layernorms are.
+/// head on the device, 2.44 GiB with the experts there too, 0.19 GiB once the
+/// layers' own projections and input layernorms were, and 0.12 GiB now that the
+/// routers' gates are.
 ///
 /// **32 GiB was slack and 1 GiB is a claim.** What is left resident is what the
 /// CPU still reads: the embedding rows a prompt asked for, and every layer's
@@ -427,12 +428,17 @@ const GENERATED: usize = 8;
 /// mapped them. The 981 MB layer scratch is still allocated and is never
 /// written, so it never faults in either.
 ///
-/// Holding those widened is where the bound has to be re-derived rather than
-/// waved at: 0.13 GiB became 0.30, and the 179 MB between them is arithmetic
-/// rather than a measurement. Forty routers' `[258, 4096]` gates are 169 MB of
-/// float32 — 95% of it — and the norms, convolution kernels and
-/// relative-position projections of forty-two layers are the other 9.8 MB. A
-/// factor of three is what is left in hand.
+/// Holding those widened is where the bound had to be re-derived rather than
+/// waved at, and where the derivation then paid for itself. Widening every
+/// layer's bfloat16 tensors at load took the peak from 0.13 GiB to 0.30, and
+/// the 179 MB between them was arithmetic rather than a measurement: forty
+/// routers' `[258, 4096]` gates are 169 MB of float32 — 95% of it — and the
+/// norms, convolution kernels and relative-position projections of forty-two
+/// layers are the other 9.8 MB.
+///
+/// The gates then went to the device as the bfloat16 they are, so on this path
+/// nothing widens them at all and the peak is 0.12 GiB — under where it started.
+/// What that says about the other 9.8 MB is that it was never the term.
 ///
 /// A bound this tight is a regression test with a name: a path that went back
 /// to decoding a layer's projections into that scratch lands at 2.44 GiB and
@@ -452,20 +458,22 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// that pays for it doubled underneath.
 ///
 /// Per layer: the input layernorm and the four projections that consume what it
-/// produced in one submission, then `o_proj` in a second — and per MoE layer six
-/// expert dispatches in four, being each bank's gate and up together and then
-/// its down. A dense layer's feed-forward network is three in two. The head is
-/// one of each.
+/// produced in one submission, then `o_proj` in a second — and per MoE layer
+/// seven expert dispatches in four, being the shared bank's gate and up
+/// *together with the router's own gate*, then its down, then the routed bank's
+/// two and its down. A dense layer's feed-forward network is three in two. The
+/// head is one of each.
 ///
-/// **The norm is the term that says what moving an op onto the device costs
-/// here.** It is a dispatch a layer did not make before and a submission it did
-/// not need: it was encoded into the command buffer its four consumers were
-/// already going to be submitted in, which is the whole of why the second figure
-/// does not move.
+/// **The norm and the router's gate are the terms that say what moving an op
+/// onto the device costs here.** Each is a dispatch a layer did not make before
+/// and a submission it did not need: both were encoded into a command buffer
+/// their consumers were already going to be submitted in, which is the whole of
+/// why the second figure does not move. Forty gates submitted on their own
+/// would be 8 ms of round trip a step.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
     (
-        6 * layers + 3 * dense + 6 * moe + 1,
+        6 * layers + 3 * dense + 7 * moe + 1,
         2 * layers + 2 * dense + 4 * moe + 1,
     )
 }
@@ -502,6 +510,7 @@ struct OnTheDevice {
 impl OnTheDevice {
     fn generate(dir: &Path, device: &Device) -> Self {
         let matmul = PackedMatmul::new(device).expect("the packed matmul compiles");
+        let dense = DenseMatmul::new(device).expect("the dense matmul compiles");
         let config = fixture::config(dir).text_config;
         let ckpt = Checkpoint::open(dir).expect("checkpoint opens");
         let ids = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
@@ -520,6 +529,7 @@ impl OnTheDevice {
         let experts = ModelExperts::wrap(
             device,
             &matmul,
+            &dense,
             &banks,
             config.num_hidden_layers,
             config.hidden_size,

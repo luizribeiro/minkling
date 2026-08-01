@@ -563,8 +563,8 @@ pub trait ExpertBackend {
     fn layer(&self, layer: usize) -> Option<&dyn Experts>;
 }
 
-/// One MoE layer's two banks, still packed, from
-/// [`CheckpointWeights::expert_banks`].
+/// One MoE layer's two banks and its router's gate, still as the checkpoint
+/// stores them, from [`CheckpointWeights::expert_banks`].
 #[derive(Debug, Clone, Copy)]
 pub struct LayerBanks<'a> {
     pub layer: usize,
@@ -572,6 +572,15 @@ pub struct LayerBanks<'a> {
     pub routed: PackedExperts<'a>,
     /// The two every token reads.
     pub shared: PackedExperts<'a>,
+    /// The `[n_routed + n_shared, hidden]` gate that chooses between them,
+    /// bfloat16 rather than packed.
+    ///
+    /// Handed over with the banks because of what it can be dispatched beside:
+    /// what it produces weights what the shared bank produces, and does not
+    /// decide what the shared bank runs, so a backend holding both can multiply
+    /// them in one command buffer. See
+    /// [`Experts::gated_shared`](crate::layer::Experts::gated_shared).
+    pub gate_weight: Bf16<'a>,
 }
 
 /// One layer's own projections, still packed, from
@@ -701,6 +710,7 @@ impl<'a> CheckpointWeights<'a> {
                     layer,
                     routed,
                     shared,
+                    gate_weight: self.layers[layer].router(layer).gate,
                 }
             })
             .collect()

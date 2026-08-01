@@ -33,23 +33,24 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
 use inkling_metal::{
-    Device, ModelExperts, ModelProjections, PackedMatmul, PackedProjection, RmsNorm,
+    DenseMatmul, Device, ModelExperts, ModelProjections, PackedMatmul, PackedProjection, RmsNorm,
 };
 
 use crate::LABEL;
 use crate::args::Backend;
 
-/// What a Metal-backed run holds for its whole life: the device, and the two
+/// What a Metal-backed run holds for its whole life: the device, and the three
 /// compiled kernels everything on it shares.
 ///
-/// None of the three is about a weight. Neither kernel's source names a shape,
-/// so one of each serves the whole model — and all three are opened before the
+/// None of them is about a weight. No kernel's source names a shape, so one of
+/// each serves the whole model — and all of them are opened before the
 /// checkpoint, so that a machine this cannot run on says so in a millisecond
 /// rather than after mapping 130 GiB.
 #[derive(Debug)]
 pub struct Gpu {
     device: Device,
     matmul: PackedMatmul,
+    dense: DenseMatmul,
     norm: RmsNorm,
 }
 
@@ -57,10 +58,12 @@ impl Gpu {
     fn open() -> Result<Self> {
         let device = Device::open().context("opening a Metal device")?;
         let matmul = PackedMatmul::new(&device).context("compiling the packed matmul")?;
+        let dense = DenseMatmul::new(&device).context("compiling the dense matmul")?;
         let norm = RmsNorm::new(&device).context("compiling the RMSNorm")?;
         Ok(Self {
             device,
             matmul,
+            dense,
             norm,
         })
     }
@@ -107,6 +110,7 @@ pub fn weights<'a>(
     let experts = ModelExperts::wrap(
         &gpu.device,
         &gpu.matmul,
+        &gpu.dense,
         &banks,
         config.num_hidden_layers,
         config.hidden_size,

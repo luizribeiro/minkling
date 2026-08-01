@@ -49,8 +49,10 @@ use inkling_core::moe::Gathered;
 use inkling_core::ops::swiglu;
 use inkling_core::weights::{ExpertBackend, LayerBanks, PackedExperts};
 
+use crate::dense::{DenseMatmul, DenseWeight};
 use crate::device::Device;
-use crate::matmul::{MatmulError, PackedBank, PackedMatmul, together};
+use crate::kernel::Batch;
+use crate::matmul::{MatmulError, PackedBank, PackedMatmul, Pending};
 
 /// One `SwitchGLU`'s three banks on the device: `[experts, hidden_dim, dim]`
 /// gate and up projections beside `[experts, dim, hidden_dim]` down projections.
@@ -167,48 +169,87 @@ impl<'a> ExpertBanks<'a> {
     /// so they are submitted together, and `silu(gate) * up` through `down`
     /// follows because it is what they produced.
     pub fn forward(&self, gathered: Gathered<'_>) -> Result<Vec<f32>, MatmulError> {
-        let chosen: Vec<u32> = gathered
-            .experts()
-            .iter()
-            .map(|expert| {
-                u32::try_from(*expert).unwrap_or_else(|_| panic!("expert {expert} is a wide index"))
-            })
-            .collect();
+        let (out, []) = self.forward_beside(gathered, |_| Ok([]))?;
+        Ok(out)
+    }
 
-        let [mut gate, up] = together(self.gate_proj.device(), |batch| {
-            Ok([
-                self.gate_proj.encode(batch, &chosen, gathered.rows())?,
-                self.up_proj.encode(batch, &chosen, gathered.rows())?,
-            ])
-        })?;
+    /// The same three dispatches, with `beside` encoded into the first of the
+    /// two command buffers they take.
+    ///
+    /// **A dispatch that reads what these rows were gathered from costs no
+    /// submission at all.** The first command buffer here is opened for `gate`
+    /// and `up`, which read the hidden state and nothing this bank produces —
+    /// so anything else with the same input can be put in beside them, and the
+    /// router's gate is exactly that: 206 microseconds a submission is what
+    /// forty of them would otherwise cost a step.
+    pub fn forward_beside<const N: usize>(
+        &self,
+        gathered: Gathered<'_>,
+        beside: impl FnOnce(&mut Batch<'_>) -> Result<[Pending; N], MatmulError>,
+    ) -> Result<(Vec<f32>, [Vec<f32>; N]), MatmulError> {
+        let chosen = chosen(gathered);
+
+        let mut batch = self.gate_proj.device().batch()?;
+        let alongside = beside(&mut batch)?;
+        let gate = self
+            .gate_proj
+            .encode(&mut batch, &chosen, gathered.rows())?;
+        let up = self.up_proj.encode(&mut batch, &chosen, gathered.rows())?;
+        batch.wait()?;
+
+        let (mut gate, up) = (gate.take(), up.take());
         swiglu(&mut gate, &up);
-        self.down_proj.multiply(&chosen, &gate)
+        Ok((
+            self.down_proj.multiply(&chosen, &gate)?,
+            alongside.map(Pending::take),
+        ))
     }
 }
 
-/// One MoE layer's two banks, which is what a layer reaches its experts through.
+/// The expert each row goes through, as the kernel indexes them.
+fn chosen(gathered: Gathered<'_>) -> Vec<u32> {
+    gathered
+        .experts()
+        .iter()
+        .map(|expert| {
+            u32::try_from(*expert).unwrap_or_else(|_| panic!("expert {expert} is a wide index"))
+        })
+        .collect()
+}
+
+/// One MoE layer's two banks and the router that chooses between them.
 ///
 /// The routed bank is 256 experts of which a token reads six and the shared bank
 /// is two every token reads, and nothing else separates them — the same three
 /// dispatches over the same gathered list, differing in how much of the bank the
 /// list names.
+///
+/// **The gate is here because of what it can be dispatched beside.** It is not
+/// an expert's weight at all — `[258, 4096]` of bfloat16 against 3.2 GiB of
+/// packed banks — and it belongs to the layer rather than to either of them. But
+/// its output weights what the shared bank produces without deciding what the
+/// shared bank runs, so the one place it can be encoded for free is the command
+/// buffer that bank already opens. Holding it anywhere else would mean a
+/// submission of its own: 40 a step, and 8 ms of the 28 the gate costs.
 #[derive(Debug)]
 pub struct LayerExperts<'a> {
     routed: ExpertBanks<'a>,
     shared: ExpertBanks<'a>,
+    gate: DenseWeight<'a>,
 }
 
 impl<'a> LayerExperts<'a> {
     pub fn wrap(
         device: &'a Device,
         matmul: &'a PackedMatmul,
-        routed: &PackedExperts<'a>,
-        shared: &PackedExperts<'a>,
+        dense: &'a DenseMatmul,
+        banks: &LayerBanks<'a>,
         dim: usize,
     ) -> Result<Self, MatmulError> {
         Ok(Self {
-            routed: ExpertBanks::wrap(device, matmul, routed, dim)?,
-            shared: ExpertBanks::wrap(device, matmul, shared, dim)?,
+            routed: ExpertBanks::wrap(device, matmul, &banks.routed, dim)?,
+            shared: ExpertBanks::wrap(device, matmul, &banks.shared, dim)?,
+            gate: DenseWeight::wrap(device, dense, &banks.gate_weight)?,
         })
     }
 }
@@ -227,6 +268,28 @@ impl Experts for LayerExperts<'_> {
 
     fn shared(&self, gathered: Gathered<'_>) -> Vec<f32> {
         through(&self.shared, gathered)
+    }
+
+    /// The shared bank and the router's gate, in the command buffer the bank
+    /// was going to open anyway.
+    ///
+    /// **The submission count does not move.** A MoE layer is seven dispatches
+    /// where it was six, in the same four command buffers, because the gate was
+    /// encoded into one its consumers were already going to be submitted in —
+    /// which is the pattern the layer's own norm established and the reason
+    /// this method exists at all rather than a `gate` on its own.
+    fn gated_shared(&self, x: &[f32], gathered: Gathered<'_>) -> (Option<Vec<f32>>, Vec<f32>) {
+        let (out, [logits]) = self
+            .shared
+            .forward_beside(gathered, |batch| Ok([self.gate.encode(batch, x)?]))
+            .unwrap_or_else(|err| panic!("the shared bank and the gate did not run: {err}"));
+        (Some(logits), out)
+    }
+
+    /// Yes, which is what keeps 4.2 MB of float32 a layer from being widened on
+    /// the other side of the seam for nobody to read.
+    fn gates(&self) -> bool {
+        true
     }
 }
 
@@ -257,14 +320,14 @@ impl<'a> ModelExperts<'a> {
     pub fn wrap(
         device: &'a Device,
         matmul: &'a PackedMatmul,
+        dense: &'a DenseMatmul,
         banks: &[LayerBanks<'a>],
         layers: usize,
         dim: usize,
     ) -> Result<Self, MatmulError> {
         let mut wrapped: Vec<Option<LayerExperts<'a>>> = (0..layers).map(|_| None).collect();
         for bank in banks {
-            let layer = LayerExperts::wrap(device, matmul, &bank.routed, &bank.shared, dim)?;
-            wrapped[bank.layer] = Some(layer);
+            wrapped[bank.layer] = Some(LayerExperts::wrap(device, matmul, dense, bank, dim)?);
         }
         Ok(Self { layers: wrapped })
     }
@@ -289,7 +352,8 @@ mod tests {
     use inkling_core::moe::ExpertBank;
     use inkling_core::quant::{GROUP_SIZE, dequantize_blocks};
 
-    use crate::matmul::testing::{Case, pack};
+    use crate::dense::testing::narrowed;
+    use crate::matmul::testing::{Case, Noise, pack};
     use crate::testing::device;
 
     /// Narrow enough to run three banks of it in a unit test, and wide enough
@@ -303,6 +367,32 @@ mod tests {
     /// and one more of them: an expert is three multiplies deep, so what
     /// separates the two sides is three summation orders rather than one.
     const TOLERANCE: f32 = 6e-6;
+
+    /// Rows a synthetic router's gate has: the routed experts and the shared
+    /// pair, which is the shape the layer's own `[258, 4096]` is.
+    const GATE_ROWS: usize = EXPERTS + 2;
+
+    /// What a call cost the device: `(dispatches, submissions)`, which is the
+    /// pair the granularity question is settled in.
+    fn spent<T>(device: &Device, run: impl FnOnce() -> T) -> (T, (u64, u64)) {
+        let (dispatches, submissions) = (device.dispatches(), device.submissions());
+        let got = run();
+        (
+            got,
+            (
+                device.dispatches() - dispatches,
+                device.submissions() - submissions,
+            ),
+        )
+    }
+
+    /// A synthetic gate, bfloat16 as the checkpoint stores one.
+    fn gate<'a>(device: &'a Device, dense: &'a DenseMatmul, seed: u32) -> DenseWeight<'a> {
+        let mut noise = Noise(seed);
+        let values: Vec<f32> = (0..GATE_ROWS * DIM).map(|_| noise.signed()).collect();
+        DenseWeight::upload(device, dense, DIM, GATE_ROWS, &narrowed(&values))
+            .expect("the gate's shape pairs")
+    }
 
     /// One synthetic `SwitchGLU`: three banks of `EXPERTS` experts, held both
     /// packed and decoded so that the same arithmetic can be run either way.
@@ -478,6 +568,60 @@ mod tests {
         assert_eq!(GROUP_SIZE, 32, "the case's widths are whole groups");
     }
 
+    /// The gate and the shared bank asked for together are the same two answers
+    /// as the gate and the shared bank asked for apart — **and one fewer
+    /// submission than that would take.**
+    ///
+    /// Both halves are the commit. That the answers agree says the batching
+    /// changed no arithmetic; that the submission count does not move is the
+    /// whole reason for batching at all, and it is the half a test of the values
+    /// alone would let slip. A gate submitted on its own would be forty round
+    /// trips a decode step, which at 206 microseconds each is 8 ms of the 28 the
+    /// gate costs on the CPU.
+    #[test]
+    fn the_gate_and_the_shared_bank_cost_what_the_shared_bank_alone_costs() {
+        let Some(device) = device() else { return };
+        let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
+        let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
+        let banks = Banks::new();
+        let layer = LayerExperts {
+            routed: banks
+                .upload(&device, &matmul, &banks.gate, &banks.up)
+                .expect("the three banks pair"),
+            shared: banks
+                .upload(&device, &matmul, &banks.gate, &banks.up)
+                .expect("the three banks pair"),
+            gate: gate(&device, &dense, 0x5eed_6666),
+        };
+
+        // Two tokens through both shared experts, which is the shape
+        // `SparseMoe::forward` hands over: every token, once per shared expert.
+        let chosen = [0usize, 0, 1, 1];
+        let x = rows(chosen.len());
+        let gathered = Gathered::new(DIM, &chosen, &x);
+
+        let ((logits, out), together) = spent(&device, || layer.gated_shared(&x[..DIM], gathered));
+        let (alone, apart) = spent(&device, || layer.shared(gathered));
+
+        assert_eq!(out, alone, "the shared bank's rows");
+        assert_eq!(
+            logits.expect("the backend holds the gate"),
+            layer
+                .gate
+                .multiply(&x[..DIM])
+                .expect("the dispatch completes"),
+            "the gate's logits"
+        );
+
+        assert_eq!(
+            together.1,
+            apart.1,
+            "the gate cost {} submissions of its own",
+            together.1 - apart.1
+        );
+        assert_eq!(together.0, apart.0 + 1, "the gate is a dispatch");
+    }
+
     /// Which layer's banks answer for which layer, which is the one thing a
     /// model-wide backend can get wrong that a single layer's cannot.
     ///
@@ -488,8 +632,9 @@ mod tests {
     fn a_dense_layer_and_a_layer_past_the_stack_have_no_banks() {
         let Some(device) = device() else { return };
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
+        let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
         let banks = Banks::new();
-        let layer = |gate: &Case| {
+        let layer = |routed: &Case| {
             let bank = |case: &Case, in_dim, out_dim| {
                 PackedBank::upload(
                     &device,
@@ -504,7 +649,7 @@ mod tests {
             };
             LayerExperts {
                 routed: ExpertBanks::new(
-                    bank(gate, DIM, HIDDEN_DIM),
+                    bank(routed, DIM, HIDDEN_DIM),
                     bank(&banks.up, DIM, HIDDEN_DIM),
                     bank(&banks.down, HIDDEN_DIM, DIM),
                 )
@@ -515,6 +660,7 @@ mod tests {
                     bank(&banks.down, HIDDEN_DIM, DIM),
                 )
                 .expect("the banks pair"),
+                gate: gate(&device, &dense, 0x5eed_5555),
             }
         };
 
