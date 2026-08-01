@@ -10,6 +10,7 @@ pub mod mask;
 pub mod model;
 pub mod moe;
 pub mod ops;
+pub mod profile;
 pub mod quant;
 pub mod sconv;
 pub mod tokenizer;
@@ -37,6 +38,7 @@ pub use moe::{
 pub use ops::{
     DenseMlp, DenseProjection, MlpProjections, Projection, linear, rms_norm, softmax, swiglu,
 };
+pub use profile::{Op, Profile};
 pub use quant::{Dequantized, QuantError, Scratch};
 pub use sconv::{ConvState, ShortConv};
 pub use tokenizer::{Detokenizer, Tokenizer, TokenizerError};
