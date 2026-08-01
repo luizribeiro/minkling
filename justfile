@@ -8,8 +8,18 @@ sync:
     cd reference && uv sync
     reference/scripts/apply_patches.sh
 
+# Every assertion that needs no checkpoint, in about twelve seconds. What to run
+# while iterating.
+#
+# One process a crate, because opening a Metal device costs a second and the 110
+# kernel tests would each pay it. Nothing here measures the process it runs in,
+# which is what makes sharing one free; `test-timing` is where that stops being
+# true. The README's test section has the figures.
+#
+# The checkpoint is unset rather than left to the environment, so a shell that
+# exports it does not turn this into `test-full` by surprise.
 test:
-    cargo nextest run
+    env -u INKLINGRS_CHECKPOINT cargo test --workspace
 
 # The measurements — a duration, a resident set, a profile table — one at a time
 # with nothing beside them. `#[ignore]` is what keeps these out of every run that
@@ -18,6 +28,13 @@ test:
 test-timing checkpoint=checkpoint:
     INKLINGRS_CHECKPOINT={{ absolute_path(checkpoint) }} \
         cargo nextest run --profile timing --run-ignored only
+
+# Everything, and what has to pass before a commit lands: the whole suite
+# against a real checkpoint, a process a test, then the measurements on their
+# own. About three minutes forty, most of it the CPU oracle at 9.0 s a decoded
+# token.
+test-full checkpoint=checkpoint: && (test-timing checkpoint)
+    INKLINGRS_CHECKPOINT={{ absolute_path(checkpoint) }} cargo nextest run
 
 fmt:
     cargo fmt --all
