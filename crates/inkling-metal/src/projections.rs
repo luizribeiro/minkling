@@ -19,9 +19,9 @@
 //! one expert every row goes through, and the only thing that stays packed is
 //! the weight itself.
 //!
-//! **One submission a layer, and twenty-six dispatches in one that routes** —
+//! **Twenty-six dispatches a layer that routes and no submission of its own** —
 //! eighteen where the two dense layers hold a feed-forward network in place of
-//! two banks. `q`, `k`, `v` and `r` consume the same normed hidden state and
+//! two banks, and one command buffer for as many layers as a run merges. `q`, `k`, `v` and `r` consume the same normed hidden state and
 //! nothing of each other; the two short convolutions consume two of those and
 //! are consumed by the two head norms and the attention step; `o_proj` consumes
 //! what the step produced; the layer's first convolution consumes that and adds
@@ -30,9 +30,10 @@
 //! consumes what the MLP answered with and adds the sum the norm was taken of.
 //! Every arrow in that is a device buffer, so the whole of a layer is one
 //! command buffer — see [`LayerDevice`], which is where an activation is formed
-//! and consumed without the CPU seeing it twenty-five times over. That is what a
-//! [`Batch`] is for: at 152 µs a marginal submission the last forty-four of them
-//! were worth 6.7 ms of a decode step.
+//! and consumed without the CPU seeing it twenty-five times over, and
+//! [`ModelLayers`], which is where the buffer stays open across the layer
+//! boundary too. That is what a [`Batch`] is for: the last forty-one submissions
+//! a decode step made were worth 12.7 ms of it.
 //!
 //! **What took longest to reach was not the arithmetic but the state.** Four of
 //! those operations write something that outlives the call — three convolutions'

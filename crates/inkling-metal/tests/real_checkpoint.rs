@@ -752,14 +752,14 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
     eprintln!(
         "{} tokens prefilled in {:.2?}, {} decoded at {:.2?}/token, peak RSS {:.2} GiB\
          \n  {dispatches} dispatches a decode step in {submissions} submissions over \
-         {allocations} buffers, which at 225 µs a submission is {:.1?} of round trip\
+         {allocations} buffers, which is {:.0} dispatches a submission\
          \n  got  {:?}\n  want {want:?}",
         run.prompt,
         run.steps[0],
         run.decode_steps(),
         run.each_decode_step(),
         run.peak as f64 / (1u64 << 30) as f64,
-        Duration::from_micros(225) * submissions as u32,
+        dispatches as f64 / submissions as f64,
         run.got,
     );
     assert_eq!(

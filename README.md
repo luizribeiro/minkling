@@ -53,7 +53,7 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 47 ms against mlx-vlm's 32 ms, and the timings go to
+A decode step is about 34 ms against mlx-vlm's 32 ms, and the timings go to
 stderr so stdout stays pipeable. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
@@ -89,10 +89,10 @@ inferred.** Every operation a forward pass runs opens a scope charged the time
 inside it that no scope inside *it* claimed, so the rows of a decode step sum to
 the step and what they leave over is a number rather than a shrug:
 
-    submit and wait      43    82%      of which the device executed for 27 ms
-    dispatch encode    1077    11%
-    readback             43     1%
-    everything else                     6%
+    submit and wait       2    83%      of which the device executed for 26 ms
+    dispatch encode    1077    14%
+    readback              2     0%
+    everything else                     3%
 
 **Every row that named an operation of a layer has left it, and the shape of
 what is left has not changed.** The routers' gates were 19% and every layer's
@@ -107,12 +107,11 @@ the layer's own second convolution: 0.8 ms between them, and 1.0 ms more of
 readback behind them, because what a layer answers with is now one tensor rather
 than five. **They cost more where they went than they cost here**, which is the
 first handover in this project of which that is true — see the layer's own
-paragraph below. Four fifths of a step is a round trip, and the device is now
-executing for two thirds of *that*, so the rest is 43 command buffers submitted
-and waited for around work that was already done. Nothing an operation of a layer
-would open a scope around is left in the table at all: what remains beside the
-round trip is encoding it, the sampling at the end, and the embedding at the
-start.
+paragraph below. Four fifths of a step is still a round trip, and the device is
+now executing for **92%** of it — two submissions, around work that is no longer
+waited for a layer at a time. Nothing an operation of a layer would open a scope
+around is left in the table at all: what remains beside the round trip is
+encoding it, the sampling at the end, and the embedding at the start.
 
 **A dispatch's shape is not an allocation.** Each of the 749 dispatches a step
 ran at the time took its dimensions, its offsets and the expert its rows go
@@ -123,7 +122,7 @@ That took the encode row from 9.35 ms to 7.28 ms, measured against the commit
 before it and alternating between the two over seven pairs, with the wait row and
 the device's own clock where they were. It stays a *copy* per dispatch rather than
 a buffer the layer holds, which is what lets two calls of different heights share
-a command buffer — and 994 allocations are left in that row, every one of them an
+a command buffer — and 953 allocations are left in that row, every one of them an
 output or a row copied over for a dispatch that could not read it where it was.
 
 Multiplies that share an input share a command buffer, and so do multiplies that
@@ -131,8 +130,8 @@ share nothing: the four projections a layer's normed hidden state feeds, the nor
 that makes it, the two convolutions and two head norms behind two of them, the
 attention step beside the projection it feeds, the convolution and add on the
 residual path behind that, the norm over what they left, and every dispatch the
-MLP then runs — 1077 dispatches in 43 submissions, one a layer and one for the
-head. **What those have in common is that a seam had to be able to express
+MLP then runs — 1077 dispatches in two submissions, one for the forty-two layers
+and one for the head. **What those have in common is that a seam had to be able to express
 them.** Handing a backend one bank at a time, none of it is visible: it takes a
 call that is given the whole layer to see that the gate reads the hidden state
 the shared bank reads, that the top-k reads what the gate wrote, and that the
@@ -214,17 +213,35 @@ routed six and the shared two together, and still carry `route_scale` *and* the
 learned `global_scale` whose absence is a 142-fold error. A layer is
 `[tokens, hidden]` in and `[tokens, hidden]` out.
 
-**It cost 0.65 ms rather than saving any**, over seven alternating pairs in which
-every pair moved the same way: 46.83 ms to 47.48. The 1.8 ms of CPU rows that
-came off is real, and so is what replaced it — 122 more dispatches a step is 0.8
-ms more device time and 0.8 ms more encoding, and 162 more buffers made and freed
-is most of the rest. **The command buffer count did not move**, and that is the
-whole of why: this handover merged nothing. What it bought is the *precondition*
-for merging — a layer whose input and output are the only values that cross, so
-that nothing between layer i and layer i+1 forces a wait. Taking that is a seam
-one level up from this one: `ModelWeights::run_layer` hands the stack `&[f32]`
-and takes back `Vec<f32>`, and until the value between two layers can be named on
-the device, the round trip between them is not the arithmetic's to give up.
+**Taking it cost 0.65 ms**, over seven alternating pairs in which every pair
+moved the same way: 46.83 ms to 47.48. The 1.8 ms of CPU rows that came off is
+real, and so is what replaced it — 122 more dispatches a step is 0.8 ms more
+device time and 0.8 ms more encoding, and 162 more buffers made and freed is most
+of the rest. The command buffer count did not move, because a layer that is one
+command buffer is still one command buffer. What it bought is what a layer is
+now: a value in and a value out, and nothing between them anybody names.
+
+**Which is what let the layers themselves merge.** Nothing between layer i's last
+dispatch and layer i+1's first forces a wait — what the first writes is what the
+second reads and nobody else looks at it — so what forced one was that the seam
+above a layer named the value between two of them in this process's memory. It
+does not any more: what a layer answers with is either rows or a count of rows
+somebody else is holding, and the backend rather than the layer decides which,
+because whether what a layer produced crosses back is a question about the layer
+*after* it. A run ends where somebody has to read it — a layer the backend does
+not hold whole, the end of the stack, or a call of more than one row, which is
+where the memory a merged run holds is traded against the round trips it saves.
+
+**So a decode step is two submissions**, one for the forty-two layers and one for
+the head, where it was 43 and 87 and 249. Over seven alternating pairs, every
+pair moving the same way: 47.43 ms to 34.69. The device's own clock did not move
+— 26.7 ms either side — so the 12.7 ms is round trip and nothing else: 10.2 ms of
+it off the wait row at 250 microseconds a submission removed, and the rest the 41
+uploads and 41 readbacks that stop happening. **250 µs is not the 152 to 172 the
+marginal figures had**, and the difference is the serialisation rather than the
+submission: a step used to encode a layer, submit it, wait for it, and only then
+encode the next. A prefill still submits a layer at a time, and its own numbers
+are unchanged.
 
 There is no operation of a layer left outside the GPU. Both backends generate the
 same tokens, and the CPU one stays the oracle every kernel here is validated
