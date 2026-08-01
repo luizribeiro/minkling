@@ -46,13 +46,13 @@
 //! is formed.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 
 use inkling_core::attention::AttentionConfig;
 use inkling_core::mask::MASKED;
 use inkling_core::profile::{self, Op};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
 use crate::kernel::{Batch, Grid, Kernel, extent};
 
@@ -200,15 +200,22 @@ const LEAST_KEYS: usize = 64;
 /// The span is `[kv_heads, capacity, head_dim]` and grows by powers of two, so
 /// what a call appends is `kv_heads` writes of `head_dim` floats at a stride
 /// rather than an append to a contiguous tail. That stride is why the kernel
-/// takes `key_stride` beside `keys`.
+/// takes `key_stride` beside `keys`, and it is what [`KeyValues::landings`] hands
+/// a dispatch that means to write the keys itself.
 ///
 /// It is **one sequence's**, and nothing here makes it more than that: the layer
 /// holds one span, so two sequences interleaved through the same layer would
 /// overwrite each other's keys. [`LayerAttention::hold`] is where that is
-/// refused rather than discovered — a sequence's own [`AttentionCache`] carries
-/// how many keys it has seen, and a span holding a different number is not its.
+/// refused rather than discovered — a sequence's own
+/// [`AttentionCache`](inkling_core::AttentionCache) carries how many keys it has
+/// seen, and a span holding a different number is not its.
+///
+/// Not public beyond this crate, and not only for want of a caller: `landings`
+/// and `appended` are two halves of one encoding, and a caller that took the
+/// first and skipped the second — or took the second and then abandoned the
+/// command buffer — would leave the span claiming keys no dispatch wrote.
 #[derive(Debug)]
-struct KeyValues {
+pub(crate) struct KeyValues {
     keys: Buffer<f32>,
     values: Buffer<f32>,
     kv_heads: usize,
@@ -269,8 +276,57 @@ impl KeyValues {
         Ok(())
     }
 
-    /// Append `[rows, kv_heads * head_dim]` keys and values, split into heads on
-    /// the way in.
+    /// Where a dispatch writing this call's keys should put them, and where one
+    /// writing its values should.
+    ///
+    /// Both at once because a call writes both and they are separate buffers, so
+    /// the borrow of one has to be able to outlive the other's dispatch.
+    ///
+    /// Neither advances `held`: the rows are not there until the batch has run,
+    /// and [`KeyValues::appended`] is what says they are.
+    pub(crate) fn landings(&mut self) -> (Landing<'_>, Landing<'_>) {
+        let (groups, stride, base) = (self.kv_heads, self.capacity, self.held);
+        (
+            Landing {
+                out: &mut self.keys,
+                groups,
+                stride,
+                base,
+            },
+            Landing {
+                out: &mut self.values,
+                groups,
+                stride,
+                base,
+            },
+        )
+    }
+
+    /// Record `rows` keys and values a dispatch wrote into the span.
+    ///
+    /// **The caller has to see that command buffer through.** This is called
+    /// while the batch is being encoded, because the step that reads the keys is
+    /// in it too — so a caller that then abandoned the buffer rather than
+    /// submitting it would leave the span counting keys the device never wrote.
+    /// [`LayerProjections::layer`](crate::LayerProjections) is the only caller
+    /// and treats a batch that does not run as a panic, which is the same thing
+    /// every dispatch in this crate does with one.
+    pub(crate) fn appended(&mut self, rows: usize) {
+        assert!(
+            self.held + rows <= self.capacity,
+            "{rows} keys past a span reserved for {}",
+            self.capacity
+        );
+        self.held += rows;
+    }
+
+    /// Append `[rows, kv_heads * head_dim]` keys and values held in this
+    /// process's memory, split into heads on the way in.
+    ///
+    /// What a caller with the keys here does, which is what
+    /// [`LayerAttention::forward`] is for a caller with the whole step here.
+    /// A layer reaches for [`KeyValues::landings`] instead, because a key it
+    /// wrote out and read back is a key that crossed the seam twice.
     ///
     /// The split is the write's own indexing rather than a pass over a tensor:
     /// what the projections produce is head-major within a row and what the
@@ -422,9 +478,9 @@ impl<'a> LayerAttention<'a> {
     /// an operation anything performs.
     ///
     /// The keys and values are copied over for the call, which is what a caller
-    /// holding the whole span in its own memory has to do.
-    /// [`LayerAttention::encode_over`] is what a caller that let this layer keep
-    /// them reaches for.
+    /// holding the whole span in its own memory has to do. A layer that let this
+    /// one keep them encodes the step against the span in place instead, which
+    /// is the path a decode step takes.
     pub fn encode(&self, batch: &mut Batch<'_>, step: Step<'_>) -> Result<Buffer<f32>, MetalError> {
         let _timed = profile::scope(Op::Encode);
         let span = self.config.kv_channels();
@@ -464,17 +520,22 @@ impl<'a> LayerAttention<'a> {
     /// over on every call, which at 16 keys is 53 µs a layer and at 1024 keys is
     /// two megabytes. Here the span is where it was left, and what the call
     /// carries is where in it the sequence's keys stop.
-    pub fn encode_over(
+    ///
+    /// The span is handed in rather than taken from the cell, because the
+    /// dispatches that *wrote* this call's keys are in the same command buffer
+    /// and hold it too — see [`KeyValues::landings`]. One borrow for the layer's
+    /// whole encoding is what lets a key be written and read without leaving the
+    /// device.
+    pub(crate) fn encode_over(
         &self,
         batch: &mut Batch<'_>,
+        span: &mut KeyValues,
         q: &mut Buffer<f32>,
         rel: &mut Buffer<f32>,
         taus: Option<&[f32]>,
         q_offset: usize,
     ) -> Result<Buffer<f32>, MetalError> {
         let _timed = profile::scope(Op::Encode);
-        let mut span = self.span.borrow_mut();
-        let span = &mut *span;
         let (keys, key_stride) = (span.held, span.capacity);
         self.encoding(
             batch,
@@ -489,6 +550,11 @@ impl<'a> LayerAttention<'a> {
                 q_offset,
             },
         )
+    }
+
+    /// The span this layer is holding, borrowed for the whole of a call.
+    pub(crate) fn span(&self) -> RefMut<'_, KeyValues> {
+        self.span.borrow_mut()
     }
 
     /// The dispatch itself, which is the same whichever of the two put the
@@ -1779,7 +1845,7 @@ mod tests {
         let mut q = device.buffer(q).expect("the query uploads");
         let mut rel = device.buffer(rel).expect("the features upload");
         let out = layer
-            .encode_over(&mut batch, &mut q, &mut rel, None, held)
+            .encode_over(&mut batch, &mut layer.span(), &mut q, &mut rel, None, held)
             .expect("the step encodes");
         batch.wait().expect("the batch completes");
         out.to_vec()

@@ -52,11 +52,12 @@
 //! tree is checked against, and a kernel that reproduced MLX's extra rounding
 //! would be the one operation in the model whose backend changed the answer.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 
 use inkling_core::profile::{self, Op};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
 use crate::kernel::{Batch, Grid, Kernel, extent};
 
@@ -186,35 +187,111 @@ impl<'a> LayerNorm<'a> {
     /// tokens is a forward pass over no tokens.
     pub fn encode(&self, batch: &mut Batch<'_>, x: &[f32]) -> Result<Buffer<f32>, MetalError> {
         let _timed = profile::scope(Op::Encode);
-        assert_eq!(
-            x.len() % self.width,
-            0,
-            "{} values are not whole rows of {}",
-            x.len(),
-            self.width
-        );
-        let rows = x.len() / self.width;
-        let mut shape = self.device.buffer(&[
-            extent(rows, "rows of a call"),
-            extent(self.width, "the width of a norm"),
-            self.eps.to_bits(),
-        ])?;
+        let rows = self.rows(x.len());
         let mut input = self.device.buffer(x)?;
-        let mut weight = self.weight.borrow_mut();
         let mut out = self.device.zeroed::<f32>(x.len())?;
-
-        // A threadgroup to a row, which is what makes the row index the
-        // threadgroup's own position and so what makes the barriers below
-        // uniform: a threadgroup either runs a row or returns from one, and
-        // never splits over the question.
-        let kernel = &self.norm.kernel;
-        let grid = Grid::new(rows * THREADS_PER_GROUP, THREADS_PER_GROUP);
-        batch.add(
-            kernel,
-            &[shape.arg(), input.arg(), weight.arg(), out.arg()],
-            grid,
+        self.encoding(
+            batch,
+            &mut input,
+            None,
+            Landing {
+                out: &mut out,
+                groups: 1,
+                stride: rows,
+                base: 0,
+            },
         )?;
         Ok(out)
+    }
+
+    /// The same normalisation over each `width`-wide group of rows a dispatch
+    /// already left on the device, scattered into `landing`.
+    ///
+    /// **This is the head norm.** `InklingAttention` reshapes a projection's
+    /// output into heads, normalises the last axis and then transposes; the
+    /// reduction is this one over a row cut into `landing.groups` groups, and
+    /// the transpose is where the rows land. The key's goes one step further and
+    /// lands in the span the layer is keeping, so a call's keys are normed and
+    /// appended by one dispatch.
+    ///
+    /// `scale` is one value per row — log scaling's `tau`, which multiplies the
+    /// query and nothing else. `None` is a row of ones.
+    pub fn encode_over(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        scale: Option<&[f32]>,
+        landing: Landing<'_>,
+    ) -> Result<(), MetalError> {
+        let _timed = profile::scope(Op::Encode);
+        self.encoding(batch, x, scale, landing)
+    }
+
+    /// How many rows of this norm's width `values` is.
+    fn rows(&self, values: usize) -> usize {
+        assert_eq!(
+            values % self.width,
+            0,
+            "{values} values are not whole rows of {}",
+            self.width
+        );
+        values / self.width
+    }
+
+    /// One dispatch encoded, without the scope its two callers each open — so
+    /// that the profile counts a dispatch once however it was reached.
+    fn encoding(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        scale: Option<&[f32]>,
+        landing: Landing<'_>,
+    ) -> Result<(), MetalError> {
+        assert!(landing.groups > 0, "a row has groups");
+        assert_eq!(
+            x.len() % landing.groups,
+            0,
+            "{} values are not {} groups",
+            x.len(),
+            landing.groups
+        );
+        let rows = self.rows(x.len() / landing.groups);
+        let scale = match scale {
+            Some(scale) => {
+                assert_eq!(scale.len(), rows, "a scale a row");
+                Cow::Borrowed(scale)
+            }
+            None => Cow::Owned(vec![1.0; rows]),
+        };
+        landing.fits(rows, self.width);
+
+        let mut shape = self.device.buffer(&[
+            extent(rows, "rows of a call"),
+            extent(landing.groups, "the groups of a row"),
+            extent(self.width, "the width of a norm"),
+            extent(landing.stride, "the rows a group has room for"),
+            extent(landing.base, "where a call's rows start"),
+            self.eps.to_bits(),
+        ])?;
+        let mut weight = self.weight.borrow_mut();
+        let mut scale = self.device.buffer(&scale)?;
+
+        // A threadgroup to each group of each row, which is what makes the pair
+        // the threadgroup's own position and so what makes the barriers inside
+        // uniform: a threadgroup either runs a group or returns from one, and
+        // never splits over the question.
+        let grid = Grid::new(rows * landing.groups * THREADS_PER_GROUP, THREADS_PER_GROUP);
+        batch.add(
+            &self.norm.kernel,
+            &[
+                shape.arg(),
+                x.arg(),
+                weight.arg(),
+                scale.arg(),
+                landing.out.arg(),
+            ],
+            grid,
+        )
     }
 }
 
@@ -239,11 +316,29 @@ using namespace metal;
 
 struct Shape {
     uint rows;
+    uint groups;
     uint width;
+    uint stride;
+    uint base;
     uint eps_bits;
 };
 
-/// `out = x * rsqrt(mean(x^2) + eps) * weight`, one threadgroup to a row.
+/// `out = x * rsqrt(mean(x^2) + eps) * weight * scale`, one threadgroup to each
+/// group of each row.
+///
+/// **A row is `groups` groups of `width`, and the norm is over a group.** A
+/// layer's input layernorm is one group of the hidden width; a head norm is
+/// `heads` groups of `head_dim`, over the same weight, which is what
+/// `InklingAttention` means by reshaping into heads and normalising the last
+/// axis. The two are the same reduction over a different divisor.
+///
+/// Where a group's rows land is [`Landing`](crate::Landing)'s three numbers —
+/// see there for why the transpose and the append are indexing rather than
+/// passes over a tensor.
+///
+/// `scale` is one value per row, multiplied into every channel of it. Log
+/// scaling's `tau` is the only thing that ever sets it and everywhere else it is
+/// a row of ones, which multiplies exactly.
 ///
 /// Three passes over the row rather than one: the peak, the sum of the scaled
 /// squares, and the write. A row of the model's width is 16 KB and the second
@@ -258,8 +353,9 @@ kernel void rms_norm(
     constant Shape &shape [[buffer(0)]],
     device const float *x [[buffer(1)]],
     device const float *weight [[buffer(2)]],
-    device float *out [[buffer(3)]],
-    uint row [[threadgroup_position_in_grid]],
+    device const float *scale [[buffer(3)]],
+    device float *out [[buffer(4)]],
+    uint slot [[threadgroup_position_in_grid]],
     uint local [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -270,17 +366,20 @@ kernel void rms_norm(
     threadgroup float sums[MOST_SIMDGROUPS];
 
     // Unreachable under the grid this is dispatched over, which gives exactly
-    // one threadgroup to each row. It is here for what it would have to be if
-    // that ever stopped being true: the row is the threadgroup's own position,
-    // so this turns away a whole group and never splits one — and a bounds check
-    // on `local` instead would leave some threads at the barriers below and
-    // others past them, which is undefined rather than slow.
-    if (row >= shape.rows) {
+    // one threadgroup to each group of each row. It is here for what it would
+    // have to be if that ever stopped being true: the pair is the threadgroup's
+    // own position, so this turns away a whole group and never splits one — and
+    // a bounds check on `local` instead would leave some threads at the barriers
+    // below and others past them, which is undefined rather than slow.
+    if (slot >= shape.rows * shape.groups) {
         return;
     }
+    const uint row = slot / shape.groups;
+    const uint group = slot % shape.groups;
 
-    device const float *values = x + (ulong)row * shape.width;
-    device float *result = out + (ulong)row * shape.width;
+    device const float *values = x + (ulong)slot * shape.width;
+    device float *result =
+        out + ((ulong)group * shape.stride + shape.base + row) * shape.width;
 
     float peak = 0.0f;
     for (uint i = local; i < shape.width; i += threads) {
@@ -325,8 +424,9 @@ kernel void rms_norm(
         sum / (float)shape.width + ldexp(eps, -2 * exponent)
     );
 
+    const float row_scale = scale[row];
     for (uint i = local; i < shape.width; i += threads) {
-        result[i] = ldexp(values[i], -exponent) * inverse * weight[i];
+        result[i] = ldexp(values[i], -exponent) * inverse * weight[i] * row_scale;
     }
 }
 "#;
@@ -336,6 +436,7 @@ mod tests {
     use super::*;
     use inkling_core::fixture::{NORM_CASES, OPS, deviation, norm_case, norm_eps};
     use inkling_core::ops::rms_norm;
+    use inkling_core::split_heads;
 
     use crate::testing::device;
 
@@ -609,6 +710,184 @@ mod tests {
 
         let deviation = deviation(&got, &on_the_cpu(&x, &weight, 1e-6));
         assert!(deviation <= TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// **The head norm**: a row cut into groups, each normalised over its own
+    /// channels by the same weight, and written where the attention step reads
+    /// it.
+    ///
+    /// The reduction is checked against [`inkling_core::ops::rms_norm`] over a
+    /// weight of the head's width, which is the same function this module's
+    /// other cases use and which already normalises a chunk per weight — so
+    /// what is new here is the divisor and the layout, not the arithmetic.
+    ///
+    /// The layout is the claim: the input is `[rows, groups * width]` and the
+    /// output is `[groups, rows, width]`, which is
+    /// [`split_heads`](inkling_core::split_heads) done by choosing an index.
+    /// Two rows and three groups, because a single row makes the transpose the
+    /// identity and a single group makes the divisor the row.
+    #[test]
+    fn a_rows_groups_are_normalised_apart_and_land_where_the_step_reads_them() {
+        let Some(device) = device() else { return };
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let (rows, groups, width) = (2, 3, 40);
+        let weight: Vec<f32> = (0..width).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+        let x: Vec<f32> = (0..rows * groups * width)
+            .map(|i| ((i * 31 % 97) as f32 - 48.0) / 16.0)
+            .collect();
+
+        let layer = LayerNorm::new(&device, &norm, &weight, 1e-6).expect("the weight uploads");
+        let mut input = device.buffer(&x).expect("the row uploads");
+        let mut out = device
+            .zeroed::<f32>(x.len())
+            .expect("the landing allocates");
+        let mut batch = device.batch().expect("a command buffer opens");
+        layer
+            .encode_over(
+                &mut batch,
+                &mut input,
+                None,
+                Landing {
+                    out: &mut out,
+                    groups,
+                    stride: rows,
+                    base: 0,
+                },
+            )
+            .expect("the norm encodes");
+        batch.wait().expect("the batch completes");
+
+        let apart = on_the_cpu(&x, &weight, 1e-6);
+        let agreed = deviation(&out.to_vec(), &split_heads(&apart, groups, width));
+        assert!(agreed <= TOLERANCE, "deviation {agreed:e}");
+
+        // And the transpose is load-bearing: the same values left where they
+        // were computed are a different tensor, which is what a landing that
+        // ignored its groups would produce.
+        assert!(
+            deviation(&out.to_vec(), &apart) > TOLERANCE,
+            "the groups landed in the order they were read"
+        );
+    }
+
+    /// A landing writes its call's rows into a span with room for more, and
+    /// touches nothing else — which is what makes a key's head norm the append
+    /// into the cache rather than a step before one.
+    ///
+    /// Two calls at different offsets into one span, with the slots between and
+    /// after them left at zero, and each group's own prefix checked against the
+    /// same call dispatched into a span of its own.
+    #[test]
+    fn a_landing_writes_its_own_rows_of_a_span_and_no_others() {
+        let Some(device) = device() else { return };
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let (groups, width, stride) = (2, 8, 6);
+        let weight: Vec<f32> = (0..width).map(|i| 1.0 + (i % 3) as f32).collect();
+        let layer = LayerNorm::new(&device, &norm, &weight, 1e-6).expect("the weight uploads");
+
+        let mut span = device
+            .zeroed::<f32>(groups * stride * width)
+            .expect("the span allocates");
+        let call = |rows: usize, salt: usize| -> Vec<f32> {
+            (0..rows * groups * width)
+                .map(|i| ((i * 13 + salt) % 29) as f32 - 14.0)
+                .collect()
+        };
+        let normed = |x: &[f32], base: usize, out: &mut Buffer<f32>, stride: usize| {
+            let mut input = device.buffer(x).expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            layer
+                .encode_over(
+                    &mut batch,
+                    &mut input,
+                    None,
+                    Landing {
+                        out,
+                        groups,
+                        stride,
+                        base,
+                    },
+                )
+                .expect("the norm encodes");
+            batch.wait().expect("the batch completes");
+        };
+
+        let (first, second) = (call(3, 0), call(2, 7));
+        normed(&first, 0, &mut span, stride);
+        normed(&second, 3, &mut span, stride);
+
+        // The same two calls into a span cut to exactly what they fill, which
+        // has no room for a row to land in the wrong place.
+        let mut want = device
+            .zeroed::<f32>(groups * 5 * width)
+            .expect("the span allocates");
+        normed(&first, 0, &mut want, 5);
+        normed(&second, 3, &mut want, 5);
+
+        let (span, want) = (span.to_vec(), want.to_vec());
+        for group in 0..groups {
+            let (filled, held) = (5 * width, stride * width);
+            assert_eq!(
+                span[group * held..][..filled],
+                want[group * filled..][..filled],
+                "group {group}"
+            );
+            assert!(
+                span[group * held + filled..][..held - filled]
+                    .iter()
+                    .all(|slot| *slot == 0.0),
+                "group {group} was written past its own rows"
+            );
+        }
+    }
+
+    /// One scale per row, multiplied into every channel of it — which is log
+    /// scaling's `tau` and nothing else, and which is why `None` has to be
+    /// exactly a row of ones rather than nearly one.
+    #[test]
+    fn the_row_scale_multiplies_every_channel_of_the_row_it_belongs_to() {
+        let Some(device) = device() else { return };
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let (rows, width) = (3, 16);
+        let weight: Vec<f32> = (0..width).map(|i| 0.5 + (i % 5) as f32).collect();
+        let x: Vec<f32> = (0..rows * width)
+            .map(|i| ((i * 19 % 31) as f32 - 15.0) / 4.0)
+            .collect();
+        let scales = [0.5, 2.0, 4.0];
+
+        let layer = LayerNorm::new(&device, &norm, &weight, 1e-6).expect("the weight uploads");
+        let scaled = |scale: Option<&[f32]>| {
+            let mut input = device.buffer(&x).expect("the rows upload");
+            let mut out = device
+                .zeroed::<f32>(x.len())
+                .expect("the landing allocates");
+            let mut batch = device.batch().expect("a command buffer opens");
+            layer
+                .encode_over(
+                    &mut batch,
+                    &mut input,
+                    scale,
+                    Landing {
+                        out: &mut out,
+                        groups: 1,
+                        stride: rows,
+                        base: 0,
+                    },
+                )
+                .expect("the norm encodes");
+            batch.wait().expect("the batch completes");
+            out.to_vec()
+        };
+
+        let plain = scaled(None);
+        assert_eq!(plain, on_the_cpu(&x, &weight, 1e-6), "a row of ones");
+
+        let want: Vec<f32> = plain
+            .chunks_exact(width)
+            .zip(scales)
+            .flat_map(|(row, scale)| row.iter().map(move |value| value * scale))
+            .collect();
+        assert_eq!(scaled(Some(&scales)), want);
     }
 
     /// What a decode-shaped norm costs the device to run, which is the figure

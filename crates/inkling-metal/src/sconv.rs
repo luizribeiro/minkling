@@ -42,7 +42,7 @@ use std::cell::{Cell, RefCell};
 
 use inkling_core::profile::{self, Op};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
 use crate::kernel::{Batch, Grid, Kernel, extent};
 
@@ -196,20 +196,55 @@ impl<'a> LayerConv<'a> {
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
     ) -> Result<Buffer<f32>, MetalError> {
+        let rows = self.rows(x.len());
+        let mut out = self.device.zeroed::<f32>(x.len())?;
+        self.encode_over(
+            batch,
+            x,
+            Landing {
+                out: &mut out,
+                groups: 1,
+                stride: rows,
+                base: 0,
+            },
+        )?;
+        Ok(out)
+    }
+
+    /// The same convolution with its rows scattered into `landing` rather than
+    /// left in a buffer of their own.
+    ///
+    /// **This is where the value's convolution ends.** Nothing between it and
+    /// the attention step touches what it produced — the value is convolved and
+    /// never normed — so its rows are keys of the span the layer is keeping, and
+    /// the split into heads and the append are the indexing of the write. The
+    /// key's convolution has a head norm behind it and lands in a buffer of its
+    /// own.
+    pub fn encode_over(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        landing: Landing<'_>,
+    ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
+        let rows = self.rows(x.len());
+        assert!(landing.groups > 0, "a row has groups");
         assert_eq!(
-            x.len() % self.channels,
+            self.channels % landing.groups,
             0,
-            "{} values are not whole rows of {}",
-            x.len(),
-            self.channels
+            "{} channels are not {} groups",
+            self.channels,
+            landing.groups
         );
-        let rows = x.len() / self.channels;
+        landing.fits(rows, self.channels / landing.groups);
 
         let mut shape = self.device.buffer(&[
             extent(rows, "the rows of a call"),
             extent(self.channels, "the channels of a convolution"),
             extent(self.taps, "the taps of a kernel"),
+            extent(landing.groups, "the groups of a row"),
+            extent(landing.stride, "the rows a group has room for"),
+            extent(landing.base, "where a call's rows start"),
         ])?;
         let mut weight = self.weight.borrow_mut();
         let mut windows = self.windows.borrow_mut();
@@ -218,7 +253,6 @@ impl<'a> LayerConv<'a> {
             0 => (first, second),
             _ => (second, first),
         };
-        let mut out = self.device.zeroed::<f32>(x.len())?;
 
         // A thread to each channel of each timestep, and one more timestep's
         // worth for the window left behind — which reads the same padded
@@ -232,13 +266,24 @@ impl<'a> LayerConv<'a> {
                 x.arg(),
                 weight.arg(),
                 window.arg(),
-                out.arg(),
+                landing.out.arg(),
                 kept.arg(),
             ],
             Grid::new(threads, THREADS_PER_GROUP),
         )?;
         self.reading.set(1 - self.reading.get());
-        Ok(out)
+        Ok(())
+    }
+
+    /// How many rows of this convolution's width `values` is.
+    fn rows(&self, values: usize) -> usize {
+        assert_eq!(
+            values % self.channels,
+            0,
+            "{values} values are not whole rows of {}",
+            self.channels
+        );
+        values / self.channels
     }
 }
 
@@ -252,6 +297,9 @@ struct Shape {
     uint rows;
     uint channels;
     uint taps;
+    uint groups;
+    uint stride;
+    uint base;
 };
 
 /// One channel of one timestep of `window ++ x`, which is the padded sequence
@@ -319,7 +367,15 @@ kernel void short_conv(
     for (uint k = 0; k < shape.taps; ++k) {
         acc += taps[k] * padded(x, window, shape, t + k, c);
     }
-    out[t * shape.channels + c] = acc + x[t * shape.channels + c];
+
+    // Where the row lands, which for the value's convolution is the span the
+    // layer keeps — see `Landing`. With one group and a stride of `rows` this is
+    // `out[t * channels + c]`, the row where it was computed.
+    const uint width = shape.channels / shape.groups;
+    const uint group = c / width;
+    device float *result =
+        out + ((ulong)group * shape.stride + shape.base + t) * width + (c % width);
+    *result = acc + x[t * shape.channels + c];
 }
 "#;
 
@@ -595,8 +651,8 @@ mod tests {
         let want = layer.forward(sequence).expect("the dispatch completes");
 
         let without = BODY.replace(
-            "out[t * shape.channels + c] = acc + x[t * shape.channels + c];",
-            "out[t * shape.channels + c] = acc;",
+            "*result = acc + x[t * shape.channels + c];",
+            "*result = acc;",
         );
         assert_ne!(without, BODY, "the mutation changed nothing");
         let mutant = ShortConvolution::from_source(&device, &without).expect("the mutant compiles");
@@ -609,6 +665,83 @@ mod tests {
         );
         eprintln!("the residual dropped: deviation {deviation:e}");
         assert!(deviation > TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// **Where the value's convolution ends.** Its rows go straight into the
+    /// span the layer keeps — split into heads and placed past the keys already
+    /// there — because nothing between it and the attention step touches them.
+    ///
+    /// Checked against the same convolution left where it was computed and
+    /// scattered here, which is the copy the landing replaces. Exact rather than
+    /// bounded: the arithmetic is the same dispatch either way and the only
+    /// thing that differs is the index it writes to.
+    ///
+    /// Two calls at different offsets, and the slots after them checked to be
+    /// untouched, because a landing that ignored its base would agree on the
+    /// first call and overwrite it on the second.
+    #[test]
+    fn a_landing_places_a_convolutions_rows_where_the_step_reads_them() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+
+        // The attention convolutions' shape rather than the fixture's, whose
+        // channel count does not divide into heads: `kv_heads` groups of
+        // `head_dim`, with the span given room for more keys than these fill.
+        let (groups, width, taps, stride) = (2, 5, 4, 8);
+        let channels = groups * width;
+        let of = |len, salt: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i * 23 + salt) % 37) as f32 / 8.0 - 2.0)
+                .collect()
+        };
+        let (weight, sequence) = (of(channels * taps, 1), of(6 * channels, 2));
+        let chunks = [1, 5];
+
+        let layer = LayerConv::new(&device, &conv, channels, &weight).expect("the kernel uploads");
+        let mut span = device
+            .zeroed::<f32>(groups * stride * width)
+            .expect("the span allocates");
+        let mut at = 0;
+        layer.restart();
+        for rows in chunks {
+            let call = &sequence[at * channels..][..rows * channels];
+            let mut input = device.buffer(call).expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            layer
+                .encode_over(
+                    &mut batch,
+                    &mut input,
+                    Landing {
+                        out: &mut span,
+                        groups,
+                        stride,
+                        base: at,
+                    },
+                )
+                .expect("the convolution encodes");
+            batch.wait().expect("the batch completes");
+            at += rows;
+        }
+
+        // The same sequence in the same two chunks, left flat and scattered
+        // here — which is what the landing is instead of.
+        layer.restart();
+        let mut flat = Vec::new();
+        at = 0;
+        for rows in chunks {
+            let call = &sequence[at * channels..][..rows * channels];
+            flat.extend(layer.forward(call).expect("the dispatch completes"));
+            at += rows;
+        }
+        let mut want = vec![0.0; span.len()];
+        for (t, row) in flat.chunks_exact(channels).enumerate() {
+            for group in 0..groups {
+                want[(group * stride + t) * width..][..width]
+                    .copy_from_slice(&row[group * width..][..width]);
+            }
+        }
+        assert_eq!(span.to_vec(), want);
+        assert!(at < stride, "the span had no room left over to check");
     }
 
     /// A kernel of one tap carries no window and would leave the two buffers

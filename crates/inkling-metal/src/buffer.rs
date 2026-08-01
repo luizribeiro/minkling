@@ -294,6 +294,56 @@ impl Bytes<'_> {
     }
 }
 
+/// Where a dispatch's `[rows, groups * width]` output goes: the `[groups,
+/// stride, width]` region of `out` whose rows start at `base`.
+///
+/// **The transpose is the write's own indexing.** What a projection or a
+/// convolution produces is group-major within a row — the heads of a token side
+/// by side — and what the attention step reads is row-major within a group, over
+/// a span with room for more rows than the sequence has put in it. A kernel
+/// handed these three numbers addresses all of that as it writes, so the
+/// [`split_heads`](inkling_core::split_heads) between a projection and the step
+/// is not a pass over a tensor and the append into the span is not a copy.
+///
+/// A dispatch with nothing to scatter passes `groups: 1`, `stride: rows` and
+/// `base: 0`, which is the identity: the rows land where they were computed.
+#[derive(Debug)]
+pub struct Landing<'a> {
+    pub out: &'a mut Buffer<f32>,
+    /// How many groups of equal width each row divides into.
+    pub groups: usize,
+    /// Rows each group has room for in `out`, which is the stride between two
+    /// groups.
+    pub stride: usize,
+    /// Where in those rows this call's own start.
+    pub base: usize,
+}
+
+impl Landing<'_> {
+    /// That `rows` rows of `groups` groups of `width` fit where this says they
+    /// go.
+    ///
+    /// Checked here rather than by each kernel that writes one, because what
+    /// these three numbers have to agree with is the buffer they index — and a
+    /// GPU write past a buffer's end is memory somebody else owns rather than a
+    /// fault. `width` is the caller's because only it knows what a row of its
+    /// own is.
+    pub fn fits(&self, rows: usize, width: usize) {
+        assert!(self.groups > 0, "a row has groups");
+        assert!(
+            self.base + rows <= self.stride,
+            "{rows} rows at {} past a landing of {}",
+            self.base,
+            self.stride
+        );
+        assert_eq!(
+            self.out.len(),
+            self.groups * self.stride * width,
+            "the landing against the shape it is written under"
+        );
+    }
+}
+
 /// A buffer bound to a kernel argument slot, from [`Buffer::arg`].
 #[derive(Debug)]
 pub struct Arg<'a>(&'a ProtocolObject<dyn MTLBuffer>);

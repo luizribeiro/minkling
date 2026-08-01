@@ -503,34 +503,33 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// dispatches alone would watch the number that cannot change while the one
 /// that pays for it doubled underneath.
 ///
-/// Per layer: the input layernorm, the four projections that consume what it
-/// produced and the two short convolutions behind `k` and `v` in one submission,
-/// then the attention step and `o_proj` in a second — and per MoE layer seven
-/// expert dispatches in three, being the shared bank's gate and up *together
-/// with the router's own gate*, then its down *together with the routed bank's
-/// gate and up*, then the routed bank's down. A dense layer's feed-forward
-/// network is three in two. The head is one of each.
+/// **A layer's attention is one submission**, and eleven dispatches: the input
+/// layernorm, the four projections that consume what it produced, the two short
+/// convolutions behind `k` and `v`, the two head norms over `q` and the
+/// convolved `k`, the attention step and `o_proj`. Per MoE layer there are seven
+/// expert dispatches in three more, being the shared bank's gate and up
+/// *together with the router's own gate*, then its down *together with the
+/// routed bank's gate and up*, then the routed bank's down. A dense layer's
+/// feed-forward network is three in two. The head is one of each.
 ///
-/// **Six terms here say what a submission is worth.** The layer's norm, its two
-/// convolutions, the router's gate and the attention step are each a dispatch
-/// that costs no submission, encoded into a command buffer their consumer was
-/// already going to be submitted in. The seam between the two banks is a
-/// submission no layer needs at all: the shared bank's last dispatch and the
-/// routed bank's first read nothing of each other, which is visible to a backend
-/// handed the whole layer and to nothing else. Forty of them is 40 round trips a
-/// step that are not taken.
+/// **Ten of a layer's eleven dispatches cost no submission**, which is the whole
+/// of what this milestone did. Every activation between the hidden state a layer
+/// is handed and the one `o_proj` returns is a buffer the next dispatch reads —
+/// including the two that outlive the call, the convolutions' windows and the
+/// span of keys and values, which is why they had to become the layer's before
+/// the rest could follow. The seam between the two expert banks is a submission
+/// no layer needs either: the shared bank's last dispatch and the routed bank's
+/// first read nothing of each other, which is visible to a backend handed the
+/// whole layer and to nothing else.
 ///
-/// **What neither the attention step nor the convolutions bought is a
-/// submission**, and the shape here says why. The step is in the second of the
-/// layer's two command buffers and not the first, because the two head norms
-/// between `q`, `k` and it still run on the CPU — so the first buffer is closed
-/// and waited for before the step's inputs exist. Those two are what stands
-/// between 2 submissions a layer and 1.
+/// What is left is one submission a layer for attention, two or three for the
+/// MLP, and one for the head — 167 where the same dispatches were 249 before any
+/// of them were merged.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
     (
-        9 * layers + 3 * dense + 7 * moe + 1,
-        2 * layers + 2 * dense + 3 * moe + 1,
+        11 * layers + 3 * dense + 7 * moe + 1,
+        layers + 2 * dense + 3 * moe + 1,
     )
 }
 

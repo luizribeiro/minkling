@@ -620,6 +620,16 @@ pub struct LayerPacked<'a> {
     /// value crossing back, and these are what it runs them against.
     pub k_sconv: Vec<f32>,
     pub v_sconv: Vec<f32>,
+    /// The weights of the two RMSNorms over each head's channels — `[head_dim]`
+    /// each, and the same width for the query's heads and the key's.
+    ///
+    /// Here for the reason the convolutions are, one step further along again:
+    /// the query's norm makes what the attention step reads and the key's makes
+    /// what the cache holds, so between the projections and the step there is
+    /// nothing left that anything but a backend answering
+    /// [`Projections::layer`] has a use for.
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
     /// The shapes and scalars `InklingAttention.__init__` derived for the layer,
     /// which the tensors do not carry: which of the two sets of head counts the
     /// layer read, and whether it has a window at all.
@@ -759,6 +769,8 @@ impl<'a> CheckpointWeights<'a> {
                     rel_proj: self.layers[layer].rel_proj.clone(),
                     k_sconv: self.layers[layer].k_sconv.clone(),
                     v_sconv: self.layers[layer].v_sconv.clone(),
+                    q_norm: self.layers[layer].q_norm.clone(),
+                    k_norm: self.layers[layer].k_norm.clone(),
                     config: AttentionConfig::for_layer(self.config, layer),
                     attention: PackedAttention {
                         q_proj: packed("self_attn.q_proj"),

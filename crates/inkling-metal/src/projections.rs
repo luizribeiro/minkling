@@ -19,28 +19,33 @@
 //! one expert every row goes through, and the only thing that stays packed is
 //! the weight itself.
 //!
-//! **Two submissions a layer, whatever is in them.** `q`, `k`, `v` and `r`
-//! consume the same normed hidden state and nothing of each other, so they are
-//! one command buffer, and the attention step with `o_proj` behind it is the
-//! second. A feed-forward network is the same shape over gate, up and then down.
-//! That is worth 26 ms of a decode step at 206 µs a submission, and it is the
-//! whole of what [`Batch`](crate::Batch) is for.
+//! **One submission a layer, and eleven dispatches in it.** `q`, `k`, `v` and
+//! `r` consume the same normed hidden state and nothing of each other; the two
+//! short convolutions consume two of those and are consumed by the two head
+//! norms and the attention step; and `o_proj` consumes what the step produced.
+//! Every arrow in that is a device buffer, so the whole of a layer's attention
+//! is one command buffer — see [`LayerProjections::layer`], which is where an
+//! activation is formed and consumed without the CPU seeing it, ten times over.
+//! That is what a [`Batch`] is for, at 157 µs a
+//! marginal submission it is worth 6.6 ms of a decode step.
 //!
-//! **Four of the layer's nine dispatches cost no submission at all.** The norm
-//! that makes the four projections' input and the two short convolutions behind
-//! `k` and `v` are in the first command buffer, and the attention step that
-//! makes `o_proj`'s input is in the second, and what each produces stays in a
-//! device buffer its consumer reads — see [`LayerProjections::layer`], which is
-//! where every activation between a hidden state and `o_proj` but two is formed
-//! and consumed without the CPU seeing it.
+//! **What took longest to reach was not the arithmetic but the state.** Four of
+//! those operations write something that outlives the call — the two
+//! convolutions' windows, and the keys and values the step attends over — so a
+//! backend could not run them without also holding that state, and a backend
+//! that did not run them had to close its command buffer in the middle of the
+//! layer to let the CPU. [`Projections::layer`] is the seam that moved, and
+//! [`AttentionCache::seen`] is what a sequence carries once the rest is here.
 
 use inkling_core::attention::{AttentionCache, AttentionStep, LayerStep, Projections, Qkvr, Sdpa};
 use inkling_core::mask::BandedMask;
 use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::weights::{LayerPacked, Packed, PackedMlp, ProjectionBackend};
 
-use crate::attention::{AttentionError, FusedAttention, LayerAttention, Step};
+use crate::attention::{AttentionError, FusedAttention, KeyValues, LayerAttention, Step};
+use crate::buffer::Landing;
 use crate::device::{Device, MetalError};
+use crate::kernel::Batch;
 use crate::matmul::{MatmulError, PackedMatmul, PackedProjection, Pending, together};
 use crate::norm::{LayerNorm, RmsNorm};
 use crate::sconv::{LayerConv, ShortConvolution};
@@ -77,6 +82,12 @@ pub struct LayerProjections<'a> {
     /// window lives — see [`LayerProjections::layer`].
     k_sconv: LayerConv<'a>,
     v_sconv: LayerConv<'a>,
+    /// The two RMSNorms over each head's channels, resident for the same reason
+    /// again. The query's writes the `[heads, queries, head_dim]` the step reads
+    /// and the key's writes into the span, so between them the last two values
+    /// a layer's attention formed here stop being formed here at all.
+    q_norm: LayerNorm<'a>,
+    k_norm: LayerNorm<'a>,
 }
 
 /// The four kernels a layer's own operations dispatch through, compiled once for
@@ -137,6 +148,8 @@ impl<'a> LayerProjections<'a> {
         let matmul = &kernels.matmul;
         let sconv =
             |weight: &[f32]| LayerConv::new(device, &kernels.conv, config.kv_channels(), weight);
+        let head_norm =
+            |weight: &[f32]| LayerNorm::new(device, &kernels.norm, weight, config.rms_norm_eps);
         Ok(Self {
             input_layernorm: LayerNorm::new(
                 device,
@@ -147,6 +160,8 @@ impl<'a> LayerProjections<'a> {
             attention: LayerAttention::new(device, &kernels.attention, config, &layer.rel_proj)?,
             k_sconv: sconv(&layer.k_sconv)?,
             v_sconv: sconv(&layer.v_sconv)?,
+            q_norm: head_norm(&layer.q_norm)?,
+            k_norm: head_norm(&layer.k_norm)?,
             q_proj: whole(device, matmul, &packed.q_proj)?,
             k_proj: whole(device, matmul, &packed.k_proj)?,
             v_proj: whole(device, matmul, &packed.v_proj)?,
@@ -205,54 +220,84 @@ impl<'a> LayerProjections<'a> {
             .unwrap_or_else(|err| panic!("the layer's span did not grow: {err}"));
     }
 
-    /// The layer's norm, its four projections and the two convolutions behind
-    /// `k` and `v`, in one command buffer.
+    /// The whole of a layer's attention encoded into `batch`: eleven dispatches
+    /// from the hidden state to what `o_proj` returns, with nothing in between
+    /// leaving the device.
     ///
-    /// Seven dispatches and one submission. Only `k` and `v` have anything
-    /// between them and the attention step, so `q` and `r` come back as the
-    /// projections left them.
-    fn convolved(
+    /// The order is the layer's own and every arrow in it is a buffer:
+    ///
+    /// ```text
+    /// input_layernorm ─┬─ q_proj ────────────── q_norm ──┐
+    ///                  ├─ k_proj ── k_sconv ─── k_norm ──┤ (into the span)
+    ///                  ├─ v_proj ── v_sconv ─────────────┤ (into the span)
+    ///                  └─ r_proj ────────────────────────┴─ attend ─ o_proj
+    /// ```
+    ///
+    /// **The value has no head norm and the key does**, which is not a symmetry
+    /// this lost: the reference norms the key after its convolution and leaves
+    /// the value alone. So the value's convolution is the last thing to touch it
+    /// and lands its rows in the span directly, where the key's convolution
+    /// lands in a buffer its norm reads.
+    fn encoding(
         &self,
-        x: &[f32],
-        input_layernorm: Option<&[f32]>,
-        eps: f32,
-    ) -> Result<Projected, MatmulError> {
-        let [q, k, v, rel] = together(self.q_proj.device(), |batch| {
-            let mut normed = match input_layernorm {
-                Some(weight) => {
-                    assert_eq!(
-                        weight.len(),
-                        self.input_layernorm.width(),
-                        "the layer's norm against the one wrapped for it"
-                    );
-                    assert_eq!(eps, self.input_layernorm.eps(), "rms_norm_eps");
-                    self.input_layernorm.encode(batch, x)?
-                }
-                None => self.q_proj.device().buffer(x)?,
-            };
-            let q = self.q_proj.encode_over(batch, &mut normed)?;
-            let mut k = self.k_proj.encode_over(batch, &mut normed)?.buffer();
-            let mut v = self.v_proj.encode_over(batch, &mut normed)?.buffer();
-            let rel = self.r_proj.encode_over(batch, &mut normed)?;
-            Ok([
-                q,
-                Pending::holding(self.k_sconv.encode(batch, &mut k)?),
-                Pending::holding(self.v_sconv.encode(batch, &mut v)?),
-                rel,
-            ])
-        })?;
-        Ok(Projected { q, k, v, rel })
-    }
-}
+        batch: &mut Batch<'_>,
+        span: &mut KeyValues,
+        step: LayerStep<'_>,
+    ) -> Result<Pending, MatmulError> {
+        let device = self.q_proj.device();
+        let mut normed = match step.input_layernorm {
+            Some(weight) => {
+                assert_eq!(
+                    weight.len(),
+                    self.input_layernorm.width(),
+                    "the layer's norm against the one wrapped for it"
+                );
+                assert_eq!(step.eps, self.input_layernorm.eps(), "rms_norm_eps");
+                self.input_layernorm.encode(batch, step.x)?
+            }
+            None => device.buffer(step.x)?,
+        };
+        let mut q = self.q_proj.encode_over(batch, &mut normed)?.buffer();
+        let mut k = self.k_proj.encode_over(batch, &mut normed)?.buffer();
+        let mut v = self.v_proj.encode_over(batch, &mut normed)?.buffer();
+        let mut rel = self.r_proj.encode_over(batch, &mut normed)?.buffer();
 
-/// What a layer's first command buffer produced: the query and the relative
-/// features as the projections left them, and the key and the value with their
-/// convolutions behind them.
-struct Projected {
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    rel: Vec<f32>,
+        let queries = q.len() / (step.sdpa.heads() * step.sdpa.head_dim());
+        let (keys, values) = span.landings();
+        let mut k = self.k_sconv.encode(batch, &mut k)?;
+        self.v_sconv.encode_over(batch, &mut v, values)?;
+
+        let mut headed = device.zeroed::<f32>(q.len())?;
+        self.q_norm.encode_over(
+            batch,
+            &mut q,
+            step.q_taus,
+            Landing {
+                out: &mut headed,
+                groups: step.sdpa.heads(),
+                stride: queries,
+                base: 0,
+            },
+        )?;
+        self.k_norm.encode_over(batch, &mut k, None, keys)?;
+
+        // **The span grows here rather than when the batch completes**, because
+        // the step below is what has to see this call's keys and it is in the
+        // same command buffer as the two dispatches that wrote them. Metal's
+        // default dispatch type is serial, so those writes are done before the
+        // step reads them — and a span that grew after the wait would attend
+        // over the previous step's keys and leave this token out of its own row.
+        span.appended(queries);
+        let mut attended = self.attention.encode_over(
+            batch,
+            span,
+            &mut headed,
+            &mut rel,
+            step.bias_taus,
+            step.q_offset,
+        )?;
+        self.o_proj.encode_over(batch, &mut attended)
+    }
 }
 
 /// What standing one layer's own weights up on the device can fail with, which
@@ -345,18 +390,11 @@ impl Projections for LayerProjections<'_> {
     /// reads, which is the pattern [`LayerProjections::normed_qkvr`] establishes
     /// at the other end of the layer.
     ///
-    /// **It is the second of the layer's two command buffers and not the
-    /// first.** The two short convolutions and the two head norms between `q`,
-    /// `k`, `v` and this run on the CPU, so the buffer the projections went in
-    /// is closed and waited for before the step's inputs exist. Those four are
-    /// what stands between two submissions a layer and one.
-    ///
-    /// The shape is checked rather than taken, for the reason
-    /// [`LayerProjections::normed_qkvr`] checks its norm: the step carries the
-    /// widths its caller derived and this holds the widths it was wrapped for,
-    /// and the two are separate copies of one fact. A step paired with another
-    /// layer's band is buffers of a plausible size read under the wrong shape,
-    /// which is a wrong answer rather than a panic.
+    /// **The step alone, over a span the caller holds.** A layer's own step is
+    /// [`LayerProjections::layer`]'s, which reads the span this layer keeps and
+    /// puts the whole of a layer's attention in one command buffer; this is what
+    /// is left for a caller that has the keys and values here — the oracle the
+    /// cases in this module measure that one against.
     fn attend(&self, step: AttentionStep<'_>) -> Vec<f32> {
         self.shaped_for(step.sdpa, step.mask);
 
@@ -384,53 +422,48 @@ impl Projections for LayerProjections<'_> {
     /// context.** [`LayerProjections::attend`] above is handed the whole cached
     /// span as a slice and allocates and copies all of it onto the device on
     /// every layer of every step, where every key but the newest was already
-    /// there. Held by [`LayerAttention`](crate::LayerAttention), a step copies
+    /// there. Held by [`LayerAttention`], a step copies
     /// the key it made — and the `[keys, kv_heads * head_dim]` to `[kv_heads,
     /// keys, head_dim]` transpose the CPU path runs over the whole span
     /// alongside it becomes the indexing of that one write.
     ///
-    /// **The two convolutions are in the first command buffer**, behind the two
-    /// projections that feed them and in front of nothing this process sees. A
-    /// convolution's input is what `k_proj` and `v_proj` left on the device and
-    /// its output is read by the attention step and by the cache, so the only
-    /// reason it was ever a value here is that there was no kernel for it. The
-    /// window it carries between calls is the layer's now too.
+    /// **One submission a layer.** Nothing between the hidden state this is
+    /// handed and the `[queries, hidden]` it returns is a value this process
+    /// forms or reads: the normed state, the four projections' outputs, the two
+    /// convolutions', the two head norms' and the attention step's are each a
+    /// buffer the next dispatch reads.
     ///
-    /// The two head norms are what is left, and they are why this is still the
-    /// layer's two submissions rather than one: the first command buffer is
-    /// closed and waited for so that a query and a key can be normalised here.
+    /// **The state is what made that possible.** Four of the eleven write
+    /// something that outlives the call — the two convolutions' windows, and the
+    /// keys and values the step attends over — so running them here is only
+    /// coherent because the layer holds all four. What crosses back is the
+    /// answer and nothing else.
     fn layer(&self, cache: &mut AttentionCache, step: LayerStep<'_>) -> Option<Vec<f32>> {
         self.shaped_for(step.sdpa, step.mask);
         let queries = step.x.len() / self.input_layernorm.width();
         self.starting(cache.seen(), queries);
         assert_eq!(
-            [step.k_sconv.kernel_size(), step.v_sconv.kernel_size()],
-            [self.k_sconv.taps(), self.v_sconv.taps()],
-            "the layer's convolutions against the ones wrapped for it"
+            [
+                step.k_sconv.kernel_size(),
+                step.v_sconv.kernel_size(),
+                step.q_norm.len(),
+                step.k_norm.len(),
+            ],
+            [
+                self.k_sconv.taps(),
+                self.v_sconv.taps(),
+                self.q_norm.width(),
+                self.k_norm.width(),
+            ],
+            "the layer's convolutions and head norms against the ones wrapped for it"
         );
 
-        let device = self.q_proj.device();
-        let Projected { q, k, v, rel } = self
-            .convolved(step.x, step.input_layernorm, step.eps)
-            .unwrap_or_else(|err| panic!("the layer's projections did not run: {err}"));
-
-        let (q, k) = step.head_norms(&q, &k);
-        self.attention.append(&k, &v);
-        cache.appended(queries);
-
-        let [out] = together(device, |batch| {
-            let mut q = device.buffer(&q)?;
-            let mut rel = device.buffer(&rel)?;
-            let mut attended = self.attention.encode_over(
-                batch,
-                &mut q,
-                &mut rel,
-                step.bias_taus,
-                step.q_offset,
-            )?;
-            Ok([self.o_proj.encode_over(batch, &mut attended)?])
+        let mut span = self.attention.span();
+        let [out] = together(self.q_proj.device(), |batch| {
+            Ok([self.encoding(batch, &mut span, step)?])
         })
-        .unwrap_or_else(|err| panic!("the layer's attention step did not run: {err}"));
+        .unwrap_or_else(|err| panic!("the layer's attention did not run: {err}"));
+        cache.appended(queries);
         Some(out)
     }
 
@@ -735,8 +768,16 @@ mod tests {
             rel_proj: rel_proj(),
             k_sconv: sconv(),
             v_sconv: sconv(),
+            q_norm: head_weight(),
+            k_norm: head_weight(),
             config: shape(),
         }
+    }
+
+    /// A head-norm weight over the channels of one head, not all ones for the
+    /// reason the layer norm's is not.
+    fn head_weight() -> Vec<f32> {
+        layernorm(shape().head_dim)
     }
 
     /// A convolution kernel that is not all one value, for the reason the norm
@@ -962,6 +1003,8 @@ mod tests {
                 rel_proj: rel_proj(),
                 k_sconv: sconv(),
                 v_sconv: sconv(),
+                q_norm: head_weight(),
+                k_norm: head_weight(),
                 config: shape(),
                 attention: attention(&ckpt, LAST_TWO[0]),
                 dense_mlp: Some(PackedMlp {
@@ -976,6 +1019,8 @@ mod tests {
                 rel_proj: rel_proj(),
                 k_sconv: sconv(),
                 v_sconv: sconv(),
+                q_norm: head_weight(),
+                k_norm: head_weight(),
                 config: shape(),
                 attention: attention(&ckpt, LAST_TWO[1]),
                 dense_mlp: None,
