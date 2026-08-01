@@ -105,9 +105,16 @@ impl Device {
 /// projection against packed weights adds 105 µs of its own. So a decode step's
 /// dispatches, each submitted alone, were 94 ms of round trip — most of the 163
 /// ms the step took then — and what shares an input should share a command
-/// buffer. A step now encodes 499 dispatches into 249 of these, and what it
-/// spends waiting for them is 60% of it, of which the device is executing for a
-/// quarter.
+/// buffer. A step now encodes 539 dispatches into 209 of these, and what it
+/// spends waiting for them is 79% of it, of which the device is executing for a
+/// third.
+///
+/// **206 µs is what one costs alone, and it is not what one costs at the
+/// margin.** Taking 40 command buffers out of a step of 249 — the same
+/// dispatches, merged — took about 6.3 ms off the wait over seven alternating
+/// pairs, which is about 157 µs each. The larger number is what a round trip is
+/// worth in isolation; the smaller is what removing one from a stream of them
+/// is worth, and it is the one an estimate should be built on.
 ///
 /// **The dispatches are ordered.** Metal's default dispatch type is serial, so
 /// each one here runs after the one before it and reads what it wrote. That is

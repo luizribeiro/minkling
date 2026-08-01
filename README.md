@@ -25,7 +25,7 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 100 ms against mlx-vlm's 32 ms, and the timings go to
+A decode step is about 87 ms against mlx-vlm's 32 ms, and the timings go to
 stderr so stdout stays pipeable. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
@@ -34,7 +34,7 @@ rather than applied by a template this does not implement.
 **Every matmul in the model runs on the GPU, and no weight one of them reads is
 ever decoded to memory** — the MXFP4 ones in registers a nibble at a time, the
 routers' bfloat16 gates by a shift — and `--backend cpu` puts them all back:
-0.100 s a token against the CPU's 8.9. The experts were the first two thirds of
+0.087 s a token against the CPU's 8.9. The experts were the first two thirds of
 that. A token reads 6 of each MoE layer's 256 experts and both of its shared
 ones, which is 32 GB of float32 the CPU path decodes to multiply against and 4.3
 GB of packed bytes the GPU path indexes into and never decodes at all. The rest
@@ -55,27 +55,38 @@ inferred.** Every operation a forward pass runs opens a scope charged the time
 inside it that no scope inside *it* claimed, so the rows of a decode step sum to
 the step and what they leave over is a number rather than a shrug:
 
-    submit and wait     249    80%      of which the device executed for 24 ms
+    submit and wait     209    79%      of which the device executed for 23 ms
     dispatch encode     539    10%
     readback            497     3%
-    everything else                     7%
+    everything else                     8%
 
 **Two rows left it since that table was first written, and the shape of what is
 left has not changed.** The routers' gates were 19% and every layer's bfloat16
 tensors widened again on every step were 8%; the first is a dispatch now and the
 second happens once, at load. Four fifths of a step is a round trip, and the
-device is executing for a quarter of that — so the rest is 249 command buffers
+device is executing for a third of that — so the rest is 209 command buffers
 submitted and waited for around work that was already done. Every activation op
 this engine has, the attention step included, is 5% of a step together.
 
-Multiplies that share an input share a command buffer: the four projections a
-layer's normed hidden state feeds, the norm that makes it, each expert bank's
-gate and up, and the router's own gate beside the shared bank it weights — 539
-dispatches in 249 submissions. **That last pair is what a seam has to be able to
-express.** The gate's answer decides how heavily each shared expert counts and
-not which rows it runs, so the two do not wait for each other and 40 gates cost
-no submission at all; encoded on their own they would have handed back 8 ms of
-the 28 they saved.
+Multiplies that share an input share a command buffer, and so do multiplies that
+share nothing: the four projections a layer's normed hidden state feeds, the norm
+that makes it, each expert bank's gate and up, the router's own gate beside the
+shared bank it weights, and that bank's last multiply beside the routed bank's
+first — 539 dispatches in 209 submissions. **What those last two have in common
+is that a seam had to be able to express them.** The gate's answer decides how
+heavily each shared expert counts and not which rows it runs; and by the time the
+shared bank's `down` is encoded, the routing that names the routed bank's rows
+has already been taken from logits the gate handed over — so neither pair waits
+for itself, and 40 gates and 40 round trips cost nothing. Handing a backend one
+bank at a time, neither is visible.
+
+Removing those 40 submissions took the wait row from 249 to 209 and about 6.3 ms
+off it, measured against the commit before it and alternating between the two
+over seven pairs: the device is executing for the same 23 ms and the dispatch
+count does not move, so what is left is the round trip. A submission is 206
+microseconds measured on its own and about 157 measured as the fortieth taken
+out of a stream of 249 — two numbers this project has to keep apart, since only
+the second says what merging a command buffer is worth.
 
 What is left on the CPU is the attention step itself — whose scores and softmax
 multiply activations against activations and have no weight to hand over — plus

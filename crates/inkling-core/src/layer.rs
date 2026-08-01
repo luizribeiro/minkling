@@ -66,8 +66,8 @@ pub trait Experts {
     /// shared bank does not wait for the gate, and the routing that names the
     /// routed bank's rows is computed from logits the gate hands over before
     /// either bank has finished. On this machine a submission is 206
-    /// microseconds around work that is already done, and a MoE layer is 4 of
-    /// them out of a step's 249.
+    /// microseconds around work that is already done, and a MoE layer is 3 of
+    /// them out of a step's 209.
     ///
     /// The default holds no gate and runs the two banks in the order the layer
     /// names them, which is what a backend that decodes an expert at a time
