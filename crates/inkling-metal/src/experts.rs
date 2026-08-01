@@ -41,21 +41,27 @@
 //! projections that were 78% of a step — which `crate::projections` has since
 //! taken, leaving dispatching the term rather than the arithmetic.
 //!
-//! **The SwiGLU stays on the CPU.** Between `gate_proj` and `down_proj` sits
-//! `silu(gate) * up` over `[rows, 2048]`, which for a decode step is eight rows
-//! — 16384 multiplies against the 4.3 GB the dispatches around it read. A kernel
-//! for it would be a fourth dispatch a bank to save nothing measurable, and the
-//! buffers it would avoid touching are shared storage the CPU addresses anyway.
+//! **The SwiGLU is a fourth dispatch and not a fourth submission.** Between
+//! `gate_proj` and `down_proj` sits `silu(gate) * up` over `[rows, 2048]`, which
+//! for a decode step is eight rows — 16384 multiplies against the 4.3 GB the
+//! dispatches around it read, so as arithmetic it is free wherever it runs. What
+//! it cost on the CPU was the command buffer it closed: `down` reads what the
+//! pair produced, so an activation this process had to see meant reading both
+//! outputs back, multiplying them, and copying the answer over again as `down`'s
+//! input. Encoded between them — see [`crate::SwiGlu`] — a bank is four
+//! dispatches in one command buffer and nothing it computes is ever a
+//! `Vec<f32>` here.
 
 use inkling_core::layer::Experts;
 use inkling_core::moe::{BankRows, Gathered, Rows};
-use inkling_core::ops::swiglu;
 use inkling_core::weights::{ExpertBackend, LayerBanks, PackedExperts};
 
+use crate::buffer::Buffer;
 use crate::dense::{DenseMatmul, DenseWeight};
 use crate::device::Device;
 use crate::kernel::Batch;
 use crate::matmul::{MatmulError, PackedBank, PackedMatmul, Pending};
+use crate::swiglu::SwiGlu;
 
 /// One `SwitchGLU`'s three banks on the device: `[experts, hidden_dim, dim]`
 /// gate and up projections beside `[experts, dim, hidden_dim]` down projections.
@@ -70,6 +76,9 @@ pub struct ExpertBanks<'a> {
     gate_proj: PackedBank<'a>,
     up_proj: PackedBank<'a>,
     down_proj: PackedBank<'a>,
+    /// The activation between the first two and the third, which is not a
+    /// weight and belongs to no bank — one pipeline serves the whole model.
+    swiglu: &'a SwiGlu,
 }
 
 impl<'a> ExpertBanks<'a> {
@@ -87,6 +96,7 @@ impl<'a> ExpertBanks<'a> {
         gate_proj: PackedBank<'a>,
         up_proj: PackedBank<'a>,
         down_proj: PackedBank<'a>,
+        swiglu: &'a SwiGlu,
     ) -> Result<Self, MatmulError> {
         let pair = |what, got, expected| match got == expected {
             true => Ok(()),
@@ -127,6 +137,7 @@ impl<'a> ExpertBanks<'a> {
             gate_proj,
             up_proj,
             down_proj,
+            swiglu,
         })
     }
 
@@ -138,6 +149,7 @@ impl<'a> ExpertBanks<'a> {
     pub fn wrap(
         device: &'a Device,
         matmul: &'a PackedMatmul,
+        swiglu: &'a SwiGlu,
         banks: &PackedExperts<'a>,
         dim: usize,
     ) -> Result<Self, MatmulError> {
@@ -147,6 +159,7 @@ impl<'a> ExpertBanks<'a> {
             gate_proj,
             PackedBank::wrap(device, matmul, &banks.up_proj(), dim)?,
             PackedBank::wrap(device, matmul, &banks.down_proj(), hidden_dim)?,
+            swiglu,
         )
     }
 
@@ -167,10 +180,9 @@ impl<'a> ExpertBanks<'a> {
     /// Every gathered row through the expert it named, as the SwiGLU MLP an
     /// expert is.
     ///
-    /// Three dispatches over the same expert list, in two command buffers:
-    /// `x @ gate^T` and `x @ up^T` read the same rows and nothing of each other,
-    /// so they are submitted together, and `silu(gate) * up` through `down`
-    /// follows because it is what they produced.
+    /// Four dispatches over the same expert list, in one command buffer: `x @
+    /// gate^T` and `x @ up^T` read the same rows and nothing of each other, and
+    /// the activation and `down` each read what the dispatch before them wrote.
     ///
     /// One bank on its own, which is what a caller with a single bank in hand
     /// wants — and what [`LayerExperts`] measures its own schedule against,
@@ -179,17 +191,47 @@ impl<'a> ExpertBanks<'a> {
     pub fn forward(&self, gathered: Gathered<'_>) -> Result<Vec<f32>, MatmulError> {
         let chosen = chosen(gathered);
         let mut batch = self.device().batch()?;
-        let glu = self.encode_glu(&mut batch, &chosen, gathered.rows())?;
-        batch.wait()?;
-
-        let mut batch = self.device().batch()?;
-        let out = self.encode_down(&mut batch, &chosen, &activated(glu))?;
+        let out = self.encode(&mut batch, &chosen, gathered.rows())?;
         batch.wait()?;
         Ok(out.take())
     }
 
+    /// The whole bank encoded into `batch`: the pair, the activation between
+    /// them, and `down` over what it produced.
+    ///
+    /// **Nothing here waits for this side.** Every value between the rows handed
+    /// in and the rows handed back is a buffer the next dispatch reads, so a
+    /// caller with something else to put in the same command buffer may — which
+    /// is what a MoE layer's two banks are to each other.
+    pub fn encode(
+        &self,
+        batch: &mut Batch<'_>,
+        chosen: &[u32],
+        rows: &[f32],
+    ) -> Result<Pending, MatmulError> {
+        let glu = self.encode_glu(batch, chosen, rows)?;
+        match self.activated(batch, glu)? {
+            Some(mut activated) => self.encode_down(batch, chosen, &mut activated),
+            None => Ok(Pending::empty()),
+        }
+    }
+
     pub fn device(&self) -> &'a Device {
         self.gate_proj.device()
+    }
+
+    /// `silu(gate) * up`, encoded over the pair's own outputs and left in the
+    /// gate's buffer — `None` for a bank no row named, which dispatched neither.
+    fn activated(
+        &self,
+        batch: &mut Batch<'_>,
+        [gate, up]: [Pending; 2],
+    ) -> Result<Option<Buffer<f32>>, MatmulError> {
+        let (Some(mut gate), Some(mut up)) = (gate.into_buffer(), up.into_buffer()) else {
+            return Ok(None);
+        };
+        self.swiglu.encode(batch, &mut gate, &mut up)?;
+        Ok(Some(gate))
     }
 
     /// The two dispatches that read the gathered rows, encoded into `batch`.
@@ -199,7 +241,7 @@ impl<'a> ExpertBanks<'a> {
     /// this bank produces, so anything else with the same input can be encoded
     /// beside them — the router's gate is exactly that, and 225 microseconds a
     /// submission is what forty of them would otherwise cost a step.
-    pub fn encode_glu(
+    fn encode_glu(
         &self,
         batch: &mut Batch<'_>,
         chosen: &[u32],
@@ -211,28 +253,15 @@ impl<'a> ExpertBanks<'a> {
         ])
     }
 
-    /// The third dispatch, over what the SwiGLU between them produced.
-    ///
-    /// **What this reads is all that ties it to `encode_glu`'s command buffer,
-    /// and it is nothing another bank produces.** So a bank whose pair has
-    /// already been waited for can have this encoded beside the *next* bank's
-    /// pair, which is what a MoE layer's two banks are to each other.
-    pub fn encode_down(
+    /// The last dispatch, over the buffer the activation left behind.
+    fn encode_down(
         &self,
         batch: &mut Batch<'_>,
         chosen: &[u32],
-        activated: &[f32],
+        activated: &mut Buffer<f32>,
     ) -> Result<Pending, MatmulError> {
-        self.down_proj.encode(batch, chosen, activated)
+        self.down_proj.encode_over(batch, chosen, activated)
     }
-}
-
-/// `silu(gate) * up`, which is what the pair [`ExpertBanks::encode_glu`]
-/// dispatched becomes before `down` reads it.
-fn activated([gate, up]: [Pending; 2]) -> Vec<f32> {
-    let (mut gate, up) = (gate.take(), up.take());
-    swiglu(&mut gate, &up);
-    gate
 }
 
 /// The expert each row goes through, as the kernel indexes them.
@@ -274,13 +303,14 @@ impl<'a> LayerExperts<'a> {
         self.shared.device()
     }
 
-    /// [`Experts::banks`]'s three command buffers, with the errors a dispatch
-    /// can fail with still in hand.
+    /// [`Experts::banks`]'s two command buffers, with the errors a dispatch can
+    /// fail with still in hand.
     ///
-    /// **`route` sits between the first buffer and the second, and that
-    /// placement is the schedule.** It turns the gate's logits — which the
-    /// first buffer produced — into the rows the routed bank runs, so by the
-    /// time the second buffer is opened everything that goes in it is in hand.
+    /// **`route` is the one thing between them, and that is the schedule.** It
+    /// turns the gate's logits — which the first buffer produced — into the rows
+    /// the routed bank runs, so the second buffer cannot be opened until this
+    /// side has seen an answer, and everything that does not wait for it is
+    /// already in the first.
     fn encode(
         &self,
         x: &[f32],
@@ -291,30 +321,19 @@ impl<'a> LayerExperts<'a> {
 
         let mut batch = self.device().batch()?;
         let logits = self.gate.encode(&mut batch, x)?;
-        let shared_glu = self
+        let shared_out = self
             .shared
-            .encode_glu(&mut batch, &shared_chosen, shared.rows())?;
+            .encode(&mut batch, &shared_chosen, shared.rows())?;
         batch.wait()?;
 
-        let shared_activated = activated(shared_glu);
         let routed_rows = route(Some(&logits.take()));
         let routed = routed_rows.gathered();
         let routed_chosen = chosen(routed);
 
         let mut batch = self.device().batch()?;
-        let shared_out = self
-            .shared
-            .encode_down(&mut batch, &shared_chosen, &shared_activated)?;
-        let routed_glu = self
-            .routed
-            .encode_glu(&mut batch, &routed_chosen, routed.rows())?;
-        batch.wait()?;
-
-        let routed_activated = activated(routed_glu);
-        let mut batch = self.device().batch()?;
         let routed_out = self
             .routed
-            .encode_down(&mut batch, &routed_chosen, &routed_activated)?;
+            .encode(&mut batch, &routed_chosen, routed.rows())?;
         batch.wait()?;
 
         Ok(BankRows {
@@ -327,12 +346,13 @@ impl<'a> LayerExperts<'a> {
         device: &'a Device,
         matmul: &'a PackedMatmul,
         dense: &'a DenseMatmul,
+        swiglu: &'a SwiGlu,
         banks: &LayerBanks<'a>,
         dim: usize,
     ) -> Result<Self, MatmulError> {
         Ok(Self {
-            routed: ExpertBanks::wrap(device, matmul, &banks.routed, dim)?,
-            shared: ExpertBanks::wrap(device, matmul, &banks.shared, dim)?,
+            routed: ExpertBanks::wrap(device, matmul, swiglu, &banks.routed, dim)?,
+            shared: ExpertBanks::wrap(device, matmul, swiglu, &banks.shared, dim)?,
             gate: DenseWeight::wrap(device, dense, &banks.gate_weight)?,
         })
     }
@@ -355,16 +375,19 @@ impl Experts for LayerExperts<'_> {
     }
 
     /// The whole layer — the gate, both banks, and the SwiGLU between each
-    /// bank's halves — in three command buffers.
+    /// bank's halves — in two command buffers.
     ///
-    /// **Seven dispatches in three submissions, where a layer whose banks run
-    /// one after the other is seven in four.** Each bank alone takes two
-    /// buffers, because `down` reads what `gate` and `up` produced and has to
-    /// wait for them. The shared bank's `down` and the routed bank's `gate` and
-    /// `up` are not in that relation to each other: `down` reads the shared
-    /// halves this side already holds, and the routed pair reads rows gathered
-    /// out of the hidden state under a routing taken from logits the *first*
-    /// buffer produced. Neither waits for the other, so they go in one.
+    /// **Nine dispatches in two submissions, where the same nine asked for a
+    /// piece at a time are three.** A bank is four dispatches that need no
+    /// answer from this side, so it is one command buffer whoever asks; what a
+    /// layer adds is that the gate's own multiply rides in the shared bank's,
+    /// because it reads the hidden state that bank's pair reads and decides only
+    /// how heavily its rows count.
+    ///
+    /// **What is left between the two is the router**, and it is the only thing
+    /// left: the routed bank's rows are named by a top-k this side takes from
+    /// logits the first buffer produced, so the second cannot be encoded until
+    /// the first has been waited for.
     fn banks(
         &self,
         x: &[f32],
@@ -410,13 +433,16 @@ impl<'a> ModelExperts<'a> {
         device: &'a Device,
         matmul: &'a PackedMatmul,
         dense: &'a DenseMatmul,
+        swiglu: &'a SwiGlu,
         banks: &[LayerBanks<'a>],
         layers: usize,
         dim: usize,
     ) -> Result<Self, MatmulError> {
         let mut wrapped: Vec<Option<LayerExperts<'a>>> = (0..layers).map(|_| None).collect();
         for bank in banks {
-            wrapped[bank.layer] = Some(LayerExperts::wrap(device, matmul, dense, bank, dim)?);
+            wrapped[bank.layer] = Some(LayerExperts::wrap(
+                device, matmul, dense, swiglu, bank, dim,
+            )?);
         }
         Ok(Self { layers: wrapped })
     }
@@ -461,16 +487,21 @@ mod tests {
     /// pair, which is the shape the layer's own `[258, 4096]` is.
     const GATE_ROWS: usize = EXPERTS + 2;
 
-    /// What a call cost the device: `(dispatches, submissions)`, which is the
-    /// pair the granularity question is settled in.
-    fn spent<T>(device: &Device, run: impl FnOnce() -> T) -> (T, (u64, u64)) {
-        let (dispatches, submissions) = (device.dispatches(), device.submissions());
+    /// What a call cost the device: `(dispatches, submissions, allocations)`,
+    /// which is what the granularity question is settled in.
+    fn spent<T>(device: &Device, run: impl FnOnce() -> T) -> (T, (u64, u64, u64)) {
+        let before = (
+            device.dispatches(),
+            device.submissions(),
+            device.allocations(),
+        );
         let got = run();
         (
             got,
             (
-                device.dispatches() - dispatches,
-                device.submissions() - submissions,
+                device.dispatches() - before.0,
+                device.submissions() - before.1,
+                device.allocations() - before.2,
             ),
         )
     }
@@ -506,6 +537,7 @@ mod tests {
             &self,
             device: &'a Device,
             matmul: &'a PackedMatmul,
+            swiglu: &'a SwiGlu,
             gate: &Case,
             up: &Case,
         ) -> Result<ExpertBanks<'a>, MatmulError> {
@@ -524,6 +556,7 @@ mod tests {
                 bank(gate, DIM, HIDDEN_DIM)?,
                 bank(up, DIM, HIDDEN_DIM)?,
                 bank(&self.down, HIDDEN_DIM, DIM)?,
+                swiglu,
             )
         }
 
@@ -554,13 +587,23 @@ mod tests {
     /// Every row goes through a different expert and one is repeated, which is
     /// what a decode step's routing looks like — so this pins the gather and the
     /// composition together rather than one at a time.
+    ///
+    /// **What it costs is asserted beside what it answers**, because the two
+    /// move independently and only one of them is visible in the values. Four
+    /// dispatches in one command buffer, and five allocations for them: the rows
+    /// copied over for `gate` and again for `up`, an output each for the three
+    /// multiplies, and nothing at all for the activation — which writes into the
+    /// buffer `gate` produced and hands it to `down`. A path that read the pair
+    /// back and copied the product over again is the same four values and six
+    /// allocations in two command buffers.
     #[test]
     fn three_banks_and_a_swiglu_are_the_expert_the_cpu_decodes() {
         let Some(device) = device() else { return };
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
         let banks = Banks::new();
         let resident = banks
-            .upload(&device, &matmul, &banks.gate, &banks.up)
+            .upload(&device, &matmul, &swiglu, &banks.gate, &banks.up)
             .expect("the three banks pair");
         assert_eq!(resident.experts(), EXPERTS);
         assert_eq!(resident.dim(), DIM);
@@ -568,10 +611,17 @@ mod tests {
 
         let chosen = [2usize, 0, 2];
         let x = rows(chosen.len());
-        let got = resident
-            .forward(Gathered::new(DIM, &chosen, &x))
-            .expect("the dispatches complete");
+        let (got, spent) = spent(&device, || {
+            resident
+                .forward(Gathered::new(DIM, &chosen, &x))
+                .expect("the dispatches complete")
+        });
         assert_eq!(got.len(), chosen.len() * DIM);
+        assert_eq!(
+            spent,
+            (4, 1, 5),
+            "the bank's dispatches, buffers and memory"
+        );
 
         for (row, expert) in chosen.iter().enumerate() {
             let want = banks.on_the_cpu(*expert, &x[row * DIM..][..DIM]);
@@ -593,13 +643,14 @@ mod tests {
     fn exchanging_the_gate_and_up_banks_changes_the_answer() {
         let Some(device) = device() else { return };
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
         let banks = Banks::new();
 
         let chosen = [1usize];
         let x = rows(1);
         let through = |gate: &Case, up: &Case| {
             banks
-                .upload(&device, &matmul, gate, up)
+                .upload(&device, &matmul, &swiglu, gate, up)
                 .expect("the three banks pair")
                 .forward(Gathered::new(DIM, &chosen, &x))
                 .expect("the dispatches complete")
@@ -619,6 +670,7 @@ mod tests {
     fn banks_that_do_not_pair_are_refused() {
         let Some(device) = device() else { return };
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
         let banks = Banks::new();
 
         // An `up_proj` of half the width, which is another layer's bank as far
@@ -641,6 +693,7 @@ mod tests {
             bank(&banks.gate, DIM, HIDDEN_DIM),
             bank(&narrow, DIM, HIDDEN_DIM / 2),
             bank(&banks.down, HIDDEN_DIM, DIM),
+            &swiglu,
         )
         .expect_err("the banks do not pair");
         assert!(
@@ -658,32 +711,33 @@ mod tests {
     }
 
     /// The whole layer asked for at once is the same three answers as the gate,
-    /// the shared bank and the routed bank asked for apart — **in the same seven
-    /// dispatches and two fewer submissions.**
+    /// the shared bank and the routed bank asked for apart — **in the same nine
+    /// dispatches and one fewer submission.**
     ///
     /// Both halves are the commit. That the answers agree says the schedule
     /// changed no arithmetic; that the dispatch count does not move while the
     /// submission count does is the whole reason for scheduling at all, and it
     /// is the half a test of the values alone would let slip.
     ///
-    /// The two saved round trips are two different merges. The gate rides in the
-    /// buffer the shared bank's `gate` and `up` open, because it reads the same
-    /// hidden state they do; and the shared bank's `down` rides beside the
-    /// routed bank's `gate` and `up`, because by then the routing that names the
-    /// routed rows has been taken from logits the first buffer produced. Over
-    /// forty MoE layers that is 80 round trips a decode step does not take.
+    /// The saved round trip is the gate's, and it is the only one a layer has to
+    /// save: a bank's four dispatches wait for nothing this side does, so each
+    /// bank is one command buffer however it is asked for. What the gate adds is
+    /// that it reads the same hidden state the shared bank's `gate` and `up`
+    /// read and decides only how heavily that bank's rows count, so it rides in
+    /// the buffer they open — 40 round trips a decode step does not take.
     #[test]
-    fn the_whole_layer_costs_two_fewer_submissions_than_its_three_parts_apart() {
+    fn the_whole_layer_costs_one_fewer_submission_than_its_three_parts_apart() {
         let Some(device) = device() else { return };
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
         let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
         let banks = Banks::new();
         let layer = LayerExperts {
             routed: banks
-                .upload(&device, &matmul, &banks.gate, &banks.up)
+                .upload(&device, &matmul, &swiglu, &banks.gate, &banks.up)
                 .expect("the three banks pair"),
             shared: banks
-                .upload(&device, &matmul, &banks.gate, &banks.up)
+                .upload(&device, &matmul, &swiglu, &banks.gate, &banks.up)
                 .expect("the three banks pair"),
             gate: gate(&device, &dense, 0x5eed_6666),
         };
@@ -717,8 +771,8 @@ mod tests {
         assert_eq!(asked.expect("the layer was routed"), logits, "the logits");
 
         assert_eq!(together.0, apart.0, "the same dispatches");
-        assert_eq!(together, (7, 3), "the layer's own cost");
-        assert_eq!(apart, (7, 5), "what the three parts cost apart");
+        assert_eq!(together, (9, 2, 12), "the layer's own cost");
+        assert_eq!(apart, (9, 3, 12), "what the three parts cost apart");
     }
 
     /// Which layer's banks answer for which layer, which is the one thing a
@@ -732,6 +786,7 @@ mod tests {
         let Some(device) = device() else { return };
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
         let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
         let banks = Banks::new();
         let layer = |routed: &Case| {
             let bank = |case: &Case, in_dim, out_dim| {
@@ -751,12 +806,14 @@ mod tests {
                     bank(routed, DIM, HIDDEN_DIM),
                     bank(&banks.up, DIM, HIDDEN_DIM),
                     bank(&banks.down, HIDDEN_DIM, DIM),
+                    &swiglu,
                 )
                 .expect("the banks pair"),
                 shared: ExpertBanks::new(
                     bank(&banks.gate, DIM, HIDDEN_DIM),
                     bank(&banks.up, DIM, HIDDEN_DIM),
                     bank(&banks.down, HIDDEN_DIM, DIM),
+                    &swiglu,
                 )
                 .expect("the banks pair"),
                 gate: gate(&device, &dense, 0x5eed_5555),

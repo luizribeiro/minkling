@@ -29,7 +29,7 @@ use inkling_core::{
 };
 use inkling_metal::{
     DenseMatmul, DenseWeight, Device, LayerKernels, LayerProjections, MetalError, ModelExperts,
-    ModelProjections, PackedBank, PackedMatmul, PackedProjection,
+    ModelProjections, PackedBank, PackedMatmul, PackedProjection, SwiGlu,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -506,11 +506,12 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// **A layer's attention is one submission**, and eleven dispatches: the input
 /// layernorm, the four projections that consume what it produced, the two short
 /// convolutions behind `k` and `v`, the two head norms over `q` and the
-/// convolved `k`, the attention step and `o_proj`. Per MoE layer there are seven
-/// expert dispatches in three more, being the shared bank's gate and up
-/// *together with the router's own gate*, then its down *together with the
-/// routed bank's gate and up*, then the routed bank's down. A dense layer's
-/// feed-forward network is three in two. The head is one of each.
+/// convolved `k`, the attention step and `o_proj`. Per MoE layer there are nine
+/// expert dispatches in two more, being the whole shared bank — gate, up, the
+/// activation between them and down — *together with the router's own gate*,
+/// and then the whole routed bank once this side has taken a top-k from the
+/// logits that first buffer produced. A dense layer's feed-forward network is
+/// three in two, its activation still here. The head is one of each.
 ///
 /// **Ten of a layer's eleven dispatches cost no submission**, which is the whole
 /// of what this milestone did. Every activation between the hidden state a layer
@@ -528,8 +529,8 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
     (
-        11 * layers + 3 * dense + 7 * moe + 1,
-        layers + 2 * dense + 3 * moe + 1,
+        11 * layers + 3 * dense + 9 * moe + 1,
+        layers + 2 * dense + 2 * moe + 1,
     )
 }
 
@@ -568,6 +569,7 @@ impl OnTheDevice {
         let kernels = LayerKernels::compile(device).expect("the layer kernels compile");
         let matmul = kernels.matmul();
         let dense = DenseMatmul::new(device).expect("the dense matmul compiles");
+        let swiglu = SwiGlu::new(device).expect("the swiglu compiles");
         let config = fixture::config(dir).text_config;
         let ckpt = Checkpoint::open(dir).expect("checkpoint opens");
         let ids = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
@@ -587,6 +589,7 @@ impl OnTheDevice {
             device,
             matmul,
             &dense,
+            &swiglu,
             &banks,
             config.num_hidden_layers,
             config.hidden_size,

@@ -141,7 +141,15 @@ pub struct Batch<'a> {
     ended: bool,
 }
 
-impl Batch<'_> {
+impl<'a> Batch<'a> {
+    /// The device this was opened on, for a kernel that holds no device of its
+    /// own — an activation between two dispatches belongs to neither weight, so
+    /// [`SwiGlu`](crate::SwiGlu) is one pipeline for the whole model and takes
+    /// the device it allocates against from the batch it encodes into.
+    pub(crate) fn device(&self) -> &'a Device {
+        self.device
+    }
+
     /// Encode `kernel` over `grid`, with `args` bound to buffer slots `0..`.
     ///
     /// The buffers have to outlive the [`Batch::wait`] and not only this call.

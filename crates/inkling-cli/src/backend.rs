@@ -37,7 +37,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
 use inkling_metal::{
-    DenseMatmul, Device, LayerKernels, ModelExperts, ModelProjections, PackedProjection,
+    DenseMatmul, Device, LayerKernels, ModelExperts, ModelProjections, PackedProjection, SwiGlu,
 };
 
 use crate::LABEL;
@@ -51,13 +51,16 @@ use crate::args::Backend;
 /// checkpoint, so that a machine this cannot run on says so in a millisecond
 /// rather than after mapping 130 GiB.
 ///
-/// The dense matmul is the one a layer does not reach: it is the router's gate,
-/// which is the single weight the quantiser left in bfloat16.
+/// The two a layer does not reach are the experts': the dense matmul is the
+/// router's gate, which is the single weight the quantiser left in bfloat16, and
+/// the SwiGLU is the activation between a bank's two halves, which is no weight
+/// at all.
 #[derive(Debug)]
 pub struct Gpu {
     device: Device,
     kernels: LayerKernels,
     dense: DenseMatmul,
+    swiglu: SwiGlu,
 }
 
 impl Gpu {
@@ -65,10 +68,12 @@ impl Gpu {
         let device = Device::open().context("opening a Metal device")?;
         let kernels = LayerKernels::compile(&device).context("compiling a layer's kernels")?;
         let dense = DenseMatmul::new(&device).context("compiling the dense matmul")?;
+        let swiglu = SwiGlu::new(&device).context("compiling the swiglu")?;
         Ok(Self {
             device,
             kernels,
             dense,
+            swiglu,
         })
     }
 }
@@ -119,6 +124,7 @@ pub fn weights<'a>(
         &gpu.device,
         gpu.kernels.matmul(),
         &gpu.dense,
+        &gpu.swiglu,
         &banks,
         config.num_hidden_layers,
         config.hidden_size,

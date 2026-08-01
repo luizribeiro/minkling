@@ -199,6 +199,12 @@ impl Pending {
         Self { out: Some(out) }
     }
 
+    /// What a dispatch over no rows produced, which is nothing — a bank no token
+    /// routed to is an ordinary step of the router's and not an error.
+    pub(crate) fn empty() -> Self {
+        Self { out: None }
+    }
+
     /// The buffer itself, for a caller that has another dispatch to feed with it
     /// rather than a value to read.
     ///
@@ -208,6 +214,13 @@ impl Pending {
     /// tokens is not a chain of dispatches; it is not a forward pass.
     pub(crate) fn buffer(self) -> Buffer<f32> {
         self.out.expect("a dispatch over no rows has no output")
+    }
+
+    /// The same buffer where a call over no rows is a case the caller handles
+    /// rather than a contradiction. A bank of 256 experts that no token routed
+    /// to is exactly that, and it has nothing to feed the dispatch after it.
+    pub(crate) fn into_buffer(self) -> Option<Buffer<f32>> {
+        self.out
     }
 
     /// The values, once the batch this was encoded into has been waited for.
@@ -441,7 +454,7 @@ impl<'a> PackedBank<'a> {
             self.in_dim
         );
         if experts.is_empty() {
-            return Ok(Pending { out: None });
+            return Ok(Pending::empty());
         }
         let _timed = profile::scope(Op::Encode);
         let mut x = self.device.buffer(x)?;
@@ -504,7 +517,7 @@ impl<'a> PackedBank<'a> {
 
         let rows = experts.len();
         if rows == 0 {
-            return Ok(Pending { out: None });
+            return Ok(Pending::empty());
         }
 
         // The shape is read out of `resident` and so is built before it is

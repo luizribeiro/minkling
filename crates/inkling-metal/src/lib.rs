@@ -20,7 +20,9 @@
 //! leaving on the device — and [`attention`], which consumes nothing but
 //! activations and is the one operation in the model with no weight to multiply
 //! against at all. [`sconv`] is where a layer's position comes from, and the one
-//! kernel here that carries state from one call to the next.
+//! kernel here that carries state from one call to the next. [`swiglu`] is the
+//! smallest of them and is here for what it lets the two matmuls either side of
+//! it do rather than for its own arithmetic.
 
 pub mod attention;
 pub mod buffer;
@@ -32,6 +34,7 @@ pub mod matmul;
 pub mod norm;
 pub mod projections;
 pub mod sconv;
+pub mod swiglu;
 
 #[cfg(test)]
 mod testing;
@@ -46,3 +49,4 @@ pub use matmul::{MatmulError, PackedBank, PackedMatmul, PackedProjection};
 pub use norm::{LayerNorm, RmsNorm};
 pub use projections::{DenseFfn, LayerKernels, LayerProjections, ModelProjections};
 pub use sconv::{LayerConv, ShortConvolution};
+pub use swiglu::SwiGlu;
