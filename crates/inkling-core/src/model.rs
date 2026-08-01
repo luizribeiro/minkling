@@ -71,7 +71,7 @@
 use crate::attention::AttentionConfig;
 use crate::config::TextConfig;
 use crate::embed::Embed;
-use crate::layer::DecoderCache;
+use crate::layer::{DecoderCache, Hidden, Passed};
 use crate::ops::rms_norm;
 
 /// The model's weights, reached through an index rather than held as slices.
@@ -90,7 +90,14 @@ pub trait ModelWeights {
     ///
     /// Running the layer rather than lending it is what keeps a layer's decoded
     /// weights from having to outlive the call that touched them.
-    fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: &[f32]) -> Vec<f32>;
+    ///
+    /// **The state between two layers need not be a value here**, which is what
+    /// [`Hidden`] is: a backend that runs layer `index` and will run `index + 1`
+    /// can leave what the first produced where the second reads it and answer
+    /// with a count. The stack asks in order and hands each answer straight to
+    /// the next layer, so the only thing it needs of a hidden state it never
+    /// sees is that the last layer's is a value again.
+    fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: Hidden<'_>) -> Passed;
 }
 
 /// Everything one sequence carries between calls to the model: one
@@ -181,11 +188,11 @@ impl<'a> Model<'a> {
             "a cache per layer of the model"
         );
 
-        let mut h = self.embed.forward(ids, |id| weights.embedding_row(id));
+        let mut h = Passed::Rows(self.embed.forward(ids, |id| weights.embedding_row(id)));
         for (index, cache) in cache.layers.iter_mut().enumerate() {
-            h = weights.run_layer(index, cache, &h);
+            h = weights.run_layer(index, cache, h.handed());
         }
-        h
+        h.rows()
     }
 
     /// The final `norm`, which the stack leaves for its caller to apply — see

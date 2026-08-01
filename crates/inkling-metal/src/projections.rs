@@ -43,8 +43,10 @@
 //! where it stopped, with [`AttentionCache::seen`] the whole of what a sequence
 //! carries once the rest is here.
 
+use std::cell::RefCell;
+
 use inkling_core::attention::{AttentionCache, AttentionStep, LayerStep, Projections, Qkvr, Sdpa};
-use inkling_core::layer::{DecoderCache, DecoderDevice, DecoderStep, Experts, LayerMlp};
+use inkling_core::layer::{DecoderCache, DecoderDevice, DecoderStep, Experts, LayerMlp, Passed};
 use inkling_core::mask::BandedMask;
 use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::profile::{self, Op};
@@ -257,9 +259,8 @@ impl<'a> LayerProjections<'a> {
     /// whole decoder layer has one more window to start over — the layer's own
     /// residual convolution — and has to do it before the same command buffer is
     /// opened.
-    fn beginning(&self, cache: &mut AttentionCache, step: LayerStep<'_>) -> usize {
+    fn beginning(&self, cache: &mut AttentionCache, step: LayerStep<'_>, queries: usize) -> usize {
         self.shaped_for(step.sdpa, step.mask);
-        let queries = step.x.len() / self.input_layernorm.width();
         self.starting(cache.seen(), queries);
         assert_eq!(
             [
@@ -277,10 +278,6 @@ impl<'a> LayerProjections<'a> {
             "the layer's convolutions and head norms against the ones wrapped for it"
         );
         queries
-    }
-
-    fn device(&self) -> &Device {
-        self.q_proj.device()
     }
 
     /// The layer's input layernorm over rows already on the device, or `None`
@@ -505,7 +502,7 @@ impl Projections for LayerProjections<'_> {
     /// coherent because the layer holds all four. What crosses back is the
     /// answer and nothing else.
     fn layer(&self, cache: &mut AttentionCache, step: LayerStep<'_>) -> Option<Vec<f32>> {
-        let queries = self.beginning(cache, step);
+        let queries = self.beginning(cache, step, step.x.len() / self.input_layernorm.width());
         let device = self.q_proj.device();
         let mut span = self.attention.span();
         let [out] = together(device, |batch| {
@@ -653,6 +650,38 @@ pub struct ModelLayers<'a> {
     /// Indexed by layer, `None` where nothing here answers for one — which is a
     /// layer the CPU keeps, and is how a partial handover stays expressible.
     layers: Vec<Option<LayerDevice<'a>>>,
+    device: &'a Device,
+    /// The command buffer a run of layers is being encoded into, and what the
+    /// last of them left in it — `None` between runs.
+    ///
+    /// Behind a cell for the reason a layer's own resident tensors are: a run
+    /// belongs to the call that started it and not to this, which is borrowed
+    /// immutably by every layer it holds.
+    carried: RefCell<Option<Carried<'a>>>,
+}
+
+/// A run of layers part way through: the command buffer they are being encoded
+/// into, the last layer encoded, and the `[tokens, hidden]` it wrote.
+///
+/// **Nothing here has run yet.** The dispatches are in the buffer and the buffer
+/// is not committed, so what `rows` names is memory the next layer's first
+/// dispatch will read and nobody will look at in between — which is the whole of
+/// what a merged run is.
+struct Carried<'a> {
+    batch: Batch<'a>,
+    at: usize,
+    rows: Buffer<f32>,
+}
+
+/// By hand because a [`Batch`] is not printable, and because what a reader wants
+/// of a run part way through is where it has got to rather than what is in it.
+impl std::fmt::Debug for Carried<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Carried")
+            .field("at", &self.at)
+            .field("rows", &self.rows.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// One whole decoder layer on the device: its attention, the convolution and
@@ -742,7 +771,11 @@ impl<'a> ModelLayers<'a> {
             let sparse = LayerExperts::wrap(device, experts, bank, dim)?;
             held.mlp = Some(LayerMlpDevice::Sparse(Box::new(sparse)));
         }
-        Ok(Self { layers: wrapped })
+        Ok(Self {
+            layers: wrapped,
+            device,
+            carried: RefCell::new(None),
+        })
     }
 
     /// How many of the stack's layers are here at all, which is how many have
@@ -799,51 +832,134 @@ impl LayerBackend for ModelLayers<'_> {
     /// A layer whose attention *and* MLP are both here, which is the condition
     /// for one command buffer — and `None` for one that is only half here, which
     /// still runs, one submission either side of the norm the CPU would apply.
+    ///
+    /// The stack rather than the layer answers, because whether a layer's output
+    /// crosses back is a question about the layer *after* it — see
+    /// [`ModelLayers::run`].
     fn decoder(&self, layer: usize) -> Option<&dyn DecoderDevice> {
-        let held = self.layer(layer)?;
-        held.mlp.as_ref()?;
-        Some(held as &dyn DecoderDevice)
+        self.whole(layer)?;
+        Some(self as &dyn DecoderDevice)
     }
 }
 
-/// The whole of one decoder layer in one command buffer.
+impl<'a> ModelLayers<'a> {
+    /// Layer `layer` where this holds the whole of it.
+    fn whole(&self, layer: usize) -> Option<&LayerDevice<'a>> {
+        let held = self.layer(layer)?;
+        held.mlp.as_ref()?;
+        Some(held)
+    }
+
+    /// Whether what layer `layer` produces can stay where it is, which is the
+    /// whole of what decides a round trip.
+    ///
+    /// **Two conditions, and the second is the memory one.** The layer after
+    /// this one has to be here whole, or there is nobody to read the buffer. And
+    /// the call has to be a single row: what a merged run holds is every
+    /// intermediate of every layer in it until the buffer completes, which at a
+    /// decode step is a few megabytes and at a 769-token prefill would be
+    /// gigabytes — while what merging buys shrinks as the work inside a
+    /// submission grows, a round trip being the same 290 microseconds whatever
+    /// is in it. So a decode step is one command buffer and a prefill is one a
+    /// layer.
+    fn carries(&self, layer: usize, queries: usize) -> bool {
+        queries == 1 && self.whole(layer + 1).is_some()
+    }
+
+    /// The layer encoded into the run's command buffer, opening one where there
+    /// is none and waiting for it where there is nothing left to carry to.
+    fn encode(
+        &self,
+        layer: usize,
+        cache: &mut DecoderCache,
+        step: DecoderStep<'_>,
+        held: &LayerDevice<'a>,
+    ) -> Result<Passed, ProjectionError> {
+        let mut carried = self.carried.borrow_mut();
+        let (mut batch, mut x) = match carried.take() {
+            Some(run) => {
+                assert_eq!(
+                    run.at + 1,
+                    layer,
+                    "layer {layer} was handed what layer {} left",
+                    run.at
+                );
+                (run.batch, run.rows)
+            }
+            None => (self.device.batch()?, self.device.buffer(step.attention.x)?),
+        };
+
+        let rows = held.encode_into(&mut batch, cache, step, &mut x)?;
+        if self.carries(layer, step.queries) {
+            *carried = Some(Carried {
+                batch,
+                at: layer,
+                rows,
+            });
+            return Ok(Passed::Carried(step.queries));
+        }
+
+        batch.wait()?;
+        Ok(Passed::Rows(profile::timed(Op::Readback, || rows.to_vec())))
+    }
+}
+
+/// A run of decoder layers in one command buffer.
 ///
-/// **Twenty-six dispatches and one submission**, where the same operations asked
-/// for a piece at a time are two submissions and three CPU rows between them.
-/// Eleven are the attention's — see [`LayerProjections::layer`], which is this
-/// one step in — and every value from the hidden state this is handed to the one
-/// it answers with is a buffer the next dispatch reads: what `o_proj` wrote, the
-/// first convolution's rows with the layer's input already added, what the
-/// second norm made of that, the gate's logits, the experts the top-k took out
-/// of them, each bank's two halves with the activation between them, the softmax
-/// over the eight logits that selection named, both banks' rows weighted by it,
-/// and the second convolution's rows with `h` already added.
+/// **Where a run ends is where somebody has to read what it produced**, and for
+/// a decode step over a stack this holds whole that is the head. Layer `i`'s
+/// output is layer `i+1`'s input and nothing else reads it, so the buffer stays
+/// open across the layer boundary and what crosses back is the last layer's
+/// answer alone — 42 round trips a step become one, and 41 uploads and 41
+/// readbacks stop happening at all.
 ///
-/// **What a sequence carries is what decided all of it.** Four operations here
-/// write state that outlives the call — the span the step attends over and three
-/// convolutions' windows — and the last of those three is `mlp_sconv`, which is
-/// why this is the commit that took the layer whole. Everything else about the
-/// second residual path was already reachable: its input is the one value the
-/// MLP produces and its output is what the next layer is handed.
-impl DecoderDevice for LayerDevice<'_> {
-    fn run(&self, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<Vec<f32>> {
-        let mlp = self.mlp.as_ref()?;
+/// **What forces a run to end early is stated rather than discovered**: a layer
+/// this does not hold whole, the last layer of the stack, or a call of more than
+/// one row — see [`ModelLayers::carries`], which is where the memory a run holds
+/// is traded against the round trips it saves.
+impl DecoderDevice for ModelLayers<'_> {
+    fn run(&self, layer: usize, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<Passed> {
+        let held = self.whole(layer)?;
         Some(
-            self.encode(cache, step, mlp)
+            self.encode(layer, cache, step, held)
                 .unwrap_or_else(|err| panic!("the layer did not run: {err}")),
         )
     }
 }
 
+/// The whole of one decoder layer, encoded.
+///
+/// **Twenty-six dispatches and no submission at all**, where the same operations
+/// asked for a piece at a time are two submissions and three CPU rows between
+/// them. Eleven are the attention's — see [`LayerProjections::layer`], which is
+/// this one step in — and every value from the hidden state this is handed to
+/// the one it answers with is a buffer the next dispatch reads: what `o_proj`
+/// wrote, the first convolution's rows with the layer's input already added,
+/// what the second norm made of that, the gate's logits, the experts the top-k
+/// took out of them, each bank's two halves with the activation between them,
+/// the softmax over the eight logits that selection named, both banks' rows
+/// weighted by it, and the second convolution's rows with `h` already added.
+///
+/// **What a sequence carries is what decided all of it.** Four operations here
+/// write state that outlives the call — the span the step attends over and three
+/// convolutions' windows — and the last of those three is `mlp_sconv`, whose
+/// rows are what the *next* layer reads. So neither end of a layer is a value
+/// this process forms, and whether either crosses back is
+/// [`ModelLayers::run`]'s question rather than this one's.
 impl LayerDevice<'_> {
-    fn encode(
+    fn encode_into(
         &self,
+        batch: &mut Batch<'_>,
         cache: &mut DecoderCache,
         step: DecoderStep<'_>,
-        mlp: &LayerMlpDevice<'_>,
-    ) -> Result<Vec<f32>, ProjectionError> {
+        x: &mut Buffer<f32>,
+    ) -> Result<Buffer<f32>, ProjectionError> {
+        let mlp = self
+            .mlp
+            .as_ref()
+            .expect("a layer run whole holds its own MLP");
         let attention = &self.attention;
-        let queries = attention.beginning(cache.attention(), step.attention);
+        let queries = attention.beginning(cache.attention(), step.attention, step.queries);
         assert_eq!(
             [step.attn_sconv.kernel_size(), step.mlp_sconv.kernel_size()],
             [self.attn_sconv.taps(), self.mlp_sconv.taps()],
@@ -869,29 +985,27 @@ impl LayerDevice<'_> {
             self.mlp_sconv.restart();
         }
 
-        let device = attention.device();
         let mut span = attention.attention.span();
-        let mut batch = device.batch()?;
-
-        let mut x = device.buffer(step.attention.x)?;
         let mut normed = attention
-            .input_norm(&mut batch, &mut x, step.attention)?
+            .input_norm(batch, x, step.attention)?
             .expect("a decoder layer normalises the state it is handed");
         let mut attended = attention
-            .encoding(&mut batch, &mut span, &mut normed, step.attention)?
+            .encoding(batch, &mut span, &mut normed, step.attention)?
             .buffer();
-        let mut h = self
-            .attn_sconv
-            .encode(&mut batch, &mut attended, Some(&mut x), 1.0)?;
-        let mut normed = self.post_attention_layernorm.encode(&mut batch, &mut h)?;
-        let (projected, scale) = self.projected(&mut batch, &mut normed, queries, mlp, step.mlp)?;
-        let out =
-            self.mlp_sconv
-                .encode(&mut batch, &mut projected.buffer(), Some(&mut h), scale)?;
-        batch.wait()?;
-        cache.attention().appended(queries);
+        let mut h = self.attn_sconv.encode(batch, &mut attended, Some(x), 1.0)?;
+        let mut normed = self.post_attention_layernorm.encode(batch, &mut h)?;
+        let (projected, scale) = self.projected(batch, &mut normed, queries, mlp, step.mlp)?;
+        let out = self
+            .mlp_sconv
+            .encode(batch, &mut projected.buffer(), Some(&mut h), scale)?;
 
-        Ok(profile::timed(Op::Readback, || out.to_vec()))
+        // **The count advances here rather than when the buffer completes**, for
+        // the reason the span's own does — see `LayerProjections::encoding`. A
+        // run of layers is encoded before any of it runs, so a sequence that
+        // counted its keys at the wait would count them all after the last
+        // layer of the run had already attended.
+        cache.attention().appended(queries);
+        Ok(out)
     }
 
     /// What the layer's MLP produced, and the scale its rows still carry.
@@ -941,7 +1055,7 @@ mod tests {
     use inkling_core::weights::PackedAttention;
 
     use inkling_core::attention::{AttentionProjections, AttentionWeights};
-    use inkling_core::layer::{DecoderLayer, DecoderWeights, NoExperts};
+    use inkling_core::layer::{DecoderLayer, DecoderWeights, Hidden, NoExperts};
     use inkling_core::ops::DenseMlp;
 
     use crate::combine::MoeCombine;
@@ -1468,9 +1582,15 @@ mod tests {
 
         /// The whole layer on the device, with a dense feed-forward network in
         /// the MLP slot.
-        fn layer(&self, weights: &NarrowWeights) -> LayerDevice<'a> {
+        ///
+        /// `salt` is what makes two of these different layers rather than one
+        /// layer twice, which a case that runs a *pair* of them needs: against
+        /// two layers built from the same codes, running them in the wrong order
+        /// would change nothing.
+        fn layer(&self, weights: &NarrowWeights, salt: u32) -> LayerDevice<'a> {
             let (heads, head_dim) = (NARROW.heads, NARROW.head_dim);
             let kv = NARROW.kv_channels();
+            let seed = |base: u32| base + salt;
             LayerDevice {
                 attention: LayerProjections {
                     input_layernorm: self.norm(&weights.input_layernorm),
@@ -1485,18 +1605,18 @@ mod tests {
                     v_sconv: self.conv(kv, &weights.v_sconv),
                     q_norm: self.norm(&weights.q_norm),
                     k_norm: self.norm(&weights.k_norm),
-                    q_proj: self.weight(0x11, NARROW.hidden, heads * head_dim),
-                    k_proj: self.weight(0x22, NARROW.hidden, kv),
-                    v_proj: self.weight(0x33, NARROW.hidden, kv),
-                    r_proj: self.weight(0x44, NARROW.hidden, heads * NARROW.d_rel),
-                    o_proj: self.weight(0x55, heads * head_dim, NARROW.hidden),
+                    q_proj: self.weight(seed(0x11), NARROW.hidden, heads * head_dim),
+                    k_proj: self.weight(seed(0x22), NARROW.hidden, kv),
+                    v_proj: self.weight(seed(0x33), NARROW.hidden, kv),
+                    r_proj: self.weight(seed(0x44), NARROW.hidden, heads * NARROW.d_rel),
+                    o_proj: self.weight(seed(0x55), heads * head_dim, NARROW.hidden),
                 },
                 attn_sconv: self.conv(NARROW.hidden, &weights.attn_sconv),
                 post_attention_layernorm: self.norm(&weights.post_attention_layernorm),
                 mlp: Some(LayerMlpDevice::Dense(Box::new(DenseFfn {
-                    gate_proj: self.weight(0x66, NARROW.hidden, NARROW_FFN),
-                    up_proj: self.weight(0x77, NARROW.hidden, NARROW_FFN),
-                    down_proj: self.weight(0x88, NARROW_FFN, NARROW.hidden),
+                    gate_proj: self.weight(seed(0x66), NARROW.hidden, NARROW_FFN),
+                    up_proj: self.weight(seed(0x77), NARROW.hidden, NARROW_FFN),
+                    down_proj: self.weight(seed(0x88), NARROW_FFN, NARROW.hidden),
                     swiglu: self.swiglu,
                 }))),
                 mlp_sconv: self.conv(NARROW.hidden, &weights.mlp_sconv),
@@ -1600,7 +1720,8 @@ mod tests {
             swiglu: &swiglu,
         };
         let weights = NarrowWeights::new();
-        let held = narrow.layer(&weights);
+        let stack = stack(&device, vec![narrow.layer(&weights, 0)]);
+        let held = stack.layer(0).expect("the layer is here");
 
         let mlp = DenseMlp::backend(
             NARROW.hidden,
@@ -1617,12 +1738,16 @@ mod tests {
         let (x, more) = (hidden_rows(3), hidden_rows(2));
         let sequence = |device: Option<&dyn DecoderDevice>| {
             let cache = &mut layer.cache();
-            let prefill = layer.forward(cache, &x, &NoExperts, device);
-            let rest = layer.forward(cache, &more, &NoExperts, device);
+            let prefill = layer
+                .forward(0, cache, Hidden::Rows(&x), &NoExperts, device)
+                .rows();
+            let rest = layer
+                .forward(0, cache, Hidden::Rows(&more), &NoExperts, device)
+                .rows();
             (prefill, rest)
         };
 
-        let fused = sequence(Some(&held as &dyn DecoderDevice));
+        let fused = sequence(Some(&stack as &dyn DecoderDevice));
         let apart = sequence(None);
         for (what, got, want) in [
             ("the prefill", &fused.0, &apart.0),
@@ -1639,9 +1764,117 @@ mod tests {
         // The same first call again, from a cache that has seen nothing — which
         // is what says the fused layer starts its own windows and span over
         // rather than continuing the sequence just run.
-        let again = sequence(Some(&held as &dyn DecoderDevice));
+        let again = sequence(Some(&stack as &dyn DecoderDevice));
         assert_eq!(again.0, fused.0, "a second sequence's prefill");
         assert_eq!(again.1, fused.1, "a second sequence's continuation");
+    }
+
+    /// **Two layers in one command buffer are the same two layers**, and one
+    /// submission rather than two.
+    ///
+    /// Both halves are the commit. That the answers agree says the schedule
+    /// changed no arithmetic; that the submission count halves while the
+    /// dispatch count does not is the whole reason for it, and it is the half a
+    /// test of the values alone would let slip.
+    ///
+    /// **Three layers rather than two**, because the middle one is the only one
+    /// that both consumes a carried buffer and leaves one — the first opens the
+    /// run and the last closes it, and a backend that got the middle case wrong
+    /// would still pass a pair.
+    ///
+    /// **And one row, because that is what carries.** A merged run holds every
+    /// intermediate of every layer in it until the buffer completes, so
+    /// [`ModelLayers::carries`] takes only a decode step; the same three layers
+    /// over two rows are three submissions, and this drives both. The second
+    /// decode against the same caches is what says the state a carried run
+    /// leaves behind is the state the next call reads.
+    ///
+    /// The three layers are not each other's: they differ in every packed
+    /// weight, so a run that ran one of them twice, or ran them in another
+    /// order, would be a different answer rather than the same one.
+    #[test]
+    fn a_run_of_layers_in_one_command_buffer_answers_what_they_answer_apart() {
+        let Some(device) = device() else { return };
+        let kernels = LayerKernels::compile(&device).expect("the kernels compile");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
+        let narrow = Narrow {
+            device: &device,
+            kernels: &kernels,
+            swiglu: &swiglu,
+        };
+        let weights = NarrowWeights::new();
+        let stack = stack(
+            &device,
+            vec![
+                narrow.layer(&weights, 0),
+                narrow.layer(&weights, 0x99),
+                narrow.layer(&weights, 0xdd),
+            ],
+        );
+
+        let layers: Vec<DecoderLayer<'_>> = (0..3)
+            .map(|at| {
+                let held = stack.layer(at).expect("the layer is here");
+                DecoderLayer::new(
+                    NARROW,
+                    weights.decoder(&held.attention),
+                    LayerMlp::Dense(DenseMlp::backend(
+                        NARROW.hidden,
+                        NARROW_FFN,
+                        held.mlp.as_ref().and_then(dense).expect("a dense layer"),
+                        GLOBAL_SCALE,
+                    )),
+                )
+            })
+            .collect();
+
+        let sequence = |device: Option<&dyn DecoderDevice>, rows: usize| {
+            let caches = &mut [layers[0].cache(), layers[1].cache(), layers[2].cache()];
+            let mut through = |x: &[f32]| {
+                let mut h = Passed::Rows(x.to_vec());
+                for (at, layer) in layers.iter().enumerate() {
+                    h = layer.forward(at, &mut caches[at], h.handed(), &NoExperts, device);
+                }
+                h.rows()
+            };
+            let first = through(&hidden_rows(rows));
+            (first, through(&hidden_rows(rows)))
+        };
+        // A decode step, which is what a run carries across.
+        let before = device.submissions();
+        let merged = sequence(Some(&stack as &dyn DecoderDevice), 1);
+        let decode = device.submissions() - before;
+
+        let apart = sequence(None, 1);
+        for (what, got, want) in [
+            ("the first call", &merged.0, &apart.0),
+            ("the second", &merged.1, &apart.1),
+        ] {
+            let agreed = deviation(got, want);
+            assert!(agreed <= TOLERANCE, "{what}: deviation {agreed:e}");
+        }
+        assert_ne!(merged.0, merged.1, "a second call that read no state");
+        assert_eq!(decode, 2, "one submission a call over three layers");
+
+        // And a call of two rows, which is a prefill and does not: what a merged
+        // run holds grows with the tokens, and what it saves does not.
+        let before = device.submissions();
+        let prefilled = sequence(Some(&stack as &dyn DecoderDevice), 2);
+        let prefill = device.submissions() - before;
+        let apart = sequence(None, 2);
+        let agreed = deviation(&prefilled.0, &apart.0);
+        assert!(agreed <= TOLERANCE, "the prefill: deviation {agreed:e}");
+        assert_eq!(prefill, 6, "a submission a layer a call over three layers");
+    }
+
+    /// A stack of layers this backend holds whole, which is what a merged run is
+    /// asked of — see [`ModelLayers::run`].
+    fn stack<'a>(device: &'a Device, held: Vec<LayerDevice<'a>>) -> ModelLayers<'a> {
+        ModelLayers {
+            layers: held.into_iter().map(Some).collect(),
+            device,
+            carried: RefCell::new(None),
+        }
     }
 
     /// The feed-forward network of a layer that has one, for a caller that holds

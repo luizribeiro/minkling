@@ -524,19 +524,21 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// feed-forward network four where a MoE layer's two banks and the router around
 /// them are twelve. The head is one of each.
 ///
-/// **Every one of them costs no submission but the layer's own.** The whole
-/// chain from the hidden state a layer is handed to the one it passes on is
-/// buffers a next dispatch reads — including the four values that outlive the
-/// call, three convolutions' windows and the span of keys and values, which is
-/// why they had to become the layer's before the rest could follow. A layer's
-/// command buffer now ends where the layer does.
+/// **Not one of them costs a submission.** The whole chain from the hidden state
+/// a layer is handed to the one it passes on is buffers a next dispatch reads —
+/// including the four values that outlive the call, three convolutions' windows
+/// and the span of keys and values, which is why they had to become the layer's
+/// before the rest could follow. And what a layer passes on is what the next
+/// layer reads, so the command buffer does not end where the layer does either:
+/// a decode step is **two submissions**, one for the forty-two layers and one
+/// for the head, where it was 43 and 87 and 249.
 ///
-/// What is left is one submission a layer and one for the head — 43 where the
-/// same dispatches were 249 before any of them were merged, and 87 while the
-/// three operations on a layer's residual path still ran here.
+/// A prefill is still one a layer, and deliberately — see
+/// `ModelLayers::carries`, where what a merged run holds is traded against what
+/// it saves. This counts a decode step.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
-    (14 * layers + 4 * dense + 12 * moe + 1, layers + 1)
+    (14 * layers + 4 * dense + 12 * moe + 1, 2)
 }
 
 /// One run of the engine with every weight it has a kernel for on the device,

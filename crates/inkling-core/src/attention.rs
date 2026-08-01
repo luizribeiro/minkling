@@ -355,7 +355,11 @@ pub trait Projections: Debug {
 pub struct LayerStep<'a> {
     pub sdpa: Sdpa,
     pub mask: BandedMask<'a>,
-    /// `[queries, hidden]`, before the layer's input layernorm.
+    /// `[queries, hidden]`, before the layer's input layernorm — and empty
+    /// where a backend already holds those rows, which is what
+    /// [`Hidden::Carried`](crate::layer::Hidden::Carried) is. How many rows a
+    /// call is is [`DecoderStep::queries`](crate::layer::DecoderStep::queries)
+    /// either way.
     pub x: &'a [f32],
     /// The layer's input layernorm weight, or `None` where `x` arrives
     /// normalised already — which is what every recorded attention case is.

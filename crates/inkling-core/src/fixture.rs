@@ -21,7 +21,9 @@ use crate::attention::{
 };
 use crate::checkpoint::{Checkpoint, Dtype, TensorView};
 use crate::config::{Config, TextConfig};
-use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
+use crate::layer::{
+    DecoderCache, DecoderLayer, DecoderWeights, Experts, Hidden, LayerMlp, NoExperts, Passed,
+};
 use crate::model::{Model, ModelWeights};
 use crate::moe::{ExpertBank, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
 use crate::ops::{DenseMlp, DenseProjection};
@@ -537,10 +539,11 @@ impl ModelWeights for Stack {
         self.table[id * hidden..][..hidden].to_vec()
     }
 
-    fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: &[f32]) -> Vec<f32> {
+    fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: Hidden<'_>) -> Passed {
         let tensors = &self.layers[self.order[index]];
         let config = AttentionConfig::for_layer(&self.config, index);
-        DecoderLayer::new(config, tensors.view(), tensors.mlp()).forward(cache, x, tensors, None)
+        DecoderLayer::new(config, tensors.view(), tensors.mlp())
+            .forward(index, cache, x, tensors, None)
     }
 }
 

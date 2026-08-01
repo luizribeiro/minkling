@@ -19,7 +19,7 @@ use inkling_core::fixture::{
 use inkling_core::generate::greedy;
 use inkling_core::head::LmHead;
 use inkling_core::layer::{
-    DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts,
+    DecoderCache, DecoderLayer, DecoderWeights, Experts, Hidden, LayerMlp, NoExperts, Passed,
 };
 use inkling_core::model::{ModelCache, ModelWeights};
 use inkling_core::moe::{BankRows, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
@@ -626,7 +626,9 @@ fn the_decoder_layer_reproduces_the_reference_against_real_weights() {
         );
 
         let against_reference = deviation(
-            &decoder.forward(&mut decoder.cache(), &x, &mlp, None),
+            &decoder
+                .forward(layer, &mut decoder.cache(), Hidden::Rows(&x), &mlp, None)
+                .rows(),
             &want,
         );
         assert!(
@@ -647,7 +649,9 @@ fn the_decoder_layer_reproduces_the_reference_against_real_weights() {
         std::mem::swap(&mut exchanged.attn_sconv, &mut exchanged.mlp_sconv);
         let exchanged = DecoderLayer::new(attention, exchanged, mlp.view(config.hidden_size));
         let swapped = deviation(
-            &exchanged.forward(&mut exchanged.cache(), &x, &mlp, None),
+            &exchanged
+                .forward(layer, &mut exchanged.cache(), Hidden::Rows(&x), &mlp, None)
+                .rows(),
             &want,
         );
         assert!(
@@ -942,12 +946,13 @@ impl ModelWeights for Watched<'_> {
         self.inner.embedding_row(id)
     }
 
-    fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: &[f32]) -> Vec<f32> {
+    fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: Hidden<'_>) -> Passed {
         let out = self.inner.run_layer(index, cache, x);
         self.peak
             .set(self.peak.get().max(fixture::resident_bytes()));
         if let Some((_, want)) = self.recorded.iter().find(|(layer, _)| *layer == index) {
-            self.drift.borrow_mut().push((index, deviation(&out, want)));
+            let deviation = deviation(out.handed().rows(), want);
+            self.drift.borrow_mut().push((index, deviation));
         }
         out
     }

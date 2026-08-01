@@ -50,17 +50,109 @@ use crate::sconv::{ConvState, ShortConv};
 /// those, and the only thing that kept them out was that whoever held the
 /// attention did not also hold the MLP.
 ///
-/// **What comes back is the layer**, and it is the first value that has to.
-/// The last operation a decoder layer runs is the short convolution on its
-/// second residual path, whose window is a fourth piece of state a backend has
-/// to hold to run it — and holding it is what took the whole layer over,
-/// because what that convolution reads is what the MLP produced and what it
-/// writes is what the next layer is handed. So `[tokens, hidden]` in and
-/// `[tokens, hidden]` out, and nothing between them is a value this process
-/// forms.
+/// **What comes back is the layer**, and it need not come back at all. The last
+/// operation a decoder layer runs is the short convolution on its second
+/// residual path, whose window is a fourth piece of state a backend has to hold
+/// to run it — and holding it is what took the whole layer over, because what
+/// that convolution reads is what the MLP produced and what it writes is what
+/// the next layer is handed. So `[tokens, hidden]` in and `[tokens, hidden]`
+/// out, and nothing between them is a value this process forms.
+///
+/// **Which is why a layer is asked for by index.** Layer `i`'s output is layer
+/// `i+1`'s input and nothing else reads it, so a backend that holds both can
+/// leave it where it is and answer [`Passed::Carried`] — one command buffer
+/// spanning as many layers as it holds, rather than one a layer with a round
+/// trip between. The index is what lets it know whether there is a next layer
+/// to carry to; the stack asks in order and every layer's cache is its own.
 pub trait DecoderDevice {
-    /// The layer, or `None` where this backend does not hold all of it.
-    fn run(&self, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<Vec<f32>>;
+    /// Layer `layer`, or `None` where this backend does not hold all of it.
+    fn run(&self, layer: usize, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<Passed>;
+}
+
+/// The `[tokens, hidden]` one decoder layer is handed: the rows, or the promise
+/// that whoever ran the layer before it still has them.
+///
+/// **A count is the whole of what the second arm carries, and that is the
+/// point.** What a merged run of layers avoids is the value crossing back, so
+/// there is nothing here to carry — only how many rows are over there, which is
+/// what every shape on this side is derived from and what a backend cannot be
+/// asked to answer without the wait this exists to skip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Hidden<'a> {
+    Rows(&'a [f32]),
+    /// The tokens of a call whose rows are a buffer the layer before this one
+    /// wrote and nobody read back — see [`DecoderDevice`].
+    Carried(usize),
+}
+
+impl Hidden<'_> {
+    /// How many rows of `hidden` this is.
+    pub fn tokens(&self, hidden: usize) -> usize {
+        match self {
+            Self::Rows(rows) => {
+                assert_eq!(
+                    rows.len() % hidden,
+                    0,
+                    "{} values are not whole rows of {hidden}",
+                    rows.len()
+                );
+                rows.len() / hidden
+            }
+            Self::Carried(tokens) => *tokens,
+        }
+    }
+
+    /// The rows themselves, where this side has them.
+    ///
+    /// A panic on the other arm, and reachable only through a backend that
+    /// carried a hidden state to a layer it does not run — which is a
+    /// contradiction rather than a case, since carrying is what a backend does
+    /// only for the layer it is about to run itself.
+    pub fn rows(&self) -> &[f32] {
+        match self {
+            Self::Rows(rows) => rows,
+            Self::Carried(tokens) => {
+                panic!("{tokens} rows were left on a device this layer does not run on")
+            }
+        }
+    }
+
+    /// The rows where this side has them and nothing where it does not, for a
+    /// backend that is about to read whichever it holds.
+    pub fn held(&self) -> &[f32] {
+        match self {
+            Self::Rows(rows) => rows,
+            Self::Carried(_) => &[],
+        }
+    }
+}
+
+/// The same value answered rather than handed: what one layer passes to the
+/// next.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Passed {
+    Rows(Vec<f32>),
+    /// The tokens of a call whose rows a backend kept — see [`Hidden`].
+    Carried(usize),
+}
+
+impl Passed {
+    pub fn handed(&self) -> Hidden<'_> {
+        match self {
+            Self::Rows(rows) => Hidden::Rows(rows),
+            Self::Carried(tokens) => Hidden::Carried(*tokens),
+        }
+    }
+
+    /// The rows, for a caller that has run out of layers to carry them to.
+    pub fn rows(self) -> Vec<f32> {
+        match self {
+            Self::Rows(rows) => rows,
+            Self::Carried(tokens) => {
+                panic!("{tokens} rows were carried past the last layer that could read them")
+            }
+        }
+    }
 }
 
 /// Everything one decoder layer runs, described rather than run.
@@ -81,6 +173,12 @@ pub struct DecoderStep<'a> {
     /// [`LayerStep::eps`].
     pub eps: f32,
     pub mlp: LayerMlp<'a>,
+    /// How many rows this call is.
+    ///
+    /// Stated rather than read off [`LayerStep::x`], because a call whose rows
+    /// a backend already holds hands over none of them — see [`Hidden`] — and
+    /// every shape a layer derives is derived from this.
+    pub queries: usize,
     /// The convolution on the residual path around the MLP, whose rows are
     /// added to `h` — the value the second norm was taken of.
     ///
@@ -306,12 +404,13 @@ impl<'a> DecoderLayer<'a> {
     /// see [`DecoderDevice`] — and `None` leaves every operation here.
     pub fn forward(
         &self,
+        layer: usize,
         cache: &mut DecoderCache,
-        x: &[f32],
+        x: Hidden<'_>,
         experts: &(impl Experts + ?Sized),
         device: Option<&dyn DecoderDevice>,
-    ) -> Vec<f32> {
-        self.run(cache, x, experts, device, Residual::PreNorm)
+    ) -> Passed {
+        self.run(layer, cache, x, experts, device, Residual::PreNorm)
     }
 
     /// [`DecoderLayer::forward`], with the two ways of wiring a residual named
@@ -324,19 +423,14 @@ impl<'a> DecoderLayer<'a> {
     /// be a second spelling of a mistake.
     fn run(
         &self,
+        layer: usize,
         cache: &mut DecoderCache,
-        x: &[f32],
+        x: Hidden<'_>,
         experts: &(impl Experts + ?Sized),
         device: Option<&dyn DecoderDevice>,
         residual: Residual,
-    ) -> Vec<f32> {
-        assert_eq!(
-            x.len() % self.hidden,
-            0,
-            "{} values are not whole rows of {}",
-            x.len(),
-            self.hidden
-        );
+    ) -> Passed {
+        let queries = x.tokens(self.hidden);
 
         // Guarded before the call and not after it: a device that ran the layer
         // has advanced the cache, so asking one and then discarding the answer
@@ -346,10 +440,11 @@ impl<'a> DecoderLayer<'a> {
             Residual::PreNorm => device,
             Residual::Normed => None,
         };
-        if let Some(out) = self.on_device(cache, x, device) {
-            return out;
+        if let Some(passed) = self.on_device(layer, cache, x, queries, device) {
+            return passed;
         }
 
+        let x = x.rows();
         let attended = self
             .attention
             .forward(&mut cache.attention, x, Some(self.input_layernorm));
@@ -362,7 +457,7 @@ impl<'a> DecoderLayer<'a> {
 
         let normed = rms_norm(&h, self.post_attention_layernorm, self.rms_norm_eps);
         let projected = self.mlp.forward(&normed, experts);
-        self.residual_path(cache, residual.of(&h, &normed), &projected)
+        Passed::Rows(self.residual_path(cache, residual.of(&h, &normed), &projected))
     }
 
     /// The layer's second residual path: what the MLP produced, convolved,
@@ -387,25 +482,27 @@ impl<'a> DecoderLayer<'a> {
     /// exist on this side.
     fn on_device(
         &self,
+        layer: usize,
         cache: &mut DecoderCache,
-        x: &[f32],
+        x: Hidden<'_>,
+        queries: usize,
         device: Option<&dyn DecoderDevice>,
-    ) -> Option<Vec<f32>> {
+    ) -> Option<Passed> {
         let device = device?;
-        let queries = x.len() / self.hidden;
         let offset = cache.attention.seen();
         let taus = self.attention.taus(offset, queries);
         let step = DecoderStep {
             attention: self
                 .attention
-                .step(x, Some(self.input_layernorm), &taus, offset),
+                .step(x.held(), Some(self.input_layernorm), &taus, offset),
             attn_sconv: self.attn_sconv,
             post_attention_layernorm: self.post_attention_layernorm,
             eps: self.rms_norm_eps,
             mlp: self.mlp,
+            queries,
             mlp_sconv: self.mlp_sconv,
         };
-        device.run(cache, step)
+        device.run(layer, cache, step)
     }
 }
 
@@ -484,6 +581,23 @@ mod tests {
     /// weakest mutation this bound has to catch — layer 0's `h` taken from the
     /// normalised value — moves the answer by 1.2e-1, a factor of forty above.
     const RECORDED_TOLERANCE: f32 = 3e-3;
+
+    /// One call over rows this side holds and no device to run it, which is
+    /// every case here.
+    ///
+    /// The index is what a layer would hand a backend so that it could tell
+    /// whether there is a next layer to carry its answer to — see
+    /// [`DecoderDevice`] — and against no backend it reaches nothing.
+    fn forward(
+        layer: &DecoderLayer<'_>,
+        cache: &mut DecoderCache,
+        x: &[f32],
+        experts: &(impl Experts + ?Sized),
+    ) -> Vec<f32> {
+        layer
+            .forward(0, cache, Hidden::Rows(x), experts, None)
+            .rows()
+    }
 
     /// One synthetic case: the layer `InklingDecoderLayer` was built as, the two
     /// sequences it was driven with, and what it produced and cached.
@@ -569,7 +683,7 @@ mod tests {
 
         /// The prefill alone, from a fresh cache.
         fn prefill(&self, layer: &DecoderLayer<'_>) -> Vec<f32> {
-            layer.forward(&mut layer.cache(), &self.x, &self.weights, None)
+            forward(layer, &mut layer.cache(), &self.x, &self.weights)
         }
 
         /// The prefill and the continuation, against one cache, as the dump
@@ -582,8 +696,26 @@ mod tests {
             let layer = self.layer();
             let cache = &mut layer.cache();
             (
-                layer.run(cache, &self.x, &self.weights, None, residual),
-                layer.run(cache, &self.continue_x, &self.weights, None, residual),
+                layer
+                    .run(
+                        0,
+                        cache,
+                        Hidden::Rows(&self.x),
+                        &self.weights,
+                        None,
+                        residual,
+                    )
+                    .rows(),
+                layer
+                    .run(
+                        0,
+                        cache,
+                        Hidden::Rows(&self.continue_x),
+                        &self.weights,
+                        None,
+                        residual,
+                    )
+                    .rows(),
             )
         }
 
@@ -649,7 +781,7 @@ mod tests {
 
             let mut whole = layer.x.clone();
             whole.extend_from_slice(&layer.continue_x);
-            let at_once = decoder.forward(&mut decoder.cache(), &whole, &layer.weights, None);
+            let at_once = forward(&decoder, &mut decoder.cache(), &whole, &layer.weights);
 
             let (prefill, rest) = layer.forward();
             let mut split = prefill;
@@ -668,8 +800,8 @@ mod tests {
             let decoder = layer.layer();
             let kernel_size = layer.weights.kernel_size();
             let mut cache = DecoderCache::new(layer.config, layer.hidden(), kernel_size);
-            let prefill = decoder.forward(&mut cache, &layer.x, &layer.weights, None);
-            let rest = decoder.forward(&mut cache, &layer.continue_x, &layer.weights, None);
+            let prefill = forward(&decoder, &mut cache, &layer.x, &layer.weights);
+            let rest = forward(&decoder, &mut cache, &layer.continue_x, &layer.weights);
             assert_eq!((prefill, rest), layer.forward(), "{}", layer.name);
         }
     }
@@ -684,7 +816,7 @@ mod tests {
             let decoder = layer.layer();
             let mut cache = decoder.cache();
 
-            let prefill = decoder.forward(&mut cache, &layer.x, &layer.weights, None);
+            let prefill = forward(&decoder, &mut cache, &layer.x, &layer.weights);
             let agreed = deviation(&prefill, &layer.prefill_out);
             assert!(
                 agreed <= TOLERANCE,
@@ -693,7 +825,7 @@ mod tests {
             );
 
             std::mem::swap(&mut cache.attn_sconv, &mut cache.mlp_sconv);
-            let rest = decoder.forward(&mut cache, &layer.continue_x, &layer.weights, None);
+            let rest = forward(&decoder, &mut cache, &layer.continue_x, &layer.weights);
             let deviation = deviation(&rest, &layer.continue_out);
             assert!(
                 deviation > TOLERANCE,
@@ -716,7 +848,7 @@ mod tests {
         for layer in Layer::all() {
             let decoder = layer.layer();
             let mut cache = decoder.cache();
-            decoder.forward(&mut cache, &layer.x, &layer.weights, None);
+            forward(&decoder, &mut cache, &layer.x, &layer.weights);
 
             let attention = layer.config.kv_heads * layer.config.head_dim;
             let hidden = layer.hidden();
@@ -757,11 +889,11 @@ mod tests {
     fn the_continuation_reads_what_the_prefill_cached() {
         for layer in Layer::all() {
             let decoder = layer.layer();
-            let fresh = decoder.forward(
+            let fresh = forward(
+                &decoder,
                 &mut decoder.cache(),
                 &layer.continue_x,
                 &layer.weights,
-                None,
             );
             let deviation = deviation(&fresh, &layer.continue_out);
             assert!(
