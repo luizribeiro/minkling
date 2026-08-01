@@ -50,12 +50,12 @@ use crate::sconv::{ConvState, ShortConv};
 /// those, and the only thing that kept them out was that whoever held the
 /// attention did not also hold the MLP.
 ///
-/// **What comes back is the first value that has to.** The routing's weights are
-/// a softmax over eight numbers taken from logits a dispatch in this same
-/// command buffer produced — see [`SparseMoe::weighted`] — so the rows both
-/// banks answered have to cross back to be weighted, and `h` with them because
-/// the layer's second residual is added to it here. Everything before that is
-/// one command buffer.
+/// **What comes back is the first value that has to.** What the MLP produced is
+/// read by the convolution on the layer's second residual path, whose window is
+/// the one piece of a layer's state a backend running everything else still does
+/// not hold — so it crosses back, and `h` with it because the residual is added
+/// to `h` where that convolution's rows land. Everything before that is one
+/// command buffer.
 pub trait DecoderDevice {
     /// The layer as far as it goes on the device, or `None` where this backend
     /// does not hold all of it.
@@ -91,8 +91,8 @@ pub struct DecoderStep<'a> {
 pub struct DecoderHalves {
     /// `x + attn_sconv(attention(x))`, which the reference calls `h`.
     pub h: Vec<f32>,
-    /// What the MLP returned over `post_attention_layernorm(h)`, weighted and
-    /// scattered where the layer routes to experts.
+    /// What the MLP returned over `post_attention_layernorm(h)` — both banks'
+    /// rows already weighted and summed where the layer routes to experts.
     pub projected: Vec<f32>,
 }
 
@@ -375,11 +375,9 @@ impl<'a> DecoderLayer<'a> {
     ///
     /// **This is where a layer's device work stops.** The convolution's window
     /// is the one piece of a layer's state that a backend running everything
-    /// else still does not hold, because the rows it reads are the routing's
-    /// weights applied to what the banks answered and those weights are
-    /// this side's — see [`SparseMoe::weighted`]. So the seam that reached
-    /// `o_proj` and then the second norm stops here, between one layer and the
-    /// next rather than inside either.
+    /// else still does not hold. So the seam that reached `o_proj`, then the
+    /// second norm, and now the whole of the MLP past it stops here, between one
+    /// layer and the next rather than inside either.
     fn residual_path(
         &self,
         cache: &mut DecoderCache,

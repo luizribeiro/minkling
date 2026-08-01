@@ -58,6 +58,7 @@ use inkling_core::profile::{self, Op};
 use inkling_core::weights::{LayerBanks, PackedExperts};
 
 use crate::buffer::Buffer;
+use crate::combine::MoeCombine;
 use crate::dense::{DenseMatmul, DenseWeight};
 use crate::device::Device;
 use crate::kernel::Batch;
@@ -318,12 +319,12 @@ fn chosen(gathered: Gathered<'_>) -> Vec<u32> {
         .collect()
 }
 
-/// The five kernels a MoE layer dispatches through, compiled once for the whole
+/// The six kernels a MoE layer dispatches through, compiled once for the whole
 /// model.
 ///
-/// Held together because that is what they are: none of the five names a shape,
+/// Held together because that is what they are: none of the six names a shape,
 /// so one pipeline each serves all forty layers, and a layer standing itself up
-/// needs all five. Borrowed rather than owned because the first of them is not
+/// needs all six. Borrowed rather than owned because the first of them is not
 /// the experts' — `crate::matmul` is the same kernel every projection and the
 /// head dispatch through, and a second compilation of it would be a second
 /// pipeline for one source string.
@@ -340,6 +341,9 @@ pub struct ExpertKernels<'a> {
     /// of the router, and a second entry point rather than a second half of the
     /// first.
     pub weights: &'a RouterWeights,
+    /// Both banks' rows weighted by that softmax and summed into the layer's
+    /// output.
+    pub combine: &'a MoeCombine,
 }
 
 /// One MoE layer's two banks and the router that chooses between them.
@@ -349,19 +353,22 @@ pub struct ExpertKernels<'a> {
 /// dispatches over the same expert list, differing in how much of the bank the
 /// list names.
 ///
-/// **The gate and the top-k over it are here because of what they can be
-/// dispatched beside.** Neither is an expert's weight — the gate is `[258,
-/// 4096]` of bfloat16 and a correction bias is 1 KB, against 3.2 GiB of packed
-/// banks — and both belong to the layer rather than to either bank. What they
-/// buy by being here is that the whole layer is one command buffer: the gate
-/// reads the hidden state the shared bank reads, the top-k reads what the gate
-/// wrote, and the routed bank indexes its experts out of what the top-k wrote.
+/// **The whole router is here because of what it can be dispatched beside.**
+/// None of it is an expert's weight — the gate is `[258, 4096]` of bfloat16 and
+/// a correction bias is 1 KB, against 3.2 GiB of packed banks — and all of it
+/// belongs to the layer rather than to either bank. What it buys by being here
+/// is that the whole layer is one command buffer: the gate reads the hidden
+/// state the shared bank reads, the top-k reads what the gate wrote, the routed
+/// bank indexes its experts out of what the top-k wrote, and the weighting reads
+/// the gate's logits again beside the rows both banks answered.
 #[derive(Debug)]
 pub struct LayerExperts<'a> {
     routed: ExpertBanks<'a>,
     shared: ExpertBanks<'a>,
     gate: DenseWeight<'a>,
     router: LayerRouter<'a>,
+    /// The two banks' rows weighted and summed, which is the layer's answer.
+    combine: &'a MoeCombine,
 }
 
 impl<'a> LayerExperts<'a> {
@@ -403,7 +410,7 @@ impl<'a> LayerExperts<'a> {
 
         let mut hidden = self.device().buffer(x)?;
         let mut batch = self.device().batch()?;
-        let dispatched = self.encode_into(&mut batch, &mut hidden, tokens)?;
+        let dispatched = self.encode_banks(&mut batch, &mut hidden, tokens)?;
         batch.wait()?;
 
         let Answered {
@@ -422,14 +429,57 @@ impl<'a> LayerExperts<'a> {
         Ok(banks)
     }
 
-    /// The layer's ten dispatches encoded into `batch`, over a hidden state
-    /// already on the device.
+    /// The whole layer's twelve dispatches encoded into `batch`, over a hidden
+    /// state already on the device: the four that produce both banks' rows, and
+    /// the two that weight them into the `[tokens, hidden]` this answers with.
     ///
-    /// **Nothing between the gate and the routed bank's last dispatch waits for
-    /// this side**, which is what lets a caller with something else in the same
-    /// command buffer put it there — and what a whole decoder layer is, since
-    /// the norm that produced `x` is three dispatches back in the same buffer.
+    /// **Nothing in it waits for this side**, which is what lets a caller with
+    /// something else in the same command buffer put it there — and what a whole
+    /// decoder layer is, since the norm that produced `x` is three dispatches
+    /// back in the same buffer.
+    ///
+    /// **What the layer answers with is its output and not its parts.** The
+    /// weights are a softmax over eight of the logits the gate wrote and the
+    /// selection the top-k made, and both are buffers in this same command
+    /// buffer — so a caller reading the parts back to weight them here would be
+    /// reading five tensors to hand back one.
     pub(crate) fn encode_into(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        tokens: usize,
+    ) -> Result<Pending, MatmulError> {
+        // Refused here rather than three dispatches later, where the two banks
+        // would each have produced no rows and the weighting would be asked to
+        // scale them: a forward pass over no tokens is not a chain of dispatches
+        // — see [`Pending::buffer`] — and this is where it can still be said
+        // which call it was.
+        assert!(tokens > 0, "a layer's MLP runs over some tokens");
+        let Dispatched {
+            mut logits,
+            mut picked,
+            shared,
+            routed,
+        } = self.encode_banks(batch, x, tokens)?;
+        let mut weights = self
+            .router
+            .encode_weights(batch, &mut logits, &mut picked)?;
+        let (mut routed, mut shared) = (routed.buffer(), shared.buffer());
+        let out = self
+            .combine
+            .encode(batch, tokens, &mut weights, &mut routed, &mut shared)?;
+        Ok(Pending::holding(out))
+    }
+
+    /// The four dispatches that name and run both banks: the gate, the top-k
+    /// over what it produced, and each bank over the rows the selection implies.
+    ///
+    /// Apart from [`LayerExperts::encode_into`] because of who reads what they
+    /// left. A caller holding the whole layer weights them here and never sees
+    /// them; a caller holding only the experts — see [`Experts::banks`] — reads
+    /// the logits, the selection and both banks' rows back and weights them on
+    /// the other side of the seam.
+    fn encode_banks(
         &self,
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
@@ -520,14 +570,15 @@ impl<'a> LayerExperts<'a> {
                 &banks.correction_bias,
                 banks.global_scale,
             )?,
+            combine: kernels.combine,
         })
     }
 }
 
-/// What a MoE layer's ten dispatches will have left on the device once the
+/// What a MoE layer's four bank dispatches will have left on the device once the
 /// command buffer they were encoded into completes.
 #[derive(Debug)]
-pub struct Dispatched {
+struct Dispatched {
     logits: Buffer<f32>,
     picked: Buffer<u32>,
     shared: Pending,
@@ -541,14 +592,14 @@ pub struct Dispatched {
 /// scatter carries and the rows it carries them over — and a caller that took
 /// some without the rest would be weighting a selection it did not have.
 #[derive(Debug)]
-pub struct Answered {
-    pub logits: Vec<f32>,
-    pub picked: Vec<usize>,
-    pub banks: BankRows,
+struct Answered {
+    logits: Vec<f32>,
+    picked: Vec<usize>,
+    banks: BankRows,
 }
 
 impl Dispatched {
-    pub fn answered(self) -> Answered {
+    fn answered(self) -> Answered {
         let _timed = profile::scope(Op::Readback);
         Answered {
             logits: self.logits.to_vec(),
@@ -577,8 +628,9 @@ impl Experts for LayerExperts<'_> {
         through(&self.shared, gathered)
     }
 
-    /// The whole layer — the gate, the top-k over it, both banks and the SwiGLU
-    /// inside each — in one command buffer.
+    /// The gate, the top-k over it, both banks and the SwiGLU inside each — in
+    /// one command buffer, for a caller that holds the experts and not the
+    /// layer.
     ///
     /// **Ten dispatches in one submission, where the same ten asked for a piece
     /// at a time are four.** Every value between the hidden state this is handed
@@ -586,6 +638,13 @@ impl Experts for LayerExperts<'_> {
     /// logits, the six indices the top-k took out of them, each bank's two
     /// halves and the activation between them. Nothing in the middle is a value
     /// this process forms or reads.
+    ///
+    /// **It stops at the rows because of who is asking.** The weights those rows
+    /// are scaled by are two more dispatches away — see
+    /// [`LayerExperts::encode_into`], which is what a caller holding the whole
+    /// layer reaches for — and a caller reaching this seam is one that has the
+    /// layer's own [`SparseMoe`](inkling_core::moe::SparseMoe) in hand and will
+    /// weight them there.
     ///
     /// **The rows the routed bank runs are not a tensor anyone built.** A token
     /// reads six experts, so its six rows are one row of the hidden state read
@@ -620,7 +679,7 @@ fn through(banks: &ExpertBanks<'_>, gathered: Gathered<'_>) -> Vec<f32> {
 mod tests {
     use super::*;
     use inkling_core::fixture::deviation;
-    use inkling_core::moe::{ExpertBank, MoeConfig};
+    use inkling_core::moe::{ExpertBank, Gate, GateWeights, MoeConfig, SparseMoe};
     use inkling_core::quant::{GROUP_SIZE, dequantize_blocks};
 
     use crate::dense::testing::narrowed;
@@ -664,14 +723,15 @@ mod tests {
     /// Every kernel a MoE layer dispatches through, compiled once for a case.
     ///
     /// Held together for the reason [`ExpertKernels`] holds them: a layer needs
-    /// all five, none of them names a shape, and a case that compiled them one
-    /// at a time would say five times what it says once.
+    /// all six, none of them names a shape, and a case that compiled them one at
+    /// a time would say six times what it says once.
     struct Kernels {
         matmul: PackedMatmul,
         dense: DenseMatmul,
         swiglu: SwiGlu,
         router: Router,
         weights: RouterWeights,
+        combine: MoeCombine,
     }
 
     impl Kernels {
@@ -682,6 +742,7 @@ mod tests {
                 swiglu: SwiGlu::new(device).expect("the swiglu compiles"),
                 router: Router::new(device).expect("the router compiles"),
                 weights: RouterWeights::new(device).expect("the weighting compiles"),
+                combine: MoeCombine::new(device).expect("the combine compiles"),
             }
         }
 
@@ -707,6 +768,7 @@ mod tests {
                     GLOBAL_SCALE,
                 )
                 .expect("the router stands up"),
+                combine: &self.combine,
             }
         }
     }
@@ -1028,6 +1090,91 @@ mod tests {
     /// reaches a side that counts in `usize`.
     fn widened(picked: &[u32]) -> Vec<usize> {
         picked.iter().map(|expert| *expert as usize).collect()
+    }
+
+    /// **What the layer answers with is the MoE's output and not its parts.**
+    /// Two dispatches past the banks — the softmax over eight logits and the
+    /// weighted sum of both banks' rows — the same command buffer holds
+    /// `[tokens, hidden]`, and what it holds is what `SparseMoe` makes of the
+    /// same rows.
+    ///
+    /// Measured against this layer's *own* four parts read back and weighted on
+    /// the CPU, which is the seam beside it — see [`Experts::banks`] — so what
+    /// this compares is two readings of one selection rather than two
+    /// selections. Exactness is not the claim and cannot be: the CPU sums a
+    /// token's routed rows and its shared rows in the same order this kernel
+    /// does, but Metal may contract each `w * y` into an FMA. Worst observed
+    /// when this landed: 7.5e-8.
+    ///
+    /// **Twelve dispatches where the parts are ten**, and still one submission.
+    /// That is the whole of what the weighting cost: two more dispatches in a
+    /// command buffer that was already open, against four values that no longer
+    /// cross back.
+    #[test]
+    fn the_whole_layer_weights_its_own_rows_and_answers_with_their_sum() {
+        let Some(device) = device() else { return };
+        let kernels = Kernels::compile(&device);
+        let banks = Banks::new();
+        let upload = || {
+            banks
+                .upload(
+                    &device,
+                    &kernels.matmul,
+                    &kernels.swiglu,
+                    &banks.gate,
+                    &banks.up,
+                )
+                .expect("the three banks pair")
+        };
+        let layer = kernels.layer(&device, upload(), upload(), 0x5eed_6666);
+
+        let tokens = 2;
+        let x = rows(tokens);
+        let shared_x: Vec<f32> = x.iter().chain(&x).copied().collect();
+        let shared_chosen = [0usize, 0, 1, 1];
+        let shared = Gathered::new(DIM, &shared_chosen, &shared_x);
+
+        let (out, whole) = spent(&device, || {
+            let mut hidden = device.buffer(&x).expect("the hidden state uploads");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let pending = layer
+                .encode_into(&mut batch, &mut hidden, tokens)
+                .expect("the layer encodes");
+            batch.wait().expect("the batch completes");
+            pending.take()
+        });
+
+        // The same layer's parts, read back and weighted where they used to be.
+        let mut asked = None;
+        let answered = layer.banks(&x, shared, &mut |routed| {
+            let Some(Routed::Picked { logits, experts }) = routed else {
+                panic!("the backend picked the experts and said so")
+            };
+            asked = Some((logits.to_vec(), experts.to_vec()));
+            None
+        });
+        let (logits, picked) = asked.expect("the layer was routed");
+        let want = SparseMoe::new(
+            CONFIG,
+            GateWeights {
+                gate: Gate::Backend { hidden: DIM },
+                correction_bias: &correction_bias(),
+                global_scale: GLOBAL_SCALE,
+            },
+        )
+        .weighted(tokens * DIM, &logits, &picked, &answered)
+        .total();
+
+        assert_eq!(out.len(), tokens * DIM);
+        let deviation = deviation(&out, &want);
+        eprintln!("a whole layer against its parts weighted here: {deviation:e}");
+        assert!(deviation <= TOLERANCE, "deviation {deviation:e}");
+        assert!(
+            out.iter().any(|y| *y != 0.0),
+            "an output of zeros would prove nothing"
+        );
+        assert_eq!(whole.0, 12, "the layer's dispatches");
+        assert_eq!(whole.1, 1, "the command buffers they went in");
     }
 
     /// Which banks a layer answers with, which is the one thing a stack of these

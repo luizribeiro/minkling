@@ -506,14 +506,16 @@ impl<'a> SparseMoe<'a> {
         self.scattered(x.len(), &routing, &assignments, &answered)
     }
 
-    /// The half of a layer's MoE that stays here when a backend ran the whole of
-    /// the other half: the weights its gate's logits imply for the selection its
-    /// router made, over the rows its two banks answered.
+    /// The whole of a layer's MoE past its banks: the weights its gate's logits
+    /// imply for the selection its router made, over the rows its two banks
+    /// answered.
     ///
     /// **Three of the four ways of misreading this gate are in these two lines**
-    /// — see [`SparseMoe::weigh`] — which is what keeps them here rather than in
-    /// whichever kernel dispatched the banks. A backend that picks is trusted
-    /// for the set of experts and for nothing else.
+    /// — see [`SparseMoe::weigh`] — and this is where they are settled whoever
+    /// runs them. A backend may weight its own selection, and the Metal one
+    /// does; what it is measured against is this function, over the same logits
+    /// and the same rows, because this is the one every fixture in this module
+    /// holds to mlx-vlm.
     ///
     /// `values` is the width of the hidden state the rows were formed from,
     /// which a caller that never held it still knows: `tokens * hidden`. That is
@@ -585,11 +587,13 @@ impl<'a> SparseMoe<'a> {
     /// selection: `[tokens, top_k]` experts in, the whole [`Routing`] out.
     ///
     /// **Three of the four traps are here and none of them is in the
-    /// selection**, which is what makes this the half worth keeping where the
+    /// selection**, which is what makes this the half worth stating where the
     /// fixtures can reach it. The weights come from the *raw* logits of whatever
     /// was picked, one softmax spans the picked routed experts and both shared
     /// ones together, and the two scales multiply what comes out. A backend that
-    /// picks is trusted for the set of experts and for nothing else.
+    /// weights its own selection reproduces these three clauses or it does not
+    /// reproduce mlx-vlm; a backend that only picks is trusted for the set of
+    /// experts and for nothing else.
     pub fn weigh(&self, logits: &[f32], picked: &[usize]) -> Routing {
         self.weigh_as(logits, picked, Reading::REFERENCE)
     }

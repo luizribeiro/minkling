@@ -32,8 +32,8 @@ use inkling_core::{
 };
 use inkling_metal::{
     DenseMatmul, DenseWeight, Device, ExpertKernels, LayerKernels, LayerProjections, LayerRouter,
-    MetalError, ModelLayers, PackedBank, PackedMatmul, PackedProjection, Router, RouterWeights,
-    SwiGlu,
+    MetalError, ModelLayers, MoeCombine, PackedBank, PackedMatmul, PackedProjection, Router,
+    RouterWeights, SwiGlu,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -510,32 +510,35 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// dispatches alone would watch the number that cannot change while the one
 /// that pays for it doubled underneath.
 ///
-/// **A whole layer is one submission**, and twenty-three dispatches on a layer
+/// **A whole layer is one submission**, and twenty-five dispatches on a layer
 /// that routes. Eleven are its attention: the input layernorm, the four
 /// projections that consume what it produced, the two short convolutions behind
 /// `k` and `v`, the two head norms over `q` and the convolved `k`, the attention
 /// step and `o_proj`. Two more are the residual path behind that — the layer's
 /// own short convolution, which adds the layer's input as it writes, and the
-/// second norm over what it left. The last ten are the MLP: the router's gate,
-/// the top-k over what it produced, and each bank's gate, up, activation and
-/// down. A dense layer is seventeen, its feed-forward network four where a MoE
-/// layer's two banks are eight. The head is one of each.
+/// second norm over what it left. The last twelve are the MLP: the router's
+/// gate, the top-k over what it produced, each bank's gate, up, activation and
+/// down, the softmax over the eight logits that selection named, and both banks'
+/// rows weighted by it. A dense layer is seventeen, its feed-forward network four
+/// where a MoE layer's two banks and the router around them are twelve. The head
+/// is one of each.
 ///
-/// **Twenty-two of a layer's twenty-three dispatches cost no submission.** Every
-/// activation between the hidden state a layer is handed and the rows its MLP
-/// answers with is a buffer the next dispatch reads — including the three that
-/// outlive the call, the three convolutions' windows and the span of keys and
-/// values, which is why they had to become the layer's before the rest could
-/// follow. What is *not* in the buffer is the half of the router that weights
-/// what it chose, and that is where a layer's command buffer ends rather than
-/// something the count is missing.
+/// **Twenty-four of a layer's twenty-five dispatches cost no submission.** Every
+/// activation between the hidden state a layer is handed and the `[tokens,
+/// hidden]` its MLP answers with is a buffer the next dispatch reads — including
+/// the three that outlive the call, the three convolutions' windows and the span
+/// of keys and values, which is why they had to become the layer's before the
+/// rest could follow. What is *not* in the buffer is the short convolution on
+/// the layer's second residual path, which carries a window this side holds, and
+/// that is where a layer's command buffer ends rather than something the count
+/// is missing.
 ///
 /// What is left is one submission a layer and one for the head — 43 where the
 /// same dispatches were 249 before any of them were merged, and 87 while the
 /// three operations on a layer's residual path still ran here.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
-    (13 * layers + 4 * dense + 10 * moe + 1, layers + 1)
+    (13 * layers + 4 * dense + 12 * moe + 1, layers + 1)
 }
 
 /// One run of the engine with every weight it has a kernel for on the device,
@@ -576,6 +579,7 @@ impl OnTheDevice {
         let swiglu = SwiGlu::new(device).expect("the swiglu compiles");
         let router = Router::new(device).expect("the router compiles");
         let weighing = RouterWeights::new(device).expect("the weighting compiles");
+        let combine = MoeCombine::new(device).expect("the combine compiles");
         let config = fixture::config(dir).text_config;
         let ckpt = Checkpoint::open(dir).expect("checkpoint opens");
         let ids = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
@@ -601,6 +605,7 @@ impl OnTheDevice {
                 swiglu: &swiglu,
                 router: &router,
                 weights: &weighing,
+                combine: &combine,
             },
             &packed,
             &banks,

@@ -11,8 +11,8 @@
 //! two head norms behind them, the band the attention step contracts against —
 //! which is the one handover that is an operation rather than a weight — and the
 //! second norm and residual convolution behind all of it. What is left on the
-//! CPU is the half of each router that weights what it chose, and the second
-//! convolution and residual add that read what it weighted.
+//! CPU is the second convolution and residual add on each layer's own residual
+//! path.
 //!
 //! Nothing downstream branches on the choice — not the generation loop, not the
 //! server, not the head's own arithmetic — which is what makes "the CPU path
@@ -37,8 +37,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
 use inkling_metal::{
-    DenseMatmul, Device, ExpertKernels, LayerKernels, ModelLayers, PackedProjection, Router,
-    RouterWeights, SwiGlu,
+    DenseMatmul, Device, ExpertKernels, LayerKernels, ModelLayers, MoeCombine, PackedProjection,
+    Router, RouterWeights, SwiGlu,
 };
 
 use crate::LABEL;
@@ -52,11 +52,12 @@ use crate::args::Backend;
 /// checkpoint, so that a machine this cannot run on says so in a millisecond
 /// rather than after mapping 130 GiB.
 ///
-/// The four a layer does not reach are the experts': the dense matmul is the
+/// The five a layer does not reach are the experts': the dense matmul is the
 /// router's gate, which is the single weight the quantiser left in bfloat16; the
 /// router is the top-k over what that gate produced and the softmax over the
-/// eight logits it picked out; and the SwiGLU is the activation between a bank's
-/// two halves. All but the first are no weight at all.
+/// eight logits it picked out; the SwiGLU is the activation between a bank's two
+/// halves; and the combine is both banks' rows weighted by that softmax. All but
+/// the first are no weight at all.
 #[derive(Debug)]
 pub struct Gpu {
     device: Device,
@@ -65,6 +66,7 @@ pub struct Gpu {
     swiglu: SwiGlu,
     router: Router,
     weights: RouterWeights,
+    combine: MoeCombine,
 }
 
 impl Gpu {
@@ -75,6 +77,7 @@ impl Gpu {
         let swiglu = SwiGlu::new(&device).context("compiling the swiglu")?;
         let router = Router::new(&device).context("compiling the router")?;
         let weights = RouterWeights::new(&device).context("compiling the router's weighting")?;
+        let combine = MoeCombine::new(&device).context("compiling the combine")?;
         Ok(Self {
             device,
             kernels,
@@ -82,10 +85,11 @@ impl Gpu {
             swiglu,
             router,
             weights,
+            combine,
         })
     }
 
-    /// The five a MoE layer dispatches through, which is four of this and the
+    /// The six a MoE layer dispatches through, which is five of this and the
     /// packed matmul every projection in the model shares.
     fn expert_kernels(&self) -> ExpertKernels<'_> {
         ExpertKernels {
@@ -94,6 +98,7 @@ impl Gpu {
             swiglu: &self.swiglu,
             router: &self.router,
             weights: &self.weights,
+            combine: &self.combine,
         }
     }
 }

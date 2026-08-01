@@ -22,12 +22,13 @@
 //! against at all. [`sconv`] is where a layer's position comes from, and the one
 //! kernel here that carries state from one call to the next. [`swiglu`] is the
 //! smallest of them and is here for what it lets the two matmuls either side of
-//! it do rather than for its own arithmetic, and [`router`] is the one that
-//! decides which weights another dispatch will read and what the rows they
-//! produce are worth.
+//! it do rather than for its own arithmetic, [`router`] is the one that decides
+//! which weights another dispatch will read and what the rows they produce are
+//! worth, and [`combine`] is where those rows and those weights meet.
 
 pub mod attention;
 pub mod buffer;
+pub mod combine;
 pub mod dense;
 pub mod device;
 pub mod experts;
@@ -44,6 +45,7 @@ mod testing;
 
 pub use attention::{AttentionError, FusedAttention, LayerAttention, Step};
 pub use buffer::{Arg, Buffer, Bytes, Element, Inline, Landing, Mapped};
+pub use combine::MoeCombine;
 pub use dense::{DenseMatmul, DenseWeight};
 pub use device::{Device, MetalError};
 pub use experts::{ExpertBanks, ExpertKernels, LayerExperts};

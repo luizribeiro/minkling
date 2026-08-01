@@ -19,7 +19,7 @@
 //! one expert every row goes through, and the only thing that stays packed is
 //! the weight itself.
 //!
-//! **One submission a layer, and twenty-three dispatches in one that routes** —
+//! **One submission a layer, and twenty-five dispatches in one that routes** —
 //! seventeen where the two dense layers hold a feed-forward network in place of
 //! two banks. `q`, `k`, `v` and `r` consume the same normed hidden state and
 //! nothing of each other; the two short convolutions consume two of those and
@@ -54,7 +54,7 @@ use inkling_core::weights::{LayerBackend, LayerBanks, LayerPacked, Packed, Packe
 use crate::attention::{AttentionError, FusedAttention, KeyValues, LayerAttention, Step};
 use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
-use crate::experts::{Dispatched, ExpertKernels, LayerExperts};
+use crate::experts::{ExpertKernels, LayerExperts};
 use crate::kernel::Batch;
 use crate::matmul::{MatmulError, PackedMatmul, PackedProjection, Pending, together};
 use crate::norm::{LayerNorm, RmsNorm};
@@ -800,21 +800,21 @@ impl LayerBackend for ModelLayers<'_> {
 
 /// The whole of one decoder layer in one command buffer.
 ///
-/// **Twenty-three dispatches and one submission**, where the same operations
+/// **Twenty-five dispatches and one submission**, where the same operations
 /// asked for a piece at a time are two submissions and three CPU rows between
 /// them. Eleven are the attention's — see [`LayerProjections::layer`], which is
-/// this one step in — and every value between them and the rows the MLP answered
+/// this one step in — and every value between them and what the MLP answers with
 /// is a buffer the next dispatch reads: what `o_proj` wrote, the convolution's
 /// rows with the layer's input already added, what the second norm made of that,
-/// the gate's logits, the experts the top-k took out of them, and each bank's
-/// two halves with the activation between them.
+/// the gate's logits, the experts the top-k took out of them, each bank's two
+/// halves with the activation between them, the softmax over the eight logits
+/// that selection named, and both banks' rows weighted by it.
 ///
-/// **Where it stops is where the routing's weights are.** They are a softmax
-/// over eight numbers from logits a dispatch in this same buffer produced, and
-/// three of the four ways of misreading this gate live in that softmax — see
-/// [`SparseMoe::weighted`](inkling_core::moe::SparseMoe::weighted) — so the rows
-/// both banks answered come back to be weighted here. `h` comes back beside
-/// them, because the layer's second residual is added to it on that side too.
+/// **Where it stops is where the second convolution's window is.** The rows the
+/// MLP produced are read by the short convolution on the layer's second residual
+/// path, and that convolution carries a window from one call to the next which
+/// this side does not hold — so they cross back, and `h` with them, because the
+/// residual is added to `h` where those rows land.
 impl DecoderDevice for LayerDevice<'_> {
     fn run(&self, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<DecoderHalves> {
         let mlp = self.mlp.as_ref()?;
@@ -885,36 +885,43 @@ impl LayerDevice<'_> {
 
         let h = profile::timed(Op::Readback, || h.to_vec());
         Ok(DecoderHalves {
-            projected: dispatched.weighted(h.len(), step.mlp),
+            projected: dispatched.finished(step.mlp),
             h,
         })
     }
 }
 
-/// What a layer's MLP left on the device, which is one value for a dense layer
-/// and four for one that routes.
+/// What a layer's MLP left on the device: one `[tokens, hidden]` either way, and
+/// which MLP produced it.
+///
+/// Two arms rather than one buffer, because what is still owed on this side
+/// differs — a dense layer's trailing `global_scale` is `InklingDenseMLP`'s
+/// rather than `SwiGLUMLP`'s, where a routed layer's two scales are already in
+/// the weights its own router applied.
 enum Dispatch {
     Dense(Pending),
-    Sparse(Dispatched),
+    Sparse(Pending),
 }
 
 impl Dispatch {
     /// The `[tokens, hidden]` the MLP produced, read back and finished on this
     /// side.
     ///
-    /// **Both arms leave something here, and neither is arithmetic a kernel
-    /// declined.** A dense layer's trailing `global_scale` is
-    /// `InklingDenseMLP`'s rather than `SwiGLUMLP`'s, and a routed layer's
-    /// weights are a softmax over the logits its own gate produced — the half of
-    /// the router where three of the four ways of misreading it live.
-    fn weighted(self, values: usize, mlp: LayerMlp<'_>) -> Vec<f32> {
+    /// **A routed layer leaves nothing here.** Its rows are already weighted:
+    /// the softmax over eight logits where three of the four ways of misreading
+    /// this gate live is a dispatch in the same command buffer as the banks it
+    /// scales — see
+    /// [`LayerRouter::encode_weights`](crate::LayerRouter::encode_weights) —
+    /// and what comes back is the sum of both banks rather than their rows.
+    ///
+    /// The pairing is checked rather than assumed: a `Dispatch` and the
+    /// [`LayerMlp`] that describes it are two copies of one fact, and a layer
+    /// whose MLP is not the one wrapped for it would otherwise scale a routed
+    /// layer's output by a dense layer's constant.
+    fn finished(self, mlp: LayerMlp<'_>) -> Vec<f32> {
         match (self, mlp) {
             (Self::Dense(rows), LayerMlp::Dense(dense)) => dense.scaled(rows.take()),
-            (Self::Sparse(dispatched), LayerMlp::Sparse(moe)) => {
-                let answered = dispatched.answered();
-                moe.weighted(values, &answered.logits, &answered.picked, &answered.banks)
-                    .total()
-            }
+            (Self::Sparse(rows), LayerMlp::Sparse(_)) => rows.take(),
             _ => panic!("the layer's MLP is not the one wrapped for it"),
         }
     }
@@ -934,6 +941,7 @@ mod tests {
     use inkling_core::layer::{DecoderLayer, DecoderWeights, NoExperts};
     use inkling_core::ops::DenseMlp;
 
+    use crate::combine::MoeCombine;
     use crate::dense::DenseMatmul;
     use crate::matmul::testing::{Case, pack};
     use crate::router::{Router, RouterWeights};
@@ -1332,13 +1340,15 @@ mod tests {
         let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
         let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
         let router = Router::new(&device).expect("the router compiles");
-        let weighing = RouterWeights::new(&device).expect("the weighting compiles");
+        let weights = RouterWeights::new(&device).expect("the weighting compiles");
+        let combine = MoeCombine::new(&device).expect("the combine compiles");
         let experts = ExpertKernels {
             matmul: kernels.matmul(),
             dense: &dense,
             swiglu: &swiglu,
             router: &router,
-            weights: &weighing,
+            weights: &weights,
+            combine: &combine,
         };
         let projections = ModelLayers::wrap(
             &device,
