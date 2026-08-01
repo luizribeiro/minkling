@@ -22,7 +22,8 @@
 //! against at all. [`sconv`] is where a layer's position comes from, and the one
 //! kernel here that carries state from one call to the next. [`swiglu`] is the
 //! smallest of them and is here for what it lets the two matmuls either side of
-//! it do rather than for its own arithmetic.
+//! it do rather than for its own arithmetic, and [`router`] is the one that
+//! decides which weights another dispatch will read.
 
 pub mod attention;
 pub mod buffer;
@@ -33,6 +34,7 @@ pub mod kernel;
 pub mod matmul;
 pub mod norm;
 pub mod projections;
+pub mod router;
 pub mod sconv;
 pub mod swiglu;
 
@@ -43,10 +45,11 @@ pub use attention::{AttentionError, FusedAttention, LayerAttention, Step};
 pub use buffer::{Arg, Buffer, Bytes, Element, Inline, Landing, Mapped};
 pub use dense::{DenseMatmul, DenseWeight};
 pub use device::{Device, MetalError};
-pub use experts::{ExpertBanks, LayerExperts, ModelExperts};
+pub use experts::{ExpertBanks, ExpertKernels, LayerExperts, ModelExperts};
 pub use kernel::{Grid, Kernel};
 pub use matmul::{MatmulError, PackedBank, PackedMatmul, PackedProjection};
 pub use norm::{LayerNorm, RmsNorm};
 pub use projections::{DenseFfn, LayerKernels, LayerProjections, ModelProjections};
+pub use router::{LayerRouter, Router};
 pub use sconv::{LayerConv, ShortConvolution};
 pub use swiglu::SwiGlu;

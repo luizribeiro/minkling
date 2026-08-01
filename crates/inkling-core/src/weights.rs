@@ -565,9 +565,17 @@ pub trait ExpertBackend {
 
 /// One MoE layer's two banks and its router's gate, still as the checkpoint
 /// stores them, from [`CheckpointWeights::expert_banks`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LayerBanks<'a> {
     pub layer: usize,
+    /// The shape the router chooses under, which a backend that picks the
+    /// experts itself needs and one that only multiplies the gate does not.
+    ///
+    /// Carried rather than derived from the banks for the reason
+    /// [`LayerPacked::config`] is carried: `top_k` is nowhere in the tensors,
+    /// and the two expert counts being here beside them is what makes a bank
+    /// paired with another layer's gate a refusal rather than an answer.
+    pub config: MoeConfig,
     /// The 256 a token reads six of.
     pub routed: PackedExperts<'a>,
     /// The two every token reads.
@@ -581,6 +589,14 @@ pub struct LayerBanks<'a> {
     /// them in one command buffer. See
     /// [`Experts::banks`].
     pub gate_weight: Bf16<'a>,
+    /// `[n_routed]`, added to the sigmoid of the routed logits to rank them and
+    /// read nowhere else — see [`GateWeights::correction_bias`].
+    ///
+    /// Owned rather than borrowed because it is 1 KB a layer of float32 that
+    /// the checkpoint holds as bfloat16, so there is nothing to leave in place;
+    /// widened once here for a backend that ranks, as it already is for the one
+    /// that does not.
+    pub correction_bias: Vec<f32>,
 }
 
 /// One layer's own projections, still packed, from
@@ -739,11 +755,15 @@ impl<'a> CheckpointWeights<'a> {
             .filter(|layer| !self.config.layer_is_dense(*layer))
             .map(|layer| {
                 let (routed, shared) = self.banks(layer);
+                let router = self.layers[layer].router(layer);
                 LayerBanks {
                     layer,
+                    config: MoeConfig::for_layer(self.config, layer)
+                        .expect("a layer with banks has a router"),
                     routed,
                     shared,
-                    gate_weight: self.layers[layer].router(layer).gate,
+                    gate_weight: router.gate,
+                    correction_bias: router.correction_bias.clone(),
                 }
             })
             .collect()

@@ -47,7 +47,7 @@ use inkling_core::profile::{self, Op};
 use inkling_core::quant::{BITS, ELEMENTS, GROUP_SIZE};
 use inkling_core::weights::Packed;
 
-use crate::buffer::{Buffer, Bytes};
+use crate::buffer::{Arg, Buffer, Bytes};
 use crate::device::{Device, MetalError};
 use crate::kernel::{Batch, Grid, Kernel, extent};
 
@@ -404,13 +404,17 @@ impl<'a> PackedBank<'a> {
     /// The scalars the kernel's `Shape` struct declares, in its order — the
     /// caller's to hold, because they are read where the dispatch is encoded and
     /// an array made here would be gone by then.
-    fn shape(&self, rows: usize) -> [u32; SHAPE_FIELDS] {
+    fn shape(&self, rows: usize, per_source: usize) -> [u32; SHAPE_FIELDS] {
         let resident = self.resident.borrow();
         let stride = self.out_dim * self.in_dim;
         [
             extent(rows, "the rows of a call"),
             extent(self.in_dim, "the width a bank maps from"),
             extent(self.out_dim, "the width a bank maps to"),
+            extent(
+                per_source,
+                "the rows of a call that read one row of the input",
+            ),
             extent(resident.codes.offset(), "where a bank's codes start"),
             extent(resident.scales.offset(), "where a bank's scales start"),
             extent(stride / CODES_PER_BYTE, "the packed bytes of an expert"),
@@ -486,8 +490,49 @@ impl<'a> PackedBank<'a> {
         self.encoding(batch, experts, x)
     }
 
-    /// One dispatch encoded, without the scope its two callers each open — so
-    /// that the profile counts a dispatch once however it was reached.
+    /// The same multiply over an expert list a dispatch already left on the
+    /// device, one row of the input feeding `per_source` consecutive rows of the
+    /// call.
+    ///
+    /// **This is a gather nobody gathered.** A token that reads `per_source`
+    /// experts is that many rows here and one row of `x`, so the rows the bank
+    /// runs are the hidden state read at a stride rather than a tensor cut out
+    /// of it — and the expert each goes through is whatever the dispatch that
+    /// wrote `chosen` put there, which is what lets a router on this device sit
+    /// in the same command buffer as the bank it routes.
+    ///
+    /// **The expert indices are not checked and cannot be**: they are in device
+    /// memory and this side has not seen them. An index past the bank is an
+    /// offset past the buffer, which a GPU read answers with whatever is there
+    /// rather than with a fault, so whoever writes `chosen` owes this the range
+    /// — see [`LayerExperts::wrap`](crate::LayerExperts::wrap), which is why
+    /// this is not public.
+    pub(crate) fn encode_picked(
+        &self,
+        batch: &mut Batch<'_>,
+        chosen: &mut Buffer<u32>,
+        x: &mut Buffer<f32>,
+        per_source: usize,
+    ) -> Result<Pending, MatmulError> {
+        let _timed = profile::scope(Op::Encode);
+        let rows = chosen.len();
+        assert!(
+            per_source > 0,
+            "a row of a call reads some row of the input"
+        );
+        assert_eq!(
+            x.len(),
+            rows.div_ceil(per_source) * self.in_dim,
+            "{} values are not {} rows of {}",
+            x.len(),
+            rows.div_ceil(per_source),
+            self.in_dim
+        );
+        self.dispatch(batch, rows, per_source, chosen.arg(), x)
+    }
+
+    /// One dispatch encoded, without the scope its callers each open — so that
+    /// the profile counts a dispatch once however it was reached.
     fn encoding(
         &self,
         batch: &mut Batch<'_>,
@@ -514,19 +559,33 @@ impl<'a> PackedBank<'a> {
                 experts: self.experts,
             });
         }
+        if experts.is_empty() {
+            return Ok(Pending::empty());
+        }
 
-        let rows = experts.len();
+        let mut chosen = self.device.inline(experts)?;
+        self.dispatch(batch, experts.len(), 1, chosen.arg(), x)
+    }
+
+    /// The dispatch itself, over an expert list wherever it lies.
+    fn dispatch(
+        &self,
+        batch: &mut Batch<'_>,
+        rows: usize,
+        per_source: usize,
+        chosen: Arg<'_>,
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
         if rows == 0 {
             return Ok(Pending::empty());
         }
 
         // The shape is read out of `resident` and so is built before it is
         // borrowed mutably for the binding below.
-        let fields = self.shape(rows);
+        let fields = self.shape(rows, per_source);
         let mut shape = self.device.inline(&fields)?;
         let mut resident = self.resident.borrow_mut();
         let resident = &mut *resident;
-        let mut chosen = self.device.inline(experts)?;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
 
         let elements = rows * self.out_dim;
@@ -536,7 +595,7 @@ impl<'a> PackedBank<'a> {
             kernel,
             &[
                 shape.arg(),
-                chosen.arg(),
+                chosen,
                 x.arg(),
                 resident.codes.arg(),
                 resident.scales.arg(),
@@ -713,7 +772,7 @@ constant float ELEMENTS[] = {{ {} }};
 }
 
 /// How many `uint`s the kernel's `Shape` struct declares.
-const SHAPE_FIELDS: usize = 7;
+const SHAPE_FIELDS: usize = 8;
 
 /// Everything of the kernel that the format does not decide.
 ///
@@ -752,17 +811,26 @@ struct Shape {
     uint rows;
     uint in_dim;
     uint out_dim;
+    uint per_source;
     uint code_base;
     uint scale_base;
     uint code_stride;
     uint scale_stride;
 };
 
-/// `out[i] = x[i] @ w[experts[i]]^T` over an `[experts, out_dim, in_dim]` bank.
+/// `out[i] = x[i / per_source] @ w[experts[i]]^T` over an
+/// `[experts, out_dim, in_dim]` bank.
 ///
 /// The expert is per row and not per dispatch, which is the whole of what a
 /// gather is: the six of 256 a token chose are six strides into the same bank,
 /// and the 250 it did not choose are addresses no thread forms.
+///
+/// **`per_source` is the other half of that gather**, and it is why the rows a
+/// bank runs need not be a tensor anyone built. A token that reads six experts
+/// is six rows of this call and one row of `x`, so consecutive rows read the
+/// same input and the copy that would have laid them out end to end is an
+/// integer divide here. Everywhere else it is 1, which makes the divide the
+/// identity and every row its own.
 kernel void packed_matmul(
     constant Shape &shape [[buffer(0)]],
     device const uint *experts [[buffer(1)]],
@@ -782,13 +850,14 @@ kernel void packed_matmul(
     const uint row = element / shape.out_dim;
     const uint col = element % shape.out_dim;
     const uint expert = experts[row];
+    const uint source = row / shape.per_source;
     const uint bytes = shape.in_dim / CODES_PER_BYTE;
 
     float sum = weight_dot(
         codes + shape.code_base + (ulong)expert * shape.code_stride + (ulong)col * bytes,
         scales + shape.scale_base + (ulong)expert * shape.scale_stride
             + (ulong)col * (bytes / BYTES_PER_GROUP),
-        x + (ulong)row * shape.in_dim,
+        x + (ulong)source * shape.in_dim,
         bytes,
         lane,
         width

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use inkling_core::fixture::{self, ACTIVATIONS, deviation, indices};
+use inkling_core::moe::{Gate, GateWeights, MoeConfig, SparseMoe};
 use inkling_core::ops::linear;
 use inkling_core::profile::{self, Op, Profile};
 use inkling_core::quant::{BITS, dequantize_blocks_into};
@@ -28,8 +29,9 @@ use inkling_core::{
     split_heads,
 };
 use inkling_metal::{
-    DenseMatmul, DenseWeight, Device, LayerKernels, LayerProjections, MetalError, ModelExperts,
-    ModelProjections, PackedBank, PackedMatmul, PackedProjection, SwiGlu,
+    DenseMatmul, DenseWeight, Device, ExpertKernels, LayerKernels, LayerProjections, LayerRouter,
+    MetalError, ModelExperts, ModelProjections, PackedBank, PackedMatmul, PackedProjection, Router,
+    SwiGlu,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -506,12 +508,11 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// **A layer's attention is one submission**, and eleven dispatches: the input
 /// layernorm, the four projections that consume what it produced, the two short
 /// convolutions behind `k` and `v`, the two head norms over `q` and the
-/// convolved `k`, the attention step and `o_proj`. Per MoE layer there are nine
-/// expert dispatches in two more, being the whole shared bank — gate, up, the
-/// activation between them and down — *together with the router's own gate*,
-/// and then the whole routed bank once this side has taken a top-k from the
-/// logits that first buffer produced. A dense layer's feed-forward network is
-/// three in two, its activation still here. The head is one of each.
+/// convolved `k`, the attention step and `o_proj`. **A MoE layer's MLP is one
+/// submission too**, and ten dispatches: the router's gate, the top-k over what
+/// it produced, and each bank's gate, up, activation and down. A dense layer's
+/// feed-forward network is three in two, its activation still here. The head is
+/// one of each.
 ///
 /// **Ten of a layer's eleven dispatches cost no submission**, which is the whole
 /// of what this milestone did. Every activation between the hidden state a layer
@@ -529,8 +530,8 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
     (
-        11 * layers + 3 * dense + 9 * moe + 1,
-        layers + 2 * dense + 2 * moe + 1,
+        11 * layers + 3 * dense + 10 * moe + 1,
+        layers + 2 * dense + moe + 1,
     )
 }
 
@@ -570,6 +571,7 @@ impl OnTheDevice {
         let matmul = kernels.matmul();
         let dense = DenseMatmul::new(device).expect("the dense matmul compiles");
         let swiglu = SwiGlu::new(device).expect("the swiglu compiles");
+        let router = Router::new(device).expect("the router compiles");
         let config = fixture::config(dir).text_config;
         let ckpt = Checkpoint::open(dir).expect("checkpoint opens");
         let ids = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
@@ -587,9 +589,12 @@ impl OnTheDevice {
         let banks = weights.expert_banks();
         let experts = ModelExperts::wrap(
             device,
-            matmul,
-            &dense,
-            &swiglu,
+            ExpertKernels {
+                matmul,
+                dense: &dense,
+                swiglu: &swiglu,
+                router: &router,
+            },
             &banks,
             config.num_hidden_layers,
             config.hidden_size,
@@ -851,6 +856,101 @@ fn where_a_decode_step_spends_its_time() {
     assert!(
         accounted > step / 2,
         "only {accounted:.2?} of a {step:.2?} step is accounted for"
+    );
+}
+
+/// The router's own selection against the CPU's, over the trained gate of the
+/// captured MoE layer and the hidden state the reference ran through it.
+///
+/// **This is the one thing the device now decides that the fixtures cannot
+/// reach.** `inkling_core::moe` pins the whole routing computation to mlx-vlm —
+/// the selection, the weights, the two scales — and the weights are still
+/// computed there. What moved is the top-k, so what has to be said here is that
+/// the same 256 scores rank to the same six on both sides, over the trained gate
+/// rather than over synthetic logits.
+///
+/// **The set and not the order.** `mx.argpartition` states nothing about the
+/// order the k come back in and MLX's own two streams disagree about it, so the
+/// engine depends on the set alone — see `SparseMoe::route`. The sets are
+/// compared sorted, which is what both sides promise.
+///
+/// The two `sigmoid`s are the GPU's `exp` and libm's and agree to a few ulps, so
+/// the selection can only part company where two scores straddling the last slot
+/// are that close. `the_trained_selection_clears_the_gates_float32_drift` in
+/// `inkling_core` measures the trained margin at four times the drift a float32
+/// gate already introduces, which is decades above a few ulps — and that is a
+/// property of these eight tokens rather than a guarantee, which is why this is
+/// stated rather than assumed.
+#[test]
+fn the_router_selects_the_experts_the_cpu_selects_over_a_real_gate() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = fixture::config(&dir).text_config;
+    let matmul = DenseMatmul::new(&device).expect("the dense matmul compiles");
+    let kernel = Router::new(&device).expect("the router compiles");
+
+    let module = "language_model.model.layers.2.mlp";
+    let of = |name: &str| {
+        ckpt.tensor(&format!("{module}.{name}"))
+            .unwrap_or_else(|err| panic!("the checkpoint holds {name}: {err}"))
+            .to_f32()
+            .unwrap_or_else(|| panic!("{name} widens"))
+    };
+    let correction_bias = of("e_score_correction_bias");
+    let moe_config = MoeConfig::for_layer(&config, 2).expect("a MoE layer has a router");
+    assert_eq!(
+        correction_bias.len(),
+        moe_config.n_routed,
+        "one bias per routed expert"
+    );
+
+    // The gate's own logits, formed by the kernel that will feed the router in
+    // anger rather than by the CPU — so what this compares is the two rankings
+    // of one row of scores and not two rows.
+    let gate = Bf16::open(&ckpt, ROUTER_GATE).expect("the checkpoint holds the gate");
+    let logits = DenseWeight::wrap(&device, &matmul, &gate)
+        .expect("the gate wraps")
+        .multiply(&normed_state())
+        .expect("the dispatch completes");
+
+    let got = LayerRouter::new(&device, &kernel, moe_config, &correction_bias)
+        .expect("the router stands up")
+        .select(&logits)
+        .expect("the dispatch completes");
+
+    let want = SparseMoe::new(
+        moe_config,
+        GateWeights {
+            gate: Gate::Backend {
+                hidden: gate.in_dim(),
+            },
+            correction_bias: &correction_bias,
+            global_scale: of("global_scale")[0],
+        },
+    )
+    .route(&logits);
+
+    let sets = |picked: &[usize]| -> Vec<Vec<usize>> {
+        picked
+            .chunks_exact(moe_config.top_k)
+            .map(|row| {
+                let mut row = row.to_vec();
+                row.sort_unstable();
+                row
+            })
+            .collect()
+    };
+    let mine: Vec<usize> = got.iter().map(|expert| *expert as usize).collect();
+    eprintln!(
+        "layer 2, {} tokens: the device selected {:?}",
+        mine.len() / moe_config.top_k,
+        &mine[..moe_config.top_k]
+    );
+    assert_eq!(sets(&mine), sets(want.experts()), "the selected sets");
+    assert!(
+        sets(&mine).iter().any(|row| *row != sets(&mine)[0]),
+        "eight tokens that all routed the same way would say nothing"
     );
 }
 

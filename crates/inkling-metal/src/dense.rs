@@ -37,7 +37,7 @@ use inkling_core::checkpoint::{BF16_BYTES, BF16_SHIFT};
 use inkling_core::profile::{self, Op};
 use inkling_core::weights::Bf16;
 
-use crate::buffer::Bytes;
+use crate::buffer::{Buffer, Bytes};
 use crate::device::{Device, MetalError};
 use crate::kernel::{Batch, Grid, Kernel, extent};
 use crate::matmul::{MatmulError, Pending};
@@ -176,6 +176,28 @@ impl<'a> DenseWeight<'a> {
     /// tokens.
     pub fn encode(&self, batch: &mut Batch<'_>, x: &[f32]) -> Result<Pending, MatmulError> {
         let _timed = profile::scope(Op::Encode);
+        let mut input = self.device.buffer(x)?;
+        self.encoding(batch, &mut input)
+    }
+
+    /// The same multiply over rows a dispatch already left on the device — see
+    /// [`PackedBank::encode_over`](crate::PackedBank::encode_over).
+    ///
+    /// The gate is the first thing a MoE layer's command buffer holds and the
+    /// hidden state it reads is what both banks read, so uploading it once and
+    /// binding the same buffer three times is what a layer wants of this.
+    pub fn encode_over(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
+        let _timed = profile::scope(Op::Encode);
+        self.encoding(batch, x)
+    }
+
+    /// One dispatch encoded, without the scope its two callers each open — so
+    /// that the profile counts a dispatch once however it was reached.
+    fn encoding(&self, batch: &mut Batch<'_>, x: &mut Buffer<f32>) -> Result<Pending, MatmulError> {
         assert_eq!(
             x.len() % self.in_dim,
             0,
@@ -188,7 +210,6 @@ impl<'a> DenseWeight<'a> {
         let fields = self.shape(rows);
         let mut shape = self.device.inline(&fields)?;
         let mut resident = self.resident.borrow_mut();
-        let mut input = self.device.buffer(x)?;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
 
         let elements = rows * self.out_dim;
@@ -196,7 +217,7 @@ impl<'a> DenseWeight<'a> {
         let grid = Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP);
         batch.add(
             kernel,
-            &[shape.arg(), input.arg(), resident.arg(), out.arg()],
+            &[shape.arg(), x.arg(), resident.arg(), out.arg()],
             grid,
         )?;
         Ok(Pending::holding(out))
