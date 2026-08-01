@@ -53,6 +53,12 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 objc2-metal = { version = "0.3", default-features = false, features = [
   "std",
   "block2",
+  # `GPUStartTime` and `GPUEndTime`, which are `CFTimeInterval` and so are
+  # gated on Core Foundation's own bindings. They are the only clock that can
+  # say how much of a submission was the GPU executing rather than this process
+  # waiting, and telling those apart is what decides whether a step is short of
+  # arithmetic or short of work to overlap it with.
+  "objc2-core-foundation",
   "MTLAllocation",
   "MTLBuffer",
   "MTLCommandBuffer",

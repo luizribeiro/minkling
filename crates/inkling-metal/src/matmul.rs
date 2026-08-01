@@ -43,6 +43,7 @@
 use std::cell::RefCell;
 
 use inkling_core::ops::Projection;
+use inkling_core::profile::{self, Op};
 use inkling_core::quant::{BITS, ELEMENTS, GROUP_SIZE};
 use inkling_core::weights::Packed;
 
@@ -182,6 +183,7 @@ pub struct Pending {
 impl Pending {
     /// The values, once the batch this was encoded into has been waited for.
     pub fn take(self) -> Vec<f32> {
+        let _timed = profile::scope(Op::Readback);
         self.out.map(|out| out.to_vec()).unwrap_or_default()
     }
 }
@@ -411,6 +413,7 @@ impl<'a> PackedBank<'a> {
         experts: &[u32],
         x: &[f32],
     ) -> Result<Pending, MatmulError> {
+        let _timed = profile::scope(Op::Encode);
         assert_eq!(
             x.len(),
             experts.len() * self.in_dim,

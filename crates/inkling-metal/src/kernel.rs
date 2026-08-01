@@ -1,5 +1,8 @@
 //! Source string to compute pipeline, and pipeline to result.
 
+use std::time::Duration;
+
+use inkling_core::profile::{self, Op};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
@@ -177,6 +180,7 @@ impl Batch<'_> {
 
     /// Submit everything encoded and wait for all of it.
     pub fn wait(mut self) -> Result<(), MetalError> {
+        let _timed = profile::scope(Op::Submit);
         self.end();
         self.commands.commit();
 
@@ -192,6 +196,7 @@ impl Batch<'_> {
         // largest is four projections at 105 µs each, four decades below it.
         self.commands.waitUntilCompleted();
         self.device.counted(self.dispatches);
+        profile::ran_on_the_gpu(self.executed());
 
         match self.commands.error() {
             None => Ok(()),
@@ -200,6 +205,20 @@ impl Batch<'_> {
                 diagnostic: diagnostic(&err),
             }),
         }
+    }
+
+    /// How long the GPU was executing this command buffer, which it timestamps
+    /// itself and which no clock on this side can see.
+    ///
+    /// The whole of what makes a submission worth reasoning about separately: a
+    /// round trip is 206 microseconds and the arithmetic inside one is less, so
+    /// what a profile has to be able to say is how much of the wait was work.
+    /// Both timestamps are only meaningful once the buffer has completed, which
+    /// is where this is read.
+    fn executed(&self) -> Duration {
+        Duration::from_secs_f64(
+            (self.commands.GPUEndTime() - self.commands.GPUStartTime()).max(0.0),
+        )
     }
 
     /// The encoder closed, which has to happen before the buffer is committed
