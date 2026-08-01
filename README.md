@@ -23,17 +23,17 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **436 of the 443 tests, no
-checkpoint, twelve seconds.** Everything a fixture can settle is here — the
+`just test` is the one to run while iterating: **467 of the 476 tests, no
+checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
-32 that need weights report a skip and pass. It runs through libtest, which puts
-a crate's tests in one process: opening a Metal device costs a second, so the 110
-kernel tests are 7.5 s sharing a process and 87 s with one each. Nothing in this
+30 that need weights report a skip and pass. It runs through libtest, which puts
+a crate's tests in one process: opening a Metal device costs a second, so the 133
+kernel tests are 7.5 s sharing a process and 161 s with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass before a commit lands: **all 443 against a
-real checkpoint, three minutes forty.** The 36 gated tests are what
+`just test-full` is what has to pass before a commit lands: **all 476 against a
+real checkpoint, four minutes thirty.** The 36 gated tests are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
 generates the oracle's own continuation — and `--backend cpu` is the oracle they
@@ -41,10 +41,10 @@ are measured against, at 9.0 s a decoded token, which is where most of those
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the seven tests whose result *is* a number — a duration
-they assert on, a resident set they bound, the decode-step table quoted above —
-run one at a time with nothing beside them. **A measurement taken while nine
-other tests ran is a measurement of the nine:** a round trip this repo has at
+`just test-timing` is the nine tests whose result *is* a number — a duration
+they assert on, a resident set they bound, the two decode-step tables quoted
+above — run one at a time with nothing beside them. **A measurement taken while
+nine other tests ran is a measurement of the nine:** a round trip this repo has at
 191 µs reports 598 under a parallel suite, and `.config/nextest.toml` records
 what believing a number like that once cost. `#[ignore]` is what keeps them out
 of the two runs above, and what selects them here.
@@ -112,6 +112,58 @@ now executing for **92%** of it — two submissions, around work that is no long
 waited for a layer at a time. Nothing an operation of a layer would open a scope
 around is left in the table at all: what remains beside the round trip is
 encoding it, the sampling at the end, and the embedding at the start.
+
+**And now which kernel owns which of those 26 milliseconds.** The device
+timestamps a command buffer, and a decode step is two of them around 1077
+dispatches, so until this landed the 26 ms was one number with nine kernels
+behind it. It is now nine numbers, each beside the bytes that dispatch said it
+moves and what that comes to against this machine's 819 GB/s:
+
+    kernel            calls    device   share       moved   achieved  of peak
+    packed_matmul       457   21.08ms   71.7%   5932.36 MB   281 GB/s     34%
+    rms_norm            168    2.53ms    8.6%      5.89 MB     2 GB/s      0%
+    dense_matmul         40    2.08ms    7.1%     85.24 MB    41 GB/s      5%
+    short_conv          168    1.30ms    4.4%     22.02 MB    17 GB/s      2%
+    fused_attention      42     763µs    2.6%      5.62 MB     7 GB/s      1%
+    router_top_k         40     545µs    1.9%      0.08 MB     0 GB/s      0%
+    swiglu               82     395µs    1.3%      8.26 MB    21 GB/s      3%
+    router_weights       40     377µs    1.3%      0.00 MB     0 GB/s      0%
+    moe_combine          40     322µs    1.1%      5.90 MB    18 GB/s      2%
+
+**The packed matmul is 72% of the device's time and it is the only kernel here
+doing bandwidth's work.** Its 5.9 GB is what the checkpoint's shapes say a token
+reads — six of each MoE layer's 256 experts and both shared ones, plus every
+layer's own projections — arrived at from a dispatch's own declaration rather
+than from that arithmetic, and the two agree. 34% of the machine is not a
+finished kernel and it is not a decade off one either; M2's isolated matmul
+measured 284 to 424 GB/s, so 281 is the bottom of the range this kernel has
+already been seen to reach.
+
+**The surprise is the other 28%.** The eight kernels under it are 8.3 ms of
+device time and 133 MB between them — a quarter of the step for 2% of the bytes
+— so not one of them is waiting on memory. `rms_norm` is the clearest: 168
+dispatches of a `[1, 4096]` row against a `[4096]` weight, 15 µs each to move 35
+KB, which is 2 GB/s and a third of a percent of the machine. A decode step gives
+that kernel one threadgroup and this GPU has 80 cores. `dense_matmul` is the
+same shape of problem at a different width — the routers' `[258, 4096]` gates
+are 2.1 MB in 52 µs — and `short_conv`, `router_top_k` and `fused_attention`
+join them. **What that says is that the next thing to attack is occupancy and
+not bandwidth**, which is the opposite of what a table with only the first row in
+it would have said.
+
+**The instrumentation is off by default and the reason is in the numbers.** This
+hardware answers `supportsCounterSampling:` with true for `AtStageBoundary` and
+false for `AtDispatchBoundary` — Apple silicon offers no timestamp *between* two
+dispatches of one compute pass — so a timed dispatch is a compute pass of its
+own. What that is deliberately not is a command buffer of its own, which would
+put back the round trip two milestones went to remove and measure an engine
+nobody runs; the passes still go in the same two submissions. Over seven
+alternating pairs it costs **10.4 ms a step and 8.1 ms of device time, 8 µs a
+dispatch**, and the pass boundary lands *between* the spans rather than inside
+them: the rows above sum to 29.4 ms against the 26.9 ms those same pairs put an
+unsampled step's device time at, so each carries a couple of microseconds it
+would not have — 9% across the table, and more of it on the short rows than on
+the long one. The ranking is the finding; the absolute figures carry that.
 
 **A dispatch's shape is not an allocation.** Each of the 749 dispatches a step
 ran at the time took its dimensions, its offsets and the expert its rows go
