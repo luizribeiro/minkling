@@ -66,6 +66,21 @@ impl Sdpa {
         self.scale
     }
 
+    /// The three widths a step is over, which whoever answers for one has to be
+    /// able to read off it — a backend holding the step holds these and not the
+    /// [`AttentionConfig`] they were derived from.
+    pub fn heads(&self) -> usize {
+        self.heads
+    }
+
+    pub fn kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
     /// The KV head that query head `head` reads.
     ///
     /// `mx.fast.scaled_dot_product_attention` repeats each KV head over a
@@ -272,6 +287,90 @@ pub trait Projections: Debug {
     fn normed_qkvr(&self, x: &[f32], weight: &[f32], eps: f32) -> Qkvr {
         self.qkvr(&rms_norm(x, weight, eps))
     }
+
+    /// The attention step and `o_proj`, in one call, `[queries, hidden]` out.
+    ///
+    /// The two are together for the reason [`Projections::normed_qkvr`]'s norm
+    /// is together with the four that read it: `o_proj` multiplies what the step
+    /// produced and nothing else does, so what the step produced is not
+    /// something the CPU wants — it is something the next dispatch wants. The
+    /// seam moves as far as the next thing that has to come back, which here is
+    /// the layer's own residual add.
+    ///
+    /// It is also the first method here that hands over an operation rather than
+    /// a weight. Every projection above multiplies against something the
+    /// checkpoint stores; this multiplies activations against activations, so
+    /// what a backend has to be able to do differently with it is not decline to
+    /// decode a weight but decline to build a tensor: `inkling_metal::attention`
+    /// derives each entry of the `[heads, queries, keys]` mask below where it
+    /// scores the key it belongs to, and the mask is quadratic in the sequence
+    /// where nothing else in a layer is.
+    ///
+    /// The default builds it, and is the oracle the other side is checked
+    /// against.
+    fn attend(&self, step: AttentionStep<'_>) -> Vec<f32> {
+        let (heads, head_dim) = (step.sdpa.heads, step.sdpa.head_dim);
+        let mut mask = step
+            .mask
+            .forward(step.rel, 1, heads, step.q_offset, step.keys());
+
+        // An entry the mask ruled out keeps the constant it carries: scaling
+        // -1e30 would overflow, and it rules the key out at any magnitude.
+        if let Some(taus) = step.taus {
+            for (row, tau) in mask.chunks_exact_mut(step.keys()).zip(taus.iter().cycle()) {
+                for bias in row.iter_mut().filter(|entry| !is_masked(**entry)) {
+                    *bias *= tau;
+                }
+            }
+        }
+
+        let out = step.sdpa.forward(step.q, step.k, step.v, &mask);
+        self.o_proj().forward(&merge_heads(&out, heads, head_dim))
+    }
+}
+
+/// Everything the attention step reads, once the projections, the two short
+/// convolutions and the two head norms have run.
+///
+/// The shape is carried by the [`Sdpa`] and the band by the [`BandedMask`],
+/// which is what lets the default [`Projections::attend`] be the whole of the
+/// step rather than a signature a backend has to be handed the config beside.
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionStep<'a> {
+    pub sdpa: Sdpa,
+    pub mask: BandedMask<'a>,
+    /// `[heads, queries, head_dim]`, with log scaling's `tau` already
+    /// multiplied through it — see [`Attention::attend`], which scales the
+    /// queries where they are formed and leaves the biases to whoever forms
+    /// them.
+    pub q: &'a [f32],
+    /// `[kv_heads, keys, head_dim]`, the whole cached span.
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    /// `[queries, heads, d_rel]` — query-major and head-minor, which is what
+    /// `r_proj` produces and is the opposite of everything else here.
+    pub rel: &'a [f32],
+    /// One `tau` per query, multiplying the biases of that query, or `None` on
+    /// a layer with no log scaling — which is every sliding layer and, below
+    /// the floor, every global one. `None` rather than a row of ones so that
+    /// the branch costs a pass over the mask only where it does something.
+    pub taus: Option<&'a [f32]>,
+    /// Where this call's queries sit: query `i` is at absolute position
+    /// `i + q_offset`.
+    pub q_offset: usize,
+}
+
+impl AttentionStep<'_> {
+    /// How many keys the cached span holds, which is what the keys divide into
+    /// rather than something the caller says again.
+    pub fn keys(&self) -> usize {
+        self.k.len() / (self.sdpa.kv_heads * self.sdpa.head_dim)
+    }
+
+    /// How many queries this call is over.
+    pub fn queries(&self) -> usize {
+        self.q.len() / (self.sdpa.heads * self.sdpa.head_dim)
+    }
 }
 
 /// What the four projections of one call produced, each `[rows, out_dim]`.
@@ -416,6 +515,13 @@ impl Projections for AttentionProjections<'_> {
     /// that overrode this said it did not need.
     fn normed_qkvr(&self, x: &[f32], weight: &[f32], eps: f32) -> Qkvr {
         self.held().normed_qkvr(x, weight, eps)
+    }
+
+    /// And delegated for the same reason again: the default would build the
+    /// mask here and multiply `o_proj` through this, which is the tensor and the
+    /// crossing a backend that overrode this said it needed neither of.
+    fn attend(&self, step: AttentionStep<'_>) -> Vec<f32> {
+        self.held().attend(step)
     }
 }
 
@@ -590,9 +696,7 @@ impl<'a> Attention<'a> {
 
         cache.keys.extend(norm(&k, self.weights.k_norm));
         cache.values.extend(v);
-        let keys = cache.keys.len() / (self.sdpa.kv_heads * head_dim);
 
-        let mut mask = self.mask.forward(&rel, 1, heads, offset, keys);
         let queries = x.len() / self.hidden;
         if let Some(log) = on_queries {
             for (q, tau) in q.chunks_exact_mut(head_dim).zip(taus(log, queries, offset)) {
@@ -601,26 +705,22 @@ impl<'a> Attention<'a> {
                 }
             }
         }
-        // An entry the mask ruled out keeps the constant it carries: scaling
-        // -1e30 would overflow, and it rules the key out at any magnitude.
-        if let Some(log) = on_biases {
-            for (row, tau) in mask.chunks_exact_mut(keys).zip(taus(log, queries, offset)) {
-                for bias in row.iter_mut().filter(|entry| !is_masked(**entry)) {
-                    *bias *= tau;
-                }
-            }
-        }
+        // The queries are scaled here and the biases are not, because the
+        // biases are not formed here: whoever answers the step forms them, and
+        // a `tau` per query is what says by how much.
+        let biases: Option<Vec<f32>> =
+            on_biases.map(|log| (0..queries).map(|i| log.tau(offset + i)).collect());
 
-        let out = self.sdpa.forward(
-            &q,
-            &split_heads(&cache.keys, self.sdpa.kv_heads, head_dim),
-            &split_heads(&cache.values, self.sdpa.kv_heads, head_dim),
-            &mask,
-        );
-        self.weights
-            .projections
-            .o_proj()
-            .forward(&merge_heads(&out, heads, head_dim))
+        projections.attend(AttentionStep {
+            sdpa: self.sdpa,
+            mask: self.mask,
+            q: &q,
+            k: &split_heads(&cache.keys, self.sdpa.kv_heads, head_dim),
+            v: &split_heads(&cache.values, self.sdpa.kv_heads, head_dim),
+            rel: &rel,
+            taus: biases.as_deref(),
+            q_offset: offset,
+        })
     }
 }
 
@@ -1284,6 +1384,12 @@ mod tests {
         /// How many times the layer asked for the four that share an input
         /// together, which is what says it did not ask for them one at a time.
         qkvr: Cell<usize>,
+        /// And how many times it asked for the step and `o_proj` together,
+        /// which is what says it did not multiply `o_proj` itself.
+        attended: Cell<usize>,
+        /// The shape of the last step it was handed, which is what says the
+        /// tensors arrived in the layouts the seam names.
+        step: Cell<Option<(usize, usize, usize)>>,
     }
 
     impl<'a> Handed<'a> {
@@ -1291,6 +1397,8 @@ mod tests {
             Self {
                 five,
                 qkvr: Cell::new(0),
+                attended: Cell::new(0),
+                step: Cell::new(None),
             }
         }
     }
@@ -1299,6 +1407,13 @@ mod tests {
         fn qkvr(&self, x: &[f32]) -> Qkvr {
             self.qkvr.set(self.qkvr.get() + 1);
             self.five.qkvr(x)
+        }
+
+        fn attend(&self, step: AttentionStep<'_>) -> Vec<f32> {
+            self.attended.set(self.attended.get() + 1);
+            self.step
+                .set(Some((step.queries(), step.keys(), step.q_offset)));
+            self.five.attend(step)
         }
 
         fn q_proj(&self) -> &dyn Projection {
@@ -1409,6 +1524,53 @@ mod tests {
 
             layer.run(weights);
             assert_eq!(handed.qkvr.get(), 1, "{}: one call a forward", layer.name);
+        }
+    }
+
+    /// And the attention step is asked for once, with `o_proj` inside it.
+    ///
+    /// The same bargain [`Projections::qkvr`] strikes, at the other end of the
+    /// layer: what the step produces is read by `o_proj` and by nothing else, so
+    /// a layer that took the step's answer back and then asked for `o_proj`
+    /// would be crossing a seam nothing needed crossed. It would also produce
+    /// exactly the same tensor, which is why the count is what is asserted.
+    ///
+    /// The shape is asserted with it, because a step handed the wrong span is
+    /// the mistake the count cannot see: a continuation attends over the whole
+    /// cache and not over its own three tokens, and its queries sit at the
+    /// offset the prefill left.
+    #[test]
+    fn a_layer_asks_a_backend_for_the_attention_step_with_o_proj_inside_it() {
+        for layer in Layer::all() {
+            let hidden = layer.hidden();
+            let handed = Handed::new(layer.weights.view(hidden).projections);
+            let mut weights = layer.weights.view(hidden);
+            weights.projections = AttentionProjections::backend(&handed);
+
+            let attention = Attention::new(layer.config, weights);
+            let cache = &mut attention.cache();
+            let prefill = attention.forward(cache, &layer.x, None);
+            assert_eq!(handed.attended.get(), 1, "{}", layer.name);
+
+            let prefilled = layer.x.len() / hidden;
+            assert_eq!(
+                handed.step.get(),
+                Some((prefilled, prefilled, 0)),
+                "{}: the prefill",
+                layer.name
+            );
+
+            let rest = attention.forward(cache, &layer.continue_x, None);
+            let decoded = layer.continue_x.len() / hidden;
+            assert_eq!(handed.attended.get(), 2, "{}", layer.name);
+            assert_eq!(
+                handed.step.get(),
+                Some((decoded, prefilled + decoded, prefilled)),
+                "{}: the continuation",
+                layer.name
+            );
+
+            assert_eq!((prefill, rest), layer.forward(), "{}", layer.name);
         }
     }
 
