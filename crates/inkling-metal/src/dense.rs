@@ -405,9 +405,9 @@ mod tests {
         /// every value is a dyadic of three significant bits and the inputs are
         /// small integers — so the answer can be checked bit for bit. And every
         /// value's bfloat16 pair stays a finite float when it is read the other
-        /// way round, which is what lets *that* be measured: a 4096-wide row of
-        /// noise read backwards overflows to a NaN, and [`deviation`] folds a
-        /// NaN away with `f32::max` rather than reporting it.
+        /// way round, which is what lets *that* be measured at all: a 4096-wide
+        /// row of noise read backwards overflows to NaN, and a tensor with no
+        /// numbers in it has no deviation to compare against a tolerance.
         fn dyadic() -> (Self, [Vec<f32>; 2]) {
             let forwards: Vec<f32> = (0..8).map(|i| (i as f32 - 3.0) / 4.0).collect();
             let backwards: Vec<f32> = forwards.iter().rev().copied().collect();
@@ -537,8 +537,8 @@ mod tests {
     ///
     /// Over the dyadic case rather than the noisy one, and [`Case::dyadic`]
     /// says why: the swap moves a value's mantissa into its exponent field, so
-    /// a wide row of noise read this way overflows to a NaN that `deviation`
-    /// would fold away rather than report.
+    /// a wide row of noise read this way overflows to NaN, which `deviation`
+    /// refuses to give a number for.
     #[test]
     fn reading_a_values_two_bytes_the_other_way_round_is_a_different_answer() {
         let Some(device) = device() else { return };

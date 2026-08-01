@@ -592,12 +592,78 @@ impl TokenizerFixture {
 /// Scaled by the tensor rather than element by element: an output that lands
 /// near zero by cancellation has no meaningful relative error of its own, and
 /// every op here reduces over an axis where cancellation is ordinary.
+///
+/// A non-finite element in either tensor is a failure rather than a number.
+/// `f32::max` answers with whichever operand is not NaN, so a fold that met one
+/// would report the worst of the elements around it — and a tensor of nothing
+/// but NaN would fold to zero, which is this measure's word for exact
+/// agreement. Every assertion in this suite is a comparison against a bound, so
+/// a kernel that produced no numbers at all would read as the best possible
+/// kernel.
 pub fn deviation(got: &[f32], want: &[f32]) -> f32 {
     assert_eq!(got.len(), want.len(), "length");
+    assert_finite(got, "measured");
+    assert_finite(want, "reference");
     let scale = want.iter().fold(0.0f32, |worst, w| worst.max(w.abs()));
     assert!(scale > 0.0, "reference tensor is all zeros");
     got.iter()
         .zip(want)
         .fold(0.0f32, |worst, (got, want)| worst.max((got - want).abs()))
         / scale
+}
+
+fn assert_finite(tensor: &[f32], which: &str) {
+    if let Some((at, value)) = tensor.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        let len = tensor.len();
+        panic!("{which} tensor holds {value} at element {at} of {len}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deviation;
+
+    /// The measure itself: the worst element's absolute miss, over the largest
+    /// value in the reference rather than over the element it missed.
+    #[test]
+    fn the_worst_element_is_reported_against_the_references_largest_value() {
+        assert_eq!(deviation(&[1.0, 3.0, 4.0], &[1.0, 2.0, 4.0]), 0.25);
+    }
+
+    /// The case this check exists for. A kernel that overflows a wide reduction
+    /// hands back nothing but NaN, and `f32::max` folds every one of them away
+    /// — so without the check the measure answers 0, which is under every
+    /// tolerance in the suite.
+    #[test]
+    #[should_panic(expected = "measured tensor holds NaN at element 0 of 3")]
+    fn a_measured_tensor_of_nothing_but_nan_is_a_failure_rather_than_agreement() {
+        deviation(&[f32::NAN; 3], &[1.0, 2.0, 3.0]);
+    }
+
+    /// One NaN among finite neighbours is the subtler half: the fold keeps
+    /// stepping past it and reports the worst of the elements that did arrive,
+    /// which is a plausible number standing for an answer nobody has.
+    #[test]
+    #[should_panic(expected = "measured tensor holds NaN at element 1 of 3")]
+    fn a_single_nan_among_finite_elements_is_a_failure_too() {
+        deviation(&[1.0, f32::NAN, 3.0], &[1.0, 2.0, 3.0]);
+    }
+
+    /// An infinity does not fold away — it would swallow the fold and report
+    /// `inf` — but it is no more a measurement than a NaN is, and it is what an
+    /// overflow reaches on the way to one.
+    #[test]
+    #[should_panic(expected = "measured tensor holds inf at element 2 of 3")]
+    fn an_infinity_is_a_failure_rather_than_an_unbounded_deviation() {
+        deviation(&[1.0, 2.0, f32::INFINITY], &[1.0, 2.0, 3.0]);
+    }
+
+    /// The reference is checked as well as the measurement. A fixture read at
+    /// the wrong offset, or an oracle that itself overflowed, would otherwise
+    /// set the scale from whatever finite values sat beside the NaN.
+    #[test]
+    #[should_panic(expected = "reference tensor holds NaN at element 1 of 3")]
+    fn a_nan_in_the_reference_tensor_is_a_failure() {
+        deviation(&[1.0, 2.0, 3.0], &[1.0, f32::NAN, 3.0]);
+    }
 }
