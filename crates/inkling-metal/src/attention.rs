@@ -1,0 +1,1506 @@
+//! The attention step, on the device, with the relative-position bias computed
+//! per element rather than read from a tensor.
+//!
+//! Every other kernel here consumes a weight. This one consumes five
+//! activations and a `[d_rel, rel_extent]` projection, and what it produces is
+//! the one value in a layer that no multiply against a weight can make: a
+//! softmax over the keys, weighted into the values.
+//!
+//! # The mask is never a tensor
+//!
+//! [`inkling_core::mask`] builds the additive `[B, H, LQ, S]` tensor attention
+//! adds to its logits, and that tensor is the reason long prefill is out of
+//! reach: `reference/results/prefill.md` measures it at 23% of the peak over
+//! resident at 16384 tokens, and the score buffers an explicit additive mask
+//! forces MLX to materialise alongside it at another 34% — 57% together, against
+//! a 32768-token prefill refused at a projected 406 GiB. It is quadratic in the
+//! sequence and it is read exactly once.
+//!
+//! So it is not built. The kernel holds one query's `d_rel` relative features in
+//! threadgroup memory and derives each key's entry from the backward distance
+//! `(i + q_offset) - j` as it scores that key, which is the same four branches
+//! [`BandedMask`](inkling_core::BandedMask) states, in the same order, evaluated
+//! where the score is. What it costs is `d_rel` multiplies an element — 16 here
+//! — against a tensor read that was going to happen anyway; what it buys is that
+//! the largest allocation in a prefill is one nobody makes.
+//!
+//! # A magnitude rather than an infinity, all the way through
+//!
+//! A masked entry is [`MASKED`], the same `-1e30` the reference writes, and it
+//! is *added* to the score rather than replacing it. That is what keeps a row
+//! with no key it may attend to finite: the running peak of a row that is masked
+//! end to end is `-1e30`, every exponent is `exp(0)`, and what comes back is the
+//! mean of the values rather than a NaN. The band cannot produce such a row —
+//! key `i + q_offset` is always visible to query `i` — but
+//! [`inkling_core::Sdpa`] is pinned to that behaviour and a kernel that
+//! substituted `-INFINITY` would part from it in the one place the two are
+//! compared.
+//!
+//! # It is a streaming softmax, because the scores are not kept either
+//!
+//! The keys are walked in tiles, carrying a running peak, a running total and
+//! the weighted values so far, and each tile rescales what came before it by
+//! `exp(peak_before - peak_now)`. The CPU path shifts by the row's largest entry
+//! in one pass over a row it has already written down; this one cannot, and does
+//! not have to — the tensor of scores is as quadratic as the mask, and neither
+//! is formed.
+
+use std::cell::RefCell;
+
+use inkling_core::attention::AttentionConfig;
+use inkling_core::mask::MASKED;
+use inkling_core::profile::{self, Op};
+
+use crate::buffer::Buffer;
+use crate::device::{Device, MetalError};
+use crate::kernel::{Batch, Grid, Kernel, extent};
+
+const ENTRY: &str = "fused_attention";
+
+/// Threads one threadgroup of a dispatch holds, all of them on one query of one
+/// head.
+///
+/// The two phases of a tile want different widths and this is the compromise
+/// between them. Scoring gives a simdgroup to each key, so 8 simdgroups score 8
+/// keys at once with the 32 lanes of each reading 32 consecutive channels of one
+/// key; weighting gives a *thread* to each channel, so 128 of the 256 are busy
+/// at Inkling's `head_dim`. Halving this would balance the second phase and
+/// double the number of tiles the first pays a barrier for.
+const THREADS_PER_GROUP: usize = 256;
+
+/// Keys one simdgroup scores before the threadgroup reduces the tile.
+///
+/// A tile is `simdgroups * KEYS_PER_SIMD` keys and each tile costs four
+/// barriers, so this is what keeps the barriers off a long row: at Inkling's
+/// shape a tile is 32 keys, and a decode over a 1024-token context is 32 tiles
+/// rather than 128.
+const KEYS_PER_SIMD: usize = 4;
+
+/// Entries the kernel's threadgroup arrays hold, which have to be constants
+/// where the shapes are not. 1024 threads is the widest threadgroup any Apple
+/// GPU allows and 32 the narrowest simdgroup any reports, so 32 simdgroups is
+/// the most a threadgroup can hold.
+const MOST_SIMDGROUPS: usize = 32;
+
+/// Channels one head may have, which bounds the staged query row and the
+/// weighted sum beside it. Inkling's `head_dim` is 128.
+const MOST_CHANNELS: usize = 256;
+
+/// Floats of a tile's values a threadgroup stages before it weights them, which
+/// with the four arrays beside it is 19 KB of the 32 KB an Apple GPU allows.
+///
+/// **This is the whole of what makes the weighting affordable.** A thread that
+/// carries one channel across a tile reads that channel of each value in turn,
+/// and those reads are `head_dim` floats apart and each waits for the last: a
+/// dependent chain as long as the tile, at a memory latency apiece. Staged
+/// first, the same values arrive as one cooperative copy that every thread has
+/// several independent loads in — 726 µs of device time for one query over 1200
+/// keys before the staging and 458 µs after, on the same dispatch.
+///
+/// It also bounds the tile: a tile is the smaller of what the simdgroups can
+/// score and what this can hold, so a head wider than 128 channels stages fewer
+/// keys rather than overrunning.
+const STAGED_VALUES: usize = 4096;
+
+/// Relative features one query may carry, which bounds the staged `r_proj` row.
+/// Inkling's `d_rel` is 16.
+const MOST_FEATURES: usize = 128;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AttentionError {
+    #[error(transparent)]
+    Metal(#[from] MetalError),
+
+    #[error("{got} projection coefficients are not whole rows of {d_rel}")]
+    PartialBand { d_rel: usize, got: usize },
+
+    #[error("{heads} query heads do not divide into {kv_heads} groups")]
+    UngroupedHeads { heads: usize, kv_heads: usize },
+
+    #[error("a head of {head_dim} channels is wider than the {MOST_CHANNELS} a threadgroup stages")]
+    TooManyChannels { head_dim: usize },
+
+    #[error("{d_rel} relative features are more than the {MOST_FEATURES} a threadgroup stages")]
+    TooManyFeatures { d_rel: usize },
+}
+
+/// The compiled kernel, which every attention layer on a device shares.
+///
+/// Per source string rather than per layer, like [`crate::RmsNorm`]: the source
+/// names no shape, so one of these serves all forty-two.
+#[derive(Debug)]
+pub struct FusedAttention {
+    kernel: Kernel,
+}
+
+impl FusedAttention {
+    pub fn new(device: &Device) -> Result<Self, MetalError> {
+        Self::from_source(device, &source())
+    }
+
+    /// [`FusedAttention::new`] out of a source string of the caller's own, which
+    /// is how a test puts a deliberately wrong kernel through the same plumbing
+    /// as the right one and measures the difference.
+    pub(crate) fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
+        Ok(Self {
+            kernel: device.compile(source, ENTRY)?,
+        })
+    }
+}
+
+/// What one call of the attention step reads, in the layouts the pieces around
+/// it already produce.
+///
+/// `q` arrives with log scaling's `tau` already multiplied through it and the
+/// biases do not — see [`LayerAttention::encode`] — which is the one asymmetry
+/// here and is the seam's rather than the kernel's.
+#[derive(Debug, Clone, Copy)]
+pub struct Step<'a> {
+    /// `[heads, queries, head_dim]`, the layout
+    /// [`split_heads`](inkling_core::split_heads) produces.
+    pub q: &'a [f32],
+    /// `[kv_heads, keys, head_dim]`, the whole cached span.
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    /// `[queries, heads, d_rel]` — query-major and head-minor, which is what
+    /// `r_proj` produces and is the opposite of everything else here.
+    pub rel: &'a [f32],
+    /// One `tau` per query, which the biases of that query are multiplied by. A
+    /// layer without log scaling passes ones.
+    pub taus: &'a [f32],
+    /// Where this call's queries sit: query `i` is at absolute position
+    /// `i + q_offset`.
+    pub q_offset: usize,
+}
+
+/// One attention layer's mask projection on the device, and the step through it.
+///
+/// The projection is `[d_rel, rel_extent]` — 64 KB on a global layer — and is
+/// copied once at wrap time rather than per call, for the reason
+/// [`crate::LayerNorm`]'s weight is: it is float32 in the checkpoint's own
+/// widening, and the CPU path reads it out of that widening on every layer of
+/// every step.
+///
+/// **It is copied transposed, and that is what makes the bias affordable.** The
+/// checkpoint stores a row per relative feature, so one distance's `d_rel`
+/// coefficients sit `rel_extent` floats apart — 4 KB apart on a global layer,
+/// which is sixteen scattered reads for every element of a mask that is
+/// computed rather than read. Stored `[rel_extent, d_rel]` they are sixteen
+/// consecutive floats: one cache line an element, and the same sixteen products
+/// in the same order.
+#[derive(Debug)]
+pub struct LayerAttention<'a> {
+    device: &'a Device,
+    attention: &'a FusedAttention,
+    /// Behind a cell for the reason [`crate::LayerNorm`]'s weight is: binding a
+    /// buffer to a dispatch borrows it exclusively, and the projection belongs
+    /// to the layer rather than to the call.
+    proj: RefCell<Buffer<f32>>,
+    config: AttentionConfig,
+    rel_extent: usize,
+}
+
+impl<'a> LayerAttention<'a> {
+    /// `proj` is the layer's own `rel_proj`, `[d_rel, rel_extent]` row-major.
+    ///
+    /// Its extent is read off its length rather than passed, which is where
+    /// [`BandedMask::new`](inkling_core::BandedMask::new) reads it too: a
+    /// sliding layer's band is its window and a global layer's is `rel_extent`,
+    /// and the checkpoint stores the tensor at whichever width the layer uses.
+    pub fn new(
+        device: &'a Device,
+        attention: &'a FusedAttention,
+        config: AttentionConfig,
+        proj: &[f32],
+    ) -> Result<Self, AttentionError> {
+        if config.d_rel == 0 || proj.len() % config.d_rel != 0 {
+            return Err(AttentionError::PartialBand {
+                d_rel: config.d_rel,
+                got: proj.len(),
+            });
+        }
+        // What `Sdpa::new` asserts, for the reason a kernel has to have it
+        // asserted: the grouping is a divide in the kernel, so a `kv_heads` of
+        // zero divides by zero there and one that does not divide the query
+        // heads sends the last block of them past the end of the keys — an
+        // address a GPU read answers with whatever is there rather than with a
+        // fault.
+        if config.kv_heads == 0 || config.heads % config.kv_heads != 0 {
+            return Err(AttentionError::UngroupedHeads {
+                heads: config.heads,
+                kv_heads: config.kv_heads,
+            });
+        }
+        if config.head_dim > MOST_CHANNELS {
+            return Err(AttentionError::TooManyChannels {
+                head_dim: config.head_dim,
+            });
+        }
+        if config.d_rel > MOST_FEATURES {
+            return Err(AttentionError::TooManyFeatures {
+                d_rel: config.d_rel,
+            });
+        }
+
+        let rel_extent = proj.len() / config.d_rel;
+        Ok(Self {
+            proj: RefCell::new(device.buffer(&by_distance(proj, config.d_rel, rel_extent))?),
+            rel_extent,
+            device,
+            attention,
+            config,
+        })
+    }
+
+    /// The shape the layer was wrapped for.
+    pub fn config(&self) -> AttentionConfig {
+        self.config
+    }
+
+    /// How far back the learned band reaches, which is the projection's own
+    /// width.
+    pub fn rel_extent(&self) -> usize {
+        self.rel_extent
+    }
+
+    /// The step submitted on its own, `[queries, heads * head_dim]` out — the
+    /// layout `o_proj` reads.
+    ///
+    /// What a caller with nothing to batch it against wants, and what the cases
+    /// here drive. The layer reaches for [`LayerAttention::encode`], because the
+    /// projection that consumes this is a dispatch that could have been in the
+    /// same command buffer.
+    pub fn forward(&self, step: Step<'_>) -> Result<Vec<f32>, AttentionError> {
+        let mut batch = self.device.batch()?;
+        let out = self.encode(&mut batch, step)?;
+        batch.wait()?;
+        Ok(profile::timed(Op::Readback, || out.to_vec()))
+    }
+
+    /// The same step encoded into `batch`, with the result left on the device
+    /// for `o_proj` to read.
+    ///
+    /// **Merged on the way out.** The kernel writes `[queries, heads *
+    /// head_dim]` rather than the `[heads, queries, head_dim]` it reads, which
+    /// is [`merge_heads`](inkling_core::merge_heads) done by choosing an output
+    /// index — so the transpose between the attention step and `o_proj` is not
+    /// an operation anything performs.
+    pub fn encode(
+        &self,
+        batch: &mut Batch<'_>,
+        step: Step<'_>,
+    ) -> Result<Buffer<f32>, AttentionError> {
+        let _timed = profile::scope(Op::Encode);
+        let (heads, kv_heads) = (self.config.heads, self.config.kv_heads);
+        let head_dim = self.config.head_dim;
+
+        let queries = step.taus.len();
+        assert_eq!(
+            step.q.len(),
+            heads * queries * head_dim,
+            "{} query values are not {heads} heads of {queries} rows of {head_dim}",
+            step.q.len()
+        );
+        let span = kv_heads * head_dim;
+        assert_eq!(
+            step.k.len() % span,
+            0,
+            "{} key values are not whole keys of {span}",
+            step.k.len()
+        );
+        let keys = step.k.len() / span;
+        assert_eq!(step.v.len(), step.k.len(), "values against keys");
+        assert_eq!(
+            step.rel.len(),
+            queries * heads * self.config.d_rel,
+            "{} relative features are not {queries} rows of {heads} heads",
+            step.rel.len()
+        );
+
+        let mut shape = self.device.buffer(&[
+            extent(heads, "the heads of a layer"),
+            extent(kv_heads, "the KV heads of a layer"),
+            extent(head_dim, "the channels of a head"),
+            extent(queries, "the queries of a call"),
+            extent(keys, "the keys of a call"),
+            extent(step.q_offset, "the offset of a call"),
+            extent(self.config.d_rel, "the relative features of a layer"),
+            extent(self.rel_extent, "the band of a layer"),
+            extent(self.config.sliding, "the window of a layer"),
+            (1.0 / head_dim as f32).to_bits(),
+        ])?;
+        let mut q = self.device.buffer(step.q)?;
+        let mut k = self.device.buffer(step.k)?;
+        let mut v = self.device.buffer(step.v)?;
+        let mut rel = self.device.buffer(step.rel)?;
+        let mut taus = self.device.buffer(step.taus)?;
+        let mut proj = self.proj.borrow_mut();
+        let mut out = self.device.zeroed::<f32>(queries * heads * head_dim)?;
+
+        // A threadgroup to each query of each head, which is what makes the pair
+        // the threadgroup's own position and so what makes the barriers below
+        // uniform: a threadgroup either runs a query or returns from one, and
+        // never splits over the question.
+        let grid = Grid::new(heads * queries * THREADS_PER_GROUP, THREADS_PER_GROUP);
+        batch.add(
+            &self.attention.kernel,
+            &[
+                shape.arg(),
+                q.arg(),
+                k.arg(),
+                v.arg(),
+                rel.arg(),
+                proj.arg(),
+                taus.arg(),
+                out.arg(),
+            ],
+            grid,
+        )?;
+        Ok(out)
+    }
+}
+
+/// The checkpoint's `[d_rel, rel_extent]` projection as `[rel_extent, d_rel]`,
+/// which is a distance's coefficients gathered where the kernel reads them.
+fn by_distance(proj: &[f32], d_rel: usize, rel_extent: usize) -> Vec<f32> {
+    (0..rel_extent)
+        .flat_map(|back| (0..d_rel).map(move |c| proj[c * rel_extent + back]))
+        .collect()
+}
+
+/// The kernel, with the constants its threadgroup arrays and its masked entry
+/// rest on written into the prelude rather than spelled twice.
+///
+/// [`MASKED`] is [`inkling_core::mask`]'s, because the constant is a fact about
+/// the reference rather than about this kernel — the CPU path emits it and the
+/// committed masks hold the bfloat16 rounding of it, and a second spelling here
+/// is one that can drift from the module that owns it.
+fn source() -> String {
+    format!(
+        "constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n\
+         constant uint MOST_CHANNELS = {MOST_CHANNELS};\n\
+         constant uint MOST_FEATURES = {MOST_FEATURES};\n\
+         constant uint KEYS_PER_SIMD = {KEYS_PER_SIMD};\n\
+         constant uint STAGED_VALUES = {STAGED_VALUES};\n\
+         constant float MASKED = {MASKED:e}f;\n{BODY}"
+    )
+}
+
+/// Everything of the kernel that those constants do not decide.
+///
+/// The logit scale arrives as the bits of a float in a `uint` field rather than
+/// as a float, because the ten scalars are one buffer and a struct mixing the
+/// two types is a layout the Rust side and the source would each have to get
+/// right independently.
+const BODY: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct Shape {
+    uint heads;
+    uint kv_heads;
+    uint head_dim;
+    uint queries;
+    uint keys;
+    uint q_offset;
+    uint d_rel;
+    uint rel_extent;
+    uint sliding;
+    uint scale_bits;
+};
+
+/// One query-key pair's entry of the banded relative-position mask, from the
+/// backward distance alone.
+///
+/// **The four cases are ordered and the order is the whole of it.** A key ahead
+/// of the query is masked before anything indexes the projection with a negative
+/// distance; a key past the window is masked whether or not the band still
+/// covers it; what is left inside the band is the learned bias, and what is left
+/// outside it is exactly zero — neither masked nor biased, which is a case only
+/// a global layer reaches, its window being zero.
+///
+/// `tau` multiplies the bias and not the mask. Scaling `-1e30` would overflow,
+/// and it rules a key out at any magnitude — so log scaling reaches the entries
+/// that carry a number and leaves the ones that carry a decision.
+///
+/// `proj` is `[rel_extent, d_rel]` — the checkpoint's rows gathered by distance
+/// — so the `d_rel` coefficients this reads are consecutive, and the products
+/// are summed in the order `inkling_core::mask` sums them, by one lane rather
+/// than across a simdgroup. Sixteen multiplies over one cache line is not work
+/// worth a reduction, and matching the CPU's association costs nothing to
+/// arrange.
+inline float banded_entry(
+    device const float *proj,
+    threadgroup const float *features,
+    constant Shape &shape,
+    int dist,
+    float tau
+) {
+    if (dist < 0) {
+        return MASKED;
+    }
+    const uint back = (uint)dist;
+    if (shape.sliding > 0 && back >= shape.sliding) {
+        return MASKED;
+    }
+    if (back >= shape.rel_extent) {
+        return 0.0f;
+    }
+
+    device const float *coefficients = proj + (ulong)back * shape.d_rel;
+    float bias = 0.0f;
+    for (uint c = 0; c < shape.d_rel; ++c) {
+        bias += features[c] * coefficients[c];
+    }
+    return bias * tau;
+}
+
+/// The attention step for one query of one head: score every key, bias it, mask
+/// it, softmax the row and weight the values by it.
+///
+/// One threadgroup to a query of a head. The keys are walked in tiles of
+/// `simdgroups * KEYS_PER_SIMD`, and each tile is two phases with the barriers
+/// between them:
+///
+/// - **Score.** A simdgroup to a key: lane `l` walks the key's channels from `l`
+///   in strides of the simdgroup width and the group sums what the lanes held,
+///   so the 32 lanes of one reduction read 32 consecutive channels. Lane 0 adds
+///   the band's entry, which it derives rather than reads.
+/// - **Weight.** A thread to a channel: the tile's exponents are formed once in
+///   threadgroup memory, and each thread carries its own channel's weighted sum
+///   across every tile. The values themselves are staged first, by the whole
+///   threadgroup and in the order they lie, so that what a thread then walks is
+///   threadgroup memory rather than a chain of `head_dim`-spaced device reads.
+///
+/// The running peak and total are every thread's rather than one thread's and
+/// broadcast: each reduces the same tile out of the same threadgroup memory, and
+/// what that costs at 32 entries is less than the barrier a broadcast needs.
+kernel void fused_attention(
+    constant Shape &shape [[buffer(0)]],
+    device const float *q [[buffer(1)]],
+    device const float *k [[buffer(2)]],
+    device const float *v [[buffer(3)]],
+    device const float *rel [[buffer(4)]],
+    device const float *proj [[buffer(5)]],
+    device const float *taus [[buffer(6)]],
+    device float *out [[buffer(7)]],
+    uint slot [[threadgroup_position_in_grid]],
+    uint local [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint width [[threads_per_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint simds [[simdgroups_per_threadgroup]]
+) {
+    threadgroup float query[MOST_CHANNELS];
+    threadgroup float weighted[MOST_CHANNELS];
+    threadgroup float features[MOST_FEATURES];
+    threadgroup float scores[MOST_SIMDGROUPS * KEYS_PER_SIMD];
+    threadgroup float staged[STAGED_VALUES];
+
+    // Unreachable under the grid this is dispatched over, which gives exactly
+    // one threadgroup to each query of each head. It is here for what it would
+    // have to be if that ever stopped being true: the pair is the threadgroup's
+    // own position, so this turns away a whole group and never splits one — and
+    // a bounds check on `local` instead would leave some threads at the barriers
+    // below and others past them, which is undefined rather than slow.
+    if (slot >= shape.heads * shape.queries) {
+        return;
+    }
+
+    const uint head = slot / shape.queries;
+    const uint i = slot % shape.queries;
+    // Each KV head serves a contiguous block of query heads: with 32 query heads
+    // over 8 KV heads, query heads 0..4 all read KV head 0. Striding instead —
+    // `head % kv_heads` — pairs every query head with keys of the right shape.
+    const uint kv = head / (shape.heads / shape.kv_heads);
+    const float scale = as_type<float>(shape.scale_bits);
+    const float tau = taus[i];
+
+    device const float *q_row = q + (ulong)slot * shape.head_dim;
+    device const float *keys_of = k + (ulong)kv * shape.keys * shape.head_dim;
+    device const float *values_of = v + (ulong)kv * shape.keys * shape.head_dim;
+    device const float *rel_row = rel + ((ulong)i * shape.heads + head) * shape.d_rel;
+
+    for (uint d = local; d < shape.head_dim; d += threads) {
+        query[d] = q_row[d];
+        weighted[d] = 0.0f;
+    }
+    for (uint c = local; c < shape.d_rel; c += threads) {
+        features[c] = rel_row[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int position = (int)(i + shape.q_offset);
+    const uint tile = min(simds * KEYS_PER_SIMD, STAGED_VALUES / shape.head_dim);
+    float peak = -INFINITY;
+    float total = 0.0f;
+
+    for (uint first = 0; first < shape.keys; first += tile) {
+        const uint held = min(tile, shape.keys - first);
+
+        // The tile's values, brought in by the whole threadgroup in the order
+        // they lie rather than by each thread down its own channel.
+        device const float *tiled = values_of + (ulong)first * shape.head_dim;
+        for (uint at = local; at < held * shape.head_dim; at += threads) {
+            staged[at] = tiled[at];
+        }
+
+        for (uint n = 0; n < KEYS_PER_SIMD; ++n) {
+            const uint s = n * simds + simd;
+            if (s >= held) {
+                continue;
+            }
+            const uint j = first + s;
+
+            float dot = 0.0f;
+            device const float *key = keys_of + (ulong)j * shape.head_dim;
+            for (uint d = lane; d < shape.head_dim; d += width) {
+                dot += query[d] * key[d];
+            }
+            dot = simd_sum(dot);
+            if (lane == 0) {
+                const float entry =
+                    banded_entry(proj, features, shape, position - (int)j, tau);
+                scores[s] = dot * scale + entry;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float top = peak;
+        for (uint s = 0; s < held; ++s) {
+            top = fmax(top, scores[s]);
+        }
+        // A tile whose largest score is below the running peak rescales by one
+        // and a first tile rescales what is not there yet by `exp(-INFINITY)`,
+        // which is zero. Neither is a case worth branching on.
+        //
+        // `precise` for the reason the RMSNorm kernel's `rsqrt` is: the default
+        // is a hardware approximation, and every weight this row hands a value
+        // comes out of one of these.
+        const float rescale = precise::exp(peak - top);
+        peak = top;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint s = local; s < held; s += threads) {
+            scores[s] = precise::exp(scores[s] - top);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float sum = 0.0f;
+        for (uint s = 0; s < held; ++s) {
+            sum += scores[s];
+        }
+        total = total * rescale + sum;
+
+        for (uint d = local; d < shape.head_dim; d += threads) {
+            float acc = weighted[d] * rescale;
+            for (uint s = 0; s < held; ++s) {
+                acc += scores[s] * staged[s * shape.head_dim + d];
+            }
+            weighted[d] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // `[queries, heads * head_dim]` rather than the `[heads, queries, head_dim]`
+    // read above: the merge `o_proj` needs is an output index here rather than a
+    // pass over a tensor.
+    //
+    // A call over no keys leaves a total of zero, which is a forward pass over
+    // no tokens rather than a row to divide by it.
+    device float *result = out + ((ulong)i * shape.heads + head) * shape.head_dim;
+    const float norm = total > 0.0f ? 1.0f / total : 0.0f;
+    for (uint d = local; d < shape.head_dim; d += threads) {
+        result[d] = weighted[d] * norm;
+    }
+}
+"#;
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use inkling_core::attention::LogScaling;
+    use inkling_core::fixture::{self, ACTIVATIONS, CAPTURED_LAYERS, LONG_ACTIVATIONS, deviation};
+    use inkling_core::{BandedMask, Checkpoint, MASKED, Sdpa, merge_heads, split_heads};
+
+    use super::*;
+    use crate::testing::device;
+
+    /// The synthetic cases and the trained projections `inkling_core::mask` is
+    /// pinned to, which is what puts the branches this kernel derives beside the
+    /// tensor mlx-vlm wrote for them.
+    const MASK_FIXTURE: &str = "mask.safetensors";
+
+    /// The synthetic cases, and the branches each was placed to reach — named
+    /// here as `inkling_core::mask` names them, so a fixture retuned until a
+    /// case stops covering its branch fails here too.
+    const SYNTHETIC: [(&str, &[u8]); 5] = [
+        ("sliding_window", &[1, 2, 3]),
+        ("global_band", &[1, 3, 4]),
+        ("decode", &[2, 3]),
+        ("prefill", &[1, 3]),
+        ("narrow_window", &[1, 2, 3]),
+    ];
+
+    /// The synthetic cases are float32 end to end and so are the queries, keys
+    /// and values invented for them, so what separates this kernel from the CPU
+    /// is summation order in two places: a `head_dim`-long dot product reduced
+    /// across a simdgroup where the CPU sums it serially, and a softmax
+    /// accumulated tile by tile where the CPU shifts a written-down row by its
+    /// peak. The same bound, for the same reason, as `matmul`'s.
+    ///
+    /// Worst observed when this landed: 1.6e-6 over the five cases, a factor of
+    /// twelve in hand, against a weakest mutation — the band consulted before
+    /// the window — of 1.3e-1, five decades above.
+    const TOLERANCE: f32 = 2e-5;
+
+    /// The same bound over the trained captures, where what it is measured
+    /// against is the CPU path running the *same* band rather than mlx-vlm.
+    ///
+    /// This is the number that says the kernel is right. It is looser than
+    /// [`TOLERANCE`] for one reason: the long capture reduces a softmax over
+    /// 1280 keys where a synthetic case reduces over 1200 of which 512 are live,
+    /// and a streaming softmax rescales once a tile rather than shifting a
+    /// written-down row by its peak. Worst observed when this landed: 4.2e-6, on
+    /// the long capture's global layer.
+    const CPU_TOLERANCE: f32 = 6e-5;
+
+    /// And the bound against mlx-vlm's own `sdpa_out`, which is four times
+    /// looser than the 6e-3 `inkling_core::attention` holds the same tensors to.
+    ///
+    /// **The reference's step read a mask that had been rounded to bfloat16, and
+    /// this one reads no mask at all.** `inkling_core::mask` measures the
+    /// computed band against the recorded one at up to 2.9e-3 of the band's
+    /// largest entry, which is bfloat16's quantum and nothing else — but that
+    /// error lands in a logit, and a logit's error is exponentiated before it is
+    /// normalised. Handed mlx-vlm's own rounded mask the CPU reproduces
+    /// `sdpa_out` to 2.8e-3; handed the band computed in float32, both paths
+    /// land 7.9e-3 away, together and in the same direction.
+    ///
+    /// So this bound is not the kernel's accuracy. It is the reference's mask
+    /// dtype, and the assertion beside it — that the CPU path over the same band
+    /// is the same distance out — is what says so.
+    const TRAINED_TOLERANCE: f32 = 1.2e-2;
+
+    /// A head narrow enough to keep the synthetic cases quick and wide enough
+    /// that it is not a simdgroup: 40 channels over 32 lanes leaves the first
+    /// eight with two apiece and the rest with one, which is the ragged stride
+    /// the dot product has to get right.
+    const HEAD_DIM: usize = 40;
+
+    /// Values spread over both signs so that a reduction cancels the way a
+    /// trained one does, from an index rather than from a generator — the two
+    /// paths have to be handed the same numbers and a seed is one more thing to
+    /// keep in step.
+    fn values(len: usize, salt: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| (((i * 37 + salt * 11) % 101) as f32 - 50.0) / 64.0)
+            .collect()
+    }
+
+    /// One configuration of the step: the shapes, the layer's band and window,
+    /// and everything both paths are handed.
+    struct Case {
+        name: String,
+        config: AttentionConfig,
+        proj: Vec<f32>,
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        rel: Vec<f32>,
+        taus: Vec<f32>,
+        q_offset: usize,
+        queries: usize,
+        keys: usize,
+        /// The mask mlx-vlm wrote for this case, where there is one. The
+        /// synthetic cases carry it; the trained captures carry their own.
+        mask: Option<Vec<f32>>,
+    }
+
+    impl Case {
+        fn sdpa(&self) -> Sdpa {
+            Sdpa::new(
+                self.config.heads,
+                self.config.kv_heads,
+                self.config.head_dim,
+            )
+        }
+
+        /// The band as `inkling_core` builds it, for the runs that want the
+        /// materialised tensor this kernel exists not to build.
+        fn banded(&self) -> BandedMask<'_> {
+            BandedMask::new(self.config.d_rel, &self.proj, self.config.sliding)
+        }
+
+        fn step(&self) -> Step<'_> {
+            Step {
+                q: &self.q,
+                k: &self.k,
+                v: &self.v,
+                rel: &self.rel,
+                taus: &self.taus,
+                q_offset: self.q_offset,
+            }
+        }
+
+        /// The attention step on the CPU, over a mask built here — the oracle
+        /// every kernel in this tree is checked against, `[queries, heads *
+        /// head_dim]` so that it is the same tensor the kernel writes.
+        fn on_the_cpu(&self) -> Vec<f32> {
+            self.through(&self.built_mask())
+        }
+
+        fn built_mask(&self) -> Vec<f32> {
+            let mut mask =
+                self.banded()
+                    .forward(&self.rel, 1, self.config.heads, self.q_offset, self.keys);
+            for (row, tau) in mask
+                .chunks_exact_mut(self.keys)
+                .zip(self.taus.iter().cycle())
+            {
+                for bias in row
+                    .iter_mut()
+                    .filter(|entry| !inkling_core::is_masked(**entry))
+                {
+                    *bias *= tau;
+                }
+            }
+            mask
+        }
+
+        fn through(&self, mask: &[f32]) -> Vec<f32> {
+            let out = self.sdpa().forward(&self.q, &self.k, &self.v, mask);
+            merge_heads(&out, self.config.heads, self.config.head_dim)
+        }
+
+        fn on_the_device(&self, device: &Device, attention: &FusedAttention) -> Vec<f32> {
+            self.wrapped(device, attention)
+                .forward(self.step())
+                .expect("the dispatch completes")
+        }
+
+        fn wrapped<'d>(
+            &self,
+            device: &'d Device,
+            attention: &'d FusedAttention,
+        ) -> LayerAttention<'d> {
+            LayerAttention::new(device, attention, self.config, &self.proj)
+                .expect("the projection uploads")
+        }
+
+        /// The synthetic cases of the mask fixture, given queries, keys and
+        /// values of their own.
+        ///
+        /// The `prefill` case is two sequences; everything here takes one at a
+        /// time, so its second is the one loaded — the batch axis is the
+        /// scheduler's and a batch of sequences is a loop over these.
+        fn synthetic() -> Vec<Self> {
+            let ckpt = fixture::open(MASK_FIXTURE);
+            SYNTHETIC
+                .iter()
+                .map(|(name, _)| {
+                    let of = |field| fixture::tensor(&ckpt, &format!("{name}.{field}"));
+                    let recorded = fixture::f32s(&of("config"));
+                    let &[q_offset, keys, sliding, rel_extent] = recorded.as_slice() else {
+                        panic!("{name}: config is [q_offset, keys, sliding, rel_extent]")
+                    };
+                    let rel = of("rel");
+                    let &[batch, queries, heads, d_rel] = rel.shape() else {
+                        panic!("{name}: rel is [batch, queries, heads, d_rel]")
+                    };
+                    let proj = fixture::f32s(&fixture::tensor(
+                        &ckpt,
+                        &format!("proj{}", rel_extent as usize),
+                    ));
+
+                    // The last of the case's sequences, and its own slice of
+                    // both tensors that carry a batch axis.
+                    let last = batch - 1;
+                    let (keys, queries) = (keys as usize, queries);
+                    let rel = fixture::f32s(&rel)[last * queries * heads * d_rel..].to_vec();
+                    let mask = fixture::f32s(&of("mask"))[last * heads * queries * keys..].to_vec();
+
+                    let config = AttentionConfig {
+                        hidden: heads * HEAD_DIM,
+                        heads,
+                        // Two query heads over one KV head, so that every case
+                        // runs a KV head shared by a block of them rather than
+                        // one apiece.
+                        kv_heads: 1,
+                        head_dim: HEAD_DIM,
+                        d_rel,
+                        sliding: sliding as usize,
+                        rms_norm_eps: 1e-6,
+                        log_scaling: None,
+                    };
+                    let span = config.kv_heads * keys * HEAD_DIM;
+                    Self {
+                        name: name.to_string(),
+                        q: values(heads * queries * HEAD_DIM, 1),
+                        k: values(span, 2),
+                        v: values(span, 3),
+                        taus: vec![1.0; queries],
+                        config,
+                        proj,
+                        rel,
+                        queries,
+                        keys,
+                        q_offset: q_offset as usize,
+                        mask: Some(mask),
+                    }
+                })
+                .collect()
+        }
+
+        /// One captured layer's step: everything mlx-vlm handed its kernel and
+        /// the band the checkpoint's own `rel_proj` builds, with no weights at
+        /// all.
+        fn captured(masks: &Checkpoint, activations: &Checkpoint, layer: usize) -> Self {
+            let of = |name: &str| fixture::layer_tensor(activations, layer, name);
+            let q = of("q_norm_out");
+            let k = of("k_norm_out");
+            let &[_, heads, queries, head_dim] = q.shape() else {
+                panic!("q_norm_out is [batch, heads, queries, head_dim]")
+            };
+            let &[_, kv_heads, keys, _] = k.shape() else {
+                panic!("k_norm_out is [batch, kv_heads, keys, head_dim]")
+            };
+
+            let recorded = fixture::f32s(&fixture::layer_tensor(masks, layer, "config"));
+            let proj = fixture::f32s(&fixture::layer_tensor(masks, layer, "rel_proj"));
+            let rel = of("r_proj_out");
+            let &[_, _, _, d_rel] = rel.shape() else {
+                panic!("r_proj_out is [batch, queries, heads, d_rel]")
+            };
+
+            Self {
+                name: format!("layer{layer}"),
+                config: AttentionConfig {
+                    hidden: heads * head_dim,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    d_rel,
+                    sliding: recorded[2] as usize,
+                    rms_norm_eps: 1e-6,
+                    log_scaling: None,
+                },
+                proj,
+                // `v_sconv_out` is the one input the capture holds in the
+                // projection's own layout: the two norms were taken as
+                // attention passed them to the kernel, already split into
+                // heads, and this one was taken a step earlier.
+                v: split_heads(&fixture::f32s(&of("v_sconv_out")), kv_heads, head_dim),
+                q: fixture::f32s(&q),
+                k: fixture::f32s(&k),
+                rel: fixture::f32s(&rel),
+                // The floor is 128000 tokens, so no capture reaches a `tau`
+                // that is not exactly 1.
+                taus: vec![1.0; queries],
+                queries,
+                keys,
+                q_offset: recorded[0] as usize,
+                mask: Some(fixture::f32s(&of("mask"))),
+            }
+        }
+
+        /// What mlx-vlm's own kernel produced for a captured layer, in the
+        /// layout this kernel writes.
+        fn recorded(activations: &Checkpoint, layer: usize, case: &Case) -> Vec<f32> {
+            merge_heads(
+                &fixture::f32s(&fixture::layer_tensor(activations, layer, "sdpa_out")),
+                case.config.heads,
+                case.config.head_dim,
+            )
+        }
+
+        /// The captured layers of a bundle, or nothing where it has not been
+        /// generated.
+        fn all(bundle: &str) -> Option<Vec<(Self, Vec<f32>)>> {
+            let masks = fixture::open(MASK_FIXTURE);
+            let activations = fixture::try_open(bundle)?;
+            Some(
+                CAPTURED_LAYERS
+                    .iter()
+                    .filter(|&&layer| fixture::holds_layer(&activations, layer))
+                    .map(|&layer| {
+                        let case = Self::captured(&masks, &activations, layer);
+                        let want = Self::recorded(&activations, layer, &case);
+                        (case, want)
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    fn synthetic(name: &str) -> Case {
+        Case::synthetic()
+            .into_iter()
+            .find(|case| case.name == name)
+            .unwrap_or_else(|| panic!("no {name} case"))
+    }
+
+    /// **The claim the whole kernel rests on.** Every entry of the additive mask
+    /// mlx-vlm wrote is reproduced by a kernel that never writes one, measured
+    /// where it is used rather than where it is built: the same queries, keys
+    /// and values through the reference's materialised mask on the CPU, and
+    /// through the four branches derived per element here.
+    ///
+    /// The five cases between them reach all four branches, including a
+    /// decode-shaped one — one query, 1200 keys, an offset of 1024 — and a
+    /// global one where a key in context sits outside the band.
+    #[test]
+    fn the_synthetic_cases_reproduce_the_step_through_mlxs_own_mask() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let mut worst = 0.0f32;
+
+        for case in Case::synthetic() {
+            let want = case.through(case.mask.as_ref().expect("a recorded mask"));
+            let deviation = deviation(&case.on_the_device(&device, &attention), &want);
+            assert!(
+                deviation <= TOLERANCE,
+                "{}: deviation {deviation:e}",
+                case.name
+            );
+            worst = worst.max(deviation);
+        }
+        eprintln!(
+            "worst deviation from the step through mlx's own mask over {} cases: {worst:e}",
+            SYNTHETIC.len()
+        );
+    }
+
+    /// The cases reach the branches they were placed to reach, asserted on the
+    /// reference's own masks. Without it every claim above holds of whichever
+    /// branches happen to be live, and the mutations below would be measuring an
+    /// empty set.
+    #[test]
+    fn the_cases_reach_the_branches_they_were_placed_to_reach() {
+        let mut reached = Vec::new();
+        for (case, want) in Case::synthetic().iter().zip(SYNTHETIC.map(|(_, b)| b)) {
+            let mut branches: Vec<u8> = (0..case.queries)
+                .flat_map(|i| {
+                    (0..case.keys).map(move |j| (i + case.q_offset) as isize - j as isize)
+                })
+                .map(|dist| branch(case, dist))
+                .collect();
+            branches.sort_unstable();
+            branches.dedup();
+            assert_eq!(branches, want, "{}", case.name);
+            reached.extend(branches);
+        }
+        reached.sort_unstable();
+        reached.dedup();
+        assert_eq!(reached, [1, 2, 3, 4]);
+    }
+
+    /// Which of the four cases a backward distance falls in, written out of the
+    /// distance alone so it agrees with the kernel only where the kernel is
+    /// right.
+    fn branch(case: &Case, dist: isize) -> u8 {
+        let (sliding, extent) = (case.config.sliding, case.proj.len() / case.config.d_rel);
+        if dist < 0 {
+            1
+        } else if sliding > 0 && dist >= sliding as isize {
+            2
+        } else if dist < extent as isize {
+            3
+        } else {
+            4
+        }
+    }
+
+    /// The trained band, over the eight tokens the committed capture holds, from
+    /// the reference's own `q_norm_out`, `k_norm_out`, `v_sconv_out` and
+    /// `r_proj_out` — the whole attention step against `sdpa_out`, with no
+    /// weight but `rel_proj` and no mask at all.
+    #[test]
+    fn the_captured_layers_reproduce_the_reference_step_without_a_mask() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let cases = Case::all(ACTIVATIONS).expect("the committed capture");
+        assert_eq!(cases.len(), CAPTURED_LAYERS.len());
+
+        let mut worst = 0.0f32;
+        for (case, want) in &cases {
+            worst = worst.max(agrees(case, &case.on_the_device(&device, &attention), want));
+        }
+        eprintln!("worst deviation from the recorded step: {worst:e}");
+        assert!(
+            worst > 0.0,
+            "a run that matched exactly would mean bfloat16 rounding vanished"
+        );
+    }
+
+    /// That `got` is the CPU's answer over the same band, and that both land the
+    /// same distance from the step mlx-vlm recorded — which is the pair of
+    /// claims [`TRAINED_TOLERANCE`] exists to keep apart. Returns the distance
+    /// from mlx-vlm.
+    fn agrees(case: &Case, got: &[f32], want: &[f32]) -> f32 {
+        let ours = case.on_the_cpu();
+        let (from_mlx, cpu_from_mlx) = (deviation(got, want), deviation(&ours, want));
+        eprintln!(
+            "{}: {from_mlx:e} from mlx, {cpu_from_mlx:e} for the CPU over the same band, {:e} \
+             between the two",
+            case.name,
+            deviation(got, &ours),
+        );
+
+        assert!(
+            deviation(got, &ours) <= CPU_TOLERANCE,
+            "{}: the kernel is not the CPU's answer",
+            case.name
+        );
+        for (what, deviation) in [("the kernel", from_mlx), ("the CPU", cpu_from_mlx)] {
+            assert!(
+                deviation <= TRAINED_TOLERANCE,
+                "{}: {what} deviates from mlx by {deviation:e}",
+                case.name
+            );
+        }
+        from_mlx
+    }
+
+    /// The same, over the long capture, which is the only place the window cap
+    /// and the far side of the band are live on trained numbers — and which is
+    /// prefill shape rather than decode: 1280 queries over 1280 keys, `q_offset`
+    /// zero, every query attending over its own prefix.
+    ///
+    /// Whole rather than cut to a tail. `inkling_core::attention` runs 64 of the
+    /// 1280 queries because a scalar float32 step over all of them is 13 GMAC;
+    /// this is the shape the kernel was written for, and running it whole is
+    /// also what says the watchdog is nowhere near a command buffer whose loop
+    /// length is the sequence.
+    #[test]
+    fn the_long_capture_reproduces_the_reference_step_past_the_band() {
+        let Some(device) = device() else { return };
+        let Some(cases) = Case::all(LONG_ACTIVATIONS) else {
+            return;
+        };
+        assert!(
+            !cases.is_empty(),
+            "the long capture holds none of the captured layers"
+        );
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+
+        let mut worst = 0.0f32;
+        for (case, want) in &cases {
+            assert!(
+                case.keys > case.proj.len() / case.config.d_rel,
+                "{}: {} keys do not outrun the band",
+                case.name,
+                case.keys
+            );
+            let started = Instant::now();
+            let got = case.on_the_device(&device, &attention);
+            eprintln!(
+                "{}: {} queries over {} keys in {:.2?}",
+                case.name,
+                case.queries,
+                case.keys,
+                started.elapsed()
+            );
+            worst = worst.max(agrees(case, &got, want));
+        }
+        assert!(
+            worst > 0.0,
+            "a run that matched exactly would mean bfloat16 rounding vanished"
+        );
+    }
+
+    /// **The decode case, which is what the profile is about.** One query over
+    /// 1200 keys at an offset of 1024, which is the only shape where the cache's
+    /// offset is load-bearing — and the kernel is handed the offset rather than
+    /// a mask indexed with it.
+    ///
+    /// Both halves are asserted, because either alone would leave the wrong
+    /// impression of what dropping the offset costs. A query at position
+    /// `i + offset` indexes the band at backward distances `i + offset - j`;
+    /// pinned to zero, every key but the very first sits at a negative distance,
+    /// which the band reads as a position that has not happened yet and rules
+    /// out — so the row attends over almost nothing rather than drifting.
+    #[test]
+    fn a_decode_shaped_step_needs_the_caches_offset() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let mut case = synthetic("decode");
+        assert_eq!((case.queries, case.keys, case.q_offset), (1, 1200, 1199));
+
+        let want = case.through(case.mask.as_ref().expect("a recorded mask"));
+        let agreed = deviation(&case.on_the_device(&device, &attention), &want);
+        assert!(agreed <= TOLERANCE, "deviation {agreed:e}");
+
+        case.q_offset = 0;
+        let dropped = deviation(&case.on_the_device(&device, &attention), &want);
+        assert!(dropped > TOLERANCE, "deviation {dropped:e}");
+    }
+
+    /// **Branch 2 before branch 3.** The two overlap only where the window is
+    /// narrower than the band, which no Inkling layer configures and which the
+    /// `narrow_window` case exists to arrange: every distance from the window
+    /// edge to the band edge is masked, and would be a learned bias if the
+    /// kernel consulted the band first.
+    ///
+    /// Driven as a mutation rather than as a claim about the entries, because
+    /// the entries are not a tensor anyone can look at — the two orderings are
+    /// two kernels through the same plumbing, and what separates them is the
+    /// answer.
+    #[test]
+    fn the_window_cap_outranks_the_band_in_the_kernel() {
+        let Some(device) = device() else { return };
+        let case = synthetic("narrow_window");
+        assert!(
+            case.config.sliding > 0 && case.proj.len() / case.config.d_rel > case.config.sliding,
+            "the case's window is not narrower than its band"
+        );
+
+        let want = case.through(case.mask.as_ref().expect("a recorded mask"));
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let agreed = deviation(&case.on_the_device(&device, &attention), &want);
+        assert!(agreed <= TOLERANCE, "deviation {agreed:e}");
+
+        let banded_first = source().replace(
+            "    if (shape.sliding > 0 && back >= shape.sliding) {\n        return MASKED;\n    }\n\
+             \x20   if (back >= shape.rel_extent) {\n        return 0.0f;\n    }\n",
+            "    if (back >= shape.rel_extent) {\n        return 0.0f;\n    }\n\
+             \x20   if (shape.sliding > 0 && back >= shape.sliding) {\n        return MASKED;\n    }\n",
+        );
+        assert_ne!(banded_first, source(), "the mutation changed nothing");
+        let mutant =
+            FusedAttention::from_source(&device, &banded_first).expect("the mutant compiles");
+        let deviation = deviation(&case.on_the_device(&device, &mutant), &want);
+        eprintln!("the band consulted before the window: deviation {deviation:e}");
+        assert!(deviation > TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// **Branch 1 before everything.** A key ahead of the query is masked
+    /// whatever the band would have said about it, and it is masked *before* the
+    /// band is consulted — which is what keeps a negative distance from indexing
+    /// the projection.
+    ///
+    /// The mutation is the causal check dropped. A negative distance read as an
+    /// unsigned one is enormous, so on a sliding layer it lands past the window
+    /// and is masked anyway; on a *global* layer, whose window is zero, it lands
+    /// outside the band and comes back as a plain zero — an unmasked key ahead
+    /// of the query, which the `global_band` case is where that shows.
+    #[test]
+    fn a_key_ahead_of_the_query_is_masked_before_the_band_is_indexed() {
+        let Some(device) = device() else { return };
+        let case = synthetic("global_band");
+        assert_eq!(
+            case.config.sliding, 0,
+            "a global case, whose window is zero"
+        );
+
+        let want = case.through(case.mask.as_ref().expect("a recorded mask"));
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let agreed = deviation(&case.on_the_device(&device, &attention), &want);
+        assert!(agreed <= TOLERANCE, "deviation {agreed:e}");
+
+        let uncaused = source().replace(
+            "    if (dist < 0) {\n        return MASKED;\n    }\n",
+            "    if (dist < -1000000000) {\n        return MASKED;\n    }\n",
+        );
+        assert_ne!(uncaused, source(), "the mutation changed nothing");
+        let mutant = FusedAttention::from_source(&device, &uncaused).expect("the mutant compiles");
+        let deviation = deviation(&case.on_the_device(&device, &mutant), &want);
+        eprintln!("the causal branch dropped: deviation {deviation:e}");
+        assert!(deviation > TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// Log scaling multiplies the biases and leaves the masked entries alone,
+    /// which is the one thing about `tau` this kernel decides — the queries are
+    /// scaled before they are handed over.
+    ///
+    /// The floor is 128000 tokens, so nothing a capture can reach makes `tau`
+    /// anything but 1; the case is driven with a floor low enough to fire, and
+    /// against the CPU under the same one. Scaling the masked entries too would
+    /// overflow rather than disagree, which is why it is not the mutation here:
+    /// what is asserted is that the branch is live at all.
+    #[test]
+    fn log_scaling_multiplies_the_biases_and_not_the_masked_entries() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let mut case = synthetic("global_band");
+
+        let log = LogScaling::new(4.0, 0.5);
+        let taus: Vec<f32> = (0..case.queries)
+            .map(|i| log.tau(i + case.q_offset))
+            .collect();
+        assert!(
+            taus.iter().any(|tau| *tau > 1.0),
+            "no query clears the floor"
+        );
+
+        let inert = case.on_the_device(&device, &attention);
+        case.taus = taus;
+        let scaled = case.on_the_device(&device, &attention);
+        assert!(
+            deviation(&scaled, &inert) > TOLERANCE,
+            "a tau above one changed nothing"
+        );
+
+        let deviation = deviation(&scaled, &case.on_the_cpu());
+        assert!(deviation <= TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// **Why a masked entry is a magnitude and not an infinity**, which a path
+    /// that materialises the mask can be indifferent about and a streaming
+    /// softmax cannot.
+    ///
+    /// The peak this kernel shifts by is a *tile's*, and a whole tile of masked
+    /// keys is ordinary rather than exotic: the decode case is one query at
+    /// position 1199 over 1200 keys through a 512-token window, so 688 keys —
+    /// five tiles of the widest a threadgroup can hold, or 21 of the 32 it
+    /// holds at this `head_dim` — are masked end to end before a live key
+    /// appears. At `-1e30` those tiles shift by `-1e30` and weigh their values
+    /// by one, which the live tiles then rescale to nothing. At `-INFINITY` they
+    /// shift by `-INFINITY`, and `exp(-inf - -inf)` is a NaN that no later tile
+    /// can rescale away.
+    ///
+    /// The mutation is that substitution, and the assertion is that the row
+    /// stops being a number at all.
+    #[test]
+    fn a_tile_of_masked_keys_leaves_the_row_a_number() {
+        let Some(device) = device() else { return };
+        let case = synthetic("decode");
+        let masked = (0..case.keys)
+            .filter(|j| branch(&case, case.q_offset as isize - *j as isize) == 2)
+            .count();
+        assert!(
+            masked > 5 * MOST_SIMDGROUPS * KEYS_PER_SIMD,
+            "{masked} masked keys do not fill five of the widest tile a threadgroup can hold"
+        );
+
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        assert!(
+            case.on_the_device(&device, &attention)
+                .iter()
+                .all(|value| value.is_finite())
+        );
+
+        let infinite = source().replace(
+            &format!("constant float MASKED = {MASKED:e}f;"),
+            "constant float MASKED = -INFINITY;",
+        );
+        assert_ne!(infinite, source(), "the mutation changed nothing");
+        let mutant = FusedAttention::from_source(&device, &infinite).expect("the mutant compiles");
+        let poisoned = case.on_the_device(&device, &mutant);
+        assert!(
+            poisoned.iter().any(|value| !value.is_finite()),
+            "an infinite mask left the row finite, so this proves nothing"
+        );
+    }
+
+    /// A key the band rules out contributes nothing to its query, whatever the
+    /// value behind it holds — the test `inkling_core::attention` makes against
+    /// a mask it was handed, made here against one the kernel derived.
+    ///
+    /// This is what fails if the entry is added to the softmax's output rather
+    /// than to its input: post-softmax a masked key carries a weight of about
+    /// `-1e30` instead of one of about zero, and the value behind it dominates
+    /// the answer rather than vanishing from it.
+    #[test]
+    fn a_key_the_band_rules_out_cannot_reach_its_query() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let mut case = synthetic("decode");
+        let head_dim = case.config.head_dim;
+
+        let want = case.on_the_device(&device, &attention);
+        let live: Vec<usize> = (0..case.keys)
+            .filter(|j| branch(&case, case.q_offset as isize - *j as isize) == 3)
+            .collect();
+        let (first, last) = (
+            *live.first().expect("a key inside the window"),
+            *live.last().expect("a key inside the window"),
+        );
+        assert!(first > 0, "every key is inside the window");
+
+        // Every key the window cap rules out, made enormous. The keys it lets
+        // through are untouched, so an answer that moved read one it should not
+        // have.
+        for j in 0..first {
+            case.v[j * head_dim..][..head_dim].fill(1e6);
+        }
+        assert_eq!(case.on_the_device(&device, &attention), want);
+
+        // And the same value at the newest key, which the window does let
+        // through — so the check above is not measuring a step that ignores its
+        // values.
+        case.v[last * head_dim..][..head_dim].fill(1e6);
+        assert_ne!(case.on_the_device(&device, &attention), want);
+    }
+
+    /// Each KV head serves a contiguous block of query heads, and the captured
+    /// layers are 32 query heads over 8 KV heads — so this is the one mistake
+    /// the shapes cannot catch, stated against the same step under the striding
+    /// rule with the keys and values gathered to match.
+    #[test]
+    fn each_kv_head_serves_a_contiguous_block_of_query_heads() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let cases = Case::all(ACTIVATIONS).expect("the committed capture");
+
+        for (case, want) in &cases {
+            let (heads, kv_heads) = (case.config.heads, case.config.kv_heads);
+            let head_dim = case.config.head_dim;
+            assert_eq!((heads, kv_heads), (32, 8));
+
+            // The same keys and values with one KV head per query head, which
+            // has no grouping left to get wrong — so a gather under the striding
+            // rule is a step over the wrong keys and nothing else.
+            let span = case.keys * head_dim;
+            let gather = |kv: &[f32]| -> Vec<f32> {
+                (0..heads)
+                    .flat_map(|head| kv[(head % kv_heads) * span..][..span].to_vec())
+                    .collect()
+            };
+            let strided = Case {
+                name: format!("{}.strided", case.name),
+                config: AttentionConfig {
+                    kv_heads: heads,
+                    ..case.config
+                },
+                k: gather(&case.k),
+                v: gather(&case.v),
+                proj: case.proj.clone(),
+                q: case.q.clone(),
+                rel: case.rel.clone(),
+                taus: case.taus.clone(),
+                queries: case.queries,
+                keys: case.keys,
+                q_offset: case.q_offset,
+                mask: None,
+            };
+
+            let deviation = deviation(&strided.on_the_device(&device, &attention), want);
+            assert!(
+                deviation > TRAINED_TOLERANCE,
+                "{}: striding deviates by {deviation:e}",
+                case.name
+            );
+        }
+    }
+
+    /// One decode-shaped step at the checkpoint's own shape: one query over a
+    /// cached span, 32 query heads over 8 KV heads of 128 channels, a 16-feature
+    /// band a thousand distances wide.
+    fn decode_shaped(keys: usize) -> Case {
+        let (heads, kv_heads, head_dim, d_rel, extent) = (32, 8, 128, 16, 1024);
+        Case {
+            name: format!("a decode step over {keys} keys"),
+            config: AttentionConfig {
+                hidden: heads * head_dim,
+                heads,
+                kv_heads,
+                head_dim,
+                d_rel,
+                sliding: 0,
+                rms_norm_eps: 1e-6,
+                log_scaling: None,
+            },
+            proj: values(d_rel * extent, 4),
+            q: values(heads * head_dim, 1),
+            k: values(kv_heads * keys * head_dim, 2),
+            v: values(kv_heads * keys * head_dim, 3),
+            rel: values(heads * d_rel, 5),
+            taus: vec![1.0],
+            queries: 1,
+            keys,
+            q_offset: keys - 1,
+            mask: None,
+        }
+    }
+
+    /// What the attention step costs at the shape a decode step runs it at,
+    /// against what the same step costs the CPU with the mask materialised —
+    /// which is the figure that says whether moving it here is worth a dispatch.
+    ///
+    /// **It is not worth one at the context a prompt of a few tokens leaves**,
+    /// and the numbers say why: at 16 keys the whole dispatch is the submission
+    /// around it, where the CPU does the same arithmetic in tens of
+    /// microseconds. The kernel overtakes as the span grows, both because the
+    /// CPU's own cost grows with it and because the mask the CPU builds beside
+    /// it does. Nothing asserts a ratio; the numbers go to stderr for the commit
+    /// message to quote.
+    ///
+    /// What is asserted is that no span here takes a command buffer anywhere
+    /// near the watchdog, which is the constraint a kernel whose loop length is
+    /// the sequence has and no kernel before it did.
+    #[test]
+    fn a_decode_shaped_step_costs_what_it_costs() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+
+        for keys in [16, 256, 1024, 4096] {
+            let case = decode_shaped(keys);
+            let layer = case.wrapped(&device, &attention);
+
+            // Warm: the first dispatch of a fresh pipeline pays for the driver's
+            // first look at these buffers, which a decode loop pays once.
+            for _ in 0..2 {
+                layer.forward(case.step()).expect("the dispatch completes");
+            }
+
+            const CALLS: u32 = 32;
+            profile::take();
+            let started = Instant::now();
+            for _ in 0..CALLS {
+                layer.forward(case.step()).expect("the dispatch completes");
+            }
+            let each = started.elapsed() / CALLS;
+            let spent = profile::take();
+
+            let started = Instant::now();
+            for _ in 0..CALLS {
+                case.on_the_cpu();
+            }
+            let on_the_cpu = started.elapsed() / CALLS;
+
+            eprintln!(
+                "one query over {keys:>5} keys: {each:>9.2?} submitted on its own — {:>9.2?} the \
+                 device executing, {:>9.2?} encoding the buffers — against {on_the_cpu:>9.2?} on \
+                 the CPU with the mask materialised",
+                spent.gpu() / CALLS,
+                spent.elapsed(Op::Encode) / CALLS,
+            );
+            assert!(each < Duration::from_millis(20), "{keys} keys: {each:?}");
+        }
+    }
+
+    /// The two shapes a wrapped layer refuses, both of which the kernel would
+    /// otherwise index past rather than fault on — a GPU read off the end of a
+    /// buffer answers with whatever is there.
+    #[test]
+    fn a_shape_the_kernel_would_index_past_is_refused_where_it_is_handed_over() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let case = synthetic("decode");
+        let wrapped = |config, proj: &[f32]| {
+            LayerAttention::new(&device, &attention, config, proj).map(|_| ())
+        };
+
+        let err = wrapped(case.config, &case.proj[..case.proj.len() - 1])
+            .expect_err("a partial band is refused");
+        assert!(matches!(err, AttentionError::PartialBand { d_rel, .. } if d_rel == 16));
+
+        // Two heads over three KV heads: the group is `2 / 3` — zero — so every
+        // query head would read past the keys rather than share one.
+        let err = wrapped(
+            AttentionConfig {
+                heads: 2,
+                kv_heads: 3,
+                ..case.config
+            },
+            &case.proj,
+        )
+        .expect_err("heads that do not group are refused");
+        assert!(matches!(err, AttentionError::UngroupedHeads { heads, .. } if heads == 2));
+
+        assert!(wrapped(case.config, &case.proj).is_ok());
+    }
+}

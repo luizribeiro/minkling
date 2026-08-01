@@ -17,8 +17,11 @@
 //! which is the same operation over the one weight the quantiser left in
 //! bfloat16. Beside them sits [`norm`], which is the first here that consumes
 //! activations rather than a weight — and so the first whose output is worth
-//! leaving on the device.
+//! leaving on the device — and [`attention`], which consumes nothing but
+//! activations and is the one operation in the model with no weight to multiply
+//! against at all.
 
+pub mod attention;
 pub mod buffer;
 pub mod dense;
 pub mod device;
@@ -31,6 +34,7 @@ pub mod projections;
 #[cfg(test)]
 mod testing;
 
+pub use attention::{AttentionError, FusedAttention, LayerAttention, Step};
 pub use buffer::{Arg, Buffer, Bytes, Element, Mapped};
 pub use dense::{DenseMatmul, DenseWeight};
 pub use device::{Device, MetalError};
