@@ -552,8 +552,9 @@ struct OnTheDevice {
     prompt: usize,
     /// What each step took, the prompt's prefill first.
     steps: Vec<Duration>,
-    /// The running `(dispatches, submissions)` each step was reached at.
-    submitted: Vec<(u64, u64)>,
+    /// The running `(dispatches, submissions, allocations)` each step was
+    /// reached at.
+    submitted: Vec<(u64, u64, u64)>,
     peak: u64,
     got: Vec<usize>,
     /// What the **decode** steps spent, by operation. The prefill's accounts
@@ -629,8 +630,11 @@ impl OnTheDevice {
             &weights,
             |id| {
                 run.steps.push(step.elapsed());
-                run.submitted
-                    .push((device.dispatches(), device.submissions()));
+                run.submitted.push((
+                    device.dispatches(),
+                    device.submissions(),
+                    device.allocations(),
+                ));
                 run.peak = run.peak.max(fixture::resident_bytes());
                 run.got.push(id);
                 if run.steps.len() == 1 {
@@ -655,13 +659,13 @@ impl OnTheDevice {
         decode.iter().sum::<Duration>() / self.decode_steps()
     }
 
-    /// The running `(dispatches, submissions)` of the last decode step, which is
-    /// the difference between the two totals either side of it.
-    fn per_decode_step(&self) -> (u64, u64) {
+    /// The `(dispatches, submissions, allocations)` of the last decode step,
+    /// which is the difference between the two running totals either side of it.
+    fn per_decode_step(&self) -> (u64, u64, u64) {
         let [.., before, after] = self.submitted.as_slice() else {
             panic!("a step per token, and more than one of them")
         };
-        (after.0 - before.0, after.1 - before.1)
+        (after.0 - before.0, after.1 - before.1, after.2 - before.2)
     }
 }
 
@@ -727,11 +731,11 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
         "a layer has a feed-forward network or banks, never both and never neither"
     );
 
-    let (dispatches, submissions) = run.per_decode_step();
+    let (dispatches, submissions, allocations) = run.per_decode_step();
     eprintln!(
         "{} tokens prefilled in {:.2?}, {} decoded at {:.2?}/token, peak RSS {:.2} GiB\
-         \n  {dispatches} dispatches a decode step in {submissions} submissions, which at 225 µs \
-         a submission is {:.1?} of round trip\
+         \n  {dispatches} dispatches a decode step in {submissions} submissions over \
+         {allocations} buffers, which at 225 µs a submission is {:.1?} of round trip\
          \n  got  {:?}\n  want {want:?}",
         run.prompt,
         run.steps[0],
@@ -746,6 +750,7 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
         per_step(config.num_hidden_layers as u64, run.dense_layers as u64),
         "a decode step's dispatches, and the command buffers they went in"
     );
+    assert!(allocations > 0, "a decode step allocated nothing");
 
     let agreed = run.got.iter().zip(want).take_while(|(a, b)| a == b).count();
     assert_eq!(run.got, want, "{agreed} of {GENERATED} tokens agree");
@@ -785,13 +790,13 @@ fn where_a_decode_step_spends_its_time() {
 
     let run = OnTheDevice::generate(&dir, &device);
     let step = run.each_decode_step();
-    let (dispatches, submissions) = run.per_decode_step();
+    let (dispatches, submissions, allocations) = run.per_decode_step();
     let accounted = run.profile.total();
 
     let share = |part: Duration| 100.0 * part.as_secs_f64() / step.as_secs_f64();
     let mut table = vec![format!(
-        "a {step:.2?} decode step, {dispatches} dispatches in {submissions} submissions\n  \
-         {:<18}{:>7}{:>12}{:>8}",
+        "a {step:.2?} decode step, {dispatches} dispatches in {submissions} submissions over \
+         {allocations} buffers\n  {:<18}{:>7}{:>12}{:>8}",
         "operation", "calls", "self time", "share"
     )];
     for (op, calls, elapsed) in run.profile.rows() {

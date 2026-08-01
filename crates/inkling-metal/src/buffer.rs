@@ -81,7 +81,9 @@ impl Device {
                 len,
                 size: size_of::<T>(),
             })?;
-        Buffer::of(self.raw().newBufferWithLength_options(bytes, STORAGE), len)
+        let buffer = Buffer::of(self.raw().newBufferWithLength_options(bytes, STORAGE), len)?;
+        self.allocated();
+        Ok(buffer)
     }
 
     /// [`Device::zeroed`] filled from a slice, for values that already exist

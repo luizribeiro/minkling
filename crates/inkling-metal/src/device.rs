@@ -67,6 +67,7 @@ pub struct Device {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     dispatches: Cell<u64>,
     submissions: Cell<u64>,
+    allocations: Cell<u64>,
 }
 
 impl Device {
@@ -80,7 +81,29 @@ impl Device {
             queue,
             dispatches: Cell::new(0),
             submissions: Cell::new(0),
+            allocations: Cell::new(0),
         })
+    }
+
+    /// How many buffers this device has been asked to allocate.
+    ///
+    /// The third number the granularity question needs, and the one a dispatch
+    /// count hides. A step's dispatches are the model's shape and its
+    /// submissions are how they were scheduled; what it *allocates* is neither
+    /// — it is how much of what a dispatch reads was already on the device, and
+    /// it moves under changes that leave both other numbers alone. A layer that
+    /// hands the same rows over twice and one that hands them over once
+    /// dispatch identically.
+    ///
+    /// Counted here because this is the one place it can be: [`Device::zeroed`]
+    /// is what every buffer in the crate is made through, wrapped pages
+    /// excepted, and those allocate nothing by construction.
+    pub fn allocations(&self) -> u64 {
+        self.allocations.get()
+    }
+
+    pub(crate) fn allocated(&self) {
+        self.allocations.set(self.allocations.get() + 1);
     }
 
     /// How many kernels this device has been asked to run.
@@ -126,6 +149,29 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use crate::testing::device;
+
+    /// Every buffer is counted once, however it was asked for — and an
+    /// allocation the device refuses is not one of them, which is what keeps the
+    /// count a count of memory rather than of calls.
+    #[test]
+    fn a_device_counts_the_buffers_it_allocated() {
+        let Some(device) = device() else { return };
+        let before = device.allocations();
+
+        let zeroed = device.zeroed::<f32>(16).expect("the buffer allocates");
+        let filled = device.buffer(&[1.0f32, 2.0]).expect("the buffer allocates");
+        assert_eq!(device.allocations() - before, 2, "one each");
+
+        assert!(device.zeroed::<f32>(0).is_err(), "a buffer of nothing");
+        assert_eq!(
+            device.allocations() - before,
+            2,
+            "an allocation the device refused was counted as one it made"
+        );
+
+        assert_eq!(zeroed.len(), 16);
+        assert_eq!(filled.to_vec(), [1.0, 2.0]);
+    }
 
     /// What one allocation can hold is a design input for M2 and not trivia:
     /// `lm_head` decoded is 3.3 GB and the routed experts are 25 GB. A device
