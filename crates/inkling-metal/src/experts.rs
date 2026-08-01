@@ -55,7 +55,7 @@
 use inkling_core::layer::Experts;
 use inkling_core::moe::{BankRows, Gathered, Routed, Rows};
 use inkling_core::profile::{self, Op};
-use inkling_core::weights::{ExpertBackend, LayerBanks, PackedExperts};
+use inkling_core::weights::{LayerBanks, PackedExperts};
 
 use crate::buffer::Buffer;
 use crate::dense::{DenseMatmul, DenseWeight};
@@ -390,24 +390,23 @@ impl<'a> LayerExperts<'a> {
         shared: Gathered<'_>,
         route: &mut dyn FnMut(Option<Routed<'_>>) -> Option<Rows>,
     ) -> Result<BankRows, MatmulError> {
-        let shared_chosen = chosen(shared);
-        let mut hidden = self.device().buffer(x)?;
+        let tokens = x.len() / self.shared.dim();
+        assert_eq!(
+            chosen(shared),
+            self.shared_chosen(tokens),
+            "the shared bank's rows against the passes over the hidden state they are"
+        );
 
+        let mut hidden = self.device().buffer(x)?;
         let mut batch = self.device().batch()?;
-        let mut logits = self.gate.encode_over(&mut batch, &mut hidden)?.buffer();
-        let mut picked = self.router.encode(&mut batch, &mut logits)?;
-        let shared_out = self
-            .shared
-            .encode_repeated(&mut batch, &shared_chosen, &mut hidden)?;
-        let routed_out = self.routed.encode_picked(
-            &mut batch,
-            &mut picked,
-            &mut hidden,
-            self.router.config().top_k,
-        )?;
+        let dispatched = self.encode_into(&mut batch, &mut hidden, tokens)?;
         batch.wait()?;
 
-        let (logits, picked) = read_back(&logits, &picked);
+        let Answered {
+            logits,
+            picked,
+            banks,
+        } = dispatched.answered();
         let gathered = route(Some(Routed::Picked {
             logits: &logits,
             experts: &picked,
@@ -416,11 +415,49 @@ impl<'a> LayerExperts<'a> {
             gathered.is_none(),
             "the layer gathered rows for a bank that had already run"
         );
+        Ok(banks)
+    }
 
-        Ok(BankRows {
-            routed: routed_out.take(),
-            shared: shared_out.take(),
+    /// The layer's ten dispatches encoded into `batch`, over a hidden state
+    /// already on the device.
+    ///
+    /// **Nothing between the gate and the routed bank's last dispatch waits for
+    /// this side**, which is what lets a caller with something else in the same
+    /// command buffer put it there — and what a whole decoder layer is, since
+    /// the norm that produced `x` is three dispatches back in the same buffer.
+    pub(crate) fn encode_into(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        tokens: usize,
+    ) -> Result<Dispatched, MatmulError> {
+        let mut logits = self.gate.encode_over(batch, x)?.buffer();
+        let mut picked = self.router.encode(batch, &mut logits)?;
+        let shared = self
+            .shared
+            .encode_repeated(batch, &self.shared_chosen(tokens), x)?;
+        let routed =
+            self.routed
+                .encode_picked(batch, &mut picked, x, self.router.config().top_k)?;
+        Ok(Dispatched {
+            logits,
+            picked,
+            shared,
+            routed,
         })
+    }
+
+    /// The expert each of the shared bank's rows goes through, which is
+    /// `SparseMoe::shared_rows`'s own list: every token once per shared expert,
+    /// expert-major.
+    ///
+    /// Derived rather than taken, because the rows it names are not a tensor
+    /// anybody hands over any more — see [`ExpertBanks::encode_repeated`]. A
+    /// caller that still has the layer's `Gathered` in hand is the one that
+    /// checks the two agree.
+    fn shared_chosen(&self, tokens: usize) -> Vec<u32> {
+        let rows = tokens * self.router.config().n_shared;
+        (0..rows).map(|row| (row / tokens.max(1)) as u32).collect()
     }
 
     /// Wrap one layer's banks, its gate and its router.
@@ -476,18 +513,41 @@ impl<'a> LayerExperts<'a> {
     }
 }
 
-/// What the layer's own command buffer left for this side to read: the gate's
-/// logits, and the experts the top-k picked out of them.
+/// What a MoE layer's ten dispatches will have left on the device once the
+/// command buffer they were encoded into completes.
+#[derive(Debug)]
+pub struct Dispatched {
+    logits: Buffer<f32>,
+    picked: Buffer<u32>,
+    shared: Pending,
+    routed: Pending,
+}
+
+/// The same four read back: the gate's logits, the experts the top-k picked out
+/// of them, and the rows both banks answered.
 ///
-/// The two together, because they are read for one thing — the weights the
-/// scatter carries — and a caller that took one without the other would be
-/// weighting a selection it did not have.
-fn read_back(logits: &Buffer<f32>, picked: &Buffer<u32>) -> (Vec<f32>, Vec<usize>) {
-    let _timed = profile::scope(Op::Readback);
-    (
-        logits.to_vec(),
-        picked.as_slice().iter().map(|e| *e as usize).collect(),
-    )
+/// All four together, because they are read for one thing — the weights the
+/// scatter carries and the rows it carries them over — and a caller that took
+/// some without the rest would be weighting a selection it did not have.
+#[derive(Debug)]
+pub struct Answered {
+    pub logits: Vec<f32>,
+    pub picked: Vec<usize>,
+    pub banks: BankRows,
+}
+
+impl Dispatched {
+    pub fn answered(self) -> Answered {
+        let _timed = profile::scope(Op::Readback);
+        Answered {
+            logits: self.logits.to_vec(),
+            picked: self.picked.as_slice().iter().map(|e| *e as usize).collect(),
+            banks: BankRows {
+                routed: self.routed.take(),
+                shared: self.shared.take(),
+            },
+        }
+    }
 }
 
 /// The seam [`inkling_core::layer`] names, so that a layer running its MoE does
@@ -543,51 +603,6 @@ fn through(banks: &ExpertBanks<'_>, gathered: Gathered<'_>) -> Vec<f32> {
     banks
         .forward(gathered)
         .unwrap_or_else(|err| panic!("the expert matmul did not run: {err}"))
-}
-
-/// Every MoE layer's banks on the device, which for Inkling-Small is forty
-/// layers of 3.2 GiB.
-///
-/// All of them, at load, and that is the residency policy stated: 137 GB
-/// wrapped in about six milliseconds, holding nothing. The alternatives — copy
-/// every layer at construction, or copy a layer the first time a token routes
-/// into it — are both answers to a question about how much of 137 GB to move,
-/// and the answer here is none of it.
-#[derive(Debug)]
-pub struct ModelExperts<'a> {
-    /// Indexed by layer, `None` where the layer is dense. A map would be the
-    /// same thing said less directly: the stack asks by index, forty-two times a
-    /// forward pass.
-    layers: Vec<Option<LayerExperts<'a>>>,
-}
-
-impl<'a> ModelExperts<'a> {
-    /// Wrap every bank `banks` names, `dim` wide in and out.
-    pub fn wrap(
-        device: &'a Device,
-        kernels: ExpertKernels<'a>,
-        banks: &[LayerBanks<'a>],
-        layers: usize,
-        dim: usize,
-    ) -> Result<Self, MatmulError> {
-        let mut wrapped: Vec<Option<LayerExperts<'a>>> = (0..layers).map(|_| None).collect();
-        for bank in banks {
-            wrapped[bank.layer] = Some(LayerExperts::wrap(device, kernels, bank, dim)?);
-        }
-        Ok(Self { layers: wrapped })
-    }
-
-    /// How many of the stack's layers have banks here, which is how many are
-    /// MoE.
-    pub fn layers(&self) -> usize {
-        self.layers.iter().flatten().count()
-    }
-}
-
-impl ExpertBackend for ModelExperts<'_> {
-    fn layer(&self, layer: usize) -> Option<&dyn Experts> {
-        Some(self.layers.get(layer)?.as_ref()? as &dyn Experts)
-    }
 }
 
 #[cfg(test)]
@@ -957,14 +972,16 @@ mod tests {
         picked.iter().map(|expert| *expert as usize).collect()
     }
 
-    /// Which layer's banks answer for which layer, which is the one thing a
-    /// model-wide backend can get wrong that a single layer's cannot.
+    /// Which banks a layer answers with, which is the one thing a stack of these
+    /// can get wrong that a single layer cannot: two layers built from the same
+    /// gate, up and down but different routed banks have to disagree.
     ///
-    /// The dense layers have no banks and are `None` here rather than absent, so
-    /// that the stack can ask by index — and a layer past the stack is `None`
-    /// too rather than an index off the end.
+    /// Which *index* answers with which layer is the stack's own question, and
+    /// is `projections::tests`' — see
+    /// `a_layer_this_does_not_hold_and_a_layer_past_the_stack_are_left_to_the_cpu`,
+    /// which is where every layer on the device is held now.
     #[test]
-    fn a_dense_layer_and_a_layer_past_the_stack_have_no_banks() {
+    fn two_layers_built_from_different_banks_do_not_answer_alike() {
         let Some(device) = device() else { return };
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
         let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
@@ -1006,28 +1023,12 @@ mod tests {
             }
         };
 
-        // A stack of four whose first two are dense, which is Inkling's shape.
-        let mut layers: Vec<Option<LayerExperts<'_>>> = (0..4).map(|_| None).collect();
-        layers[2] = Some(layer(&banks.gate));
-        layers[3] = Some(layer(&banks.up));
-        let experts = ModelExperts { layers };
-
-        assert_eq!(experts.layers(), 2, "two of the four are MoE");
-        assert!(experts.layer(0).is_none(), "a dense layer");
-        assert!(experts.layer(1).is_none());
-        assert!(experts.layer(2).is_some());
-        assert!(experts.layer(4).is_none(), "past the stack");
-
-        // And the two MoE layers are not each other's, which is what an index
-        // off by one would produce.
+        // Two layers whose routed banks differ, which is what a stack holds and
+        // what an index off by one confuses.
+        let (first, second) = (layer(&banks.gate), layer(&banks.up));
         let chosen = [1usize];
         let x = rows(1);
-        let of = |layer: usize| {
-            experts
-                .layer(layer)
-                .expect("a MoE layer")
-                .routed(Gathered::new(DIM, &chosen, &x))
-        };
-        assert_ne!(of(2), of(3));
+        let of = |layer: &LayerExperts<'_>| layer.routed(Gathered::new(DIM, &chosen, &x));
+        assert_ne!(of(&first), of(&second));
     }
 }

@@ -37,8 +37,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
 use inkling_metal::{
-    DenseMatmul, Device, ExpertKernels, LayerKernels, ModelExperts, ModelProjections,
-    PackedProjection, Router, SwiGlu,
+    DenseMatmul, Device, ExpertKernels, LayerKernels, ModelLayers, PackedProjection, Router, SwiGlu,
 };
 
 use crate::LABEL;
@@ -135,30 +134,28 @@ pub fn weights<'a>(
     .context("giving lm_head to the Metal device")?;
 
     let banks = weights.expert_banks();
-    let experts = ModelExperts::wrap(
+    let packed = weights.layer_projections();
+    let layers = ModelLayers::wrap(
         &gpu.device,
+        &gpu.kernels,
         gpu.expert_kernels(),
+        &packed,
         &banks,
         config.num_hidden_layers,
         config.hidden_size,
     )
-    .context("giving the expert banks to the Metal device")?;
-
-    let packed = weights.layer_projections();
-    let projections =
-        ModelProjections::wrap(&gpu.device, &gpu.kernels, &packed, config.num_hidden_layers)
-            .context("giving the layers' projections to the Metal device")?;
+    .context("giving the model's layers to the Metal device")?;
     eprintln!(
-        "{:<LABEL$}metal, {rows} rows of lm_head, {} MoE layers' banks and all {} layers' \
-         projections wrapped in {:.2?}",
+        "{:<LABEL$}metal, {rows} rows of lm_head and all {} layers — {} MoE banks, {} dense \
+         feed-forward networks — wrapped in {:.2?}",
         "backend",
-        experts.layers(),
-        projections.layers(),
+        layers.layers(),
+        layers.expert_layers(),
+        layers.dense_layers(),
         started.elapsed()
     );
 
     Ok(weights
         .with_head(Box::new(head))
-        .with_experts(Box::new(experts))
-        .with_projections(Box::new(projections)))
+        .with_backend(Box::new(layers)))
 }

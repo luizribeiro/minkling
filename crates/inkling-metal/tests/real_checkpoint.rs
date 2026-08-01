@@ -30,8 +30,7 @@ use inkling_core::{
 };
 use inkling_metal::{
     DenseMatmul, DenseWeight, Device, ExpertKernels, LayerKernels, LayerProjections, LayerRouter,
-    MetalError, ModelExperts, ModelProjections, PackedBank, PackedMatmul, PackedProjection, Router,
-    SwiGlu,
+    MetalError, ModelLayers, PackedBank, PackedMatmul, PackedProjection, Router, SwiGlu,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -505,35 +504,32 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// dispatches alone would watch the number that cannot change while the one
 /// that pays for it doubled underneath.
 ///
-/// **A layer's attention is one submission**, and eleven dispatches: the input
-/// layernorm, the four projections that consume what it produced, the two short
-/// convolutions behind `k` and `v`, the two head norms over `q` and the
-/// convolved `k`, the attention step and `o_proj`. **A MoE layer's MLP is one
-/// submission too**, and ten dispatches: the router's gate, the top-k over what
-/// it produced, and each bank's gate, up, activation and down. A dense layer's
-/// feed-forward network is three in two, its activation still here. The head is
-/// one of each.
+/// **A whole layer is one submission**, and twenty-three dispatches on a layer
+/// that routes. Eleven are its attention: the input layernorm, the four
+/// projections that consume what it produced, the two short convolutions behind
+/// `k` and `v`, the two head norms over `q` and the convolved `k`, the attention
+/// step and `o_proj`. Two more are the residual path behind that — the layer's
+/// own short convolution, which adds the layer's input as it writes, and the
+/// second norm over what it left. The last ten are the MLP: the router's gate,
+/// the top-k over what it produced, and each bank's gate, up, activation and
+/// down. A dense layer is seventeen, its feed-forward network four where a MoE
+/// layer's two banks are eight. The head is one of each.
 ///
-/// **Ten of a layer's eleven attention dispatches cost no submission**, which is
-/// the whole of what M10 did. Every activation between the hidden state a layer
-/// is handed and the one `o_proj` returns is a buffer the next dispatch reads —
-/// including the two that outlive the call, the convolutions' windows and the
-/// span of keys and values, which is why they had to become the layer's before
-/// the rest could follow. A MoE layer's nine other dispatches cost no submission
-/// either: the gate reads the hidden state its shared bank reads, the top-k
-/// reads what the gate wrote, and the routed bank's experts are named by what
-/// the top-k wrote — which is visible to a backend handed the whole layer and to
-/// nothing else.
+/// **Twenty-two of a layer's twenty-three dispatches cost no submission.** Every
+/// activation between the hidden state a layer is handed and the rows its MLP
+/// answers with is a buffer the next dispatch reads — including the three that
+/// outlive the call, the three convolutions' windows and the span of keys and
+/// values, which is why they had to become the layer's before the rest could
+/// follow. What is *not* in the buffer is the half of the router that weights
+/// what it chose, and that is where a layer's command buffer ends rather than
+/// something the count is missing.
 ///
-/// What is left is one submission a layer for attention, one or two for the MLP,
-/// and one for the head — 87 where the same dispatches were 249 before any of
-/// them were merged.
+/// What is left is one submission a layer and one for the head — 43 where the
+/// same dispatches were 249 before any of them were merged, and 87 while the
+/// three operations on a layer's residual path still ran here.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
-    (
-        11 * layers + 3 * dense + 10 * moe + 1,
-        layers + 2 * dense + moe + 1,
-    )
+    (13 * layers + 4 * dense + 10 * moe + 1, layers + 1)
 }
 
 /// One run of the engine with every weight it has a kernel for on the device,
@@ -588,29 +584,28 @@ impl OnTheDevice {
         )
         .expect("the head wraps");
         let banks = weights.expert_banks();
-        let experts = ModelExperts::wrap(
+        let packed = weights.layer_projections();
+        let layers = ModelLayers::wrap(
             device,
+            &kernels,
             ExpertKernels {
                 matmul,
                 dense: &dense,
                 swiglu: &swiglu,
                 router: &router,
             },
+            &packed,
             &banks,
             config.num_hidden_layers,
             config.hidden_size,
         )
-        .expect("the banks wrap");
-        let packed = weights.layer_projections();
-        let projections =
-            ModelProjections::wrap(device, &kernels, &packed, config.num_hidden_layers)
-                .expect("the projections wrap");
+        .expect("the layers wrap");
 
         let mut run = Self {
-            expert_layers: experts.layers(),
+            expert_layers: layers.expert_layers(),
             first_routed: banks[0].layer,
-            projection_layers: projections.layers(),
-            dense_layers: projections.dense_layers(),
+            projection_layers: layers.layers(),
+            dense_layers: layers.dense_layers(),
             wrapped: started.elapsed(),
             prompt: ids.len(),
             steps: Vec::new(),
@@ -624,8 +619,7 @@ impl OnTheDevice {
         // ms for 137 GB, so what that used to be defending against is gone.
         let weights = weights
             .with_head(Box::new(head))
-            .with_experts(Box::new(experts))
-            .with_projections(Box::new(projections));
+            .with_backend(Box::new(layers));
         let generator = weights.generator();
 
         let mut step = Instant::now();

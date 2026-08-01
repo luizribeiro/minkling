@@ -33,11 +33,68 @@
 
 use std::borrow::Cow;
 
-use crate::attention::{Attention, AttentionCache, AttentionConfig, AttentionWeights};
+use crate::attention::{Attention, AttentionCache, AttentionConfig, AttentionWeights, LayerStep};
 use crate::moe::{BankRows, Gathered, Routed, Rows, SparseMoe};
 use crate::ops::{DenseMlp, rms_norm};
 use crate::profile::{self, Op};
 use crate::sconv::{ConvState, ShortConv};
+
+/// Where a whole decoder layer runs, when it is not here.
+///
+/// [`Projections::layer`](crate::attention::Projections::layer) is the same
+/// bargain one step in, and its documentation is the argument for this one: a
+/// backend holding the attention runs everything between the input layernorm
+/// and `o_proj` because none of it is a value anybody else reads. What is
+/// between `o_proj` and the MLP's own dispatches — the convolution on the
+/// residual path, the add behind it, and the second norm — is three more of
+/// those, and the only thing that kept them out was that whoever held the
+/// attention did not also hold the MLP.
+///
+/// **What comes back is the first value that has to.** The routing's weights are
+/// a softmax over eight numbers taken from logits a dispatch in this same
+/// command buffer produced — see [`SparseMoe::weighted`] — so the rows both
+/// banks answered have to cross back to be weighted, and `h` with them because
+/// the layer's second residual is added to it here. Everything before that is
+/// one command buffer.
+pub trait DecoderDevice {
+    /// The layer as far as it goes on the device, or `None` where this backend
+    /// does not hold all of it.
+    fn run(&self, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<DecoderHalves>;
+}
+
+/// Everything one decoder layer runs before the first value that has to come
+/// back.
+///
+/// [`LayerStep`] carries the attention layer's half, as it does for
+/// [`Projections::layer`](crate::attention::Projections::layer); what this adds
+/// is the residual path behind it and the MLP past it.
+#[derive(Debug, Clone, Copy)]
+pub struct DecoderStep<'a> {
+    pub attention: LayerStep<'a>,
+    /// The convolution on the residual path around attention, whose rows are
+    /// added to the layer's input.
+    pub attn_sconv: ShortConv<'a>,
+    /// `[hidden]`, the weight of the norm the MLP consumes the output of.
+    pub post_attention_layernorm: &'a [f32],
+    /// The `rms_norm_eps` this layer's norms share, which is also
+    /// [`LayerStep::eps`].
+    pub eps: f32,
+    pub mlp: LayerMlp<'a>,
+}
+
+/// What a decoder layer's device work left for this side: the value its second
+/// residual is added to, and what its MLP made of the normed form of that value.
+///
+/// Named halves rather than a pair because they are two `[tokens, hidden]`
+/// vectors of the same length, and exchanging them is a layer that still runs.
+#[derive(Debug, Clone)]
+pub struct DecoderHalves {
+    /// `x + attn_sconv(attention(x))`, which the reference calls `h`.
+    pub h: Vec<f32>,
+    /// What the MLP returned over `post_attention_layernorm(h)`, weighted and
+    /// scattered where the layer routes to experts.
+    pub projected: Vec<f32>,
+}
 
 /// How a layer reaches the experts its router chose.
 ///
@@ -172,6 +229,14 @@ pub struct DecoderCache {
 }
 
 impl DecoderCache {
+    /// The attention layer's own state, for a backend answering
+    /// [`DecoderDevice::run`] — which runs the attention itself and so needs
+    /// what [`Projections::layer`](crate::attention::Projections::layer) is
+    /// handed directly.
+    pub fn attention(&mut self) -> &mut AttentionCache {
+        &mut self.attention
+    }
+
     /// The state a sequence starts from: no keys, and four empty convolution
     /// windows.
     ///
@@ -241,25 +306,33 @@ impl<'a> DecoderLayer<'a> {
 
     /// `[tokens, hidden]` in and out, continuing from `cache` and leaving this
     /// call's keys, values and convolution windows behind in it.
+    ///
+    /// `device` runs the layer as far as it goes without a value crossing back —
+    /// see [`DecoderDevice`] — and `None` leaves every operation here.
     pub fn forward(
         &self,
         cache: &mut DecoderCache,
         x: &[f32],
         experts: &(impl Experts + ?Sized),
+        device: Option<&dyn DecoderDevice>,
     ) -> Vec<f32> {
-        self.run(cache, x, experts, Residual::PreNorm)
+        self.run(cache, x, experts, device, Residual::PreNorm)
     }
 
     /// [`DecoderLayer::forward`], with the two ways of wiring a residual named
     /// apart.
     ///
     /// Both leave a layer that runs, normalises and generates, so the tests
-    /// drive them from here to show that only one reproduces mlx-vlm.
+    /// drive them from here to show that only one reproduces mlx-vlm. Only the
+    /// reference's wiring reaches `device`: the other exists to be measured
+    /// against this side's arithmetic, and a backend that spelled it too would
+    /// be a second spelling of a mistake.
     fn run(
         &self,
         cache: &mut DecoderCache,
         x: &[f32],
         experts: &(impl Experts + ?Sized),
+        device: Option<&dyn DecoderDevice>,
         residual: Residual,
     ) -> Vec<f32> {
         assert_eq!(
@@ -269,6 +342,18 @@ impl<'a> DecoderLayer<'a> {
             x.len(),
             self.hidden
         );
+
+        // Guarded before the call and not after it: a device that ran the layer
+        // has advanced the cache, so asking one and then discarding the answer
+        // would leave the arithmetic below reading a sequence that had already
+        // moved on.
+        let device = match residual {
+            Residual::PreNorm => device,
+            Residual::Normed => None,
+        };
+        if let Some(halves) = self.on_device(cache, x, device) {
+            return self.residual_path(cache, &halves.h, &halves.projected);
+        }
 
         let attended = self
             .attention
@@ -282,12 +367,57 @@ impl<'a> DecoderLayer<'a> {
 
         let normed = rms_norm(&h, self.post_attention_layernorm, self.rms_norm_eps);
         let projected = self.mlp.forward(&normed, experts);
+        self.residual_path(cache, residual.of(&h, &normed), &projected)
+    }
+
+    /// The layer's second residual path, which both routes take: what the MLP
+    /// produced, convolved, added to the value before the norm that fed it.
+    ///
+    /// **This is where a layer's device work stops.** The convolution's window
+    /// is the one piece of a layer's state that a backend running everything
+    /// else still does not hold, because the rows it reads are the routing's
+    /// weights applied to what the banks answered and those weights are
+    /// this side's — see [`SparseMoe::weighted`]. So the seam that reached
+    /// `o_proj` and then the second norm stops here, between one layer and the
+    /// next rather than inside either.
+    fn residual_path(
+        &self,
+        cache: &mut DecoderCache,
+        residual: &[f32],
+        projected: &[f32],
+    ) -> Vec<f32> {
         add(
-            residual.of(&h, &normed),
+            residual,
             &self
                 .mlp_sconv
-                .forward(&mut cache.mlp_sconv, &projected, None),
+                .forward(&mut cache.mlp_sconv, projected, None),
         )
+    }
+
+    /// The layer as far as `device` takes it, with the step it needs built here
+    /// — because [`Attention::forward`] would run the attention rather than
+    /// describe it, and what it would hand back is the one value the residual
+    /// add wants.
+    fn on_device(
+        &self,
+        cache: &mut DecoderCache,
+        x: &[f32],
+        device: Option<&dyn DecoderDevice>,
+    ) -> Option<DecoderHalves> {
+        let device = device?;
+        let queries = x.len() / self.hidden;
+        let offset = cache.attention.seen();
+        let taus = self.attention.taus(offset, queries);
+        let step = DecoderStep {
+            attention: self
+                .attention
+                .step(x, Some(self.input_layernorm), &taus, offset),
+            attn_sconv: self.attn_sconv,
+            post_attention_layernorm: self.post_attention_layernorm,
+            eps: self.rms_norm_eps,
+            mlp: self.mlp,
+        };
+        device.run(cache, step)
     }
 }
 
@@ -451,7 +581,7 @@ mod tests {
 
         /// The prefill alone, from a fresh cache.
         fn prefill(&self, layer: &DecoderLayer<'_>) -> Vec<f32> {
-            layer.forward(&mut layer.cache(), &self.x, &self.weights)
+            layer.forward(&mut layer.cache(), &self.x, &self.weights, None)
         }
 
         /// The prefill and the continuation, against one cache, as the dump
@@ -464,8 +594,8 @@ mod tests {
             let layer = self.layer();
             let cache = &mut layer.cache();
             (
-                layer.run(cache, &self.x, &self.weights, residual),
-                layer.run(cache, &self.continue_x, &self.weights, residual),
+                layer.run(cache, &self.x, &self.weights, None, residual),
+                layer.run(cache, &self.continue_x, &self.weights, None, residual),
             )
         }
 
@@ -531,7 +661,7 @@ mod tests {
 
             let mut whole = layer.x.clone();
             whole.extend_from_slice(&layer.continue_x);
-            let at_once = decoder.forward(&mut decoder.cache(), &whole, &layer.weights);
+            let at_once = decoder.forward(&mut decoder.cache(), &whole, &layer.weights, None);
 
             let (prefill, rest) = layer.forward();
             let mut split = prefill;
@@ -550,8 +680,8 @@ mod tests {
             let decoder = layer.layer();
             let kernel_size = layer.weights.kernel_size();
             let mut cache = DecoderCache::new(layer.config, layer.hidden(), kernel_size);
-            let prefill = decoder.forward(&mut cache, &layer.x, &layer.weights);
-            let rest = decoder.forward(&mut cache, &layer.continue_x, &layer.weights);
+            let prefill = decoder.forward(&mut cache, &layer.x, &layer.weights, None);
+            let rest = decoder.forward(&mut cache, &layer.continue_x, &layer.weights, None);
             assert_eq!((prefill, rest), layer.forward(), "{}", layer.name);
         }
     }
@@ -566,7 +696,7 @@ mod tests {
             let decoder = layer.layer();
             let mut cache = decoder.cache();
 
-            let prefill = decoder.forward(&mut cache, &layer.x, &layer.weights);
+            let prefill = decoder.forward(&mut cache, &layer.x, &layer.weights, None);
             let agreed = deviation(&prefill, &layer.prefill_out);
             assert!(
                 agreed <= TOLERANCE,
@@ -575,7 +705,7 @@ mod tests {
             );
 
             std::mem::swap(&mut cache.attn_sconv, &mut cache.mlp_sconv);
-            let rest = decoder.forward(&mut cache, &layer.continue_x, &layer.weights);
+            let rest = decoder.forward(&mut cache, &layer.continue_x, &layer.weights, None);
             let deviation = deviation(&rest, &layer.continue_out);
             assert!(
                 deviation > TOLERANCE,
@@ -598,7 +728,7 @@ mod tests {
         for layer in Layer::all() {
             let decoder = layer.layer();
             let mut cache = decoder.cache();
-            decoder.forward(&mut cache, &layer.x, &layer.weights);
+            decoder.forward(&mut cache, &layer.x, &layer.weights, None);
 
             let attention = layer.config.kv_heads * layer.config.head_dim;
             let hidden = layer.hidden();
@@ -639,7 +769,12 @@ mod tests {
     fn the_continuation_reads_what_the_prefill_cached() {
         for layer in Layer::all() {
             let decoder = layer.layer();
-            let fresh = decoder.forward(&mut decoder.cache(), &layer.continue_x, &layer.weights);
+            let fresh = decoder.forward(
+                &mut decoder.cache(),
+                &layer.continue_x,
+                &layer.weights,
+                None,
+            );
             let deviation = deviation(&fresh, &layer.continue_out);
             assert!(
                 deviation > TOLERANCE,

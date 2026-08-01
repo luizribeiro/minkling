@@ -540,7 +540,7 @@ impl ModelWeights for Stack {
     fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: &[f32]) -> Vec<f32> {
         let tensors = &self.layers[self.order[index]];
         let config = AttentionConfig::for_layer(&self.config, index);
-        DecoderLayer::new(config, tensors.view(), tensors.mlp()).forward(cache, x, tensors)
+        DecoderLayer::new(config, tensors.view(), tensors.mlp()).forward(cache, x, tensors, None)
     }
 }
 

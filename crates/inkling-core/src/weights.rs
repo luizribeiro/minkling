@@ -6,7 +6,7 @@
 //! into a [`Scratch`] the whole pass shares, the layer is built around those
 //! runs, run, and dropped; the next layer overwrites them — or they are not
 //! decoded at all, which is what handing them to a backend does and what
-//! [`CheckpointWeights::with_projections`] is. The routed experts go further
+//! [`CheckpointWeights::with_backend`] is. The routed experts go further
 //! still and are not decoded even here unless a token chose them.
 //!
 //! **A bfloat16 tensor is the exception, and it is held.** The bargain above is
@@ -56,7 +56,9 @@ use crate::checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
 use crate::config::TextConfig;
 use crate::generate::Generator;
 use crate::head::LmHead;
-use crate::layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
+use crate::layer::{
+    DecoderCache, DecoderDevice, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts,
+};
 use crate::model::{Model, ModelWeights};
 use crate::moe::{ExpertBank, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
 use crate::ops::{DenseMlp, MlpProjections, Projection, linear};
@@ -454,8 +456,7 @@ pub struct CheckpointWeights<'a> {
     embed_tokens: Packed<'a>,
     lm_head: Packed<'a>,
     head: Box<dyn Projection + 'a>,
-    experts: Option<Box<dyn ExpertBackend + 'a>>,
-    projections: Option<Box<dyn ProjectionBackend + 'a>>,
+    backend: Option<Box<dyn LayerBackend + 'a>>,
     embed_norm: Option<Vec<f32>>,
     norm: Vec<f32>,
     layers: Vec<Widened<'a>>,
@@ -551,16 +552,54 @@ impl<'a> Widened<'a> {
     }
 }
 
-/// Where the MoE layers' experts run, when it is not here.
+/// Where a model's layers run, when it is not here.
 ///
-/// Per layer because the answer is per layer twice over: the first two are dense
-/// and have no bank to run anywhere, and a backend that could not stand one
-/// layer's banks up should be able to say so about that layer rather than about
-/// the model.
-pub trait ExpertBackend {
+/// **Per layer, and per piece of a layer.** The first two layers are dense and
+/// have no bank to run anywhere; every layer's attention projections are read by
+/// every token; and a backend that could not stand one layer up should be able
+/// to say so about that layer rather than about the model. So this is four
+/// questions about one index rather than one question about the stack, and every
+/// answer is an `Option`.
+///
+/// **One trait rather than one per piece, because a layer is what a backend can
+/// merge.** The pieces were separate for as long as the answers were: a bank
+/// multiplied where the projections did not was a partial handover that cost
+/// nothing to express. What changed is [`DecoderDevice`]: a whole layer in one
+/// command buffer is only reachable by something that holds the attention *and*
+/// the MLP, so the thing that answers for one has to be the thing that answers
+/// for the other.
+pub trait LayerBackend {
+    /// Layer `layer`'s five attention projections, or `None` for a layer this
+    /// does not answer for — which leaves them to be decoded here.
+    ///
+    /// Unlike the experts, every layer's attention projections are read by every
+    /// token — there is nothing here a decode step might skip — so what a
+    /// backend saves is the decoding rather than the reading.
+    fn attention(&self, layer: usize) -> Option<&dyn Projections>;
+
+    /// Layer `layer`'s dense feed-forward network, or `None` for a layer this
+    /// does not answer for — which leaves it to be decoded here.
+    ///
+    /// Never asked of a layer that routes to experts instead: those have no
+    /// feed-forward network at all, and what runs there is
+    /// [`LayerBackend::experts`]'s question.
+    fn dense_mlp(&self, layer: usize) -> Option<&dyn MlpProjections>;
+
     /// Layer `layer`'s experts, or `None` for a layer this does not answer for —
     /// which leaves the CPU path to decode them.
-    fn layer(&self, layer: usize) -> Option<&dyn Experts>;
+    fn experts(&self, layer: usize) -> Option<&dyn Experts>;
+
+    /// The whole of layer `layer` in one command buffer, or `None` where this
+    /// backend holds only some of it — see [`DecoderDevice`].
+    ///
+    /// Defaulted where the three above are not, because a backend can answer for
+    /// every weight in a layer and still have nothing to gain from being asked
+    /// the layer as a whole: on the CPU the operations between them are loops
+    /// over slices, and what this buys is a round trip rather than arithmetic.
+    fn decoder(&self, layer: usize) -> Option<&dyn DecoderDevice> {
+        let _ = layer;
+        None
+    }
 }
 
 /// One MoE layer's two banks and its router's gate, still as the checkpoint
@@ -617,6 +656,21 @@ pub struct LayerPacked<'a> {
     /// five holds the norm in front of them or the value crosses back for
     /// nobody. See [`Projections::normed_qkvr`].
     pub input_layernorm: Vec<f32>,
+    /// The weight of the layer's *second* norm, whose output the MLP consumes,
+    /// widened for the same reason.
+    ///
+    /// Here because of what sits either side of it: it reads the layer's first
+    /// residual add and is read by the MLP's first dispatch, and a backend
+    /// holding both is the only thing that can run it without two values
+    /// crossing back. See [`DecoderDevice`].
+    pub post_attention_layernorm: Vec<f32>,
+    /// The kernel of the short convolution on the residual path around
+    /// attention, `[hidden, taps]`, widened for the same reason again.
+    ///
+    /// Here for the same reason too: it consumes what `o_proj` produced and its
+    /// rows are added to the layer's input, which is the add that would
+    /// otherwise close the command buffer in the middle of the layer.
+    pub attn_sconv: Vec<f32>,
     /// The `[d_rel, rel_extent]` projection the relative-position bias is
     /// contracted against, widened for the same reason `input_layernorm` is —
     /// 64 KB of bfloat16 on a global layer.
@@ -650,31 +704,6 @@ pub struct LayerPacked<'a> {
     /// which the tensors do not carry: which of the two sets of head counts the
     /// layer read, and whether it has a window at all.
     pub config: AttentionConfig,
-}
-
-/// Where a layer's own projections multiply, when it is not here.
-///
-/// Per layer for the reason [`ExpertBackend`] is asked per layer: a backend
-/// that could not stand one layer's projections up should be able to say so
-/// about that layer rather than about the model, and the two answers are
-/// separate because only two layers of forty-two have a dense feed-forward
-/// network at all.
-///
-/// Unlike the experts, every layer's attention projections are read by every
-/// token — there is nothing here a decode step might skip — so what a backend
-/// saves is the decoding rather than the reading.
-pub trait ProjectionBackend {
-    /// Layer `layer`'s five attention projections, or `None` for a layer this
-    /// does not answer for — which leaves them to be decoded here.
-    fn attention(&self, layer: usize) -> Option<&dyn Projections>;
-
-    /// Layer `layer`'s dense feed-forward network, or `None` for a layer this
-    /// does not answer for — which leaves it to be decoded here.
-    ///
-    /// Never asked of a layer that routes to experts instead: those have no
-    /// feed-forward network at all, and what runs there is [`ExpertBackend`]'s
-    /// question.
-    fn dense_mlp(&self, layer: usize) -> Option<&dyn MlpProjections>;
 }
 
 impl<'a> CheckpointWeights<'a> {
@@ -712,8 +741,7 @@ impl<'a> CheckpointWeights<'a> {
             layer_scratch: RefCell::new(vec![0.0; layer_scratch_floats(config)]),
             expert_scratch: RefCell::new(vec![0.0; expert_scratch_floats(config)]),
             head: Box::new(PackedRows::new(lm_head, LmHead::for_config(config).vocab())),
-            experts: None,
-            projections: None,
+            backend: None,
             embed_tokens,
             lm_head,
             embed_norm,
@@ -786,6 +814,8 @@ impl<'a> CheckpointWeights<'a> {
                 LayerPacked {
                     layer,
                     input_layernorm: self.layers[layer].input_layernorm.clone(),
+                    post_attention_layernorm: self.layers[layer].post_attention_layernorm.clone(),
+                    attn_sconv: self.layers[layer].attn_sconv.clone(),
                     rel_proj: self.layers[layer].rel_proj.clone(),
                     k_sconv: self.layers[layer].k_sconv.clone(),
                     v_sconv: self.layers[layer].v_sconv.clone(),
@@ -809,27 +839,17 @@ impl<'a> CheckpointWeights<'a> {
             .collect()
     }
 
-    /// The same weights with every layer's projections multiplied somewhere
-    /// else, in place of decoding them into the pass's scratch a layer at a
-    /// time.
+    /// The same weights with every layer run somewhere else — gathered Metal
+    /// dispatches against projections and banks that are never decoded, in place
+    /// of the CPU's decode into the pass's scratch.
     ///
-    /// The largest of the three handovers by what it stops decoding: the
-    /// attention projections are 7.40 GB of float32 a decode step and the two
-    /// dense layers 1.61 GB, against the experts' 32 GB and the head's 3.3 —
-    /// and unlike the experts, all of it is read by every token.
-    pub fn with_projections(mut self, projections: Box<dyn ProjectionBackend + 'a>) -> Self {
-        self.projections = Some(projections);
-        self
-    }
-
-    /// The same weights with the experts run somewhere else — gathered Metal
-    /// dispatches against banks that are never decoded, in place of the CPU's
-    /// expert-at-a-time decode.
-    ///
-    /// The other half of [`CheckpointWeights::with_head`], and the larger one: a
-    /// decode step decodes 32 GB of experts against the head's 3.3.
-    pub fn with_experts(mut self, experts: Box<dyn ExpertBackend + 'a>) -> Self {
-        self.experts = Some(experts);
+    /// The larger half of [`CheckpointWeights::with_head`] by what it stops
+    /// decoding, several times over: a decode step decodes 32 GB of experts,
+    /// 7.40 GB of attention projections and 1.61 GB of dense feed-forward
+    /// network against the head's 3.3 — and unlike the experts, all but the
+    /// first of those is read by every token.
+    pub fn with_backend(mut self, backend: Box<dyn LayerBackend + 'a>) -> Self {
+        self.backend = Some(backend);
         self
     }
 
@@ -902,7 +922,7 @@ impl<'a> CheckpointWeights<'a> {
             v_sconv: &widened.v_sconv,
             rel_proj: &widened.rel_proj,
             projections: match self
-                .projections
+                .backend
                 .as_deref()
                 .and_then(|backend| backend.attention(layer))
             {
@@ -942,7 +962,7 @@ impl<'a> CheckpointWeights<'a> {
             let (dim, hidden_dim) = (self.config.hidden_size, self.config.dense_intermediate_size);
             return Mlp::Dense(
                 match self
-                    .projections
+                    .backend
                     .as_deref()
                     .and_then(|backend| backend.dense_mlp(layer))
                 {
@@ -1002,10 +1022,9 @@ impl ModelWeights for CheckpointWeights<'_> {
         let mut scratch = Scratch::new(&mut buffer);
         let widened = &self.layers[index];
 
-        let experts = self
-            .experts
-            .as_ref()
-            .and_then(|backend| backend.layer(index));
+        let backend = self.backend.as_deref();
+        let experts = backend.and_then(|backend| backend.experts(index));
+        let device = backend.and_then(|backend| backend.decoder(index));
         let attention = self.attention(index, &mut scratch);
         let mlp = self.mlp(index, &mut scratch, experts.is_some_and(Experts::gates));
         let weights = DecoderWeights {
@@ -1018,8 +1037,8 @@ impl ModelWeights for CheckpointWeights<'_> {
         let config = AttentionConfig::for_layer(self.config, index);
         let layer = DecoderLayer::new(config, weights, mlp.view());
         match experts {
-            Some(experts) => layer.forward(cache, x, experts),
-            None => layer.forward(cache, x, &mlp),
+            Some(experts) => layer.forward(cache, x, experts, device),
+            None => layer.forward(cache, x, &mlp, device),
         }
     }
 }

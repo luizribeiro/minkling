@@ -221,12 +221,18 @@ impl<'a> DenseMlp<'a> {
 
         let (mut gate, up) = three.gate_up(x);
         swiglu(&mut gate, &up);
-        three
-            .down_proj()
-            .forward(&gate)
-            .iter()
-            .map(|y| y * self.global_scale)
-            .collect()
+        self.scaled(three.down_proj().forward(&gate))
+    }
+
+    /// The trailing `global_scale`, over rows the three projections produced
+    /// wherever they ran.
+    ///
+    /// Handed out because it is the one thing in this network that a backend
+    /// which dispatched all three still owes: mlx-vlm applies it in
+    /// `InklingDenseMLP`, outside the `SwiGLUMLP` body it shares with other
+    /// models, so it is easy to leave out and it is not 1.
+    pub fn scaled(&self, rows: Vec<f32>) -> Vec<f32> {
+        rows.iter().map(|y| y * self.global_scale).collect()
     }
 }
 

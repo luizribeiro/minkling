@@ -38,17 +38,23 @@
 //! [`AttentionCache::seen`] is what a sequence carries once the rest is here.
 
 use inkling_core::attention::{AttentionCache, AttentionStep, LayerStep, Projections, Qkvr, Sdpa};
+use inkling_core::layer::{
+    DecoderCache, DecoderDevice, DecoderHalves, DecoderStep, Experts, LayerMlp,
+};
 use inkling_core::mask::BandedMask;
 use inkling_core::ops::{MlpProjections, Projection};
-use inkling_core::weights::{LayerPacked, Packed, PackedMlp, ProjectionBackend};
+use inkling_core::profile::{self, Op};
+use inkling_core::weights::{LayerBackend, LayerBanks, LayerPacked, Packed, PackedMlp};
 
 use crate::attention::{AttentionError, FusedAttention, KeyValues, LayerAttention, Step};
 use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
+use crate::experts::{Dispatched, ExpertKernels, LayerExperts};
 use crate::kernel::Batch;
 use crate::matmul::{MatmulError, PackedMatmul, PackedProjection, Pending, together};
 use crate::norm::{LayerNorm, RmsNorm};
 use crate::sconv::{LayerConv, ShortConvolution};
+use crate::swiglu::SwiGlu;
 
 /// One attention layer's five projections on the device.
 ///
@@ -238,6 +244,41 @@ impl<'a> LayerProjections<'a> {
     /// the value alone. So the value's convolution is the last thing to touch it
     /// and lands its rows in the span directly, where the key's convolution
     /// lands in a buffer its norm reads.
+    /// Everything a call has to settle before a dispatch is encoded: that the
+    /// step is over the shape this was wrapped for, that its convolutions and
+    /// head norms are the ones this holds, and that the span and windows belong
+    /// to this sequence. Answers how many queries the call is.
+    ///
+    /// Apart from [`LayerProjections::encoding`] because a caller running the
+    /// whole decoder layer has one more window to start over — the layer's own
+    /// residual convolution — and has to do it before the same command buffer is
+    /// opened.
+    fn beginning(&self, cache: &mut AttentionCache, step: LayerStep<'_>) -> usize {
+        self.shaped_for(step.sdpa, step.mask);
+        let queries = step.x.len() / self.input_layernorm.width();
+        self.starting(cache.seen(), queries);
+        assert_eq!(
+            [
+                step.k_sconv.kernel_size(),
+                step.v_sconv.kernel_size(),
+                step.q_norm.len(),
+                step.k_norm.len(),
+            ],
+            [
+                self.k_sconv.taps(),
+                self.v_sconv.taps(),
+                self.q_norm.width(),
+                self.k_norm.width(),
+            ],
+            "the layer's convolutions and head norms against the ones wrapped for it"
+        );
+        queries
+    }
+
+    fn device(&self) -> &Device {
+        self.q_proj.device()
+    }
+
     /// The layer's input layernorm over rows already on the device, or `None`
     /// where the step says they arrive normalised — in which case the four
     /// projections read those rows themselves.
@@ -460,25 +501,7 @@ impl Projections for LayerProjections<'_> {
     /// coherent because the layer holds all four. What crosses back is the
     /// answer and nothing else.
     fn layer(&self, cache: &mut AttentionCache, step: LayerStep<'_>) -> Option<Vec<f32>> {
-        self.shaped_for(step.sdpa, step.mask);
-        let queries = step.x.len() / self.input_layernorm.width();
-        self.starting(cache.seen(), queries);
-        assert_eq!(
-            [
-                step.k_sconv.kernel_size(),
-                step.v_sconv.kernel_size(),
-                step.q_norm.len(),
-                step.k_norm.len(),
-            ],
-            [
-                self.k_sconv.taps(),
-                self.v_sconv.taps(),
-                self.q_norm.width(),
-                self.k_norm.width(),
-            ],
-            "the layer's convolutions and head norms against the ones wrapped for it"
-        );
-
+        let queries = self.beginning(cache, step);
         let device = self.q_proj.device();
         let mut span = self.attention.span();
         let [out] = together(device, |batch| {
@@ -523,6 +546,12 @@ pub struct DenseFfn<'a> {
     gate_proj: PackedProjection<'a>,
     up_proj: PackedProjection<'a>,
     down_proj: PackedProjection<'a>,
+    /// The activation between the pair and the third, which is not a weight and
+    /// belongs to no layer — one pipeline serves the whole model, and it is here
+    /// for the reason [`ExpertBanks`](crate::ExpertBanks) holds one: encoded
+    /// between them, the network is four dispatches in one command buffer and
+    /// nothing it computes is ever a `Vec<f32>`.
+    swiglu: &'a SwiGlu,
 }
 
 impl<'a> DenseFfn<'a> {
@@ -532,13 +561,35 @@ impl<'a> DenseFfn<'a> {
     pub fn wrap(
         device: &'a Device,
         matmul: &'a PackedMatmul,
+        swiglu: &'a SwiGlu,
         packed: &PackedMlp<'a>,
     ) -> Result<Self, MatmulError> {
         Ok(Self {
             gate_proj: whole(device, matmul, &packed.gate_proj)?,
             up_proj: whole(device, matmul, &packed.up_proj)?,
             down_proj: whole(device, matmul, &packed.down_proj)?,
+            swiglu,
         })
+    }
+
+    /// The whole network encoded into `batch`, over rows a dispatch already left
+    /// on the device: the pair, the activation between them, and `down` over
+    /// what it produced.
+    ///
+    /// The same four dispatches an expert bank is — see
+    /// [`ExpertBanks::encode`](crate::ExpertBanks::encode) — over a bank of one
+    /// expert every row goes through. What is left for the caller is the trailing
+    /// `global_scale`, which is `InklingDenseMLP`'s rather than `SwiGLUMLP`'s and
+    /// is not 1.
+    pub(crate) fn encode_into(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
+        let mut gate = self.gate_proj.encode_over(batch, x)?.buffer();
+        let mut up = self.up_proj.encode_over(batch, x)?.buffer();
+        self.swiglu.encode(batch, &mut gate, &mut up)?;
+        self.down_proj.encode_over(batch, &mut gate)
     }
 }
 
@@ -583,85 +634,284 @@ fn whole<'a>(
     PackedProjection::wrap_packed(device, matmul, packed, packed.slices())
 }
 
-/// Every layer's own projections on the device, which for Inkling-Small is 42
-/// layers of five and two of three more.
+/// Every layer on the device, which for Inkling-Small is 42 attentions, two
+/// dense feed-forward networks and forty pairs of expert banks.
 ///
-/// 1.19 GB of packed bytes — 9.6 GB were it decoded — wrapped where the
-/// checkpoint mapped them and holding no resident set of their own. The same
-/// bargain [`ModelExperts`](crate::ModelExperts) strikes over its 138 GB, and
-/// cheap enough for the same reason that there is no residency question to
-/// answer.
+/// 1.19 GB of packed projections beside 137 GB of packed banks — 9.6 GB and 1.1
+/// TB were either decoded — wrapped where the checkpoint mapped them and holding
+/// no resident set of their own. That is the residency policy stated: all of it,
+/// at load, in about six milliseconds, holding nothing. The alternatives — copy
+/// every layer at construction, or copy a layer the first time a token routes
+/// into it — are both answers to a question about how much of 137 GB to move,
+/// and the answer here is none of it.
 #[derive(Debug)]
-pub struct ModelProjections<'a> {
+pub struct ModelLayers<'a> {
     /// Indexed by layer, `None` where nothing here answers for one — which is a
     /// layer the CPU keeps, and is how a partial handover stays expressible.
-    layers: Vec<Option<Layer<'a>>>,
+    layers: Vec<Option<LayerDevice<'a>>>,
 }
 
-/// One layer's own projections: attention's five, and the feed-forward network
-/// of a layer that has one.
+/// One decoder layer on the device: its attention, the convolution and residual
+/// add behind that, the second norm, and its MLP.
+///
+/// **What this is that [`LayerProjections`] is not is the MLP**, and that is the
+/// whole of why it exists. Everything else here was already reachable from the
+/// attention — the convolution on the residual path reads what `o_proj` wrote,
+/// the add reads the layer's input, the second norm reads the add — but a
+/// backend that stopped at the norm would have closed its command buffer there
+/// for the MLP's first dispatch to open another. Holding both, it does not.
 #[derive(Debug)]
-struct Layer<'a> {
+pub struct LayerDevice<'a> {
     attention: LayerProjections<'a>,
-    dense_mlp: Option<DenseFfn<'a>>,
+    /// The convolution on the layer's residual path, which carries the layer's
+    /// input as a second addend — see [`LayerConv::encode_over`].
+    attn_sconv: LayerConv<'a>,
+    /// The layer's second norm, between that add and the MLP.
+    post_attention_layernorm: LayerNorm<'a>,
+    /// `None` where this backend holds the layer's attention and not its MLP,
+    /// which is the partial handover [`LayerBackend::decoder`] answers `None`
+    /// for.
+    mlp: Option<LayerMlpDevice<'a>>,
 }
 
-impl<'a> ModelProjections<'a> {
-    /// Wrap every projection `packed` names, over a stack of `layers`.
+/// Whichever MLP a layer index called for, on the device: `InklingDenseMLP`
+/// below `dense_mlp_idx` and `InklingSparseMoE` above it.
+///
+/// The mirror of [`LayerMlp`](inkling_core::LayerMlp), and boxed on both sides
+/// because a layer holds one of them and the two are hundreds of bytes apart.
+#[derive(Debug)]
+enum LayerMlpDevice<'a> {
+    Dense(Box<DenseFfn<'a>>),
+    Sparse(Box<LayerExperts<'a>>),
+}
+
+impl<'a> ModelLayers<'a> {
+    /// Wrap every projection `packed` names and every bank `banks` names, over a
+    /// stack of `layers` mapping through `dim`.
     ///
-    /// The stack's length is stated rather than read off the last entry, for the
-    /// reason [`ModelExperts::wrap`](crate::ModelExperts::wrap) states it: a
+    /// The stack's length is stated rather than read off the last entry: a
     /// backend answering for none of the last layers would otherwise report a
     /// shorter stack than the model has, and "past the stack" and "left to the
     /// CPU" would stop being answerable apart.
     pub fn wrap(
         device: &'a Device,
         kernels: &'a LayerKernels,
+        experts: ExpertKernels<'a>,
         packed: &[LayerPacked<'a>],
+        banks: &[LayerBanks<'a>],
         layers: usize,
+        dim: usize,
     ) -> Result<Self, ProjectionError> {
-        let mut wrapped: Vec<Option<Layer<'a>>> = (0..layers).map(|_| None).collect();
+        let mut wrapped: Vec<Option<LayerDevice<'a>>> = (0..layers).map(|_| None).collect();
         for layer in packed {
-            wrapped[layer.layer] = Some(Layer {
+            wrapped[layer.layer] = Some(LayerDevice {
                 attention: LayerProjections::wrap(device, kernels, layer)?,
-                dense_mlp: layer
+                attn_sconv: LayerConv::new(device, &kernels.conv, dim, &layer.attn_sconv)?,
+                post_attention_layernorm: LayerNorm::new(
+                    device,
+                    &kernels.norm,
+                    &layer.post_attention_layernorm,
+                    layer.config.rms_norm_eps,
+                )?,
+                mlp: layer
                     .dense_mlp
-                    .map(|mlp| DenseFfn::wrap(device, &kernels.matmul, &mlp))
+                    .map(|mlp| {
+                        DenseFfn::wrap(device, &kernels.matmul, experts.swiglu, &mlp)
+                            .map(|ffn| LayerMlpDevice::Dense(Box::new(ffn)))
+                    })
                     .transpose()?,
             });
+        }
+        for bank in banks {
+            let Some(held) = wrapped[bank.layer].as_mut() else {
+                continue;
+            };
+            let sparse = LayerExperts::wrap(device, experts, bank, dim)?;
+            held.mlp = Some(LayerMlpDevice::Sparse(Box::new(sparse)));
         }
         Ok(Self { layers: wrapped })
     }
 
-    /// How many of the stack's layers have their attention projections here.
+    /// How many of the stack's layers are here at all, which is how many have
+    /// their attention projections here.
     pub fn layers(&self) -> usize {
         self.layers.iter().flatten().count()
     }
 
-    /// How many of those also have a feed-forward network here, which is how
+    /// How many of those have a dense feed-forward network here, which is how
     /// many are dense.
     pub fn dense_layers(&self) -> usize {
+        self.held(|mlp| matches!(mlp, LayerMlpDevice::Dense(_)))
+    }
+
+    /// How many have expert banks here, which is how many are MoE.
+    pub fn expert_layers(&self) -> usize {
+        self.held(|mlp| matches!(mlp, LayerMlpDevice::Sparse(_)))
+    }
+
+    fn held(&self, of: impl Fn(&LayerMlpDevice<'a>) -> bool) -> usize {
         self.layers
             .iter()
             .flatten()
-            .filter(|layer| layer.dense_mlp.is_some())
+            .filter(|layer| layer.mlp.as_ref().is_some_and(&of))
             .count()
     }
 
-    fn layer(&self, layer: usize) -> Option<&Layer<'a>> {
+    fn layer(&self, layer: usize) -> Option<&LayerDevice<'a>> {
         self.layers.get(layer)?.as_ref()
     }
 }
 
 /// The seam [`inkling_core::weights`] names, so that a layer standing itself up
-/// does not know whether its projections were ever decoded.
-impl ProjectionBackend for ModelProjections<'_> {
+/// does not know whether any of its weights was ever decoded.
+impl LayerBackend for ModelLayers<'_> {
     fn attention(&self, layer: usize) -> Option<&dyn Projections> {
         Some(&self.layer(layer)?.attention as &dyn Projections)
     }
 
     fn dense_mlp(&self, layer: usize) -> Option<&dyn MlpProjections> {
-        Some(self.layer(layer)?.dense_mlp.as_ref()? as &dyn MlpProjections)
+        match self.layer(layer)?.mlp.as_ref()? {
+            LayerMlpDevice::Dense(ffn) => Some(&**ffn as &dyn MlpProjections),
+            LayerMlpDevice::Sparse(_) => None,
+        }
+    }
+
+    fn experts(&self, layer: usize) -> Option<&dyn Experts> {
+        match self.layer(layer)?.mlp.as_ref()? {
+            LayerMlpDevice::Sparse(experts) => Some(&**experts as &dyn Experts),
+            LayerMlpDevice::Dense(_) => None,
+        }
+    }
+
+    /// A layer whose attention *and* MLP are both here, which is the condition
+    /// for one command buffer — and `None` for one that is only half here, which
+    /// still runs, one submission either side of the norm the CPU would apply.
+    fn decoder(&self, layer: usize) -> Option<&dyn DecoderDevice> {
+        let held = self.layer(layer)?;
+        held.mlp.as_ref()?;
+        Some(held as &dyn DecoderDevice)
+    }
+}
+
+/// The whole of one decoder layer in one command buffer.
+///
+/// **Twenty-three dispatches and one submission**, where the same operations
+/// asked for a piece at a time are two submissions and three CPU rows between
+/// them. Eleven are the attention's — see [`LayerProjections::layer`], which is
+/// this one step in — and every value between them and the rows the MLP answered
+/// is a buffer the next dispatch reads: what `o_proj` wrote, the convolution's
+/// rows with the layer's input already added, what the second norm made of that,
+/// the gate's logits, the experts the top-k took out of them, and each bank's
+/// two halves with the activation between them.
+///
+/// **Where it stops is where the routing's weights are.** They are a softmax
+/// over eight numbers from logits a dispatch in this same buffer produced, and
+/// three of the four ways of misreading this gate live in that softmax — see
+/// [`SparseMoe::weighted`](inkling_core::moe::SparseMoe::weighted) — so the rows
+/// both banks answered come back to be weighted here. `h` comes back beside
+/// them, because the layer's second residual is added to it on that side too.
+impl DecoderDevice for LayerDevice<'_> {
+    fn run(&self, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<DecoderHalves> {
+        let mlp = self.mlp.as_ref()?;
+        Some(
+            self.encode(cache, step, mlp)
+                .unwrap_or_else(|err| panic!("the layer did not run: {err}")),
+        )
+    }
+}
+
+impl LayerDevice<'_> {
+    fn encode(
+        &self,
+        cache: &mut DecoderCache,
+        step: DecoderStep<'_>,
+        mlp: &LayerMlpDevice<'_>,
+    ) -> Result<DecoderHalves, ProjectionError> {
+        let attention = &self.attention;
+        let queries = attention.beginning(cache.attention(), step.attention);
+        assert_eq!(
+            step.attn_sconv.kernel_size(),
+            self.attn_sconv.taps(),
+            "the layer's residual convolution against the one wrapped for it"
+        );
+        assert_eq!(
+            step.post_attention_layernorm.len(),
+            self.post_attention_layernorm.width(),
+            "the layer's second norm against the one wrapped for it"
+        );
+        assert_eq!(
+            step.eps,
+            self.post_attention_layernorm.eps(),
+            "rms_norm_eps"
+        );
+
+        // The residual convolution's window is this sequence's, and it advances
+        // exactly when the span and the two windows inside attention do — which
+        // `beginning` has already started over if this sequence has seen nothing.
+        if cache.attention().seen() == 0 {
+            self.attn_sconv.restart();
+        }
+
+        let device = attention.device();
+        let mut span = attention.attention.span();
+        let mut batch = device.batch()?;
+
+        let mut x = device.buffer(step.attention.x)?;
+        let mut normed = attention
+            .input_norm(&mut batch, &mut x, step.attention)?
+            .expect("a decoder layer normalises the state it is handed");
+        let mut attended = attention
+            .encoding(&mut batch, &mut span, &mut normed, step.attention)?
+            .buffer();
+        let mut h = self
+            .attn_sconv
+            .encode(&mut batch, &mut attended, Some(&mut x))?;
+        let mut normed = self.post_attention_layernorm.encode(&mut batch, &mut h)?;
+        let dispatched = match mlp {
+            LayerMlpDevice::Dense(ffn) => {
+                Dispatch::Dense(ffn.encode_into(&mut batch, &mut normed)?)
+            }
+            LayerMlpDevice::Sparse(experts) => {
+                Dispatch::Sparse(experts.encode_into(&mut batch, &mut normed, queries)?)
+            }
+        };
+        batch.wait()?;
+        cache.attention().appended(queries);
+
+        let h = profile::timed(Op::Readback, || h.to_vec());
+        Ok(DecoderHalves {
+            projected: dispatched.weighted(h.len(), step.mlp),
+            h,
+        })
+    }
+}
+
+/// What a layer's MLP left on the device, which is one value for a dense layer
+/// and four for one that routes.
+enum Dispatch {
+    Dense(Pending),
+    Sparse(Dispatched),
+}
+
+impl Dispatch {
+    /// The `[tokens, hidden]` the MLP produced, read back and finished on this
+    /// side.
+    ///
+    /// **Both arms leave something here, and neither is arithmetic a kernel
+    /// declined.** A dense layer's trailing `global_scale` is
+    /// `InklingDenseMLP`'s rather than `SwiGLUMLP`'s, and a routed layer's
+    /// weights are a softmax over the logits its own gate produced — the half of
+    /// the router where three of the four ways of misreading it live.
+    fn weighted(self, values: usize, mlp: LayerMlp<'_>) -> Vec<f32> {
+        match (self, mlp) {
+            (Self::Dense(rows), LayerMlp::Dense(dense)) => dense.scaled(rows.take()),
+            (Self::Sparse(dispatched), LayerMlp::Sparse(moe)) => {
+                let answered = dispatched.answered();
+                moe.weighted(values, &answered.logits, &answered.picked, &answered.banks)
+                    .total()
+            }
+            _ => panic!("the layer's MLP is not the one wrapped for it"),
+        }
     }
 }
 
@@ -675,6 +925,13 @@ mod tests {
     use inkling_core::ops::{DenseProjection, rms_norm};
     use inkling_core::weights::PackedAttention;
 
+    use inkling_core::attention::{AttentionProjections, AttentionWeights};
+    use inkling_core::layer::{DecoderLayer, DecoderWeights, NoExperts};
+    use inkling_core::ops::DenseMlp;
+
+    use crate::dense::DenseMatmul;
+    use crate::matmul::testing::{Case, pack};
+    use crate::router::Router;
     use crate::testing::device;
 
     /// The packed tensors `just dump-quant-fixture` cut out of the checkpoint
@@ -790,6 +1047,8 @@ mod tests {
             attention: attention(ckpt, names),
             dense_mlp: None,
             input_layernorm: layernorm(IN_DIM),
+            post_attention_layernorm: layernorm(IN_DIM),
+            attn_sconv: residual_sconv(),
             rel_proj: rel_proj(),
             k_sconv: sconv(),
             v_sconv: sconv(),
@@ -811,6 +1070,14 @@ mod tests {
     fn sconv() -> Vec<f32> {
         (0..shape().kv_channels() * KERNEL_SIZE)
             .map(|i| ((i % 7) as f32 - 3.0) / 8.0)
+            .collect()
+    }
+
+    /// The same, over the hidden state's channels rather than the key's — which
+    /// is what the two convolutions on a layer's residual path are over.
+    fn residual_sconv() -> Vec<f32> {
+        (0..IN_DIM * KERNEL_SIZE)
+            .map(|i| ((i % 11) as f32 - 5.0) / 8.0)
             .collect()
     }
 
@@ -861,9 +1128,11 @@ mod tests {
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
         let ckpt = fixture::open(fixture::MXFP4);
 
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
         let three = DenseFfn::wrap(
             &device,
             &matmul,
+            &swiglu,
             &PackedMlp {
                 gate_proj: packed(&ckpt, TENSORS[0]),
                 up_proj: packed(&ckpt, TENSORS[1]),
@@ -1025,6 +1294,8 @@ mod tests {
             LayerPacked {
                 layer: 0,
                 input_layernorm: layernorm(IN_DIM),
+                post_attention_layernorm: layernorm(IN_DIM),
+                attn_sconv: residual_sconv(),
                 rel_proj: rel_proj(),
                 k_sconv: sconv(),
                 v_sconv: sconv(),
@@ -1041,6 +1312,8 @@ mod tests {
             LayerPacked {
                 layer: 2,
                 input_layernorm: layernorm(IN_DIM),
+                post_attention_layernorm: layernorm(IN_DIM),
+                attn_sconv: residual_sconv(),
                 rel_proj: rel_proj(),
                 k_sconv: sconv(),
                 v_sconv: sconv(),
@@ -1051,11 +1324,29 @@ mod tests {
                 dense_mlp: None,
             },
         ];
-        let projections = ModelProjections::wrap(&device, &kernels, &packed_layers, LAYERS)
-            .expect("the layers wrap");
+        let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
+        let router = Router::new(&device).expect("the router compiles");
+        let experts = ExpertKernels {
+            matmul: kernels.matmul(),
+            dense: &dense,
+            swiglu: &swiglu,
+            router: &router,
+        };
+        let projections = ModelLayers::wrap(
+            &device,
+            &kernels,
+            experts,
+            &packed_layers,
+            &[],
+            LAYERS,
+            IN_DIM,
+        )
+        .expect("the layers wrap");
 
         assert_eq!(projections.layers(), 2, "two of the five");
         assert_eq!(projections.dense_layers(), 1);
+        assert_eq!(projections.expert_layers(), 0, "no banks were handed over");
         assert!(projections.dense_mlp(0).is_some());
         assert!(
             projections.dense_mlp(2).is_none(),
@@ -1068,11 +1359,273 @@ mod tests {
         assert!(projections.attention(4).is_none(), "the last of the stack");
         assert!(projections.attention(LAYERS).is_none(), "past the stack");
 
+        // **A whole layer is only reachable where the whole layer is here.** The
+        // dense one has its feed-forward network and answers for the layer; the
+        // MoE one was handed no banks, so it still runs — one submission either
+        // side of the norm the CPU applies — and says so by declining.
+        assert!(projections.decoder(0).is_some(), "a layer held whole");
+        assert!(
+            projections.decoder(2).is_none(),
+            "a layer whose MLP is not here"
+        );
+        assert!(projections.decoder(1).is_none(), "a layer left to the CPU");
+        assert!(projections.decoder(LAYERS).is_none(), "past the stack");
+
         // And the two layers wrapped are not each other's, which is what an
         // index off by one would produce. They differ in `o_proj` alone.
         for (layer, (_, o_proj)) in [(0, LAST_TWO[0]), (2, LAST_TWO[1])] {
             let five = projections.attention(layer).expect("a wrapped layer");
             each_answers(&ckpt, &[(o_proj, five.o_proj())]);
+        }
+    }
+
+    /// A layer narrow enough to stand up out of synthetic weights, which is what
+    /// running a *whole* one needs.
+    ///
+    /// The fixture's three tensors are `[64, 4096]`, `[64, 4096]` and a
+    /// two-expert `[2, 32, 4096]` bank — every one of them mapping *from* the
+    /// model's width — so no three of them are a feed-forward network, and a
+    /// layer without an MLP is exactly the layer this case is about. Uploaded
+    /// codes are, and the widths below are Inkling's own ratios shrunk: two
+    /// heads over one key head, a query as wide as the hidden state, and a
+    /// feed-forward network half of it.
+    struct Narrow<'a> {
+        device: &'a Device,
+        kernels: &'a LayerKernels,
+        swiglu: &'a SwiGlu,
+    }
+
+    /// The shapes a `Narrow` layer is built to, which have to be whole groups of
+    /// 32 codes on every width a weight maps *from*.
+    const NARROW: AttentionConfig = AttentionConfig {
+        hidden: 128,
+        heads: 2,
+        kv_heads: 1,
+        head_dim: 64,
+        d_rel: 8,
+        sliding: 32,
+        rms_norm_eps: EPS,
+        log_scaling: None,
+    };
+
+    /// The width the narrow layer's feed-forward network maps through.
+    const NARROW_FFN: usize = 64;
+
+    /// `InklingDenseMLP`'s trailing scale, which is not 1 in the checkpoint and
+    /// must not be here — a path that dropped it would agree with a path that
+    /// dropped it.
+    const GLOBAL_SCALE: f32 = 1.75;
+
+    impl<'a> Narrow<'a> {
+        /// One packed weight of the given shape, uploaded — the seed is what
+        /// makes two of them differ, and against weights that agreed an
+        /// exchanged pair would change nothing.
+        fn weight(&self, seed: u32, in_dim: usize, out_dim: usize) -> PackedProjection<'a> {
+            let case = Case::seeded(seed, in_dim, out_dim, 1);
+            PackedProjection::upload(
+                self.device,
+                self.kernels.matmul(),
+                in_dim,
+                out_dim,
+                &pack(&case.codes),
+                &case.scales,
+            )
+            .expect("the weight's shapes pair")
+        }
+
+        fn norm(&self, weight: &[f32]) -> LayerNorm<'a> {
+            LayerNorm::new(self.device, &self.kernels.norm, weight, NARROW.rms_norm_eps)
+                .expect("the norm uploads")
+        }
+
+        fn conv(&self, channels: usize, weight: &[f32]) -> LayerConv<'a> {
+            LayerConv::new(self.device, &self.kernels.conv, channels, weight)
+                .expect("the kernel uploads")
+        }
+
+        /// The whole layer on the device, with a dense feed-forward network in
+        /// the MLP slot.
+        fn layer(&self, weights: &NarrowWeights) -> LayerDevice<'a> {
+            let (heads, head_dim) = (NARROW.heads, NARROW.head_dim);
+            let kv = NARROW.kv_channels();
+            LayerDevice {
+                attention: LayerProjections {
+                    input_layernorm: self.norm(&weights.input_layernorm),
+                    attention: LayerAttention::new(
+                        self.device,
+                        &self.kernels.attention,
+                        NARROW,
+                        &weights.rel_proj,
+                    )
+                    .expect("the step stands up"),
+                    k_sconv: self.conv(kv, &weights.k_sconv),
+                    v_sconv: self.conv(kv, &weights.v_sconv),
+                    q_norm: self.norm(&weights.q_norm),
+                    k_norm: self.norm(&weights.k_norm),
+                    q_proj: self.weight(0x11, NARROW.hidden, heads * head_dim),
+                    k_proj: self.weight(0x22, NARROW.hidden, kv),
+                    v_proj: self.weight(0x33, NARROW.hidden, kv),
+                    r_proj: self.weight(0x44, NARROW.hidden, heads * NARROW.d_rel),
+                    o_proj: self.weight(0x55, heads * head_dim, NARROW.hidden),
+                },
+                attn_sconv: self.conv(NARROW.hidden, &weights.attn_sconv),
+                post_attention_layernorm: self.norm(&weights.post_attention_layernorm),
+                mlp: Some(LayerMlpDevice::Dense(Box::new(DenseFfn {
+                    gate_proj: self.weight(0x66, NARROW.hidden, NARROW_FFN),
+                    up_proj: self.weight(0x77, NARROW.hidden, NARROW_FFN),
+                    down_proj: self.weight(0x88, NARROW_FFN, NARROW.hidden),
+                    swiglu: self.swiglu,
+                }))),
+            }
+        }
+    }
+
+    /// The narrow layer's own small tensors, held so that both sides can borrow
+    /// the same ones.
+    struct NarrowWeights {
+        input_layernorm: Vec<f32>,
+        post_attention_layernorm: Vec<f32>,
+        q_norm: Vec<f32>,
+        k_norm: Vec<f32>,
+        k_sconv: Vec<f32>,
+        v_sconv: Vec<f32>,
+        attn_sconv: Vec<f32>,
+        mlp_sconv: Vec<f32>,
+        rel_proj: Vec<f32>,
+    }
+
+    impl NarrowWeights {
+        /// None of them all one value, and no two of them equal — so a slot
+        /// filled from the wrong name is a different answer rather than the same
+        /// one.
+        fn new() -> Self {
+            let of = |len: usize, salt: usize| -> Vec<f32> {
+                (0..len)
+                    .map(|i| 0.5 + ((i * 7 + salt) % 13) as f32 / 16.0)
+                    .collect()
+            };
+            let kv = NARROW.kv_channels();
+            Self {
+                input_layernorm: of(NARROW.hidden, 1),
+                post_attention_layernorm: of(NARROW.hidden, 2),
+                q_norm: of(NARROW.head_dim, 3),
+                k_norm: of(NARROW.head_dim, 4),
+                k_sconv: of(kv * KERNEL_SIZE, 5),
+                v_sconv: of(kv * KERNEL_SIZE, 6),
+                attn_sconv: of(NARROW.hidden * KERNEL_SIZE, 7),
+                mlp_sconv: of(NARROW.hidden * KERNEL_SIZE, 8),
+                rel_proj: of(NARROW.d_rel * NARROW.sliding, 9),
+            }
+        }
+
+        /// The same tensors as `CheckpointWeights` hands a layer, around
+        /// whichever projections answer for it.
+        fn decoder<'w>(&'w self, five: &'w dyn Projections) -> DecoderWeights<'w> {
+            DecoderWeights {
+                attention: AttentionWeights {
+                    projections: AttentionProjections::backend(five),
+                    q_norm: &self.q_norm,
+                    k_norm: &self.k_norm,
+                    k_sconv: &self.k_sconv,
+                    v_sconv: &self.v_sconv,
+                    rel_proj: &self.rel_proj,
+                },
+                input_layernorm: &self.input_layernorm,
+                post_attention_layernorm: &self.post_attention_layernorm,
+                attn_sconv: &self.attn_sconv,
+                mlp_sconv: &self.mlp_sconv,
+            }
+        }
+    }
+
+    /// `[rows, hidden]` spread over both signs, so that a reduction cancels the
+    /// way a trained one does.
+    fn hidden_rows(rows: usize) -> Vec<f32> {
+        (0..rows * NARROW.hidden)
+            .map(|i| ((i * 31 % 67) as f32 - 33.0) / 33.0)
+            .collect()
+    }
+
+    /// **The whole layer in one command buffer is the same layer.**
+    ///
+    /// This is the claim the seam rests on and the only way to make it is to run
+    /// both, because what the fused path forms in the middle is never a value
+    /// this process sees: the convolved residual, the second norm's output and
+    /// the rows the feed-forward network answered exist only in buffers between
+    /// dispatches. So one `DecoderLayer` is driven twice over the same weights —
+    /// once with the device holding the whole layer, once with it holding only
+    /// the attention and the three operations behind it left here — and what is
+    /// compared is the far end.
+    ///
+    /// **Two calls against one cache**, because three of the layer's windows and
+    /// its span are the *device's* rather than the cache's on the fused path, and
+    /// a prefill that agreed alone would say nothing about the call that reads
+    /// what it left. And a third call from a fresh cache after them, which has to
+    /// reproduce the prefill: the windows are the layer's, so what starts them
+    /// over is a cache that has seen nothing, and a fused layer that never
+    /// restarted its residual convolution would answer the second sequence with
+    /// the first one's tail.
+    #[test]
+    fn a_whole_layer_in_one_command_buffer_answers_what_its_pieces_answer() {
+        let Some(device) = device() else { return };
+        let kernels = LayerKernels::compile(&device).expect("the kernels compile");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
+        let narrow = Narrow {
+            device: &device,
+            kernels: &kernels,
+            swiglu: &swiglu,
+        };
+        let weights = NarrowWeights::new();
+        let held = narrow.layer(&weights);
+
+        let mlp = DenseMlp::backend(
+            NARROW.hidden,
+            NARROW_FFN,
+            held.mlp.as_ref().and_then(dense).expect("a dense layer"),
+            GLOBAL_SCALE,
+        );
+        let layer = DecoderLayer::new(
+            NARROW,
+            weights.decoder(&held.attention),
+            LayerMlp::Dense(mlp),
+        );
+
+        let (x, more) = (hidden_rows(3), hidden_rows(2));
+        let sequence = |device: Option<&dyn DecoderDevice>| {
+            let cache = &mut layer.cache();
+            let prefill = layer.forward(cache, &x, &NoExperts, device);
+            let rest = layer.forward(cache, &more, &NoExperts, device);
+            (prefill, rest)
+        };
+
+        let fused = sequence(Some(&held as &dyn DecoderDevice));
+        let apart = sequence(None);
+        for (what, got, want) in [
+            ("the prefill", &fused.0, &apart.0),
+            ("the continuation", &fused.1, &apart.1),
+        ] {
+            let agreed = deviation(got, want);
+            assert!(agreed <= TOLERANCE, "{what}: deviation {agreed:e}");
+        }
+        assert!(
+            deviation(&fused.1, &apart.0[..more.len()]) > TOLERANCE,
+            "two calls of one sequence that agreed would say nothing about the cache"
+        );
+
+        // The same first call again, from a cache that has seen nothing — which
+        // is what says the fused layer starts its own windows and span over
+        // rather than continuing the sequence just run.
+        let again = sequence(Some(&held as &dyn DecoderDevice));
+        assert_eq!(again.0, fused.0, "a second sequence's prefill");
+        assert_eq!(again.1, fused.1, "a second sequence's continuation");
+    }
+
+    /// The feed-forward network of a layer that has one, for a caller that holds
+    /// the layer rather than the network.
+    fn dense<'m>(mlp: &'m LayerMlpDevice<'_>) -> Option<&'m dyn MlpProjections> {
+        match mlp {
+            LayerMlpDevice::Dense(ffn) => Some(&**ffn as &dyn MlpProjections),
+            LayerMlpDevice::Sparse(_) => None,
         }
     }
 }

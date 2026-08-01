@@ -843,6 +843,69 @@ impl<'a> Attention<'a> {
         )
     }
 
+    /// The scaling this layer applies to a call of `queries` queries whose first
+    /// sits at `offset`.
+    ///
+    /// Handed out because [`LayerStep`] borrows it: a caller building the step
+    /// itself — see [`Attention::step`] — has to hold this for as long as the
+    /// step lives.
+    pub fn taus(&self, offset: usize, queries: usize) -> Taus {
+        let log_scaling = self.config.log_scaling;
+        self.scaled(offset, queries, log_scaling, log_scaling)
+    }
+
+    /// [`Attention::taus`], with log scaling's two multiplications named apart —
+    /// see [`Attention::attend`].
+    fn scaled(
+        &self,
+        offset: usize,
+        queries: usize,
+        on_queries: Option<LogScaling>,
+        on_biases: Option<LogScaling>,
+    ) -> Taus {
+        // The queries are scaled where they are formed and the biases are not,
+        // because the biases are not formed here: whoever answers the step forms
+        // them, and a `tau` per query is what says by how much.
+        let taus = |log: Option<LogScaling>| -> Option<Vec<f32>> {
+            log.map(|log| (0..queries).map(|i| log.tau(offset + i)).collect())
+        };
+        Taus {
+            q: taus(on_queries),
+            bias: taus(on_biases),
+        }
+    }
+
+    /// The whole of this layer's attention as a value, without running any of
+    /// it.
+    ///
+    /// What [`Attention::forward`] hands [`Projections::layer`], handed out so
+    /// that a caller running the whole *decoder* layer can encode this beside
+    /// what follows it — which it cannot do through [`Attention::forward`],
+    /// because the value that would come back is the one the layer's residual
+    /// add wants and nothing else does.
+    pub fn step<'s>(
+        &'s self,
+        x: &'s [f32],
+        input_layernorm: Option<&'s [f32]>,
+        taus: &'s Taus,
+        q_offset: usize,
+    ) -> LayerStep<'s> {
+        LayerStep {
+            sdpa: self.sdpa,
+            mask: self.mask,
+            x,
+            input_layernorm,
+            eps: self.config.rms_norm_eps,
+            q_norm: self.weights.q_norm,
+            k_norm: self.weights.k_norm,
+            k_sconv: self.k_sconv,
+            v_sconv: self.v_sconv,
+            q_taus: taus.q.as_deref(),
+            bias_taus: taus.bias.as_deref(),
+            q_offset,
+        }
+    }
+
     /// [`Attention::forward`], with the query offset and log scaling's two
     /// multiplications named apart.
     ///
@@ -871,36 +934,15 @@ impl<'a> Attention<'a> {
         let queries = x.len() / self.hidden;
         let offset = query_offset.of(cache.seen());
 
-        // The queries are scaled where they are formed and the biases are not,
-        // because the biases are not formed here: whoever answers the step forms
-        // them, and a `tau` per query is what says by how much.
-        let taus = |log: Option<LogScaling>| -> Option<Vec<f32>> {
-            log.map(|log| (0..queries).map(|i| log.tau(offset + i)).collect())
-        };
-        let (q_taus, bias_taus) = (taus(on_queries), taus(on_biases));
-
-        let eps = self.config.rms_norm_eps;
+        let taus = self.scaled(offset, queries, on_queries, on_biases);
         let projections = &self.weights.projections;
-        let step = LayerStep {
-            sdpa: self.sdpa,
-            mask: self.mask,
-            x,
-            input_layernorm,
-            eps,
-            q_norm: self.weights.q_norm,
-            k_norm: self.weights.k_norm,
-            k_sconv: self.k_sconv,
-            v_sconv: self.v_sconv,
-            q_taus: q_taus.as_deref(),
-            bias_taus: bias_taus.as_deref(),
-            q_offset: offset,
-        };
+        let step = self.step(x, input_layernorm, &taus, offset);
         if let Some(out) = projections.layer(cache, step) {
             return out;
         }
 
         let projected = match input_layernorm {
-            Some(weight) => projections.normed_qkvr(x, weight, eps),
+            Some(weight) => projections.normed_qkvr(x, weight, self.config.rms_norm_eps),
             None => projections.qkvr(x),
         };
         let Convolved { q, k, v } = step.convolved(cache, &projected);
@@ -916,10 +958,23 @@ impl<'a> Attention<'a> {
             k: &split_heads(&cache.keys, self.sdpa.kv_heads, head_dim),
             v: &split_heads(&cache.values, self.sdpa.kv_heads, head_dim),
             rel: &projected.r,
-            taus: bias_taus.as_deref(),
+            taus: step.bias_taus,
             q_offset: offset,
         })
     }
+}
+
+/// One `tau` per query, which log scaling multiplies the query and its biases
+/// by — or nothing at all on a layer without it.
+///
+/// A value of its own because [`LayerStep`] borrows the two vectors and a caller
+/// that builds the step has to hold them. They are separate because the
+/// reference applies the same `tau` to both and they are separable: either one
+/// alone is a plausible misreading that leaves a model which still generates.
+#[derive(Debug, Clone, Default)]
+pub struct Taus {
+    q: Option<Vec<f32>>,
+    bias: Option<Vec<f32>>,
 }
 
 /// Where a call's queries sit in the sequence, which is `InklingAttention`'s

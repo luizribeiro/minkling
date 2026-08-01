@@ -503,10 +503,50 @@ impl<'a> SparseMoe<'a> {
 
         let (routing, assignments) =
             routing.expect("the backend asked the layer what its gate routed");
+        self.scattered(x.len(), &routing, &assignments, &answered)
+    }
+
+    /// The half of a layer's MoE that stays here when a backend ran the whole of
+    /// the other half: the weights its gate's logits imply for the selection its
+    /// router made, over the rows its two banks answered.
+    ///
+    /// **Three of the four ways of misreading this gate are in these two lines**
+    /// — see [`SparseMoe::weigh`] — which is what keeps them here rather than in
+    /// whichever kernel dispatched the banks. A backend that picks is trusted
+    /// for the set of experts and for nothing else.
+    ///
+    /// `values` is the width of the hidden state the rows were formed from,
+    /// which a caller that never held it still knows: `tokens * hidden`. That is
+    /// the whole of what [`SparseMoe::forward`] needs `x` for once the gate, the
+    /// selection and both banks have run somewhere else.
+    pub fn weighted(
+        &self,
+        values: usize,
+        logits: &[f32],
+        picked: &[usize],
+        answered: &BankRows,
+    ) -> MoeOutput {
+        let routing = profile::timed(Op::Router, || self.weigh(logits, picked));
+        let by_token = routing.by_token();
+        self.scattered(values, &routing, &by_token, answered)
+    }
+
+    /// Both banks' rows weighted and summed back into `[tokens, hidden]`.
+    ///
+    /// `assignments` is the routed bank's, in the order that bank answered its
+    /// rows; the shared bank's is the routing's own, because every token goes
+    /// through every shared expert whatever was picked.
+    fn scattered(
+        &self,
+        values: usize,
+        routing: &Routing,
+        assignments: &[(usize, f32)],
+        answered: &BankRows,
+    ) -> MoeOutput {
         MoeOutput {
-            routed: self.scatter(x.len(), &assignments, &answered.routed),
+            routed: self.scatter(values, assignments, &answered.routed),
             shared: self.scatter(
-                x.len(),
+                values,
                 &self::assignments(&routing.shared_batches()),
                 &answered.shared,
             ),

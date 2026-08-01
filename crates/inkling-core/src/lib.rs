@@ -45,6 +45,6 @@ pub use quant::{Dequantized, QuantError, Scratch};
 pub use sconv::{ConvState, ShortConv};
 pub use tokenizer::{Detokenizer, Tokenizer, TokenizerError};
 pub use weights::{
-    Bf16, CheckpointWeights, ExpertBackend, LayerBanks, LayerPacked, Packed, PackedAttention,
-    PackedExperts, PackedMlp, PackedRows, ProjectionBackend, WeightsError,
+    Bf16, CheckpointWeights, LayerBackend, LayerBanks, LayerPacked, Packed, PackedAttention,
+    PackedExperts, PackedMlp, PackedRows, WeightsError,
 };

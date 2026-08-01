@@ -623,7 +623,10 @@ fn the_decoder_layer_reproduces_the_reference_against_real_weights() {
             mlp.view(config.hidden_size),
         );
 
-        let against_reference = deviation(&decoder.forward(&mut decoder.cache(), &x, &mlp), &want);
+        let against_reference = deviation(
+            &decoder.forward(&mut decoder.cache(), &x, &mlp, None),
+            &want,
+        );
         assert!(
             against_reference <= LAYER_TOLERANCE,
             "layer {layer}: deviation {against_reference:e}"
@@ -641,7 +644,10 @@ fn the_decoder_layer_reproduces_the_reference_against_real_weights() {
         let mut exchanged = weights.view(config.hidden_size);
         std::mem::swap(&mut exchanged.attn_sconv, &mut exchanged.mlp_sconv);
         let exchanged = DecoderLayer::new(attention, exchanged, mlp.view(config.hidden_size));
-        let swapped = deviation(&exchanged.forward(&mut exchanged.cache(), &x, &mlp), &want);
+        let swapped = deviation(
+            &exchanged.forward(&mut exchanged.cache(), &x, &mlp, None),
+            &want,
+        );
         assert!(
             swapped > LAYER_TOLERANCE,
             "layer {layer}: exchanging the two convolutions deviates by only {swapped:e}"
