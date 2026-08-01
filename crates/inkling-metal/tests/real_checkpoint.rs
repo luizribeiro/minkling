@@ -514,19 +514,20 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// feed-forward network is three in two, its activation still here. The head is
 /// one of each.
 ///
-/// **Ten of a layer's eleven dispatches cost no submission**, which is the whole
-/// of what this milestone did. Every activation between the hidden state a layer
+/// **Ten of a layer's eleven attention dispatches cost no submission**, which is
+/// the whole of what M10 did. Every activation between the hidden state a layer
 /// is handed and the one `o_proj` returns is a buffer the next dispatch reads —
 /// including the two that outlive the call, the convolutions' windows and the
 /// span of keys and values, which is why they had to become the layer's before
-/// the rest could follow. The seam between the two expert banks is a submission
-/// no layer needs either: the shared bank's last dispatch and the routed bank's
-/// first read nothing of each other, which is visible to a backend handed the
-/// whole layer and to nothing else.
+/// the rest could follow. A MoE layer's nine other dispatches cost no submission
+/// either: the gate reads the hidden state its shared bank reads, the top-k
+/// reads what the gate wrote, and the routed bank's experts are named by what
+/// the top-k wrote — which is visible to a backend handed the whole layer and to
+/// nothing else.
 ///
-/// What is left is one submission a layer for attention, two or three for the
-/// MLP, and one for the head — 167 where the same dispatches were 249 before any
-/// of them were merged.
+/// What is left is one submission a layer for attention, one or two for the MLP,
+/// and one for the head — 87 where the same dispatches were 249 before any of
+/// them were merged.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
     (

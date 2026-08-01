@@ -351,7 +351,7 @@ impl Landing<'_> {
 ///
 /// The second is what a dispatch's shape is. A shape is a dozen `uint`s that
 /// describe one call and are read once, so what an allocation would buy it is a
-/// lifetime it has no use for at a price a step pays 749 times.
+/// lifetime it has no use for at a price a step pays 869 times.
 #[derive(Debug)]
 pub enum Arg<'a> {
     /// An allocation, from [`Buffer::arg`]. The command buffer retains it, so it

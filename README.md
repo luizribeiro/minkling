@@ -25,7 +25,7 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 75 ms against mlx-vlm's 32 ms, and the timings go to
+A decode step is about 55 ms against mlx-vlm's 32 ms, and the timings go to
 stderr so stdout stays pipeable. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
@@ -34,7 +34,7 @@ rather than applied by a template this does not implement.
 **Every matmul in the model runs on the GPU, and no weight one of them reads is
 ever decoded to memory** — the MXFP4 ones in registers a nibble at a time, the
 routers' bfloat16 gates by a shift — and `--backend cpu` puts them all back:
-0.075 s a token against the CPU's 9.0. The experts were the first two thirds of
+0.055 s a token against the CPU's 9.0. The experts were the first two thirds of
 that. A token reads 6 of each MoE layer's 256 experts and both of its shared
 ones, which is 32 GB of float32 the CPU path decodes to multiply against and 4.3
 GB of packed bytes the GPU path indexes into and never decodes at all. The rest
@@ -61,10 +61,10 @@ inferred.** Every operation a forward pass runs opens a scope charged the time
 inside it that no scope inside *it* claimed, so the rows of a decode step sum to
 the step and what they leave over is a number rather than a shrug:
 
-    submit and wait     167    81%      of which the device executed for 25 ms
-    dispatch encode     749    10%
-    readback            329     3%
-    everything else                     6%
+    submit and wait      87    81%      of which the device executed for 25 ms
+    dispatch encode     869    10%
+    readback            169     2%
+    everything else                     7%
 
 **Six rows have left it since that table was first written, and the shape of
 what is left has not changed.** The routers' gates were 19% and every layer's
@@ -74,51 +74,51 @@ were 1.4% between them, and the two are one dispatch now. The two short
 convolutions inside attention and the two head norms beside them were 0.8% by
 the rows that named them, and they are four more dispatches — what they cost was
 never their own time. Four fifths of a step is a round trip, and the device is
-executing for two fifths of that — so the rest is 167 command buffers submitted
-and waited for around work that was already done. Every activation op left is
-3.8% of a step together.
+executing for a little over half of that — so the rest is 87 command buffers
+submitted and waited for around work that was already done. Every activation op
+left is 3.8% of a step together — the same share of a step 20 ms shorter, since
+the swiglu row and half the gather row came off with the round trips.
 
-**A dispatch's shape is not an allocation.** Each of the 749 took its dimensions,
-its offsets and the expert its rows go through in small `MTLBuffer`s of its own —
-1374 a step, made and freed between two steps that wanted the same values — where
+**A dispatch's shape is not an allocation.** Each of the 749 dispatches a step
+ran then took its dimensions, its offsets and the expert its rows go through in
+small `MTLBuffer`s of its own — 1374 a step, made and freed between two steps
+that wanted the same values — where
 `setBytes:` puts the same bytes in the command buffer as the dispatch is encoded.
 That took the encode row from 9.35 ms to 7.28 ms, measured against the commit
 before it and alternating between the two over seven pairs, with the wait row and
 the device's own clock where they were. It stays a *copy* per dispatch rather than
 a buffer the layer holds, which is what lets two calls of different heights share
-a command buffer — and 994 allocations are left in that row, every one of them an
-output or a row gathered for a bank.
+a command buffer — and 874 allocations are left in that row, every one of them an
+output or a row copied over for a dispatch that could not read it where it was.
 
 Multiplies that share an input share a command buffer, and so do multiplies that
 share nothing: the four projections a layer's normed hidden state feeds, the norm
 that makes it, the two convolutions and two head norms behind two of them, the
-attention step beside the projection it feeds, each expert bank's gate and up,
-the router's own gate beside the shared bank it weights, and that bank's last
-multiply beside the routed bank's first — 749 dispatches in 167 submissions.
-**What those last two have in common
-is that a seam had to be able to express them.** The gate's answer decides how
-heavily each shared expert counts and not which rows it runs; and by the time the
-shared bank's `down` is encoded, the routing that names the routed bank's rows
-has already been taken from logits the gate handed over — so neither pair waits
-for itself, and 40 gates and 40 round trips cost nothing. Handing a backend one
-bank at a time, neither is visible.
+attention step beside the projection it feeds, and every dispatch a MoE layer
+runs — 869 dispatches in 87 submissions. **What those have in common is that a
+seam had to be able to express them.** Handing a backend one bank at a time,
+none of it is visible: it takes a call that is given the whole layer to see that
+the gate reads the hidden state the shared bank reads, that the top-k reads what
+the gate wrote, and that the routed bank's experts are named by what the top-k
+wrote — so that a layer is ten dispatches and one round trip.
 
-Removing those 40 submissions took the wait row from 249 to 209 and about 6.3 ms
-off it, measured against the commit before it and alternating between the two
-over seven pairs: the device is executing for the same 23 ms and the dispatch
-count does not move, so what is left is the round trip. A submission is 206
-microseconds measured on its own and about 157 measured as the fortieth taken
-out of a stream of 249 — two numbers this project has to keep apart, since only
-the second says what merging a command buffer is worth.
+Four alternating measurements have now taken 40 or 42 command buffers out of a
+step and read the wait row either side, and each says the same thing in a
+different denominator: 6.3 ms out of 249, 7.2 out of 209, 6.3 out of 167 and 6.6
+out of 127 — 157, 172, 156 and 165 microseconds a merged submission. A
+submission measured on its own is 225. **The two are different numbers and this
+project has to keep them apart**, since only the first says what merging a
+command buffer is worth; and none of the four is the same as another, so an
+estimate built on the difference between 156 and 172 is over-fitted.
 
-**A layer's attention is now one submission rather than two**, and the same
-alternating measurement says what that was worth: 209 command buffers to 167,
-7.2 ms off the wait row and 8.8 ms off the step over seven pairs. The dispatch
-count went the other way — 581 to 749, four more a layer — and cost nothing to
-encode, because what came off beside them is a copy of the whole cached span
-onto the device per layer per step. At 42 round trips the wait says a marginal
-submission is about 172 microseconds here, a little above the 157 the fortieth
-of 249 measured.
+**A layer's attention became one submission rather than two** for 7.2 ms off the
+wait row and 8.8 ms off the step, and its dispatch count went the other way —
+581 to 749, four more a layer — for nothing, because what came off beside them
+is a copy of the whole cached span onto the device per layer per step. **A MoE
+layer became one rather than three** for 12.8 ms off the wait row over two
+commits, and its dispatch count rose too, 7 to 10 a layer. Both times the device
+was executing for the same time either side, which is what says a merged
+submission buys the round trip and not the work.
 
 **The attention step is a dispatch even though it has no weight to hand over**,
 and what it hands over instead is a tensor nobody builds. The reference adds a
@@ -140,10 +140,19 @@ the key's norm and the value's convolution leave the span the step attends over
 — so where those three ran decided where that state lives, and holding it is
 what let the rest follow.
 
-What is left on the CPU is each layer's second norm, the two short convolutions
-on its residual path, and the router's top-k and softmax over eight numbers.
-There is no matmul left outside the GPU. Both backends generate the same tokens,
-and the CPU one stays the oracle every kernel here is validated against.
+**A MoE layer is one command buffer too**: the router's gate, the top-k over 256
+sigmoid-corrected scores, and each bank's gate, up, activation and down — ten
+dispatches and one submission. The rows the routed bank runs are not a tensor
+anybody builds, either. A token reads six experts, so its six rows are one row of
+the hidden state read six times, and laying them out end to end is an integer
+divide inside the kernel.
+
+What that leaves on the CPU is each layer's second norm, the two short
+convolutions on its residual path, and the half of each router that weights what
+it chose — a softmax over eight numbers, where three of the four ways of
+misreading this gate live. There is no matmul left outside the GPU. Both
+backends generate the same tokens, and the CPU one stays the oracle every kernel
+here is validated against.
 
 Or the same model behind an OpenAI-compatible endpoint, loaded once:
 

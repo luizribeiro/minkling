@@ -16,7 +16,7 @@
 //! So a second client waits rather than fails. `tiny_http` accepts and parses on
 //! a thread of its own and hands requests over one at a time, so a request that
 //! arrives mid-generation is queued and answered when the one before it is
-//! finished. At 0.075 s a token that is a wait a client can sit through, and at
+//! finished. At 0.055 s a token that is a wait a client can sit through, and at
 //! the CPU path's 9.0 s it is a long one — honest either way.
 //!
 //! # Each request prefills its whole prompt

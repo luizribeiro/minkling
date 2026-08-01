@@ -184,7 +184,7 @@ impl<'a> Generator<'a> {
     ///
     /// The prompt is prefilled by the first step rather than by a step of its
     /// own, so that step's cost is a prefill's and every later one's is a
-    /// decode's. Against this checkpoint those are 1.10 s and 0.075 s on the
+    /// decode's. Against this checkpoint those are 0.99 s and 0.055 s on the
     /// device path and 9.0 s a decode step on the CPU's — the two
     /// regimes are worth telling apart in anything that reports timings, and a
     /// mean over the steps of one call describes neither.
