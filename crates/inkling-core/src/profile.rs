@@ -33,6 +33,18 @@
 //! Left on rather than put behind a feature, because a profile that has to be
 //! switched on is one that is never on when the surprising run happens.
 //!
+//! # Two clocks, and only one of them is a scope
+//!
+//! Everything above is this process's clock around work it asked for. What the
+//! *device* spent is a second account, reported by a backend rather than
+//! measured here: [`ran_on_the_gpu`] for a whole command buffer, and
+//! [`dispatched`] for one kernel's share of one. Neither adds to [`total`] —
+//! both are subdivisions of [`Op::Submit`], which is the wall time around them
+//! — and the per-kernel rows are what say which of the dispatches inside a
+//! submission owns it. Which kernel owns which milliseconds is the one thing a
+//! `submit and wait` row cannot answer, and it is what decides which kernel is
+//! worth rewriting.
+//!
 //! # One thread's
 //!
 //! The accounts are thread-local, which is what a sequence is: everything below
@@ -42,6 +54,7 @@
 //! something to sum.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -156,6 +169,19 @@ impl fmt::Display for Op {
 
 const OPS: usize = Op::ALL.len();
 
+/// What one kernel's dispatches cost on the device, from the GPU's own clock.
+///
+/// A row of the table [`Profile::kernels`] returns, and empty unless a backend
+/// is sampling — the timestamps behind it are hardware counters somebody has to
+/// have asked for.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Dispatches {
+    /// How many dispatches of this kernel the device timed.
+    pub calls: u64,
+    /// What it was executing them for, summed.
+    pub elapsed: Duration,
+}
+
 /// What the calling thread has spent, and where.
 #[derive(Debug, Default, Clone)]
 struct Accounts {
@@ -170,6 +196,11 @@ struct Accounts {
     /// What the device reported it was executing for, which is inside
     /// [`Op::Submit`] rather than beside it.
     gpu: Duration,
+    /// The same figure split by the kernel that ran, which is inside [`gpu`]
+    /// rather than beside it.
+    ///
+    /// [`gpu`]: Accounts::gpu
+    kernels: BTreeMap<String, Dispatches>,
 }
 
 thread_local! {
@@ -231,6 +262,25 @@ pub fn ran_on_the_gpu(elapsed: Duration) {
     ACCOUNTS.with_borrow_mut(|accounts| accounts.gpu += elapsed);
 }
 
+/// What the device reported one kernel's `calls` dispatches executed for, which
+/// is a share of the [`ran_on_the_gpu`] figure for the command buffer they were
+/// in rather than a figure beside it.
+///
+/// Charged per kernel per command buffer rather than per dispatch, so that a
+/// submission holding a thousand of them costs a handful of lookups: a backend
+/// that has timestamps for each one sums them by kernel first, which is the
+/// grain this is read at anyway.
+pub fn dispatched(kernel: &str, calls: u64, elapsed: Duration) {
+    ACCOUNTS.with_borrow_mut(|accounts| {
+        let account = match accounts.kernels.get_mut(kernel) {
+            Some(account) => account,
+            None => accounts.kernels.entry(kernel.to_owned()).or_default(),
+        };
+        account.calls += calls;
+        account.elapsed += elapsed;
+    });
+}
+
 /// Everything charged since the last [`take`], and the accounts cleared.
 ///
 /// Cleared rather than read, so that a caller measuring one step of a loop
@@ -251,6 +301,7 @@ pub fn take() -> Profile {
             elapsed: accounts.elapsed,
             calls: accounts.calls,
             gpu: accounts.gpu,
+            kernels: std::mem::take(&mut accounts.kernels),
         };
         accounts.elapsed = [Duration::ZERO; OPS];
         accounts.calls = [0; OPS];
@@ -265,6 +316,7 @@ pub struct Profile {
     elapsed: [Duration; OPS],
     calls: [u64; OPS],
     gpu: Duration,
+    kernels: BTreeMap<String, Dispatches>,
 }
 
 impl Profile {
@@ -302,6 +354,32 @@ impl Profile {
         rows
     }
 
+    /// Each kernel the device timed dispatches of, heaviest first.
+    ///
+    /// Empty unless a backend was sampling: these come from
+    /// [`dispatched`] rather than from a scope, and what a backend has to do to
+    /// know them is not free.
+    pub fn kernels(&self) -> Vec<(&str, Dispatches)> {
+        let mut rows: Vec<(&str, Dispatches)> = self
+            .kernels
+            .iter()
+            .map(|(kernel, account)| (kernel.as_str(), *account))
+            .collect();
+        rows.sort_by_key(|(_, account)| std::cmp::Reverse(account.elapsed));
+        rows
+    }
+
+    /// What the device was executing for over every kernel [`Profile::kernels`]
+    /// holds, which is the part of [`Profile::gpu`] the sampling accounted for.
+    ///
+    /// The two are not the same number and the gap is the finding rather than
+    /// an error: a command buffer's own clock runs from before its first
+    /// dispatch to after its last, and what the passes inside it do not claim is
+    /// the device's own gaps between them.
+    pub fn dispatched(&self) -> Duration {
+        self.kernels.values().map(|account| account.elapsed).sum()
+    }
+
     /// Each figure divided by the `steps` that produced it, for a profile taken
     /// over a run rather than over one step.
     ///
@@ -314,6 +392,19 @@ impl Profile {
             elapsed: self.elapsed.map(|elapsed| elapsed / steps),
             calls: self.calls.map(|calls| calls / u64::from(steps)),
             gpu: self.gpu / steps,
+            kernels: self
+                .kernels
+                .iter()
+                .map(|(kernel, account)| {
+                    (
+                        kernel.clone(),
+                        Dispatches {
+                            calls: account.calls / u64::from(steps),
+                            elapsed: account.elapsed / steps,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -490,6 +581,76 @@ mod tests {
         );
     }
 
+    /// The per-kernel rows are a subdivision of the device's own clock and not
+    /// a second charge against it, the same way that clock is a subdivision of
+    /// the submission around it. Three figures nested, and the total is still
+    /// the wall time.
+    #[test]
+    fn a_kernels_device_time_is_reported_inside_the_gpus_rather_than_beside_it() {
+        fresh();
+        timed(Op::Submit, || {
+            spin(SPIN);
+            ran_on_the_gpu(SPIN / 2);
+            dispatched("packed_matmul", 3, SPIN / 4);
+            dispatched("rms_norm", 1, SPIN / 8);
+        });
+
+        let profile = take();
+        assert_eq!(profile.dispatched(), SPIN / 4 + SPIN / 8);
+        assert!(profile.dispatched() < profile.gpu());
+        assert_eq!(
+            profile.total(),
+            profile.elapsed(Op::Submit),
+            "a kernel's device time was added to the wall time around it"
+        );
+    }
+
+    /// One kernel is dispatched from several command buffers a step, so what a
+    /// row has to be is the sum over all of them rather than the last one seen.
+    #[test]
+    fn a_kernel_dispatched_from_several_command_buffers_is_one_row() {
+        fresh();
+        dispatched("packed_matmul", 26, SPIN);
+        dispatched("rms_norm", 2, 3 * SPIN);
+        dispatched("packed_matmul", 4, SPIN);
+
+        let profile = take();
+        assert_eq!(
+            profile.kernels(),
+            [
+                (
+                    "rms_norm",
+                    Dispatches {
+                        calls: 2,
+                        elapsed: 3 * SPIN
+                    }
+                ),
+                (
+                    "packed_matmul",
+                    Dispatches {
+                        calls: 30,
+                        elapsed: 2 * SPIN
+                    }
+                ),
+            ],
+            "heaviest first, and one row a kernel"
+        );
+    }
+
+    /// A profile with nothing sampled has no kernel rows at all rather than a
+    /// row of zeroes for every kernel that ran — which is what makes an empty
+    /// table mean "nobody was sampling" and not "the device did nothing".
+    #[test]
+    fn a_profile_taken_without_sampling_has_no_kernel_rows() {
+        fresh();
+        timed(Op::Submit, || ran_on_the_gpu(SPIN));
+
+        let profile = take();
+        assert!(profile.kernels().is_empty());
+        assert_eq!(profile.dispatched(), Duration::ZERO);
+        assert_eq!(profile.gpu(), SPIN);
+    }
+
     /// A table leaves out what a run never reached, and puts the heaviest first
     /// — which is the whole use it is put to.
     #[test]
@@ -519,6 +680,26 @@ mod tests {
         assert!(each.elapsed(Op::Sdpa) >= SPIN / 2);
         assert!(each.elapsed(Op::Sdpa) < 2 * SPIN);
         assert_eq!(each.gpu(), SPIN / 2);
+    }
+
+    #[test]
+    fn a_profile_divides_its_kernel_rows_by_the_steps_too() {
+        fresh();
+        for _ in 0..2 {
+            dispatched("packed_matmul", 26, SPIN);
+        }
+
+        let each = take().per_step(2);
+        assert_eq!(
+            each.kernels(),
+            [(
+                "packed_matmul",
+                Dispatches {
+                    calls: 26,
+                    elapsed: SPIN
+                }
+            )]
+        );
     }
 
     /// A panic unwinding through a scope still closes it, which is what keeps
