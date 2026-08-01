@@ -28,8 +28,8 @@ use inkling_core::{
     split_heads,
 };
 use inkling_metal::{
-    DenseMatmul, DenseWeight, Device, FusedAttention, LayerProjections, MetalError, ModelExperts,
-    ModelProjections, PackedBank, PackedMatmul, PackedProjection, RmsNorm,
+    DenseMatmul, DenseWeight, Device, LayerKernels, LayerProjections, MetalError, ModelExperts,
+    ModelProjections, PackedBank, PackedMatmul, PackedProjection,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -104,6 +104,25 @@ const TOLERANCE: f32 = 1e-6;
 /// the format a kernel can invert — `dense::tests` measures 4.0, six decades
 /// above.
 const GATE_TOLERANCE: f32 = 3e-6;
+
+/// How far a layer answered whole may land from the same layer's pieces run
+/// apart.
+///
+/// The two run the same five projections through the same kernel and the same
+/// attention step through the same kernel, so neither the multiplies nor the
+/// softmax is what separates them. What does is the two short convolutions:
+/// on one side they are a dispatch and on the other they are
+/// `LayerStep::convolved` here, and Metal compiles `acc += w * v` with fast math
+/// on and may contract it to an FMA — one rounding a tap where the CPU takes
+/// two. Every kernel in this tree is held to the CPU within a bound for a reason
+/// of this shape; this one is four taps wide and then goes through a softmax.
+///
+/// Worst observed when this landed: 2.7e-7, about four f32 ulps of the layer's
+/// output peak, which leaves a factor of three and a half. What the bound has to
+/// tell that from is a span read under the wrong stride, and the assertion below
+/// says what that scale is: the same row against a layer that has seen nothing
+/// lands 1.1 away, six decades above.
+const LAYER_TOLERANCE: f32 = 1e-6;
 
 fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var_os(CHECKPOINT_VAR).map(PathBuf::from);
@@ -484,32 +503,33 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// dispatches alone would watch the number that cannot change while the one
 /// that pays for it doubled underneath.
 ///
-/// Per layer: the input layernorm and the four projections that consume what it
-/// produced in one submission, then the attention step and `o_proj` in a second
-/// — and per MoE layer seven expert dispatches in three, being the shared bank's
-/// gate and up *together with the router's own gate*, then its down *together
-/// with the routed bank's gate and up*, then the routed bank's down. A dense
-/// layer's feed-forward network is three in two. The head is one of each.
+/// Per layer: the input layernorm, the four projections that consume what it
+/// produced and the two short convolutions behind `k` and `v` in one submission,
+/// then the attention step and `o_proj` in a second — and per MoE layer seven
+/// expert dispatches in three, being the shared bank's gate and up *together
+/// with the router's own gate*, then its down *together with the routed bank's
+/// gate and up*, then the routed bank's down. A dense layer's feed-forward
+/// network is three in two. The head is one of each.
 ///
-/// **Four terms here say what a submission is worth.** The layer's norm, the
-/// router's gate and the attention step are each a dispatch that costs no
-/// submission, encoded into a command buffer their consumer was already going to
-/// be submitted in. The seam between the two banks is a submission no layer
-/// needs at all: the shared bank's last dispatch and the routed bank's first
-/// read nothing of each other, which is visible to a backend handed the whole
-/// layer and to nothing else. Forty of them is 40 round trips a step that are
-/// not taken.
+/// **Six terms here say what a submission is worth.** The layer's norm, its two
+/// convolutions, the router's gate and the attention step are each a dispatch
+/// that costs no submission, encoded into a command buffer their consumer was
+/// already going to be submitted in. The seam between the two banks is a
+/// submission no layer needs at all: the shared bank's last dispatch and the
+/// routed bank's first read nothing of each other, which is visible to a backend
+/// handed the whole layer and to nothing else. Forty of them is 40 round trips a
+/// step that are not taken.
 ///
-/// **What the attention step did not buy is a submission**, and the shape here
-/// says why. The step is in the second of the layer's two command buffers and
-/// not the first, because the two short convolutions and the two head norms
-/// between `q`, `k`, `v` and it still run on the CPU — so the first buffer is
-/// closed and waited for before the step's inputs exist. Those four are what
-/// stands between 2 submissions a layer and 1.
+/// **What neither the attention step nor the convolutions bought is a
+/// submission**, and the shape here says why. The step is in the second of the
+/// layer's two command buffers and not the first, because the two head norms
+/// between `q`, `k` and it still run on the CPU — so the first buffer is closed
+/// and waited for before the step's inputs exist. Those two are what stands
+/// between 2 submissions a layer and 1.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
     (
-        7 * layers + 3 * dense + 7 * moe + 1,
+        9 * layers + 3 * dense + 7 * moe + 1,
         2 * layers + 2 * dense + 3 * moe + 1,
     )
 }
@@ -545,7 +565,8 @@ struct OnTheDevice {
 
 impl OnTheDevice {
     fn generate(dir: &Path, device: &Device) -> Self {
-        let matmul = PackedMatmul::new(device).expect("the packed matmul compiles");
+        let kernels = LayerKernels::compile(device).expect("the layer kernels compile");
+        let matmul = kernels.matmul();
         let dense = DenseMatmul::new(device).expect("the dense matmul compiles");
         let config = fixture::config(dir).text_config;
         let ckpt = Checkpoint::open(dir).expect("checkpoint opens");
@@ -556,7 +577,7 @@ impl OnTheDevice {
         let started = Instant::now();
         let head = PackedProjection::wrap_packed(
             device,
-            &matmul,
+            matmul,
             &weights.head_packed(),
             weights.head().vocab(),
         )
@@ -564,7 +585,7 @@ impl OnTheDevice {
         let banks = weights.expert_banks();
         let experts = ModelExperts::wrap(
             device,
-            &matmul,
+            matmul,
             &dense,
             &banks,
             config.num_hidden_layers,
@@ -572,17 +593,9 @@ impl OnTheDevice {
         )
         .expect("the banks wrap");
         let packed = weights.layer_projections();
-        let norm = RmsNorm::new(device).expect("the norm compiles");
-        let step = FusedAttention::new(device).expect("the attention step compiles");
-        let projections = ModelProjections::wrap(
-            device,
-            &matmul,
-            &norm,
-            &step,
-            &packed,
-            config.num_hidden_layers,
-        )
-        .expect("the projections wrap");
+        let projections =
+            ModelProjections::wrap(device, &kernels, &packed, config.num_hidden_layers)
+                .expect("the projections wrap");
 
         let mut run = Self {
             expert_layers: experts.layers(),
@@ -927,22 +940,10 @@ fn a_layers_whole_attention_matches_its_pieces_run_apart() {
     let config = fixture::config(&dir).text_config;
     let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
 
-    let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
-    let norm = RmsNorm::new(&device).expect("the norm compiles");
-    let step = FusedAttention::new(&device).expect("the attention step compiles");
+    let kernels = LayerKernels::compile(&device).expect("the layer kernels compile");
     let packed = weights.layer_projections();
     let layer = &packed[LAYER];
-    let five = LayerProjections::wrap(
-        &device,
-        &matmul,
-        &norm,
-        &step,
-        &layer.attention,
-        &layer.input_layernorm,
-        &layer.rel_proj,
-        layer.config,
-    )
-    .expect("the layer wraps");
+    let five = LayerProjections::wrap(&device, &kernels, layer).expect("the layer wraps");
 
     let shape = layer.config;
     let heads = HeadTensors::open(&ckpt, LAYER);
@@ -954,6 +955,7 @@ fn a_layers_whole_attention_matches_its_pieces_run_apart() {
     let (mut resident, mut apart) = (fresh(), fresh());
     let (mut keys, mut values) = (Vec::new(), Vec::new());
     let (mut at, mut last) = (0, Vec::new());
+    let mut worst = 0.0f32;
 
     for rows in [5, 1, 1, 1] {
         let call = &x[at * HIDDEN..(at + rows) * HIDDEN];
@@ -978,7 +980,12 @@ fn a_layers_whole_attention_matches_its_pieces_run_apart() {
             q_offset: at,
         });
 
-        assert_eq!(fused, whole, "{rows} rows at offset {at}");
+        let deviation = deviation(&fused, &whole);
+        assert!(
+            deviation <= LAYER_TOLERANCE,
+            "{rows} rows at offset {at}: deviation {deviation:e}"
+        );
+        worst = worst.max(deviation);
         at += rows;
         assert_eq!(resident.seen(), at, "the sequence's count");
         last = fused;
@@ -991,7 +998,9 @@ fn a_layers_whole_attention_matches_its_pieces_run_apart() {
     let alone = five
         .layer(&mut fresh(), heads.step(layer, &x[(at - 1) * HIDDEN..], 0))
         .expect("the layer answers for itself");
-    assert_ne!(alone, last, "the sequence's own state did not reach it");
+    let carried = deviation(&alone, &last);
+    eprintln!("worst deviation over four calls: {worst:e}, against {carried:e} for the state");
+    assert!(carried > LAYER_TOLERANCE, "deviation {carried:e}");
 }
 
 /// The other shape in the model, which the head does not cover: one expert of a

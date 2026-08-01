@@ -196,6 +196,17 @@ impl Pending {
         Self { out: Some(out) }
     }
 
+    /// The buffer itself, for a caller that has another dispatch to feed with it
+    /// rather than a value to read.
+    ///
+    /// Panics on a call with no rows, which is a caller asking a *second*
+    /// dispatch to consume nothing — and the device refuses a zero-length
+    /// buffer, so there would be nothing to hand it. A forward pass over no
+    /// tokens is not a chain of dispatches; it is not a forward pass.
+    pub(crate) fn buffer(self) -> Buffer<f32> {
+        self.out.expect("a dispatch over no rows has no output")
+    }
+
     /// The values, once the batch this was encoded into has been waited for.
     pub fn take(self) -> Vec<f32> {
         let _timed = profile::scope(Op::Readback);

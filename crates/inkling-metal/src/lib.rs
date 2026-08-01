@@ -19,7 +19,8 @@
 //! activations rather than a weight — and so the first whose output is worth
 //! leaving on the device — and [`attention`], which consumes nothing but
 //! activations and is the one operation in the model with no weight to multiply
-//! against at all.
+//! against at all. [`sconv`] is where a layer's position comes from, and the one
+//! kernel here that carries state from one call to the next.
 
 pub mod attention;
 pub mod buffer;
@@ -30,6 +31,7 @@ pub mod kernel;
 pub mod matmul;
 pub mod norm;
 pub mod projections;
+pub mod sconv;
 
 #[cfg(test)]
 mod testing;
@@ -42,4 +44,5 @@ pub use experts::{ExpertBanks, LayerExperts, ModelExperts};
 pub use kernel::{Grid, Kernel};
 pub use matmul::{MatmulError, PackedBank, PackedMatmul, PackedProjection};
 pub use norm::{LayerNorm, RmsNorm};
-pub use projections::{DenseFfn, LayerProjections, ModelProjections};
+pub use projections::{DenseFfn, LayerKernels, LayerProjections, ModelProjections};
+pub use sconv::{LayerConv, ShortConvolution};

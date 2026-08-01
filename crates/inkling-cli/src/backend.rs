@@ -9,8 +9,8 @@
 //! layernorm goes over with its projections because they are the only thing
 //! that reads it — as does the band its attention step contracts against, which
 //! is the one handover that is an operation rather than a weight. What is left
-//! on the CPU is each layer's second norm, the convolutions, the two head norms
-//! inside attention, and the routers.
+//! on the CPU is each layer's second norm, the two convolutions on the residual
+//! path, the two head norms inside attention, and the routers.
 //!
 //! Nothing downstream branches on the choice — not the generation loop, not the
 //! server, not the head's own arithmetic — which is what makes "the CPU path
@@ -35,43 +35,38 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
 use inkling_metal::{
-    DenseMatmul, Device, FusedAttention, ModelExperts, ModelProjections, PackedMatmul,
-    PackedProjection, RmsNorm,
+    DenseMatmul, Device, LayerKernels, ModelExperts, ModelProjections, PackedProjection,
 };
 
 use crate::LABEL;
 use crate::args::Backend;
 
-/// What a Metal-backed run holds for its whole life: the device, and the four
+/// What a Metal-backed run holds for its whole life: the device, and the
 /// compiled kernels everything on it shares.
 ///
 /// None of them is about a weight. No kernel's source names a shape, so one of
 /// each serves the whole model — and all of them are opened before the
 /// checkpoint, so that a machine this cannot run on says so in a millisecond
 /// rather than after mapping 130 GiB.
+///
+/// The dense matmul is the one a layer does not reach: it is the router's gate,
+/// which is the single weight the quantiser left in bfloat16.
 #[derive(Debug)]
 pub struct Gpu {
     device: Device,
-    matmul: PackedMatmul,
+    kernels: LayerKernels,
     dense: DenseMatmul,
-    norm: RmsNorm,
-    attention: FusedAttention,
 }
 
 impl Gpu {
     fn open() -> Result<Self> {
         let device = Device::open().context("opening a Metal device")?;
-        let matmul = PackedMatmul::new(&device).context("compiling the packed matmul")?;
+        let kernels = LayerKernels::compile(&device).context("compiling a layer's kernels")?;
         let dense = DenseMatmul::new(&device).context("compiling the dense matmul")?;
-        let norm = RmsNorm::new(&device).context("compiling the RMSNorm")?;
-        let attention =
-            FusedAttention::new(&device).context("compiling the fused attention step")?;
         Ok(Self {
             device,
-            matmul,
+            kernels,
             dense,
-            norm,
-            attention,
         })
     }
 }
@@ -109,14 +104,18 @@ pub fn weights<'a>(
 
     let rows = weights.head().vocab();
     let started = Instant::now();
-    let head =
-        PackedProjection::wrap_packed(&gpu.device, &gpu.matmul, &weights.head_packed(), rows)
-            .context("giving lm_head to the Metal device")?;
+    let head = PackedProjection::wrap_packed(
+        &gpu.device,
+        gpu.kernels.matmul(),
+        &weights.head_packed(),
+        rows,
+    )
+    .context("giving lm_head to the Metal device")?;
 
     let banks = weights.expert_banks();
     let experts = ModelExperts::wrap(
         &gpu.device,
-        &gpu.matmul,
+        gpu.kernels.matmul(),
         &gpu.dense,
         &banks,
         config.num_hidden_layers,
@@ -125,15 +124,9 @@ pub fn weights<'a>(
     .context("giving the expert banks to the Metal device")?;
 
     let packed = weights.layer_projections();
-    let projections = ModelProjections::wrap(
-        &gpu.device,
-        &gpu.matmul,
-        &gpu.norm,
-        &gpu.attention,
-        &packed,
-        config.num_hidden_layers,
-    )
-    .context("giving the layers' projections to the Metal device")?;
+    let projections =
+        ModelProjections::wrap(&gpu.device, &gpu.kernels, &packed, config.num_hidden_layers)
+            .context("giving the layers' projections to the Metal device")?;
     eprintln!(
         "{:<LABEL$}metal, {rows} rows of lm_head, {} MoE layers' banks and all {} layers' \
          projections wrapped in {:.2?}",

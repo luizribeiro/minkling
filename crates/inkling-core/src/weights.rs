@@ -609,6 +609,17 @@ pub struct LayerPacked<'a> {
     /// answering [`Projections::attend`] is the thing that forms the bias, and
     /// what it forms the bias out of is this.
     pub rel_proj: Vec<f32>,
+    /// The kernels of the two short convolutions inside attention, `[channels,
+    /// taps]` each, widened for the same reason again — 16 KB of bfloat16
+    /// apiece.
+    ///
+    /// Here because of where they sit: they consume what `k_proj` and `v_proj`
+    /// produced and nothing else does, and what they produce is read by the
+    /// attention step and by the cache. A backend answering
+    /// [`Projections::layer`] is the only thing that can run them without a
+    /// value crossing back, and these are what it runs them against.
+    pub k_sconv: Vec<f32>,
+    pub v_sconv: Vec<f32>,
     /// The shapes and scalars `InklingAttention.__init__` derived for the layer,
     /// which the tensors do not carry: which of the two sets of head counts the
     /// layer read, and whether it has a window at all.
@@ -746,6 +757,8 @@ impl<'a> CheckpointWeights<'a> {
                     layer,
                     input_layernorm: self.layers[layer].input_layernorm.clone(),
                     rel_proj: self.layers[layer].rel_proj.clone(),
+                    k_sconv: self.layers[layer].k_sconv.clone(),
+                    v_sconv: self.layers[layer].v_sconv.clone(),
                     config: AttentionConfig::for_layer(self.config, layer),
                     attention: PackedAttention {
                         q_proj: packed("self_attn.q_proj"),

@@ -406,13 +406,26 @@ impl LayerStep<'_> {
     /// `cache`'s; the keys and values they produce are the caller's to put
     /// wherever it holds them.
     pub fn convolved(&self, cache: &mut AttentionCache, projected: &Qkvr) -> Convolved {
-        let (heads, head_dim) = (self.sdpa.heads(), self.sdpa.head_dim());
-        let norm = |x: &[f32], weight| rms_norm(x, weight, self.eps);
-
         let (k_state, v_state) = cache.convolutions();
         let k = self.k_sconv.forward(k_state, &projected.k, None);
         let v = self.v_sconv.forward(v_state, &projected.v, None);
-        let mut q = split_heads(&norm(&projected.q, self.q_norm), heads, head_dim);
+        let (q, k) = self.head_norms(&projected.q, &k);
+        Convolved { q, k, v }
+    }
+
+    /// The two head norms alone, on the CPU: the query as the attention step
+    /// reads it and the key as the cache holds it.
+    ///
+    /// `k` is the key *after* its convolution, which is where the reference
+    /// norms it — before it would be a layer that still runs.
+    ///
+    /// Apart from [`LayerStep::convolved`] because the four operations move to a
+    /// backend one at a time: a backend that has a kernel for the convolutions
+    /// and not for the norms runs the convolutions there and asks for these.
+    pub fn head_norms(&self, q: &[f32], k: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let (heads, head_dim) = (self.sdpa.heads(), self.sdpa.head_dim());
+        let norm = |x: &[f32], weight| rms_norm(x, weight, self.eps);
+        let mut q = split_heads(&norm(q, self.q_norm), heads, head_dim);
 
         // Both tensors log scaling touches are `[heads, queries, stride]` with
         // the query minor, so cycling over the queries walks their rows in
@@ -424,12 +437,7 @@ impl LayerStep<'_> {
                 }
             }
         }
-
-        Convolved {
-            q,
-            k: norm(&k, self.k_norm),
-            v,
-        }
+        (q, norm(k, self.k_norm))
     }
 }
 
