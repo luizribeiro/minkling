@@ -175,7 +175,7 @@ impl<'a> LayerConv<'a> {
     pub fn forward(&self, x: &[f32]) -> Result<Vec<f32>, MetalError> {
         let mut batch = self.device.batch()?;
         let mut input = self.device.buffer(x)?;
-        let out = self.encode(&mut batch, &mut input)?;
+        let out = self.encode(&mut batch, &mut input, None)?;
         batch.wait()?;
         Ok(profile::timed(Op::Readback, || out.to_vec()))
     }
@@ -195,12 +195,14 @@ impl<'a> LayerConv<'a> {
         &self,
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
+        carried: Option<&mut Buffer<f32>>,
     ) -> Result<Buffer<f32>, MetalError> {
         let rows = self.rows(x.len());
         let mut out = self.device.zeroed::<f32>(x.len())?;
         self.encode_over(
             batch,
             x,
+            carried,
             Landing {
                 out: &mut out,
                 groups: 1,
@@ -220,10 +222,21 @@ impl<'a> LayerConv<'a> {
     /// the split into heads and the append are the indexing of the write. The
     /// key's convolution has a head norm behind it and lands in a buffer of its
     /// own.
+    ///
+    /// `carried` is the layer's *own* residual — the value before the norm the
+    /// block this convolution ends began with — added to every row on the way
+    /// out. It is a second addend and not a second convolution: `out = conv(x) +
+    /// x + carried`, where `+ x` is the convolution's own residual and belongs
+    /// to it wherever it runs. The two inside attention have no block around
+    /// them and pass `None`; the two on a layer's residual path are the whole
+    /// reason this argument exists, since the add is otherwise the one operation
+    /// that would force the command buffer closed between `o_proj` and the
+    /// second norm.
     pub fn encode_over(
         &self,
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
+        carried: Option<&mut Buffer<f32>>,
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
@@ -238,6 +251,13 @@ impl<'a> LayerConv<'a> {
         );
         landing.fits(rows, self.channels / landing.groups);
 
+        if let Some(carried) = &carried {
+            assert_eq!(
+                carried.len(),
+                x.len(),
+                "a residual against what it is added to"
+            );
+        }
         let fields = [
             extent(rows, "the rows of a call"),
             extent(self.channels, "the channels of a convolution"),
@@ -245,6 +265,7 @@ impl<'a> LayerConv<'a> {
             extent(landing.groups, "the groups of a row"),
             extent(landing.stride, "the rows a group has room for"),
             extent(landing.base, "where a call's rows start"),
+            carried.is_some() as u32,
         ];
         let mut shape = self.device.inline(&fields)?;
         let mut weight = self.weight.borrow_mut();
@@ -253,6 +274,15 @@ impl<'a> LayerConv<'a> {
         let (window, kept) = match self.reading.get() {
             0 => (first, second),
             _ => (second, first),
+        };
+
+        // A slot the kernel is told to ignore still has to be filled, and one
+        // float in the command buffer is what filling it costs — see
+        // `Device::inline`, which allocates nothing for a value this small.
+        let mut absent = self.device.inline(&[0.0f32])?;
+        let carried = match carried {
+            Some(carried) => carried.arg(),
+            None => absent.arg(),
         };
 
         // A thread to each channel of each timestep, and one more timestep's
@@ -269,6 +299,7 @@ impl<'a> LayerConv<'a> {
                 window.arg(),
                 landing.out.arg(),
                 kept.arg(),
+                carried,
             ],
             Grid::new(threads, THREADS_PER_GROUP),
         )?;
@@ -301,6 +332,7 @@ struct Shape {
     uint groups;
     uint stride;
     uint base;
+    uint carried;
 };
 
 /// One channel of one timestep of `window ++ x`, which is the padded sequence
@@ -333,6 +365,13 @@ inline float padded(
 /// anything scaled: `out = conv(x) + x`. Dropping it leaves a convolution that is
 /// still smooth, still causal and still plausible.
 ///
+/// **`carried` is a second residual and belongs to the layer, not here.** A
+/// convolution on a residual path has its rows added to the value the block
+/// began with, and that add is what would otherwise force a command buffer
+/// closed between the block and the norm after it. One addend more costs a read
+/// and nothing else; the two convolutions inside attention have no block around
+/// them and clear the flag.
+///
 /// The taps are walked from zero and accumulated in that order, which is the
 /// order `inkling_core::sconv` accumulates them in — and which is what makes a
 /// sequence split anywhere the same sequence, since the only thing a split
@@ -344,6 +383,7 @@ kernel void short_conv(
     device const float *window [[buffer(3)]],
     device float *out [[buffer(4)]],
     device float *kept [[buffer(5)]],
+    device const float *carried [[buffer(6)]],
     uint id [[thread_position_in_grid]]
 ) {
     const uint lead = shape.taps - 1;
@@ -369,6 +409,11 @@ kernel void short_conv(
         acc += taps[k] * padded(x, window, shape, t + k, c);
     }
 
+    acc += x[t * shape.channels + c];
+    if (shape.carried) {
+        acc += carried[t * shape.channels + c];
+    }
+
     // Where the row lands, which for the value's convolution is the span the
     // layer keeps — see `Landing`. With one group and a stride of `rows` this is
     // `out[t * channels + c]`, the row where it was computed.
@@ -376,7 +421,7 @@ kernel void short_conv(
     const uint group = c / width;
     device float *result =
         out + ((ulong)group * shape.stride + shape.base + t) * width + (c % width);
-    *result = acc + x[t * shape.channels + c];
+    *result = acc;
 }
 "#;
 
@@ -651,10 +696,7 @@ mod tests {
         layer.restart();
         let want = layer.forward(sequence).expect("the dispatch completes");
 
-        let without = BODY.replace(
-            "*result = acc + x[t * shape.channels + c];",
-            "*result = acc;",
-        );
+        let without = BODY.replace("acc += x[t * shape.channels + c];", "");
         assert_ne!(without, BODY, "the mutation changed nothing");
         let mutant = ShortConvolution::from_source(&device, &without).expect("the mutant compiles");
         let dropped = fx.wrapped(&device, &mutant, &fx.weight);
@@ -666,6 +708,52 @@ mod tests {
         );
         eprintln!("the residual dropped: deviation {deviation:e}");
         assert!(deviation > TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// **The layer's own residual is a second addend, not a second operation.**
+    /// A convolution on a residual path has its rows added to the value the
+    /// block began with, and that add is the whole of what would otherwise close
+    /// the command buffer between `o_proj` and the layer's second norm.
+    ///
+    /// Exact rather than bounded, and that is the claim: the taps are summed in
+    /// the same order either way and the carried value is added last, so what a
+    /// dispatch carrying it produces is what the same dispatch produced plus
+    /// that value element for element. A kernel that folded it into the
+    /// accumulation instead would be within a tolerance and outside this.
+    ///
+    /// The carried rows are not the input, which is the mistake worth catching:
+    /// against `carried == x` a kernel that added the input twice would agree.
+    #[test]
+    fn the_carried_residual_is_added_to_what_the_convolution_returns() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let fx = Synthetic::load();
+        let layer = fx.wrapped(&device, &conv, &fx.weight);
+        let sequence = fx.sequence(&fx.input, 0);
+        let carried: Vec<f32> = (0..sequence.len())
+            .map(|i| ((i * 29 % 53) as f32 - 26.0) / 4.0)
+            .collect();
+        assert_ne!(carried, sequence, "a residual equal to the input");
+
+        layer.restart();
+        let alone = layer.forward(sequence).expect("the dispatch completes");
+
+        layer.restart();
+        let mut input = device.buffer(sequence).expect("the rows upload");
+        let mut residual = device.buffer(&carried).expect("the residual uploads");
+        let mut batch = device.batch().expect("a command buffer opens");
+        let out = layer
+            .encode(&mut batch, &mut input, Some(&mut residual))
+            .expect("the convolution encodes");
+        batch.wait().expect("the batch completes");
+
+        let want: Vec<f32> = alone.iter().zip(&carried).map(|(a, b)| a + b).collect();
+        assert_eq!(out.to_vec(), want);
+        assert_eq!(
+            layer.window(),
+            sequence[sequence.len() - (fx.kernel_size - 1) * fx.channels..],
+            "the window is the input's, whatever was carried"
+        );
     }
 
     /// **Where the value's convolution ends.** Its rows go straight into the
@@ -712,6 +800,7 @@ mod tests {
                 .encode_over(
                     &mut batch,
                     &mut input,
+                    None,
                     Landing {
                         out: &mut span,
                         groups,

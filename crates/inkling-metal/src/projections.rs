@@ -264,8 +264,8 @@ impl<'a> LayerProjections<'a> {
 
         let queries = q.len() / (step.sdpa.heads() * step.sdpa.head_dim());
         let (keys, values) = span.landings();
-        let mut k = self.k_sconv.encode(batch, &mut k)?;
-        self.v_sconv.encode_over(batch, &mut v, values)?;
+        let mut k = self.k_sconv.encode(batch, &mut k, None)?;
+        self.v_sconv.encode_over(batch, &mut v, None, values)?;
 
         let mut headed = device.zeroed::<f32>(q.len())?;
         self.q_norm.encode_over(
