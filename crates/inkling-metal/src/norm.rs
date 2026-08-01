@@ -73,6 +73,9 @@ const ENTRY: &str = "rms_norm";
 /// width it was 250 microseconds of device time for 16 KB read three times,
 /// which is more than the submission around it. Eight simdgroups on the same row
 /// is `a_decode_shaped_norm_costs_less_than_the_submission_around_it`.
+///
+/// It is a ceiling rather than the count: [`LayerNorm::threads_per_group`] takes
+/// the narrower of this and what the group has lanes for.
 const THREADS_PER_GROUP: usize = 256;
 
 /// Floats one thread reads at a stride, where the group's width is a multiple of
@@ -139,6 +142,11 @@ pub struct LayerNorm<'a> {
     /// a norm is bound once per call while the weight belongs to the norm.
     weight: RefCell<Buffer<f32>>,
     width: usize,
+    /// What [`LayerNorm::threads_per_group`] worked out, held rather than asked
+    /// again: it is decided by the weight's width and the kernel's simdgroup,
+    /// and neither moves once a norm exists, where a decode step encodes four of
+    /// these a layer.
+    threads: usize,
     eps: f32,
 }
 
@@ -152,6 +160,7 @@ impl<'a> LayerNorm<'a> {
         Ok(Self {
             weight: RefCell::new(device.buffer(weight)?),
             width: weight.len(),
+            threads: Self::threads_per_group(weight.len(), norm.kernel.simd_width()),
             device,
             norm,
             eps,
@@ -246,6 +255,32 @@ impl<'a> LayerNorm<'a> {
         self.encoding(batch, x, scale, landing)
     }
 
+    /// Threads the threadgroup over one group holds: whole simdgroups enough to
+    /// give each thread a lane of the group, and never more than
+    /// [`THREADS_PER_GROUP`].
+    ///
+    /// **A threadgroup wider than its group is threads that read nothing and
+    /// wait at both barriers anyway.** A head norm is 128 wide, which is 32
+    /// lanes of [`LANE`], so seven of every eight of [`THREADS_PER_GROUP`] have
+    /// no stride to run — and a prefill gives one threadgroup to each (row,
+    /// head), so it pays for all of them: 33 microseconds a dispatch against 10
+    /// over a 97-token prompt's query norm.
+    ///
+    /// The simdgroup is asked of the kernel rather than assumed, for
+    /// [`Kernel::simd_width`](crate::kernel::Kernel::simd_width)'s reason: both
+    /// reductions inside are `simd_`-prefixed and their partials are indexed by
+    /// simdgroup, so a threadgroup that was not whole simdgroups would leave one
+    /// of them holding a partial answer nothing reduces. The cap is the one
+    /// place that can still round to a part of one, and a group wide enough to
+    /// reach it has lanes for every thread anyway.
+    fn threads_per_group(width: usize, simd: usize) -> usize {
+        let lanes = match width % LANE {
+            0 => width / LANE,
+            _ => width,
+        };
+        (lanes.div_ceil(simd) * simd).min(THREADS_PER_GROUP)
+    }
+
     /// How many rows of this norm's width `values` is.
     fn rows(&self, values: usize) -> usize {
         assert_eq!(
@@ -300,7 +335,7 @@ impl<'a> LayerNorm<'a> {
         // the threadgroup's own position and so what makes the barriers inside
         // uniform: a threadgroup either runs a group or returns from one, and
         // never splits over the question.
-        let grid = Grid::new(rows * landing.groups * THREADS_PER_GROUP, THREADS_PER_GROUP);
+        let grid = Grid::new(rows * landing.groups * self.threads, self.threads);
         // The rows in, the same rows out, the one weight every row of every call
         // reads, and a scale for each row.
         let moves = size_of::<f32>() * (2 * x.len() + self.width + rows);
@@ -915,8 +950,8 @@ mod tests {
 
     /// A width no power of two divides leaves threads idle on the last stride
     /// of every pass, and it leaves the two reductions with simdgroups that
-    /// contributed nothing — 37 values are read a float at a time, so over 256
-    /// threads seven simdgroups hold one lane's worth each and one holds none.
+    /// contributed nothing — 37 values are read a float at a time, and the two
+    /// simdgroups the threadgroup is sized to hold 32 of them and 5.
     #[test]
     fn a_width_narrower_than_the_threadgroup_still_reproduces_the_cpu() {
         let Some(device) = device() else { return };
@@ -1146,6 +1181,56 @@ mod tests {
 
         eprintln!("a [1, {width}] norm submitted on its own: {each:.2?}");
         assert!(each < std::time::Duration::from_millis(2), "{each:?}");
+    }
+
+    /// **A group's threadgroup is the simdgroups its lanes need**, which is the
+    /// one thing about this dispatch that no other case here can see: the kernel
+    /// strides over the group by `threads_per_threadgroup` whatever that is, so
+    /// a threadgroup of the wrong width still normalises correctly and every
+    /// other test in this module passes.
+    ///
+    /// The two anchors are the shapes the model runs — a head norm's 128 and the
+    /// hidden width's 4096 — and the rest is the two ways the sizing can be
+    /// wrong. A threadgroup narrower than the group's lanes is a thread doing
+    /// two strides where the cap did not ask it to; a threadgroup a whole
+    /// simdgroup wider is 32 threads that read nothing and wait at both
+    /// barriers.
+    #[test]
+    fn a_groups_threadgroup_is_the_simdgroups_its_lanes_need() {
+        let Some(device) = device() else { return };
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let simd = norm.kernel.simd_width();
+        let sized = |width: usize| {
+            LayerNorm::new(&device, &norm, &vec![1.0; width], 1e-6)
+                .expect("the weight uploads")
+                .threads
+        };
+
+        assert_eq!(sized(128), simd, "a head norm is one simdgroup of lanes");
+        assert_eq!(sized(4096), THREADS_PER_GROUP, "the hidden width fills one");
+
+        for width in [1, 2, 16, 33, 37, 40, 48, 128, 256, 1024, 4096] {
+            let lanes = if width % LANE == 0 {
+                width / LANE
+            } else {
+                width
+            };
+            let threads = sized(width);
+            assert!(threads <= THREADS_PER_GROUP, "{width}: {threads}");
+            assert_eq!(
+                threads % simd,
+                0,
+                "{width}: {threads} is a partial simdgroup"
+            );
+            assert!(
+                threads >= lanes.min(THREADS_PER_GROUP),
+                "{width}: {lanes} lanes over {threads} threads"
+            );
+            assert!(
+                threads == THREADS_PER_GROUP || threads - simd < lanes,
+                "{width}: a simdgroup of {threads} has no lane to read"
+            );
+        }
     }
 
     /// **What each norm a layer runs costs the device**, at the shape a decode
