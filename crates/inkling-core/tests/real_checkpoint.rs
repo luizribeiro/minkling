@@ -376,7 +376,7 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     let shared = packed_experts(&ckpt, layer, "shared_experts");
     let got = moe.forward(&x, |_, gathered, route| BankRows {
         shared: through_bank(&shared, gathered),
-        routed: through_bank(&routed, route(None).gathered()),
+        routed: through_bank(&routed, route(None).expect("rows to gather").gathered()),
     });
 
     let mut worst = 0.0f32;
@@ -403,7 +403,7 @@ fn the_moe_layer_reproduces_the_reference_against_real_weights() {
     // shared bank is two experts rather than the routed bank's 256.
     let exchanged = moe.forward(&x, |_, gathered, route| BankRows {
         shared: through_bank_reversed(&shared, gathered),
-        routed: vec![0.0; route(None).gathered().rows().len()],
+        routed: vec![0.0; route(None).expect("rows to gather").gathered().rows().len()],
     });
     let deviation = deviation(&exchanged.shared, &recorded("shared_out"));
     assert!(

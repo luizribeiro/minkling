@@ -53,7 +53,7 @@
 //! `Vec<f32>` here.
 
 use inkling_core::layer::Experts;
-use inkling_core::moe::{BankRows, Gathered, Rows};
+use inkling_core::moe::{BankRows, Gathered, Routed, Rows};
 use inkling_core::weights::{ExpertBackend, LayerBanks, PackedExperts};
 
 use crate::buffer::Buffer;
@@ -315,7 +315,7 @@ impl<'a> LayerExperts<'a> {
         &self,
         x: &[f32],
         shared: Gathered<'_>,
-        route: &mut dyn FnMut(Option<&[f32]>) -> Rows,
+        route: &mut dyn FnMut(Option<Routed<'_>>) -> Option<Rows>,
     ) -> Result<BankRows, MatmulError> {
         let shared_chosen = chosen(shared);
 
@@ -326,7 +326,8 @@ impl<'a> LayerExperts<'a> {
             .encode(&mut batch, &shared_chosen, shared.rows())?;
         batch.wait()?;
 
-        let routed_rows = route(Some(&logits.take()));
+        let routed_rows = route(Some(Routed::Logits(&logits.take())))
+            .expect("the layer gathers the rows it named");
         let routed = routed_rows.gathered();
         let routed_chosen = chosen(routed);
 
@@ -392,7 +393,7 @@ impl Experts for LayerExperts<'_> {
         &self,
         x: &[f32],
         shared: Gathered<'_>,
-        route: &mut dyn FnMut(Option<&[f32]>) -> Rows,
+        route: &mut dyn FnMut(Option<Routed<'_>>) -> Option<Rows>,
     ) -> BankRows {
         self.encode(x, shared, route)
             .unwrap_or_else(|err| panic!("the layer's experts did not run: {err}"))
@@ -754,9 +755,10 @@ mod tests {
 
         let mut asked = None;
         let (got, together) = spent(&device, || {
-            layer.banks(&x, shared, &mut |logits| {
-                asked = Some(logits.expect("the backend holds the gate").to_vec());
-                Rows::new(DIM, routed_chosen.to_vec(), routed_x.clone())
+            layer.banks(&x, shared, &mut |routed| {
+                let logits = routed.expect("the backend holds the gate").logits();
+                asked = Some(logits.to_vec());
+                Some(Rows::new(DIM, routed_chosen.to_vec(), routed_x.clone()))
             })
         });
 

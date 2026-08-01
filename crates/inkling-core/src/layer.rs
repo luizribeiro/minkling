@@ -34,7 +34,7 @@
 use std::borrow::Cow;
 
 use crate::attention::{Attention, AttentionCache, AttentionConfig, AttentionWeights};
-use crate::moe::{BankRows, Gathered, Rows, SparseMoe};
+use crate::moe::{BankRows, Gathered, Routed, Rows, SparseMoe};
 use crate::ops::{DenseMlp, rms_norm};
 use crate::profile::{self, Op};
 use crate::sconv::{ConvState, ShortConv};
@@ -56,18 +56,17 @@ pub trait Experts {
     /// The always-on shared bank, over every token, once per shared expert.
     fn shared(&self, gathered: Gathered<'_>) -> Vec<f32>;
 
-    /// Both banks and, where this backend holds the router's gate, the
-    /// `[tokens, n_routed + n_shared]` logits for `x` that route the first of
-    /// them — the whole layer in one call.
+    /// Both banks and, where this backend holds the router's gate, what its own
+    /// router got to — the whole layer in one call. See [`Routed`].
     ///
     /// **One call because what is adjacent inside a layer is what a backend can
     /// merge, and only a backend handed the layer can see what is adjacent.**
-    /// [`SparseMoe::forward`] states the two orderings that decide it: the
-    /// shared bank does not wait for the gate, and the routing that names the
-    /// routed bank's rows is computed from logits the gate hands over before
-    /// either bank has finished. On this machine a submission is 206
-    /// microseconds around work that is already done, and a MoE layer is 3 of
-    /// them out of a step's 167.
+    /// [`SparseMoe::forward`] states the ordering that decides it: the shared
+    /// bank does not wait for the gate, so the gate's multiply rides in the
+    /// command buffer that bank already opens. What a backend that also picks
+    /// the experts adds is that nothing between the gate and the routed bank's
+    /// last dispatch waits for this side at all. On this machine a marginal
+    /// submission is about 156 microseconds around work that is already done.
     ///
     /// The default holds no gate and runs the two banks in the order the layer
     /// names them, which is what a backend that decodes an expert at a time
@@ -77,11 +76,11 @@ pub trait Experts {
         &self,
         x: &[f32],
         shared: Gathered<'_>,
-        route: &mut dyn FnMut(Option<&[f32]>) -> Rows,
+        route: &mut dyn FnMut(Option<Routed<'_>>) -> Option<Rows>,
     ) -> BankRows {
         let _ = x;
         let shared = self.shared(shared);
-        let routed = route(None);
+        let routed = route(None).expect("a layer that gathers nothing was not asked to");
         BankRows {
             routed: self.routed(routed.gathered()),
             shared,

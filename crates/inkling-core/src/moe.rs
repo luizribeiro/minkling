@@ -89,6 +89,43 @@ pub enum Gate<'a> {
     Backend { hidden: usize },
 }
 
+/// What a backend answered when the layer asked it what its gate routed.
+///
+/// **Two shapes because a backend can hold more of the router than the gate.**
+/// The multiply is the whole of it for a backend that only holds a weight; a
+/// backend that can also run a top-k over what the multiply produced has the
+/// selection in device memory before this side sees anything, and so has already
+/// dispatched the bank those experts name. The layer weights that selection
+/// rather than making one of its own — and the arithmetic that decides the
+/// weights stays here either way, which is the point of carrying the logits in
+/// both arms.
+#[derive(Debug, Clone, Copy)]
+pub enum Routed<'a> {
+    /// The `[tokens, n_routed + n_shared]` logits its gate produced, and no
+    /// more. The layer picks the top-k out of them and answers with the rows the
+    /// routed bank has to run, gathered and grouped by expert.
+    Logits(&'a [f32]),
+    /// The same logits, and the `[tokens, top_k]` routed experts the backend
+    /// picked out of them itself. The layer answers with nothing to gather: the
+    /// rows are wherever the backend put them, one per selected slot, and it
+    /// weights them in the order this names them.
+    Picked {
+        logits: &'a [f32],
+        experts: &'a [usize],
+    },
+}
+
+impl<'a> Routed<'a> {
+    /// The gate's own output, which both arms carry because the weights come
+    /// from the raw logits whoever picked the experts.
+    pub fn logits(&self) -> &'a [f32] {
+        match self {
+            Self::Logits(logits) => logits,
+            Self::Picked { logits, .. } => logits,
+        }
+    }
+}
+
 /// Which experts a token reads and with what weight: `[tokens, top_k]` routed
 /// experts and their weights, and `[tokens, n_shared]` shared weights.
 ///
@@ -420,38 +457,59 @@ impl<'a> SparseMoe<'a> {
     /// shared bank's last one produces. A backend handed both calls separately
     /// cannot see that; handed the layer, it can put them in one command buffer.
     ///
-    /// `route` is asked once, with the gate's logits where the backend holds
-    /// the gate and `None` where it does not — and then the layer's own weight
-    /// is multiplied here, which is what the CPU path does and what every case
-    /// below drives.
+    /// `route` is asked once, with whatever the backend's own router got to —
+    /// see [`Routed`] — and `None` where it holds no gate at all, in which case
+    /// the layer's own weight is multiplied here. What comes back is the rows
+    /// the routed bank has to run, or nothing where the backend has them
+    /// already.
     pub fn forward(
         &self,
         x: &[f32],
-        banks: impl FnOnce(&[f32], Gathered<'_>, &mut dyn FnMut(Option<&[f32]>) -> Rows) -> BankRows,
+        banks: impl FnOnce(
+            &[f32],
+            Gathered<'_>,
+            &mut dyn FnMut(Option<Routed<'_>>) -> Option<Rows>,
+        ) -> BankRows,
     ) -> MoeOutput {
         let shared_rows = self.shared_rows(x);
         let mut routing = None;
-        let answered = banks(x, shared_rows.gathered(), &mut |logits| {
+        let answered = banks(x, shared_rows.gathered(), &mut |routed| {
             assert!(routing.is_none(), "the layer was routed twice");
             let widened;
-            let logits = match logits {
-                Some(logits) => logits,
+            let routed = match routed {
+                Some(routed) => routed,
                 None => {
                     widened = self.gate(x);
-                    &widened
+                    Routed::Logits(&widened)
                 }
             };
-            let routed = profile::timed(Op::Router, || self.route(logits));
-            let batches = routed.routed_batches();
-            let rows = self.gather(x, &batches);
-            routing = Some((routed, batches));
+
+            let (weighted, assignments, rows) = match routed {
+                Routed::Logits(logits) => {
+                    let weighted = profile::timed(Op::Router, || self.route(logits));
+                    let batches = weighted.routed_batches();
+                    let rows = self.gather(x, &batches);
+                    (weighted, assignments(&batches), Some(rows))
+                }
+                Routed::Picked { logits, experts } => {
+                    let weighted = profile::timed(Op::Router, || self.weigh(logits, experts));
+                    let by_token = weighted.by_token();
+                    (weighted, by_token, None)
+                }
+            };
+            routing = Some((weighted, assignments));
             rows
         });
 
-        let (routing, batches) = routing.expect("the backend asked the layer what its gate routed");
+        let (routing, assignments) =
+            routing.expect("the backend asked the layer what its gate routed");
         MoeOutput {
-            routed: self.scatter(x.len(), &batches, &answered.routed),
-            shared: self.scatter(x.len(), &routing.shared_batches(), &answered.shared),
+            routed: self.scatter(x.len(), &assignments, &answered.routed),
+            shared: self.scatter(
+                x.len(),
+                &self::assignments(&routing.shared_batches()),
+                &answered.shared,
+            ),
         }
     }
 
@@ -483,52 +541,94 @@ impl<'a> SparseMoe<'a> {
         Rows::new(self.hidden, experts, rows)
     }
 
+    /// The weights a selection carries, for a backend whose own device made the
+    /// selection: `[tokens, top_k]` experts in, the whole [`Routing`] out.
+    ///
+    /// **Three of the four traps are here and none of them is in the
+    /// selection**, which is what makes this the half worth keeping where the
+    /// fixtures can reach it. The weights come from the *raw* logits of whatever
+    /// was picked, one softmax spans the picked routed experts and both shared
+    /// ones together, and the two scales multiply what comes out. A backend that
+    /// picks is trusted for the set of experts and for nothing else.
+    pub fn weigh(&self, logits: &[f32], picked: &[usize]) -> Routing {
+        self.weigh_as(logits, picked, Reading::REFERENCE)
+    }
+
     /// [`SparseMoe::route`], with the ways of misreading the gate named apart.
     ///
     /// Each of them produces a distribution over experts that a running model
     /// cannot be read to disagree with, so the tests drive them from here to
     /// show that none reproduces mlx-vlm.
     fn route_as(&self, logits: &[f32], reading: Reading) -> Routing {
+        let picked = self.select_as(logits, reading);
+        self.weigh_as(logits, &picked, reading)
+    }
+
+    /// Which experts each token's logits select: `sigmoid(logit) + bias`, the
+    /// top-k of that, ties to the lower index.
+    ///
+    /// The correction bias ranks and takes no further part, which is the trap
+    /// [`SparseMoe::weigh_as`] is the other half of.
+    fn select_as(&self, logits: &[f32], reading: Reading) -> Vec<usize> {
+        let MoeConfig {
+            n_routed,
+            n_shared,
+            top_k,
+            ..
+        } = self.config;
+        let mut picked = Vec::with_capacity(top_k * self.rows(logits));
+        for logits in logits.chunks_exact(n_routed + n_shared) {
+            let (routed, _) = reading.split(logits, n_routed, n_shared);
+            picked.extend(ops::top_k(&self.scores(routed), top_k));
+        }
+        picked
+    }
+
+    /// `sigmoid(logit) + e_score_correction_bias` over one token's routed
+    /// logits, which is what the selection ranks on and nothing else reads.
+    fn scores(&self, routed: &[f32]) -> Vec<f32> {
+        routed
+            .iter()
+            .zip(self.weights.correction_bias)
+            .map(|(logit, bias)| sigmoid(*logit) + bias)
+            .collect()
+    }
+
+    fn weigh_as(&self, logits: &[f32], picked: &[usize], reading: Reading) -> Routing {
         let MoeConfig {
             n_routed,
             n_shared,
             top_k,
             route_scale,
         } = self.config;
-        let width = n_routed + n_shared;
+        let tokens = self.rows(logits);
         assert_eq!(
-            logits.len() % width,
-            0,
-            "{} logits are not whole rows of {width} experts",
-            logits.len()
+            picked.len(),
+            tokens * top_k,
+            "{} selected experts are not {top_k} for each of {tokens} tokens",
+            picked.len()
         );
 
         let scale = route_scale * self.weights.global_scale;
         let mut routing = Routing {
             top_k,
             n_shared,
-            experts: Vec::new(),
-            weights: Vec::new(),
-            shared: Vec::new(),
+            experts: picked.to_vec(),
+            weights: Vec::with_capacity(picked.len()),
+            shared: Vec::with_capacity(tokens * n_shared),
         };
         let mut row = vec![0.0; top_k + n_shared];
 
-        for logits in logits.chunks_exact(width) {
+        for (logits, picked) in logits
+            .chunks_exact(n_routed + n_shared)
+            .zip(picked.chunks_exact(top_k))
+        {
             let (routed, shared) = reading.split(logits, n_routed, n_shared);
-            let scores: Vec<f32> = routed
-                .iter()
-                .zip(self.weights.correction_bias)
-                .map(|(logit, bias)| sigmoid(*logit) + bias)
-                .collect();
-            let picked = ops::top_k(&scores, top_k);
 
             let (chosen, rest) = row.split_at_mut(top_k);
-            for (slot, expert) in chosen.iter_mut().zip(&picked) {
-                let weighted = reading.weighted_logit(
-                    routed[*expert],
-                    self.weights.correction_bias[*expert],
-                    scores[*expert],
-                );
+            for (slot, expert) in chosen.iter_mut().zip(picked) {
+                let weighted =
+                    reading.weighted_logit(routed, self.weights.correction_bias, *expert);
                 *slot = log_sigmoid(weighted);
             }
             for (slot, logit) in rest.iter_mut().zip(shared) {
@@ -536,7 +636,6 @@ impl<'a> SparseMoe<'a> {
             }
             reading.normalise(&mut row, top_k);
 
-            routing.experts.extend(picked);
             routing
                 .weights
                 .extend(row[..top_k].iter().map(|w| w * scale));
@@ -545,6 +644,18 @@ impl<'a> SparseMoe<'a> {
                 .extend(row[top_k..].iter().map(|w| w * scale));
         }
         routing
+    }
+
+    /// How many tokens a run of gate logits is.
+    fn rows(&self, logits: &[f32]) -> usize {
+        let width = self.config.n_routed + self.config.n_shared;
+        assert_eq!(
+            logits.len() % width,
+            0,
+            "{} logits are not whole rows of {width} experts",
+            logits.len()
+        );
+        logits.len() / width
     }
 
     /// The rows a set of batches names, gathered out of the hidden state:
@@ -574,31 +685,44 @@ impl<'a> SparseMoe<'a> {
     /// What a bank answered, weighted and summed back into `[tokens, hidden]`.
     ///
     /// The other half of [`SparseMoe::gather`], and separate from it because
-    /// only this half needs the routing: `got` is one row per assignment in the
-    /// order the batches name them, and what the routing supplies is the weight
-    /// each carries.
-    fn scatter(&self, len: usize, batches: &[ExpertBatch], got: &[f32]) -> Vec<f32> {
+    /// only this half needs the routing: `got` is one row per assignment and
+    /// `assignments` says, for each of them in the order the bank answered
+    /// them, which token it came from and what weight it carries.
+    ///
+    /// **The order is the caller's and not this side's**, which is what lets one
+    /// scatter serve both gathers. A backend that decodes an expert before it
+    /// can multiply against it runs every row of one expert together and takes
+    /// [`assignments`] of [`Routing::routed_batches`]; a backend that indexes a
+    /// packed bank from a list has no reason to regroup and takes
+    /// [`Routing::by_token`], which is the selection read straight through.
+    fn scatter(&self, len: usize, assignments: &[(usize, f32)], got: &[f32]) -> Vec<f32> {
         let _timed = profile::scope(Op::Gather);
-        let assignments: usize = batches.iter().map(|batch| batch.tokens.len()).sum();
         assert_eq!(
             got.len(),
-            assignments * self.hidden,
-            "the bank answered {} values for {assignments} rows",
+            assignments.len() * self.hidden,
+            "the bank answered {} values for {} rows",
             got.len(),
+            assignments.len(),
         );
 
         let mut out = vec![0.0; len];
-        let mut answered = got.chunks_exact(self.hidden);
-        for batch in batches {
-            for (token, weight) in &batch.tokens {
-                let y = answered.next().expect("a row per assignment");
-                for (out, y) in out[token * self.hidden..][..self.hidden].iter_mut().zip(y) {
-                    *out += weight * y;
-                }
+        for ((token, weight), y) in assignments.iter().zip(got.chunks_exact(self.hidden)) {
+            for (out, y) in out[token * self.hidden..][..self.hidden].iter_mut().zip(y) {
+                *out += weight * y;
             }
         }
         out
     }
+}
+
+/// The `(token, weight)` of every row a set of batches names, in the order the
+/// batches name them — which is the order [`SparseMoe::gather`] laid the rows
+/// out in.
+pub fn assignments(batches: &[ExpertBatch]) -> Vec<(usize, f32)> {
+    batches
+        .iter()
+        .flat_map(|batch| batch.tokens.iter().copied())
+        .collect()
 }
 
 impl Routing {
@@ -640,6 +764,22 @@ impl Routing {
         by_expert
             .into_iter()
             .map(|(expert, tokens)| ExpertBatch { expert, tokens })
+            .collect()
+    }
+
+    /// The routed work in the order the selection names it: one row per token
+    /// per slot, token-major, with the weight that slot carries.
+    ///
+    /// The other reading of the same assignments — see
+    /// [`Routing::routed_batches`] — for a bank that never had to group them.
+    /// Which order a token's own experts came back in still does not matter,
+    /// because every slot of a token scatters into the same row and addition
+    /// over a token's six is the same sum whichever way round it is done.
+    pub fn by_token(&self) -> Vec<(usize, f32)> {
+        self.weights
+            .iter()
+            .enumerate()
+            .map(|(row, weight)| (row / self.top_k, *weight))
             .collect()
     }
 
@@ -726,11 +866,18 @@ impl Reading {
         }
     }
 
-    fn weighted_logit(&self, logit: f32, bias: f32, score: f32) -> f32 {
+    /// What one chosen expert's weight is computed from, out of the token's
+    /// routed logits and the correction bias.
+    ///
+    /// The score is formed here rather than handed in, because only the reading
+    /// that carries it whole has any use for it — the reference weights from the
+    /// raw logit, so a caller that computed all `n_routed` scores to pass one of
+    /// them in would be ranking the experts a second time to throw it away.
+    fn weighted_logit(&self, routed: &[f32], bias: &[f32], expert: usize) -> f32 {
         match self.weighted_by {
-            WeightedBy::RawLogit => logit,
-            WeightedBy::LogitPlusBias => logit + bias,
-            WeightedBy::BiasedScore => score,
+            WeightedBy::RawLogit => routed[expert],
+            WeightedBy::LogitPlusBias => routed[expert] + bias[expert],
+            WeightedBy::BiasedScore => sigmoid(routed[expert]) + bias[expert],
         }
     }
 
@@ -894,9 +1041,40 @@ mod tests {
         fn forward_gated(&self, logits: Option<Vec<f32>>) -> MoeOutput {
             self.moe().forward(&self.x, |_, shared, route| {
                 let shared = self.shared.gathered(shared);
-                let routed = route(logits.as_deref());
+                let routed = route(logits.as_deref().map(Routed::Logits)).expect("rows to gather");
                 BankRows {
                     routed: self.routed.gathered(routed.gathered()),
+                    shared,
+                }
+            })
+        }
+
+        /// The same layer with a backend that picked the experts itself, which
+        /// is what a top-k on a device does: the layer gathers nothing and the
+        /// rows the routed bank ran are token-major, one per slot.
+        ///
+        /// The rows are built here the way a device forms them — each token's
+        /// own row of `x`, once per slot it selected — because that is the
+        /// order the scatter has to agree with.
+        fn forward_picked(&self, picked: &[usize]) -> MoeOutput {
+            let by_token: Vec<f32> = (0..picked.len())
+                .flat_map(|row| {
+                    self.x[(row / self.config.top_k) * self.hidden..][..self.hidden]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            self.moe().forward(&self.x, |_, shared, route| {
+                let shared = self.shared.gathered(shared);
+                let nothing = route(Some(Routed::Picked {
+                    logits: &self.logits,
+                    experts: picked,
+                }));
+                assert!(nothing.is_none(), "a picked layer gathered rows");
+                BankRows {
+                    routed: self
+                        .routed
+                        .gathered(Gathered::new(self.hidden, picked, &by_token)),
                     shared,
                 }
             })
@@ -908,7 +1086,7 @@ mod tests {
         fn forward_inspecting(&self, inspect: impl FnOnce(Gathered<'_>)) -> MoeOutput {
             self.moe().forward(&self.x, |_, shared, route| {
                 let shared = self.shared.gathered(shared);
-                let routed = route(None);
+                let routed = route(None).expect("rows to gather");
                 inspect(routed.gathered());
                 BankRows {
                     routed: self.routed.gathered(routed.gathered()),
@@ -1040,7 +1218,7 @@ mod tests {
         assert_eq!(moe.hidden(), case.hidden, "the width comes off the gate");
         let got = moe.forward(&case.x, |_, shared, route| {
             let shared = case.shared.gathered(shared);
-            let routed = route(Some(&logits));
+            let routed = route(Some(Routed::Logits(&logits))).expect("rows to gather");
             BankRows {
                 routed: case.routed.gathered(routed.gathered()),
                 shared,
@@ -1073,8 +1251,9 @@ mod tests {
         case.moe().forward(&case.x, |_, shared, route| {
             let shared = case.shared.gathered(shared);
             route(None);
+            let routed = route(None).expect("rows to gather");
             BankRows {
-                routed: case.routed.gathered(route(None).gathered()),
+                routed: case.routed.gathered(routed.gathered()),
                 shared,
             }
         });
@@ -1099,12 +1278,83 @@ mod tests {
         )
         .forward(&case.x, |_, shared, route| {
             let shared = case.shared.gathered(shared);
-            let routed = route(None);
+            let routed = route(None).expect("rows to gather");
             BankRows {
                 routed: case.routed.gathered(routed.gathered()),
                 shared,
             }
         });
+    }
+
+    /// A backend that picked the experts itself weights them exactly as the
+    /// layer's own router would have, and scatters them under the order it ran
+    /// them in.
+    ///
+    /// **Two orders, one answer, and that is the claim.** A layer that picks
+    /// runs one row per token per slot, token-major; a layer that does not runs
+    /// the same assignments grouped by expert. The rows come back in different
+    /// orders and the weight each carries has to follow its own row, so a
+    /// scatter that paired them by position rather than by assignment would be a
+    /// tensor of exactly the right shape with the wrong weights in it.
+    ///
+    /// Not exact, and that is the order itself showing: a token's six weighted
+    /// rows are summed into its own row of the output in whatever order the bank
+    /// answered them, and float32 addition is not associative. Worst observed
+    /// when this landed: 4.4e-8, which is a couple of ulps and two decades
+    /// inside the bound. What the bound has to tell that from is a weight paired
+    /// with the wrong row, and the case below says what *that* costs.
+    #[test]
+    fn a_backend_that_picks_the_experts_weights_and_scatters_them_the_same_way() {
+        for case in Case::all() {
+            let picked = case.routing().experts().to_vec();
+            let got = case.forward_picked(&picked);
+            let want = case.forward();
+            for (what, got, want) in [
+                ("routed", &got.routed, &want.routed),
+                ("shared", &got.shared, &want.shared),
+            ] {
+                let deviation = deviation(got, want);
+                assert!(
+                    deviation <= TOLERANCE,
+                    "{}: {what} deviation {deviation:e}",
+                    case.name
+                );
+            }
+        }
+    }
+
+    /// And a selection the layer would not have made is followed rather than
+    /// second-guessed, which is what says the layer weights what it was handed.
+    ///
+    /// Reversing each token's slots is the same set in a different order, which
+    /// the routing is allowed to differ about — so the experts here are rotated
+    /// into a set the gate did not choose.
+    #[test]
+    fn a_layer_weights_the_selection_it_was_handed_and_not_one_of_its_own() {
+        let case = Case::load("main");
+        let elsewhere: Vec<usize> = case
+            .routing()
+            .experts()
+            .iter()
+            .map(|expert| (expert + 1) % case.config.n_routed)
+            .collect();
+
+        let deviation = deviation(
+            &case.forward_picked(&elsewhere).routed,
+            &case.forward().routed,
+        );
+        assert!(deviation > TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// A selection that is not `top_k` for every token, which is a backend
+    /// whose router ran under another layer's shape — and would otherwise be
+    /// weighted against whatever the chunks happened to line up with.
+    #[test]
+    #[should_panic(expected = "selected experts are not")]
+    fn a_selection_that_is_not_one_per_slot_per_token_is_refused() {
+        let case = Case::load("main");
+        let short = case.routing().experts()[..case.config.top_k].to_vec();
+        case.forward_picked(&short);
     }
 
     /// The first trap. `e_score_correction_bias` ranks the experts and then

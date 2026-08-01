@@ -34,7 +34,8 @@ pub use layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, N
 pub use mask::{BandedMask, MASKED, is_masked};
 pub use model::{Model, ModelCache, ModelWeights};
 pub use moe::{
-    ExpertBank, ExpertBatch, GateWeights, Gathered, MoeConfig, MoeOutput, Routing, SparseMoe,
+    ExpertBank, ExpertBatch, GateWeights, Gathered, MoeConfig, MoeOutput, Routed, Routing,
+    SparseMoe,
 };
 pub use ops::{
     DenseMlp, DenseProjection, MlpProjections, Projection, linear, rms_norm, softmax, swiglu,
