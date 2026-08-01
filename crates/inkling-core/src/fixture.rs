@@ -57,6 +57,37 @@ pub const LONG_ACTIVATIONS: &str = "long_activations.safetensors";
 /// without decoding it whole.
 pub const MXFP4: &str = "mxfp4_dequant.safetensors";
 
+/// mlx-vlm's answers to synthetic inputs for the two ops a dense layer is built
+/// from, from `just dump-op-fixture`.
+///
+/// Read by both backends' RMSNorm, which is what puts its cases here rather than
+/// in either of them: the kernel is checked against MLX itself, and a second
+/// list of case names would be a second answer to which shapes the two have to
+/// agree about.
+pub const OPS: &str = "ops.safetensors";
+
+/// The RMSNorm cases [`OPS`] carries: a wide row, one whose width is not a
+/// multiple of eight, a batch of rows, one that is all zeros, and one large
+/// enough to matter to an f32 accumulator.
+pub const NORM_CASES: [&str; 5] = [
+    "norm_wide",
+    "norm_odd",
+    "norm_batched",
+    "norm_zero_row",
+    "norm_large",
+];
+
+/// The `rms_norm_eps` the reference ran [`NORM_CASES`] under.
+pub fn norm_eps(ckpt: &Checkpoint) -> f32 {
+    f32s(&tensor(ckpt, "rms_norm_eps"))[0]
+}
+
+/// One case's input, weight and mlx-vlm's output for it.
+pub fn norm_case(ckpt: &Checkpoint, case: &str) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let of = |field| f32s(&tensor(ckpt, &format!("{case}.{field}")));
+    (of("input"), of("weight"), of("output"))
+}
+
 /// The slice of that bundle which straddles the head's cut:
 /// `lm_head[200026:200090]` against an `unpadded_vocab_size` of 200058, so the
 /// first [`VOCAB_PADDING_ROWS`] rows are vocabulary and the rest are the

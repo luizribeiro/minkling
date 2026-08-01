@@ -37,14 +37,16 @@ pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
 /// normalises to zero rather than to something obviously wrong. MLX accumulates
 /// in f32 and does flush such a row.
 ///
-/// Apple GPUs have no double at all, so a Metal RMSNorm cannot buy that range
-/// the way this does. It has to buy it the way [`softmax`] below already does —
-/// divide each row by its largest magnitude before squaring, and put the factor
-/// back after the reciprocal square root — which holds the same range entirely
-/// in f32. Until that kernel exists, `a_row_that_squares_past_f32_still_normalises`
-/// below is what a naive port fails: that failure is the intended signal, and the
-/// answer is to scale the kernel's row, never to lower this accumulator to
-/// match it.
+/// Apple GPUs have no double at all, so `inkling_metal::norm` cannot buy that
+/// range the way this does. It buys it the way [`softmax`] below already does —
+/// scaling each row before squaring — over a power of two rather than over the
+/// peak itself, so that the division is exact and the factor cancels out of the
+/// answer instead of being multiplied back into it.
+///
+/// `a_row_that_squares_past_f32_still_normalises` below is what a port that
+/// scaled nothing fails, and the kernel keeps that case of its own. A failure
+/// there is the intended signal: the answer is to scale the kernel's row, never
+/// to lower this accumulator to match it.
 ///
 /// `eps` sits under the square root, which is what keeps an all-zero row from
 /// dividing by zero: it scales by `1/sqrt(eps)` and stays zero.
@@ -394,19 +396,7 @@ mod tests {
 
     use super::*;
     use crate::checkpoint::Checkpoint;
-    use crate::fixture::{self, deviation};
-
-    /// Synthetic inputs and mlx-vlm's answers to them, from
-    /// `just dump-op-fixture`.
-    const FIXTURE: &str = "ops.safetensors";
-
-    const NORM_CASES: [&str; 5] = [
-        "norm_wide",
-        "norm_odd",
-        "norm_batched",
-        "norm_zero_row",
-        "norm_large",
-    ];
+    use crate::fixture::{self, NORM_CASES, OPS as FIXTURE, deviation, norm_case, norm_eps};
 
     /// 1e-6 is a few tens of f32 ulps at that scale. Both ops reduce over their
     /// feature axis, so their summation order and MLX's part company in the
@@ -416,16 +406,6 @@ mod tests {
     /// bound has a factor of five in hand. Needing more than that is a bug
     /// signal, not a reason to widen it.
     const TOLERANCE: f32 = 1e-6;
-
-    fn eps(ckpt: &Checkpoint) -> f32 {
-        fixture::f32s(&fixture::tensor(ckpt, "rms_norm_eps"))[0]
-    }
-
-    /// A case's input, weight and mlx-vlm's output for it.
-    fn norm_case(ckpt: &Checkpoint, case: &str) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        let of = |field| fixture::f32s(&fixture::tensor(ckpt, &format!("{case}.{field}")));
-        (of("input"), of("weight"), of("output"))
-    }
 
     struct Mlp {
         dim: usize,
@@ -515,7 +495,7 @@ mod tests {
     #[test]
     fn rms_norm_reproduces_mlx_for_every_shape() {
         let ckpt = fixture::open(FIXTURE);
-        let eps = eps(&ckpt);
+        let eps = norm_eps(&ckpt);
         let mut widths = Vec::new();
 
         for case in NORM_CASES {
@@ -546,7 +526,7 @@ mod tests {
             .position(|row| row.iter().all(|x| *x == 0.0))
             .expect("the fixture carries an all-zero row");
 
-        let got = rms_norm(&x, &weight, eps(&ckpt));
+        let got = rms_norm(&x, &weight, norm_eps(&ckpt));
         assert!(got.iter().all(|y| y.is_finite()), "{got:?}");
         assert!(
             got[zeroed * width..(zeroed + 1) * width]
