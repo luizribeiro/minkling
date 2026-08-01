@@ -1,6 +1,8 @@
 //! The packed matmul against a real Inkling-Small checkpoint, which is far too
 //! large to commit. Set `INKLINGRS_CHECKPOINT` to a checkpoint directory to run
-//! these; unset, each reports a skip and passes.
+//! these; unset, each reports a skip and passes. `just test-full` sets it, to an
+//! absolute path — a relative one resolves against each test process's own
+//! working directory and fails every one of them.
 //!
 //! What the hermetic cases in `matmul::tests` cannot settle is the shape and the
 //! contents of a trained weight. `lm_head` is `[201024, 4096]` — 411 MB of codes

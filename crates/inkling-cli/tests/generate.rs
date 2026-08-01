@@ -10,7 +10,7 @@
 //!
 //! The case that needs weights sets `INKLINGRS_CHECKPOINT` to a checkpoint
 //! directory; unset, it reports a skip and passes, the way
-//! `inkling-core`'s own checkpoint tests do.
+//! `inkling-core`'s own checkpoint tests do. `just test-full` sets it.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};

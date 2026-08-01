@@ -1,6 +1,8 @@
 //! Assertions against a real Inkling-Small checkpoint, which is far too large
 //! to commit. Set `INKLINGRS_CHECKPOINT` to a checkpoint directory to run them;
-//! unset, each test reports a skip and passes.
+//! unset, each test reports a skip and passes. `just test-full` sets it, to an
+//! absolute path — a relative one resolves against each test process's own
+//! working directory and fails every one of them.
 
 use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;

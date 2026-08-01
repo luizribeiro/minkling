@@ -21,6 +21,34 @@ than a request loop.
     just sync             # reference venv + mlx-vlm patches
     just test
 
+### Which of the three test runs to use
+
+`just test` is the one to run while iterating: **436 of the 443 tests, no
+checkpoint, twelve seconds.** Everything a fixture can settle is here — the
+kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
+tokenizer against the whole vocabulary, the server against its own frames. The
+32 that need weights report a skip and pass. It runs through libtest, which puts
+a crate's tests in one process: opening a Metal device costs a second, so the 110
+kernel tests are 7.5 s sharing a process and 87 s with one each. Nothing in this
+tier measures the process it runs in, which is what makes sharing one free.
+
+`just test-full` is what has to pass before a commit lands: **all 443 against a
+real checkpoint, three minutes forty.** The 36 gated tests are what
+only weights can settle — that the packed tensors decode to what the reference
+decodes, that 42 trained layers reproduce the recorded stack, that the engine
+generates the oracle's own continuation — and `--backend cpu` is the oracle they
+are measured against, at 9.0 s a decoded token, which is where most of those
+minutes go. This tier runs a process a test, which is what keeps a test that
+bounds its resident set bounding only its own.
+
+`just test-timing` is the seven tests whose result *is* a number — a duration
+they assert on, a resident set they bound, the decode-step table quoted above —
+run one at a time with nothing beside them. **A measurement taken while nine
+other tests ran is a measurement of the nine:** a round trip this repo has at
+191 µs reports 598 under a parallel suite, and `.config/nextest.toml` records
+what believing a number like that once cost. `#[ignore]` is what keeps them out
+of the two runs above, and what selects them here.
+
 Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4

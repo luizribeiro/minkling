@@ -9,7 +9,7 @@
 //! leaked into the field a client renders.
 //!
 //! Gated on `INKLINGRS_CHECKPOINT`, which is 0.3 s to load and 0.35 GiB peak.
-//! Unset, it reports a skip and passes.
+//! Unset, it reports a skip and passes; `just test-full` sets it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
