@@ -209,6 +209,11 @@ impl<'a> ExpertBanks<'a> {
     }
 
     /// The third dispatch, over what the SwiGLU between them produced.
+    ///
+    /// **What this reads is all that ties it to `encode_glu`'s command buffer,
+    /// and it is nothing another bank produces.** So a bank whose pair has
+    /// already been waited for can have this encoded beside the *next* bank's
+    /// pair, which is what a MoE layer's two banks are to each other.
     pub fn encode_down(
         &self,
         batch: &mut Batch<'_>,
@@ -260,8 +265,19 @@ pub struct LayerExperts<'a> {
 }
 
 impl<'a> LayerExperts<'a> {
-    /// [`Experts::banks`]'s command buffers, with the errors a dispatch can
-    /// fail with still in hand.
+    /// The one device both banks and the gate were wrapped on, which is what
+    /// lets a command buffer opened here hold dispatches against any of them.
+    fn device(&self) -> &'a Device {
+        self.shared.device()
+    }
+
+    /// [`Experts::banks`]'s three command buffers, with the errors a dispatch
+    /// can fail with still in hand.
+    ///
+    /// **`route` sits between the first buffer and the second, and that
+    /// placement is the schedule.** It turns the gate's logits — which the
+    /// first buffer produced — into the rows the routed bank runs, so by the
+    /// time the second buffer is opened everything that goes in it is in hand.
     fn encode(
         &self,
         x: &[f32],
@@ -270,7 +286,7 @@ impl<'a> LayerExperts<'a> {
     ) -> Result<BankRows, MatmulError> {
         let shared_chosen = chosen(shared);
 
-        let mut batch = self.shared.device().batch()?;
+        let mut batch = self.device().batch()?;
         let logits = self.gate.encode(&mut batch, x)?;
         let shared_glu = self
             .shared
@@ -278,15 +294,28 @@ impl<'a> LayerExperts<'a> {
         batch.wait()?;
 
         let shared_activated = activated(shared_glu);
-        let mut batch = self.shared.device().batch()?;
+        let routed_rows = route(Some(&logits.take()));
+        let routed = routed_rows.gathered();
+        let routed_chosen = chosen(routed);
+
+        let mut batch = self.device().batch()?;
         let shared_out = self
             .shared
             .encode_down(&mut batch, &shared_chosen, &shared_activated)?;
+        let routed_glu = self
+            .routed
+            .encode_glu(&mut batch, &routed_chosen, routed.rows())?;
         batch.wait()?;
 
-        let routed_rows = route(Some(&logits.take()));
+        let routed_activated = activated(routed_glu);
+        let mut batch = self.device().batch()?;
+        let routed_out = self
+            .routed
+            .encode_down(&mut batch, &routed_chosen, &routed_activated)?;
+        batch.wait()?;
+
         Ok(BankRows {
-            routed: self.routed.forward(routed_rows.gathered())?,
+            routed: routed_out.take(),
             shared: shared_out.take(),
         })
     }
@@ -323,13 +352,16 @@ impl Experts for LayerExperts<'_> {
     }
 
     /// The whole layer — the gate, both banks, and the SwiGLU between each
-    /// bank's halves — in the four command buffers the two banks take.
+    /// bank's halves — in three command buffers.
     ///
-    /// **The submission count does not move.** Seven dispatches in four, the
-    /// same as the two banks asked for separately: the gate is encoded into the
-    /// buffer the shared bank's `gate` and `up` open, which is where it already
-    /// was. What changes is that this side can now see the whole layer at once,
-    /// and so can see where the routing sits in it.
+    /// **Seven dispatches in three submissions, where a layer whose banks run
+    /// one after the other is seven in four.** Each bank alone takes two
+    /// buffers, because `down` reads what `gate` and `up` produced and has to
+    /// wait for them. The shared bank's `down` and the routed bank's `gate` and
+    /// `up` are not in that relation to each other: `down` reads the shared
+    /// halves this side already holds, and the routed pair reads rows gathered
+    /// out of the hidden state under a routing taken from logits the *first*
+    /// buffer produced. Neither waits for the other, so they go in one.
     fn banks(
         &self,
         x: &[f32],
@@ -624,19 +656,21 @@ mod tests {
 
     /// The whole layer asked for at once is the same three answers as the gate,
     /// the shared bank and the routed bank asked for apart — **in the same seven
-    /// dispatches and one fewer submission.**
+    /// dispatches and two fewer submissions.**
     ///
-    /// Both halves are the commit. That the answers agree says the seam changed
-    /// no arithmetic; that the dispatch count does not move while the submission
-    /// count does is the whole reason for the seam at all, and it is the half a
-    /// test of the values alone would let slip.
+    /// Both halves are the commit. That the answers agree says the schedule
+    /// changed no arithmetic; that the dispatch count does not move while the
+    /// submission count does is the whole reason for scheduling at all, and it
+    /// is the half a test of the values alone would let slip.
     ///
-    /// The saved round trip is the gate's: it reads the same hidden state the
-    /// shared bank's `gate` and `up` do, so it rides in the buffer they open. A
-    /// gate submitted on its own would be forty round trips a decode step, which
-    /// at 206 microseconds each is 8 ms of the 28 the gate costs on the CPU.
+    /// The two saved round trips are two different merges. The gate rides in the
+    /// buffer the shared bank's `gate` and `up` open, because it reads the same
+    /// hidden state they do; and the shared bank's `down` rides beside the
+    /// routed bank's `gate` and `up`, because by then the routing that names the
+    /// routed rows has been taken from logits the first buffer produced. Over
+    /// forty MoE layers that is 80 round trips a decode step does not take.
     #[test]
-    fn the_whole_layer_costs_one_fewer_submission_than_its_three_parts_apart() {
+    fn the_whole_layer_costs_two_fewer_submissions_than_its_three_parts_apart() {
         let Some(device) = device() else { return };
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
         let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
@@ -680,7 +714,7 @@ mod tests {
         assert_eq!(asked.expect("the layer was routed"), logits, "the logits");
 
         assert_eq!(together.0, apart.0, "the same dispatches");
-        assert_eq!(together, (7, 4), "the layer's own cost");
+        assert_eq!(together, (7, 3), "the layer's own cost");
         assert_eq!(apart, (7, 5), "what the three parts cost apart");
     }
 

@@ -459,22 +459,23 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 ///
 /// Per layer: the input layernorm and the four projections that consume what it
 /// produced in one submission, then `o_proj` in a second — and per MoE layer
-/// seven expert dispatches in four, being the shared bank's gate and up
-/// *together with the router's own gate*, then its down, then the routed bank's
-/// two and its down. A dense layer's feed-forward network is three in two. The
-/// head is one of each.
+/// seven expert dispatches in three, being the shared bank's gate and up
+/// *together with the router's own gate*, then its down *together with the
+/// routed bank's gate and up*, then the routed bank's down. A dense layer's
+/// feed-forward network is three in two. The head is one of each.
 ///
-/// **The norm and the router's gate are the terms that say what moving an op
-/// onto the device costs here.** Each is a dispatch a layer did not make before
-/// and a submission it did not need: both were encoded into a command buffer
-/// their consumers were already going to be submitted in, which is the whole of
-/// why the second figure does not move. Forty gates submitted on their own
-/// would be 8 ms of round trip a step.
+/// **Three terms here say what a submission is worth.** The layer's norm and
+/// the router's gate are each a dispatch that costs no submission, encoded into
+/// a command buffer their consumers were already going to be submitted in. The
+/// seam between the two banks is a submission the layer stopped needing at all:
+/// the shared bank's last dispatch and the routed bank's first read nothing of
+/// each other, which is visible to a backend handed the whole layer and to
+/// nothing else. Forty of them is 40 fewer round trips a step.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
     (
         6 * layers + 3 * dense + 7 * moe + 1,
-        2 * layers + 2 * dense + 4 * moe + 1,
+        2 * layers + 2 * dense + 3 * moe + 1,
     )
 }
 
