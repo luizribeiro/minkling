@@ -43,7 +43,7 @@ use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::weights::{LayerPacked, Packed, PackedMlp, ProjectionBackend};
 
 use crate::attention::{AttentionError, FusedAttention, KeyValues, LayerAttention, Step};
-use crate::buffer::Landing;
+use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
 use crate::kernel::Batch;
 use crate::matmul::{MatmulError, PackedMatmul, PackedProjection, Pending, together};
@@ -238,29 +238,48 @@ impl<'a> LayerProjections<'a> {
     /// the value alone. So the value's convolution is the last thing to touch it
     /// and lands its rows in the span directly, where the key's convolution
     /// lands in a buffer its norm reads.
+    /// The layer's input layernorm over rows already on the device, or `None`
+    /// where the step says they arrive normalised — in which case the four
+    /// projections read those rows themselves.
+    ///
+    /// Apart from [`LayerProjections::encoding`] because of what else reads the
+    /// rows it was given. A caller running the whole decoder layer adds the
+    /// layer's first residual to `x`, so `x` has to outlive the norm over it;
+    /// one that runs the attention alone has nothing else to do with it.
+    ///
+    /// `weight` and `eps` arrive and are checked rather than used: this holds
+    /// the same norm already, uploaded once at wrap time where the CPU path
+    /// widens its copy out of the mapping on every step.
+    pub(crate) fn input_norm(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        step: LayerStep<'_>,
+    ) -> Result<Option<Buffer<f32>>, MetalError> {
+        let Some(weight) = step.input_layernorm else {
+            return Ok(None);
+        };
+        assert_eq!(
+            weight.len(),
+            self.input_layernorm.width(),
+            "the layer's norm against the one wrapped for it"
+        );
+        assert_eq!(step.eps, self.input_layernorm.eps(), "rms_norm_eps");
+        self.input_layernorm.encode(batch, x).map(Some)
+    }
+
     fn encoding(
         &self,
         batch: &mut Batch<'_>,
         span: &mut KeyValues,
+        normed: &mut Buffer<f32>,
         step: LayerStep<'_>,
     ) -> Result<Pending, MatmulError> {
         let device = self.q_proj.device();
-        let mut normed = match step.input_layernorm {
-            Some(weight) => {
-                assert_eq!(
-                    weight.len(),
-                    self.input_layernorm.width(),
-                    "the layer's norm against the one wrapped for it"
-                );
-                assert_eq!(step.eps, self.input_layernorm.eps(), "rms_norm_eps");
-                self.input_layernorm.encode(batch, step.x)?
-            }
-            None => device.buffer(step.x)?,
-        };
-        let mut q = self.q_proj.encode_over(batch, &mut normed)?.buffer();
-        let mut k = self.k_proj.encode_over(batch, &mut normed)?.buffer();
-        let mut v = self.v_proj.encode_over(batch, &mut normed)?.buffer();
-        let mut rel = self.r_proj.encode_over(batch, &mut normed)?.buffer();
+        let mut q = self.q_proj.encode_over(batch, normed)?.buffer();
+        let mut k = self.k_proj.encode_over(batch, normed)?.buffer();
+        let mut v = self.v_proj.encode_over(batch, normed)?.buffer();
+        let mut rel = self.r_proj.encode_over(batch, normed)?.buffer();
 
         let queries = q.len() / (step.sdpa.heads() * step.sdpa.head_dim());
         let (keys, values) = span.landings();
@@ -366,8 +385,10 @@ impl Projections for LayerProjections<'_> {
         );
         assert_eq!(eps, self.input_layernorm.eps(), "rms_norm_eps");
 
-        let [q, k, v, r] = together(self.q_proj.device(), |batch| {
-            let mut normed = self.input_layernorm.encode(batch, x)?;
+        let device = self.q_proj.device();
+        let [q, k, v, r] = together(device, |batch| {
+            let mut input = device.buffer(x)?;
+            let mut normed = self.input_layernorm.encode(batch, &mut input)?;
             Ok([
                 self.q_proj.encode_over(batch, &mut normed)?,
                 self.k_proj.encode_over(batch, &mut normed)?,
@@ -458,9 +479,13 @@ impl Projections for LayerProjections<'_> {
             "the layer's convolutions and head norms against the ones wrapped for it"
         );
 
+        let device = self.q_proj.device();
         let mut span = self.attention.span();
-        let [out] = together(self.q_proj.device(), |batch| {
-            Ok([self.encoding(batch, &mut span, step)?])
+        let [out] = together(device, |batch| {
+            let mut x = device.buffer(step.x)?;
+            let mut normed = self.input_norm(batch, &mut x, step)?;
+            let normed = normed.as_mut().unwrap_or(&mut x);
+            Ok([self.encoding(batch, &mut span, normed, step)?])
         })
         .unwrap_or_else(|err| panic!("the layer's attention did not run: {err}"));
         cache.appended(queries);

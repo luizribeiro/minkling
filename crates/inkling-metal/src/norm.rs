@@ -164,19 +164,22 @@ impl<'a> LayerNorm<'a> {
     /// microseconds and this arithmetic does not.
     pub fn forward(&self, x: &[f32]) -> Result<Vec<f32>, MetalError> {
         let mut batch = self.device.batch()?;
-        let normed = self.encode(&mut batch, x)?;
+        let mut input = self.device.buffer(x)?;
+        let normed = self.encode(&mut batch, &mut input)?;
         batch.wait()?;
         Ok(normed.to_vec())
     }
 
-    /// The same normalisation encoded into `batch`, with the result left on the
-    /// device for whatever reads it next.
+    /// The same normalisation over rows a dispatch already left on the device,
+    /// encoded into `batch` and leaving its own rows there in turn.
     ///
-    /// The buffer is returned rather than the values, and that is the whole
-    /// point of this method existing beside [`LayerNorm::forward`]: a normed
-    /// hidden state is not something the CPU wants, it is something the next
-    /// dispatch wants, and copying it back to be read out again is two crossings
-    /// of a seam that nothing asked for.
+    /// Both ends are a buffer, and that is the whole point of this method
+    /// existing beside [`LayerNorm::forward`]: neither a normed hidden state nor
+    /// the value it was normed from is something the CPU wants — they are what
+    /// the dispatch before and the dispatch after want — and copying either back
+    /// to be copied over again is two crossings of a seam that nothing asked
+    /// for. A layer's *second* norm is the case that made the input end of it
+    /// matter: it reads the residual add before it, which is a dispatch now.
     ///
     /// A call over no rows is the device's refusal of a zero-length allocation
     /// rather than an empty answer, which is where this parts company with
@@ -185,14 +188,17 @@ impl<'a> LayerNorm<'a> {
     /// ordinary step of the router's; this returns the buffer the *next*
     /// dispatch reads, and there is no empty buffer to hand it — a norm over no
     /// tokens is a forward pass over no tokens.
-    pub fn encode(&self, batch: &mut Batch<'_>, x: &[f32]) -> Result<Buffer<f32>, MetalError> {
+    pub fn encode(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+    ) -> Result<Buffer<f32>, MetalError> {
         let _timed = profile::scope(Op::Encode);
         let rows = self.rows(x.len());
-        let mut input = self.device.buffer(x)?;
         let mut out = self.device.zeroed::<f32>(x.len())?;
         self.encoding(
             batch,
-            &mut input,
+            x,
             None,
             Landing {
                 out: &mut out,
