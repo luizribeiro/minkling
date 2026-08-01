@@ -1745,6 +1745,7 @@ mod tests {
     /// near the watchdog, which is the constraint a kernel whose loop length is
     /// the sequence has and no kernel before it did.
     #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn a_decode_shaped_step_costs_what_it_costs() {
         let Some(device) = device() else { return };
         let attention = FusedAttention::new(&device).expect("the kernel compiles");

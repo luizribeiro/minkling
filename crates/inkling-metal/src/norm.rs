@@ -906,6 +906,7 @@ mod tests {
     /// whether the grid is wide enough to hide the latency. Nothing asserts a
     /// ratio; the numbers go to stderr for the commit message to quote.
     #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn a_decode_shaped_norm_costs_less_than_the_submission_around_it() {
         let Some(device) = device() else { return };
         let norm = RmsNorm::new(&device).expect("the norm compiles");

@@ -395,6 +395,7 @@ fn the_packed_matmul_reproduces_the_cpu_over_the_real_head() {
 /// and that it is not somehow slower than the loop it replaces; the numbers go
 /// to stderr for the commit message to quote.
 #[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
 fn one_dispatch_does_an_lm_head_shaped_multiply_without_meeting_the_watchdog() {
     let Some(dir) = checkpoint_dir() else { return };
     let Some(device) = device() else { return };
@@ -704,6 +705,7 @@ impl OnTheDevice {
 ///
 /// The timings go to stderr rather than into an assertion.
 #[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
 fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
     let Some(dir) = checkpoint_dir() else { return };
     let Some(device) = device() else { return };
@@ -789,6 +791,7 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
 /// they leave over stays small enough for the table to be a description of the
 /// step rather than of a fraction of it.
 #[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
 fn where_a_decode_step_spends_its_time() {
     let Some(dir) = checkpoint_dir() else { return };
     let Some(device) = device() else { return };

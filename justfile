@@ -1,3 +1,5 @@
+checkpoint := "models/Inkling-Small-mxfp4"
+
 default:
     @just --list
 
@@ -8,6 +10,14 @@ sync:
 
 test:
     cargo nextest run
+
+# The measurements — a duration, a resident set, a profile table — one at a time
+# with nothing beside them. `#[ignore]` is what keeps these out of every run that
+# has tests beside them, and what selects them here; `.config/nextest.toml` says
+# what a number taken beside another test is worth.
+test-timing checkpoint=checkpoint:
+    INKLINGRS_CHECKPOINT={{ absolute_path(checkpoint) }} \
+        cargo nextest run --profile timing --run-ignored only
 
 fmt:
     cargo fmt --all

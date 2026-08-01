@@ -1037,6 +1037,7 @@ fn the_whole_stack_reproduces_the_reference_against_real_weights() {
 }
 
 #[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
 fn the_whole_stack_holds_its_resident_set_under_a_bound() {
     let Some(dir) = checkpoint_dir() else { return };
     let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");

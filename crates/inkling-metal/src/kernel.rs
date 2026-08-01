@@ -658,6 +658,7 @@ mod tests {
     /// Nothing asserts a ratio; what is asserted is the direction, and the
     /// numbers go to stderr for the commit message to quote.
     #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn a_batch_of_dispatches_costs_less_than_the_same_dispatches_apart() {
         let Some(device) = device() else { return };
         let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");

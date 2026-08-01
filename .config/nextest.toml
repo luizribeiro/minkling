@@ -1,0 +1,10 @@
+# One test at a time, a process each: the profile `just test-timing` runs the
+# measurements under, and the only one that runs them at all.
+#
+# What a serial profile costs is minutes and what it buys is the numbers being
+# about the code. M12 lost a day to the other arrangement: left to nextest's
+# default parallelism the gated tests moved a device-time row by 15 ms against
+# each other, and a correct kernel was nearly rewritten to chase it. A round trip
+# this repo has at 191 µs still reports 598 when a suite runs around it.
+[profile.timing]
+test-threads = 1
