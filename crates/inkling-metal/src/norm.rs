@@ -63,8 +63,8 @@ use crate::kernel::{Batch, Grid, Kernel, extent};
 
 const ENTRY: &str = "rms_norm";
 
-/// Threads one threadgroup of a dispatch holds, and — unlike
-/// [`crate::matmul`]'s — all of them work on one row.
+/// The widest threadgroup a dispatch here uses, and — unlike [`crate::matmul`]'s
+/// — all of it works on one group of one row.
 ///
 /// **A norm is far too small to be given a simdgroup.** The packed matmul gives
 /// one simdgroup to each output element and has 201024 of them to dispatch; a
@@ -74,6 +74,19 @@ const ENTRY: &str = "rms_norm";
 /// which is more than the submission around it. Eight simdgroups on the same row
 /// is `a_decode_shaped_norm_costs_less_than_the_submission_around_it`.
 const THREADS_PER_GROUP: usize = 256;
+
+/// Floats one thread reads at a stride, where the group's width is a multiple of
+/// it.
+///
+/// **What a thread reads at once is what the kernel's occupancy is really made
+/// of.** A group is reduced by one threadgroup, which is one core of eighty, so
+/// what is left to hide the memory latency behind is the requests one thread can
+/// have outstanding. A `[1, 4096]` group over 256 threads is sixteen dependent
+/// strides a thread when they are floats and four when they are `float4`, and
+/// the device's own clock puts that difference at 17.6 microseconds against 8.0.
+/// See [`BODY`] for the alignment this rests on, and
+/// `what_a_decode_steps_norms_cost_the_device` for the rest of the figures.
+const LANE: usize = 4;
 
 /// Entries the kernel's threadgroup arrays hold, which has to be a constant
 /// where the number of simdgroups is not: 1024 threads is the widest threadgroup
@@ -311,7 +324,8 @@ impl<'a> LayerNorm<'a> {
 fn source() -> String {
     format!(
         "constant int LEAST_EXPONENT = {LEAST_EXPONENT};\n\
-         constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n{BODY}"
+         constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n\
+         constant uint LANE = {LANE};\n{BODY}"
     )
 }
 
@@ -334,6 +348,135 @@ struct Shape {
     uint eps_bits;
 };
 
+/// What a lane contributes to each of the two reductions, and how it is brought
+/// into the row's scale — the three places the body below touches a value rather
+/// than an index, overloaded so that it is written once for a lane of one float
+/// and a lane of `LANE`.
+///
+/// `ldexp` is where the two genuinely differ: Metal spells the vector one with a
+/// vector of exponents, and every lane of a group shares the group's.
+///
+/// **A square is rounded before it is summed, and the pragma is what says so.**
+/// Metal contracts a multiply feeding an add into `fma` by default, which keeps
+/// the product's low bits and is the more accurate reduction of the two — and it
+/// is the one that costs this kernel the property it exists for. A uniform row
+/// normalises to its weight exactly because the row's own factor cancels: the
+/// sum is a whole multiple of one rounded square, and the reciprocal square root
+/// of its mean multiplies back against the value it was formed from. Summing
+/// unrounded products leaves that mean a bit low and the answer an ulp under the
+/// weight, which is exactly where the CPU's own narrowing leaves it —
+/// `a_row_at_the_top_of_f32_normalises_where_the_cpus_own_scale_narrows` is the
+/// pair, and it is a lane of `LANE` that can be measured saying so.
+///
+/// A lane of one is held to the same rule and cannot demonstrate it: a thread
+/// with a single value adds its square to a zero, and `fma(x, x, 0)` rounds
+/// where `x * x` rounds. It is written this way because the two overloads are
+/// one reduction with one rounding rule and not two, which is what
+/// `the_vectorised_lane_and_the_ragged_one_reduce_alike` compares.
+static inline float peak_of(float value) {
+    return fabs(value);
+}
+static inline float peak_of(float4 values) {
+    const float4 magnitude = fabs(values);
+    return fmax(fmax(magnitude.x, magnitude.y), fmax(magnitude.z, magnitude.w));
+}
+static inline float squares_of(float value) {
+    #pragma clang fp contract(off)
+    return value * value;
+}
+static inline float squares_of(float4 values) {
+    #pragma clang fp contract(off)
+    const float4 squares = values * values;
+    return (squares.x + squares.y) + (squares.z + squares.w);
+}
+static inline float scaled_by(float value, int exponent) {
+    return ldexp(value, exponent);
+}
+static inline float4 scaled_by(float4 values, int exponent) {
+    return ldexp(values, int4(exponent));
+}
+
+/// One group of one row normalised, by the whole threadgroup that holds it.
+///
+/// Three passes over the row rather than one: the peak, the sum of the scaled
+/// squares, and the write. A row of the model's width is 16 KB and the second
+/// and third passes read what the first pulled in, where holding the row in
+/// registers would fit in none of them.
+///
+/// Each of the two reductions is a simdgroup reduction and then a pass over what
+/// the simdgroups left, which every thread does for itself — cheaper than
+/// reducing the partials once and broadcasting, at eight entries, and it needs
+/// one barrier rather than two.
+///
+/// **A lane is `LANE` floats where the group's width is a multiple of it**, and
+/// this is where the two instantiations below come from. A width `LANE` divides
+/// is both what makes `width / LANE` the whole of the group and what makes the
+/// group's pointers safe to read as vectors: `values` and `result` are the
+/// buffer's base plus a multiple of `width`, so nothing else bounds their
+/// alignment. A norm over a ragged width takes the same body a float at a time.
+template <typename Lane>
+static void normalise(
+    constant Shape &shape,
+    device const Lane *values,
+    device const Lane *weight,
+    device Lane *result,
+    uint lanes,
+    float row_scale,
+    threadgroup float *peaks,
+    threadgroup float *sums,
+    uint local,
+    uint threads,
+    uint lane,
+    uint simd,
+    uint simds
+) {
+    float peak = 0.0f;
+    for (uint i = local; i < lanes; i += threads) {
+        peak = fmax(peak, peak_of(values[i]));
+    }
+    peak = simd_max(peak);
+    if (lane == 0) {
+        peaks[simd] = peak;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 0; s < simds; ++s) {
+        peak = fmax(peak, peaks[s]);
+    }
+
+    // `ilogb` of zero is a value the language leaves to the implementation, and
+    // an all-zero row is the case `eps` exists for — so the exponent is chosen
+    // without asking about it. Every thread reaches the same answer, `peak`
+    // having been reduced across the whole threadgroup first.
+    const int exponent = peak > 0.0f ? max(ilogb(peak), LEAST_EXPONENT) : LEAST_EXPONENT;
+
+    float sum = 0.0f;
+    for (uint i = local; i < lanes; i += threads) {
+        sum += squares_of(scaled_by(values[i], -exponent));
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) {
+        sums[simd] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = 0.0f;
+    for (uint s = 0; s < simds; ++s) {
+        sum += sums[s];
+    }
+
+    // The scaled mean, against an `eps` brought into the same scale — which is
+    // what lets the row's own factor cancel below rather than be multiplied
+    // back in. `precise` because the default is a hardware approximation, and
+    // this is the one reciprocal square root the whole answer rests on.
+    const float eps = as_type<float>(shape.eps_bits);
+    const float inverse = precise::rsqrt(
+        sum / (float)shape.width + ldexp(eps, -2 * exponent)
+    );
+
+    for (uint i = local; i < lanes; i += threads) {
+        result[i] = scaled_by(values[i], -exponent) * inverse * weight[i] * row_scale;
+    }
+}
+
 /// `out = x * rsqrt(mean(x^2) + eps) * weight * scale`, one threadgroup to each
 /// group of each row.
 ///
@@ -350,16 +493,6 @@ struct Shape {
 /// `scale` is one value per row, multiplied into every channel of it. Log
 /// scaling's `tau` is the only thing that ever sets it and everywhere else it is
 /// a row of ones, which multiplies exactly.
-///
-/// Three passes over the row rather than one: the peak, the sum of the scaled
-/// squares, and the write. A row of the model's width is 16 KB and the second
-/// and third passes read what the first pulled in, where holding the row in
-/// registers would fit in none of them.
-///
-/// Each of the two reductions is a simdgroup reduction and then a pass over what
-/// the simdgroups left, which every thread does for itself — cheaper than
-/// reducing the partials once and broadcasting, at eight entries, and it needs
-/// one barrier rather than two.
 kernel void rms_norm(
     constant Shape &shape [[buffer(0)]],
     device const float *x [[buffer(1)]],
@@ -391,59 +524,32 @@ kernel void rms_norm(
     device const float *values = x + (ulong)slot * shape.width;
     device float *result =
         out + ((ulong)group * shape.stride + shape.base + row) * shape.width;
-
-    float peak = 0.0f;
-    for (uint i = local; i < shape.width; i += threads) {
-        peak = fmax(peak, fabs(values[i]));
-    }
-    peak = simd_max(peak);
-    if (lane == 0) {
-        peaks[simd] = peak;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = 0; s < simds; ++s) {
-        peak = fmax(peak, peaks[s]);
-    }
-
-    // `ilogb` of zero is a value the language leaves to the implementation, and
-    // an all-zero row is the case `eps` exists for — so the exponent is chosen
-    // without asking about it. Every thread reaches the same answer, `peak`
-    // having been reduced across the whole threadgroup first.
-    const int exponent = peak > 0.0f ? max(ilogb(peak), LEAST_EXPONENT) : LEAST_EXPONENT;
-
-    float sum = 0.0f;
-    for (uint i = local; i < shape.width; i += threads) {
-        const float scaled = ldexp(values[i], -exponent);
-        sum += scaled * scaled;
-    }
-    sum = simd_sum(sum);
-    if (lane == 0) {
-        sums[simd] = sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    sum = 0.0f;
-    for (uint s = 0; s < simds; ++s) {
-        sum += sums[s];
-    }
-
-    // The scaled mean, against an `eps` brought into the same scale — which is
-    // what lets the row's own factor cancel below rather than be multiplied
-    // back in. `precise` because the default is a hardware approximation, and
-    // this is the one reciprocal square root the whole answer rests on.
-    const float eps = as_type<float>(shape.eps_bits);
-    const float inverse = precise::rsqrt(
-        sum / (float)shape.width + ldexp(eps, -2 * exponent)
-    );
-
     const float row_scale = scale[row];
-    for (uint i = local; i < shape.width; i += threads) {
-        result[i] = ldexp(values[i], -exponent) * inverse * weight[i] * row_scale;
+
+    // The width is a shape and not a thread's own, so both barriers inside stay
+    // uniform however this branches.
+    if (shape.width % LANE == 0) {
+        normalise(
+            shape,
+            (device const float4 *)values,
+            (device const float4 *)weight,
+            (device float4 *)result,
+            shape.width / LANE,
+            row_scale, peaks, sums, local, threads, lane, simd, simds
+        );
+    } else {
+        normalise(
+            shape, values, weight, result, shape.width,
+            row_scale, peaks, sums, local, threads, lane, simd, simds
+        );
     }
 }
 "#;
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use inkling_core::fixture::{NORM_CASES, OPS, deviation, norm_case, norm_eps};
     use inkling_core::ops::rms_norm;
@@ -553,37 +659,93 @@ mod tests {
     /// The mutation below is what says the scaling is what buys the range and
     /// not something else: the same source with the row's exponent taken out of
     /// it, through the same plumbing, on the same input.
+    ///
+    /// **Both read widths, because the reduction is written once and
+    /// instantiated twice.** A width [`LANE`] divides reads four values to a
+    /// lane and a ragged one reads them a float at a time, so a scaling that
+    /// survived only one of those would be a range this kernel has at the
+    /// model's widths and not at the fixtures'.
+    ///
+    /// The bound each is held to is the width's own arithmetic and not the two
+    /// paths'. A uniform row sums one rounded square as many times as it is
+    /// wide, and 32 of anything doubles five times and rounds nowhere where 33
+    /// of it needs thirty bits — so the first agrees with the f64 oracle bit for
+    /// bit and the second is an ulp under it, on either path.
     #[test]
     fn a_row_that_squares_past_f32_still_normalises_on_the_device() {
         let Some(device) = device() else { return };
-        let width = 32;
-        let x = vec![1e20; width];
-        let weight = vec![1.0; width];
-        let normed = |norm: &RmsNorm| {
-            LayerNorm::new(&device, norm, &weight, 1e-6)
+        for (width, exactly) in [(32, 0.0), (33, TOLERANCE)] {
+            let x = vec![1e20; width];
+            let weight = vec![1.0; width];
+            let normed = |norm: &RmsNorm| {
+                LayerNorm::new(&device, norm, &weight, 1e-6)
+                    .expect("the weight uploads")
+                    .forward(&x)
+                    .expect("the dispatch completes")
+            };
+
+            let got = normed(&RmsNorm::new(&device).expect("the norm compiles"));
+            assert!(
+                got.iter().all(|y| (y - 1.0).abs() <= TOLERANCE),
+                "a uniform row of {width} should normalise to its weight: {got:?}"
+            );
+            let deviation = deviation(&got, &on_the_cpu(&x, &weight, 1e-6));
+            assert!(deviation <= exactly, "{width}: deviation {deviation:e}");
+
+            let unscaled = source()
+                .replace("scaled_by(values[i], -exponent)", "values[i]")
+                .replace("ldexp(eps, -2 * exponent)", "eps");
+            assert_ne!(unscaled, source(), "the mutation changed nothing");
+            let flushed =
+                normed(&RmsNorm::from_source(&device, &unscaled).expect("the mutant compiles"));
+            assert_eq!(
+                flushed,
+                vec![0.0; width],
+                "summing a row of {width} unscaled did not flush it, so this proves nothing"
+            );
+        }
+    }
+
+    /// **The two read widths are one reduction**, and this is what says so: the
+    /// same values through the shipped kernel and through one whose width test
+    /// can never pass, so the float-at-a-time body runs where the `float4` one
+    /// would have.
+    ///
+    /// Within the same bound as the CPU rather than bit for bit, and the reason
+    /// is the reason the bound exists at all. The two paths group a group's
+    /// values differently — a lane of four holds four neighbours where a lane of
+    /// one holds every `threads`th value — so what they hand the simdgroup tree
+    /// are different partial sums of the same terms, and summation order alone
+    /// moves the last bits. What is being asked here is whether the vectorised
+    /// read reaches the same values, which a stride or a cast that was wrong
+    /// would answer by decades rather than by ulps.
+    #[test]
+    fn the_vectorised_lane_and_the_ragged_one_reduce_alike() {
+        let Some(device) = device() else { return };
+        let scalar = source().replace("shape.width % LANE == 0", "false");
+        assert_ne!(scalar, source(), "the mutation changed nothing");
+        let (rows, width) = (3, 256);
+        let weight: Vec<f32> = (0..width).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+        let x: Vec<f32> = (0..rows * width)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 12.0)
+            .collect();
+
+        let normed = |source: &str| {
+            let norm = RmsNorm::from_source(&device, source).expect("the norm compiles");
+            LayerNorm::new(&device, &norm, &weight, 1e-6)
                 .expect("the weight uploads")
                 .forward(&x)
                 .expect("the dispatch completes")
         };
 
-        let got = normed(&RmsNorm::new(&device).expect("the norm compiles"));
-        assert!(
-            got.iter().all(|y| (y - 1.0).abs() <= TOLERANCE),
-            "a uniform row should normalise to its weight: {got:?}"
-        );
-        assert_eq!(deviation(&got, &on_the_cpu(&x, &weight, 1e-6)), 0.0);
-
-        let unscaled = source()
-            .replace("ldexp(values[i], -exponent)", "values[i]")
-            .replace("ldexp(eps, -2 * exponent)", "eps");
-        assert_ne!(unscaled, source(), "the mutation changed nothing");
-        let flushed =
-            normed(&RmsNorm::from_source(&device, &unscaled).expect("the mutant compiles"));
-        assert_eq!(
-            flushed,
-            vec![0.0; width],
-            "summing the squares unscaled did not flush the row, so this proves nothing"
-        );
+        let want = on_the_cpu(&x, &weight, 1e-6);
+        for (path, got) in [
+            ("a lane of LANE", normed(&source())),
+            ("a lane of one", normed(&scalar)),
+        ] {
+            let deviation = deviation(&got, &want);
+            assert!(deviation <= TOLERANCE, "{path}: deviation {deviation:e}");
+        }
     }
 
     /// `eps` sits under the square root, which is the one place the
@@ -619,18 +781,27 @@ mod tests {
     /// two decades further up it would be the whole answer, and neither is a
     /// magnitude a hidden state reaches — what this pins is that the device path
     /// has no such ceiling to be near.
+    ///
+    /// **And it is the rounded square that keeps it there.** The mutation is the
+    /// pragma taken out of the kernel, which lets Metal fuse the multiply that
+    /// forms a square into the add that accumulates it — the more accurate sum
+    /// of the two, and the one that lands the answer on the CPU's own narrowed
+    /// value. That is the whole of what the pragma is for, on the only lane
+    /// width that can be measured saying so.
     #[test]
     fn a_row_at_the_top_of_f32_normalises_where_the_cpus_own_scale_narrows() {
         let Some(device) = device() else { return };
-        let norm = RmsNorm::new(&device).expect("the norm compiles");
         let width = 32;
         let x = vec![f32::MAX / 2.0; width];
         let weight = vec![1.0; width];
+        let normed = |norm: &RmsNorm| {
+            LayerNorm::new(&device, norm, &weight, 1e-6)
+                .expect("the weight uploads")
+                .forward(&x)
+                .expect("the dispatch completes")
+        };
 
-        let got = LayerNorm::new(&device, &norm, &weight, 1e-6)
-            .expect("the weight uploads")
-            .forward(&x)
-            .expect("the dispatch completes");
+        let got = normed(&RmsNorm::new(&device).expect("the norm compiles"));
         let theirs = on_the_cpu(&x, &weight, 1e-6);
         eprintln!(
             "a row at {:e}: the device gives {}, the CPU {}",
@@ -639,6 +810,14 @@ mod tests {
 
         assert_eq!(got, weight, "a uniform row normalises to its weight");
         assert_ne!(theirs, weight, "the CPU's scale did not narrow after all");
+
+        let fused = source().replace("#pragma clang fp contract(off)\n", "");
+        assert_ne!(fused, source(), "the mutation changed nothing");
+        assert_eq!(
+            normed(&RmsNorm::from_source(&device, &fused).expect("the mutant compiles")),
+            theirs,
+            "summing unrounded squares did not narrow the answer, so this proves nothing"
+        );
     }
 
     /// The other end of the range, where the clamp is: a row far below where
@@ -736,8 +915,8 @@ mod tests {
 
     /// A width no power of two divides leaves threads idle on the last stride
     /// of every pass, and it leaves the two reductions with simdgroups that
-    /// contributed nothing — 37 values over 256 threads is seven simdgroups
-    /// holding one lane's worth each and one holding none.
+    /// contributed nothing — 37 values are read a float at a time, so over 256
+    /// threads seven simdgroups hold one lane's worth each and one holds none.
     #[test]
     fn a_width_narrower_than_the_threadgroup_still_reproduces_the_cpu() {
         let Some(device) = device() else { return };
@@ -967,6 +1146,106 @@ mod tests {
 
         eprintln!("a [1, {width}] norm submitted on its own: {each:.2?}");
         assert!(each < std::time::Duration::from_millis(2), "{each:?}");
+    }
+
+    /// **What each norm a layer runs costs the device**, at the shape a decode
+    /// step gives it and at the three prefill lengths M9 measured.
+    ///
+    /// The per-kernel table says `rms_norm` is 8.6% of a decode step's device
+    /// time for 0.3% of its bandwidth, which is a ranking and not a diagnosis.
+    /// This is the diagnosis: the same 4096 values, as one group and as the 32 a
+    /// query head norm cuts them into, are 18.0 microseconds and 5.4 — so what
+    /// the kernel waits on is the memory latency one core can have outstanding,
+    /// and not the memory. An empty dispatch of the same grid is 1.5, which is
+    /// the floor under every row here.
+    ///
+    /// Read off the device's own clock over a command buffer of `CALLS`
+    /// dispatches, rather than off the wall clock around one: a submission is
+    /// 225 microseconds and every figure here is under forty. Sampling stays off
+    /// — a timed dispatch is a compute pass of its own and that boundary is
+    /// worth a couple of microseconds against numbers this size.
+    ///
+    /// The shapes are interleaved and repeated rather than run one after the
+    /// other, because T1 established that this machine's own state moves a
+    /// measurement by more than the differences here are made of. Nothing
+    /// asserts a duration; the numbers go to stderr for the commit message to
+    /// quote.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_decode_steps_norms_cost_the_device() {
+        let Some(device) = device() else { return };
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        const CALLS: usize = 256;
+        const ROUNDS: usize = 5;
+        // The checkpoint's own attention shape, so the head norms below are the
+        // ones a layer runs and not a plausible pair.
+        const HIDDEN: usize = 4096;
+        const HEAD: usize = 128;
+        const HEADS: usize = 32;
+        const KV_HEADS: usize = 8;
+
+        let cost = |rows: usize, groups: usize, width: usize| -> Duration {
+            let layer = LayerNorm::new(&device, &norm, &vec![1.0; width], 1e-6)
+                .expect("the weight uploads");
+            let x: Vec<f32> = (0..rows * groups * width)
+                .map(|i| (i % 37) as f32 - 18.0)
+                .collect();
+            let mut input = device.buffer(&x).expect("the rows upload");
+            let mut out = device
+                .zeroed::<f32>(x.len())
+                .expect("the landing allocates");
+
+            let mut batch = device.batch().expect("a command buffer opens");
+            for _ in 0..CALLS {
+                layer
+                    .encode_over(
+                        &mut batch,
+                        &mut input,
+                        None,
+                        Landing {
+                            out: &mut out,
+                            groups,
+                            stride: rows,
+                            base: 0,
+                        },
+                    )
+                    .expect("the norm encodes");
+            }
+            profile::take();
+            batch.wait().expect("the batch completes");
+            profile::take().gpu() / CALLS as u32
+        };
+
+        let shapes = [
+            ("input layernorm, decode", 1, 1, HIDDEN),
+            ("query head norm, decode", 1, HEADS, HEAD),
+            ("key head norm, decode", 1, KV_HEADS, HEAD),
+            ("input layernorm, 97", 97, 1, HIDDEN),
+            ("query head norm, 97", 97, HEADS, HEAD),
+            ("input layernorm, 385", 385, 1, HIDDEN),
+            ("input layernorm, 769", 769, 1, HIDDEN),
+        ];
+        // Warm: the first dispatch of a fresh pipeline pays for the driver's
+        // first look at these buffers, which a decode loop pays once.
+        let mut taken = shapes.map(|(_, rows, groups, width)| {
+            cost(rows, groups, width);
+            Vec::with_capacity(ROUNDS)
+        });
+        for _ in 0..ROUNDS {
+            for (each, (_, rows, groups, width)) in taken.iter_mut().zip(shapes) {
+                each.push(cost(rows, groups, width));
+            }
+        }
+
+        for ((name, rows, groups, width), each) in shapes.iter().zip(&taken) {
+            let mean = each.iter().sum::<Duration>() / each.len() as u32;
+            eprintln!(
+                "{name:<26} [{rows}, {}] in {groups} of {width}, one threadgroup each: \
+                 {mean:.2?} a dispatch, best {:.2?}",
+                groups * width,
+                each.iter().min().expect("a round ran"),
+            );
+        }
     }
 
     /// A row of the width the model actually runs, which is what says whether a
