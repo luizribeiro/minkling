@@ -1,18 +1,18 @@
 //! Where the model's multiplies run, and what a run holds to get them there.
 //!
 //! The choice is made once, before a token is decoded, and it reaches the engine
-//! as three handovers: the [`Projection`](inkling_core::Projection) `lm_head`
-//! multiplies through, the experts every MoE layer routes into, and the five
-//! attention projections every layer holds — along with the feed-forward network
-//! the two dense layers hold where the other forty hold experts. Between them
+//! as two handovers: the [`Projection`](inkling_core::Projection) `lm_head`
+//! multiplies through, and every layer — its five attention projections, and
+//! either the experts it routes into or the feed-forward network the two dense
+//! ones hold in their place. Between them
 //! they are every weight this engine has a kernel for, and a layer's own small
 //! tensors go over with its projections because nothing else reads them: its
 //! input layernorm, the kernels of the two convolutions inside attention, the
-//! two head norms behind them, and the band the attention step contracts
-//! against — which is the one handover that is an operation rather than a
-//! weight. What is left
-//! on the CPU is each layer's second norm, the two convolutions on its residual
-//! path, and the half of each router that weights what it chose.
+//! two head norms behind them, the band the attention step contracts against —
+//! which is the one handover that is an operation rather than a weight — and the
+//! second norm and residual convolution behind all of it. What is left on the
+//! CPU is the half of each router that weights what it chose, and the second
+//! convolution and residual add that read what it weighted.
 //!
 //! Nothing downstream branches on the choice — not the generation loop, not the
 //! server, not the head's own arithmetic — which is what makes "the CPU path

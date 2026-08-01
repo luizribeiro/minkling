@@ -19,23 +19,28 @@
 //! one expert every row goes through, and the only thing that stays packed is
 //! the weight itself.
 //!
-//! **One submission a layer, and eleven dispatches in it.** `q`, `k`, `v` and
-//! `r` consume the same normed hidden state and nothing of each other; the two
-//! short convolutions consume two of those and are consumed by the two head
-//! norms and the attention step; and `o_proj` consumes what the step produced.
-//! Every arrow in that is a device buffer, so the whole of a layer's attention
-//! is one command buffer — see [`LayerProjections::layer`], which is where an
-//! activation is formed and consumed without the CPU seeing it, ten times over.
-//! That is what a [`Batch`] is for, at 157 µs a
-//! marginal submission it is worth 6.6 ms of a decode step.
+//! **One submission a layer, and twenty-three dispatches in one that routes** —
+//! seventeen where the two dense layers hold a feed-forward network in place of
+//! two banks. `q`, `k`, `v` and `r` consume the same normed hidden state and
+//! nothing of each other; the two short convolutions consume two of those and
+//! are consumed by the two head norms and the attention step; `o_proj` consumes
+//! what the step produced; the layer's own convolution consumes that and adds
+//! the layer's input as it writes; the second norm consumes the sum; and the
+//! MLP's first dispatches consume what the norm left. Every arrow in that is a
+//! device buffer, so the whole of a layer is one command buffer — see
+//! [`LayerDevice`], which is where an activation is formed and consumed without
+//! the CPU seeing it twenty-two times over. That is what a [`Batch`] is for: at
+//! 152 µs a marginal submission the last forty-four of them were worth 6.7 ms of
+//! a decode step.
 //!
 //! **What took longest to reach was not the arithmetic but the state.** Four of
-//! those operations write something that outlives the call — the two
-//! convolutions' windows, and the keys and values the step attends over — so a
-//! backend could not run them without also holding that state, and a backend
-//! that did not run them had to close its command buffer in the middle of the
-//! layer to let the CPU. [`Projections::layer`] is the seam that moved, and
-//! [`AttentionCache::seen`] is what a sequence carries once the rest is here.
+//! those operations write something that outlives the call — three convolutions'
+//! windows, and the span the step attends over — so a backend could not run them
+//! without also holding that state, and a backend that did not run them had to
+//! close its command buffer in the middle of the layer to let the CPU.
+//! [`Projections::layer`] is the seam that moved first and [`DecoderDevice`] is
+//! where it stopped, with [`AttentionCache::seen`] the whole of what a sequence
+//! carries once the rest is here.
 
 use inkling_core::attention::{AttentionCache, AttentionStep, LayerStep, Projections, Qkvr, Sdpa};
 use inkling_core::layer::{
