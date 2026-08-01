@@ -422,7 +422,7 @@ impl<'a> PackedBank<'a> {
     /// The same multiply, encoded into `batch` rather than submitted on its own.
     ///
     /// What this buys is the whole of the granularity question: a submission
-    /// costs 206 microseconds whatever is in it, so a caller with several
+    /// costs 225 microseconds whatever is in it, so a caller with several
     /// multiplies whose inputs are all in hand — the four projections of an
     /// attention layer, a feed-forward network's gate and up — encodes them
     /// together and waits once.

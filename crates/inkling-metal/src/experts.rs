@@ -24,12 +24,15 @@
 //! is six dispatches — gate, up and down of each bank — and a step is 240.
 //!
 //! What that costs is worth stating, because it is what the term became rather
-//! than what it stopped being. Measured over all forty layers at decode shape:
-//! 72 ms once the pages are resident, which is 300 microseconds a dispatch
-//! against the 16 ms its 4.28 GB would take at the bandwidth — so the expert
-//! term is now bound by dispatching and not by reading. Cold it is 892 ms, which
-//! is the checkpoint arriving from disk at 5 GB/s and is a cost the CPU path
-//! paid too, under six seconds of dequantisation that hid it.
+//! than what it stopped being. Measured over all forty layers at decode shape,
+//! with each of the 240 dispatches submitted on its own: 72 ms once the pages
+//! are resident, which is 300 microseconds a dispatch against the 16 ms its 4.28
+//! GB would take at the bandwidth — so the expert term is now bound by
+//! dispatching and not by reading. Three command buffers a layer is what that
+//! reading led to, and the figure is the one that argued for them rather than a
+//! measurement of what they cost. Cold it is 892 ms, which is the checkpoint
+//! arriving from disk at 5 GB/s and is a cost the CPU path paid too, under six
+//! seconds of dequantisation that hid it.
 //!
 //! Two things would move it. The shared bank is two experts and gets three
 //! dispatches of its own, the same as the routed bank's six; and gate and up
@@ -194,7 +197,7 @@ impl<'a> ExpertBanks<'a> {
     /// **A dispatch that reads what these rows were gathered from costs no
     /// submission at all.** `gate` and `up` read the hidden state and nothing
     /// this bank produces, so anything else with the same input can be encoded
-    /// beside them — the router's gate is exactly that, and 206 microseconds a
+    /// beside them — the router's gate is exactly that, and 225 microseconds a
     /// submission is what forty of them would otherwise cost a step.
     pub fn encode_glu(
         &self,
@@ -256,7 +259,7 @@ fn chosen(gathered: Gathered<'_>) -> Vec<u32> {
 /// its output weights what the shared bank produces without deciding what the
 /// shared bank runs, so the one place it can be encoded for free is the command
 /// buffer that bank already opens. Holding it anywhere else would mean a
-/// submission of its own: 40 a step, and 8 ms of the 28 the gate costs.
+/// submission of its own: 40 a step, and 9 ms of the 28 the gate costs.
 #[derive(Debug)]
 pub struct LayerExperts<'a> {
     routed: ExpertBanks<'a>,

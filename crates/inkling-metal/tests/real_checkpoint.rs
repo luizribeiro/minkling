@@ -730,7 +730,7 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
     let (dispatches, submissions) = run.per_decode_step();
     eprintln!(
         "{} tokens prefilled in {:.2?}, {} decoded at {:.2?}/token, peak RSS {:.2} GiB\
-         \n  {dispatches} dispatches a decode step in {submissions} submissions, which at 206 µs \
+         \n  {dispatches} dispatches a decode step in {submissions} submissions, which at 225 µs \
          a submission is {:.1?} of round trip\
          \n  got  {:?}\n  want {want:?}",
         run.prompt,
@@ -738,7 +738,7 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
         run.decode_steps(),
         run.each_decode_step(),
         run.peak as f64 / (1u64 << 30) as f64,
-        Duration::from_micros(206) * submissions as u32,
+        Duration::from_micros(225) * submissions as u32,
         run.got,
     );
     assert_eq!(
@@ -1012,7 +1012,7 @@ fn a_layers_whole_attention_matches_its_pieces_run_apart() {
 /// checked against decoding that expert's own slice.
 ///
 /// The bank is wrapped rather than copied, which is what makes it cheap enough
-/// to state on a real one at all: 1.06 GiB in 40 microseconds instead of 130
+/// to state on a real one at all: 1.06 GiB in 50 microseconds instead of 130
 /// milliseconds and a second copy.
 #[test]
 fn the_gathered_matmul_reproduces_the_cpu_over_a_routed_bank() {

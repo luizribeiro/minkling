@@ -317,8 +317,8 @@ pub enum ProjectionError {
 impl Projections for LayerProjections<'_> {
     /// The four that consume the normed hidden state, in one command buffer.
     ///
-    /// Four submissions become one, which at 206 microseconds a submission is
-    /// 618 µs a layer and 26 ms of a decode step — against the 105 µs the
+    /// Four submissions become one, which at 225 microseconds a submission is
+    /// 675 µs a layer and 28 ms of a decode step — against the 105 µs the
     /// arithmetic of one of these projections takes. They are independent of
     /// each other, so the only thing the batch orders is what they cost.
     fn qkvr(&self, x: &[f32]) -> Qkvr {

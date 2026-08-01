@@ -95,7 +95,7 @@ impl Device {
     /// Bytes this process already holds, given to the GPU where they lie.
     ///
     /// **No copy at all, and no residency of its own.** Wrapping a gibibyte of
-    /// a mapped checkpoint takes about 40 microseconds against the 130
+    /// a mapped checkpoint takes about 50 microseconds against the 130
     /// milliseconds copying it takes, and leaves the resident set where it was:
     /// what the GPU then reads through it are the file's own pages, faulted by
     /// the same demand paging the CPU path faults them by. That is what makes a

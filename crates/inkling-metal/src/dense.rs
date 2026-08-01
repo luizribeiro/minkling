@@ -155,7 +155,7 @@ impl<'a> DenseWeight<'a> {
     ///
     /// What a caller with nothing to batch it against wants, and what the cases
     /// here drive. The router has something to batch it against — see
-    /// [`crate::LayerExperts`] — because a submission costs 206 microseconds
+    /// [`crate::LayerExperts`] — because a submission costs 225 microseconds
     /// and a `[1, 4096] @ [258, 4096]ᵀ` multiply does not.
     pub fn multiply(&self, x: &[f32]) -> Result<Vec<f32>, MatmulError> {
         let mut batch = self.device.batch()?;

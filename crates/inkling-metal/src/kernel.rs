@@ -99,9 +99,9 @@ impl Device {
 /// Dispatches encoded into one command buffer, submitted and waited for
 /// together.
 ///
-/// **A submission costs 206 microseconds and the arithmetic inside one costs
+/// **A submission costs 225 microseconds and the arithmetic inside one costs
 /// less.** Measured on this machine with a kernel that writes a single float:
-/// opening a command buffer, committing it and waiting for it is 206 µs
+/// opening a command buffer, committing it and waiting for it is 225 µs
 /// whatever is in it, where a decode-shaped `[1, 4096] @ [4096, 4096]ᵀ`
 /// projection against packed weights adds 105 µs of its own. So a decode step's
 /// dispatches, each submitted alone, were 94 ms of round trip — most of the 163
@@ -110,7 +110,7 @@ impl Device {
 /// spends waiting for them is 79% of it, of which the device is executing for
 /// two fifths.
 ///
-/// **206 µs is what one costs alone, and it is not what one costs at the
+/// **225 µs is what one costs alone, and it is not what one costs at the
 /// margin.** Taking 40 command buffers out of a step of 249 — the same
 /// dispatches, merged — took about 6.3 ms off the wait over seven alternating
 /// pairs, which is about 157 µs each; taking 42 more out of the 209 that left
@@ -236,7 +236,7 @@ impl Batch<'_> {
     /// itself and which no clock on this side can see.
     ///
     /// The whole of what makes a submission worth reasoning about separately: a
-    /// round trip is 206 microseconds and the arithmetic inside one is less, so
+    /// round trip is 225 microseconds and the arithmetic inside one is less, so
     /// what a profile has to be able to say is how much of the wait was work.
     /// Both timestamps are only meaningful once the buffer has completed, which
     /// is where this is read.
