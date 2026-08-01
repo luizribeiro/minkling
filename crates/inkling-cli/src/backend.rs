@@ -10,9 +10,9 @@
 //! input layernorm, the kernels of the two convolutions inside attention, the
 //! two head norms behind them, the band the attention step contracts against —
 //! which is the one handover that is an operation rather than a weight — and the
-//! second norm and residual convolution behind all of it. What is left on the
-//! CPU is the second convolution and residual add on each layer's own residual
-//! path.
+//! second norm and both residual convolutions behind all of it. What is left on
+//! the CPU is nothing of a layer: it hands one over `[tokens, hidden]` and takes
+//! back `[tokens, hidden]`.
 //!
 //! Nothing downstream branches on the choice — not the generation loop, not the
 //! server, not the head's own arithmetic — which is what makes "the CPU path

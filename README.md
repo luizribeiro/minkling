@@ -89,23 +89,30 @@ inferred.** Every operation a forward pass runs opens a scope charged the time
 inside it that no scope inside *it* claimed, so the rows of a decode step sum to
 the step and what they leave over is a number rather than a shrug:
 
-    submit and wait      43    82%      of which the device executed for 26 ms
-    dispatch encode     955     9%
-    readback            165     3%
+    submit and wait      43    82%      of which the device executed for 27 ms
+    dispatch encode    1077    11%
+    readback             43     1%
     everything else                     6%
 
-**Six rows have left it since that table was first written, and the shape of
+**Every row that named an operation of a layer has left it, and the shape of
 what is left has not changed.** The routers' gates were 19% and every layer's
 bfloat16 tensors widened again on every step were 8%; the first is a dispatch now
 and the second happens once, at load. The attention step and the mask it added
 were 1.4% between them, and the two are one dispatch now. The two short
 convolutions inside attention and the two head norms beside them were 0.8% by
 the rows that named them, and they are four more dispatches — what they cost was
-never their own time. Four fifths of a step is a round trip, and the device is
-now executing for two thirds of *that* — so the rest is 43 command buffers
-submitted and waited for around work that was already done. Every activation op
-left is 1.9% of a step together, and the rows that named a layer's second norm
-and half its short convolutions are gone with the round trips they were between.
+never their own time. The last four to go were the router's softmax, the two
+scatters that weighted what its banks answered, the add between those halves and
+the layer's own second convolution: 0.8 ms between them, and 1.0 ms more of
+readback behind them, because what a layer answers with is now one tensor rather
+than five. **They cost more where they went than they cost here**, which is the
+first handover in this project of which that is true — see the layer's own
+paragraph below. Four fifths of a step is a round trip, and the device is now
+executing for two thirds of *that*, so the rest is 43 command buffers submitted
+and waited for around work that was already done. Nothing an operation of a layer
+would open a scope around is left in the table at all: what remains beside the
+round trip is encoding it, the sampling at the end, and the embedding at the
+start.
 
 **A dispatch's shape is not an allocation.** Each of the 749 dispatches a step
 ran at the time took its dimensions, its offsets and the expert its rows go
@@ -116,7 +123,7 @@ That took the encode row from 9.35 ms to 7.28 ms, measured against the commit
 before it and alternating between the two over seven pairs, with the wait row and
 the device's own clock where they were. It stays a *copy* per dispatch rather than
 a buffer the layer holds, which is what lets two calls of different heights share
-a command buffer — and 832 allocations are left in that row, every one of them an
+a command buffer — and 994 allocations are left in that row, every one of them an
 output or a row copied over for a dispatch that could not read it where it was.
 
 Multiplies that share an input share a command buffer, and so do multiplies that
@@ -124,7 +131,7 @@ share nothing: the four projections a layer's normed hidden state feeds, the nor
 that makes it, the two convolutions and two head norms behind two of them, the
 attention step beside the projection it feeds, the convolution and add on the
 residual path behind that, the norm over what they left, and every dispatch the
-MLP then runs — 955 dispatches in 43 submissions, one a layer and one for the
+MLP then runs — 1077 dispatches in 43 submissions, one a layer and one for the
 head. **What those have in common is that a seam had to be able to express
 them.** Handing a backend one bank at a time, none of it is visible: it takes a
 call that is given the whole layer to see that the gate reads the hidden state
@@ -171,17 +178,19 @@ about the millisecond the CPU's own scores and mask cost — and it is not what 
 kernel is for. A 769-token prompt prefills in 13.6 s against 55.4 s, and the gap
 widens with the prompt: ×1.3 at 97 tokens, ×2.4 at 385, ×4.1 at 769.
 
-**A whole decoder layer is now one command buffer**, and twenty-three dispatches
+**A whole decoder layer is now one command buffer**, and twenty-six dispatches
 on a layer that routes. Eleven are its attention: the input layernorm, the four
 projections that read it, the two short convolutions behind the key and the
 value, the two head norms over the query and the convolved key, the attention
-step and `o_proj`. Two more are the residual path behind that — the layer's own
-short convolution, which adds the layer's input as a second addend where it
-writes rather than in a dispatch of its own, and the second norm over what it
-left. The last ten are the MLP: the router's gate, the top-k over 256
-sigmoid-corrected scores, and each bank's gate, up, activation and down. Every
-value between them is a buffer the next dispatch reads. A dense layer is
-seventeen, its feed-forward network four where a MoE layer's two banks are eight.
+step and `o_proj`. Three more are the two residual paths around the MLP — the
+layer's two short convolutions, each of which adds the value its block began with
+as a second addend where it writes rather than in a dispatch of its own, and the
+second norm between them. The last twelve are the MLP: the router's gate, the
+top-k over 256 sigmoid-corrected scores, each bank's gate, up, activation and
+down, the softmax over the eight logits that selection named, and both banks'
+rows weighted by it and summed. Every value between them is a buffer the next
+dispatch reads. A dense layer is eighteen, its feed-forward network four where a
+MoE layer's two banks and the router around them are twelve.
 
 Neither bank's rows are a tensor anybody builds. A token reads six experts, so
 its six rows are one row of the hidden state read six times; every token reads
@@ -190,18 +199,36 @@ end after itself. `out[i] = x[(i / per_source) % sources] @ w[experts[i]]ᵀ` is
 both of those and, at `per_source` of one and `sources` of the rows, every
 ordinary dispatch too.
 
-**Four of those twenty-three write state that outlives the call** — three
+**Five of those twenty-six write state that outlives the call** — four
 convolution windows, and the span the step attends over — so where they ran
 decided where that state lives, and holding all of it is what let the rest
 follow. What a sequence still carries here is a count.
 
-What that leaves on the CPU is the half of each router that weights what it
-chose — a softmax over eight numbers, where three of the four ways of misreading
-this gate live — and, behind it, the second short convolution and the residual
-add it feeds. Those two used to sit *inside* a layer and now sit between two of
-them, which is the whole of what took a step from 87 command buffers to 43. There
-is no matmul left outside the GPU. Both backends generate the same tokens, and
-the CPU one stays the oracle every kernel here is validated against.
+**What that leaves on the CPU is nothing of a layer.** The last two things it
+held were the router's own softmax — over eight numbers, where three of the four
+ways of misreading this gate live — and the short convolution and residual add
+that read what it weighted. The softmax is a dispatch now, measured against
+`SparseMoe::weigh`, which stays the arithmetic every fixture holds to mlx-vlm and
+is what says the eight weights still come from the raw logits, still span the
+routed six and the shared two together, and still carry `route_scale` *and* the
+learned `global_scale` whose absence is a 142-fold error. A layer is
+`[tokens, hidden]` in and `[tokens, hidden]` out.
+
+**It cost 0.65 ms rather than saving any**, over seven alternating pairs in which
+every pair moved the same way: 46.83 ms to 47.48. The 1.8 ms of CPU rows that
+came off is real, and so is what replaced it — 122 more dispatches a step is 0.8
+ms more device time and 0.8 ms more encoding, and 162 more buffers made and freed
+is most of the rest. **The command buffer count did not move**, and that is the
+whole of why: this handover merged nothing. What it bought is the *precondition*
+for merging — a layer whose input and output are the only values that cross, so
+that nothing between layer i and layer i+1 forces a wait. Taking that is a seam
+one level up from this one: `ModelWeights::run_layer` hands the stack `&[f32]`
+and takes back `Vec<f32>`, and until the value between two layers can be named on
+the device, the round trip between them is not the arithmetic's to give up.
+
+There is no operation of a layer left outside the GPU. Both backends generate the
+same tokens, and the CPU one stays the oracle every kernel here is validated
+against.
 
 Or the same model behind an OpenAI-compatible endpoint, loaded once:
 

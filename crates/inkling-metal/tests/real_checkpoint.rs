@@ -489,8 +489,9 @@ const GENERATED: usize = 8;
 /// beside a copy of all of it made onto the device on every layer of every
 /// step. Measured over the same eight-token generation the peak went 0.13 GiB
 /// to 0.14, which is the 64 slots minus the 16 keys' worth of vector. The same
-/// generation measures 0.16 now, 0.15 of which it was before a layer took the
-/// third convolution's two windows and the buffers of its own residual path.
+/// generation measures 0.17 now, 0.15 of which it was before a layer took the
+/// two residual paths' four convolution windows and the buffers between their
+/// dispatches.
 ///
 /// So the bound now covers a *span*, and what it can no longer be read as is a
 /// claim about a long context: at 4096 tokens the two spans are 1.4 GiB and
