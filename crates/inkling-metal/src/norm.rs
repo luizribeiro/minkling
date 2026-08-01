@@ -60,12 +60,23 @@ use crate::kernel::{Batch, Grid, Kernel};
 
 const ENTRY: &str = "rms_norm";
 
-/// Threads one threadgroup of a dispatch holds, a multiple of every simdgroup
-/// width Metal reports — the same bargain [`crate::matmul`] strikes, and for the
-/// same reason: the row a lane works on is `thread_position_in_grid` divided by
-/// `threads_per_simdgroup`, and a threadgroup that was not a whole number of
-/// simdgroups would put one row's lanes in two of them.
+/// Threads one threadgroup of a dispatch holds, and — unlike
+/// [`crate::matmul`]'s — all of them work on one row.
+///
+/// **A norm is far too small to be given a simdgroup.** The packed matmul gives
+/// one simdgroup to each output element and has 201024 of them to dispatch; a
+/// decode-shaped norm has one row, so a simdgroup apiece is 32 threads for the
+/// whole kernel and nothing to hide a memory latency behind. Measured at that
+/// width it was 250 microseconds of device time for 16 KB read three times,
+/// which is more than the submission around it. Eight simdgroups on the same row
+/// is `a_decode_shaped_norm_costs_less_than_the_submission_around_it`.
 const THREADS_PER_GROUP: usize = 256;
+
+/// Entries the kernel's threadgroup arrays hold, which has to be a constant
+/// where the number of simdgroups is not: 1024 threads is the widest threadgroup
+/// any Apple GPU allows and 32 the narrowest simdgroup any reports, so 32
+/// partials is the most a threadgroup can produce.
+const MOST_SIMDGROUPS: usize = 32;
 
 /// How far down `ilogb` of a row's peak is allowed to go, which bounds the
 /// `eps·2^-2e` the kernel forms. See the module documentation: at -60 the clamp
@@ -136,6 +147,11 @@ impl<'a> LayerNorm<'a> {
         self.width
     }
 
+    /// The `rms_norm_eps` this was wrapped with.
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
+
     /// `[rows, width]` in, `[rows, width]` out, submitted on its own.
     ///
     /// What a caller with nothing to batch it against wants, and what the cases
@@ -184,8 +200,12 @@ impl<'a> LayerNorm<'a> {
         let mut weight = self.weight.borrow_mut();
         let mut out = self.device.zeroed::<f32>(x.len())?;
 
+        // A threadgroup to a row, which is what makes the row index the
+        // threadgroup's own position and so what makes the barriers below
+        // uniform: a threadgroup either runs a row or returns from one, and
+        // never splits over the question.
         let kernel = &self.norm.kernel;
-        let grid = Grid::new(rows * kernel.simd_width(), THREADS_PER_GROUP);
+        let grid = Grid::new(rows * THREADS_PER_GROUP, THREADS_PER_GROUP);
         batch.add(
             kernel,
             &[shape.arg(), input.arg(), weight.arg(), out.arg()],
@@ -207,7 +227,10 @@ fn extent(value: usize, what: &str) -> u32 {
 /// The kernel, with the one constant the range argument rests on written into
 /// its prelude rather than spelled twice.
 fn source() -> String {
-    format!("constant int LEAST_EXPONENT = {LEAST_EXPONENT};\n{BODY}")
+    format!(
+        "constant int LEAST_EXPONENT = {LEAST_EXPONENT};\n\
+         constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n{BODY}"
+    )
 }
 
 /// Everything of the kernel that the clamp does not decide.
@@ -226,22 +249,38 @@ struct Shape {
     uint eps_bits;
 };
 
-/// `out = x * rsqrt(mean(x^2) + eps) * weight`, one simdgroup to a row.
+/// `out = x * rsqrt(mean(x^2) + eps) * weight`, one threadgroup to a row.
 ///
 /// Three passes over the row rather than one: the peak, the sum of the scaled
 /// squares, and the write. A row of the model's width is 16 KB and the second
-/// and third passes read what the first pulled in, where holding 128 values a
-/// lane in registers would fit in none of them.
+/// and third passes read what the first pulled in, where holding the row in
+/// registers would fit in none of them.
+///
+/// Each of the two reductions is a simdgroup reduction and then a pass over what
+/// the simdgroups left, which every thread does for itself — cheaper than
+/// reducing the partials once and broadcasting, at eight entries, and it needs
+/// one barrier rather than two.
 kernel void rms_norm(
     constant Shape &shape [[buffer(0)]],
     device const float *x [[buffer(1)]],
     device const float *weight [[buffer(2)]],
     device float *out [[buffer(3)]],
-    uint position [[thread_position_in_grid]],
+    uint row [[threadgroup_position_in_grid]],
+    uint local [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
-    uint lanes [[threads_per_simdgroup]]
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint simds [[simdgroups_per_threadgroup]]
 ) {
-    const uint row = position / lanes;
+    threadgroup float peaks[MOST_SIMDGROUPS];
+    threadgroup float sums[MOST_SIMDGROUPS];
+
+    // Unreachable under the grid this is dispatched over, which gives exactly
+    // one threadgroup to each row. It is here for what it would have to be if
+    // that ever stopped being true: the row is the threadgroup's own position,
+    // so this turns away a whole group and never splits one — and a bounds check
+    // on `local` instead would leave some threads at the barriers below and
+    // others past them, which is undefined rather than slow.
     if (row >= shape.rows) {
         return;
     }
@@ -250,23 +289,38 @@ kernel void rms_norm(
     device float *result = out + (ulong)row * shape.width;
 
     float peak = 0.0f;
-    for (uint i = lane; i < shape.width; i += lanes) {
+    for (uint i = local; i < shape.width; i += threads) {
         peak = fmax(peak, fabs(values[i]));
     }
     peak = simd_max(peak);
+    if (lane == 0) {
+        peaks[simd] = peak;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 0; s < simds; ++s) {
+        peak = fmax(peak, peaks[s]);
+    }
 
     // `ilogb` of zero is a value the language leaves to the implementation, and
     // an all-zero row is the case `eps` exists for — so the exponent is chosen
-    // without asking about it. Every lane reaches the same answer, `peak`
-    // having been reduced across the simdgroup first.
+    // without asking about it. Every thread reaches the same answer, `peak`
+    // having been reduced across the whole threadgroup first.
     const int exponent = peak > 0.0f ? max(ilogb(peak), LEAST_EXPONENT) : LEAST_EXPONENT;
 
     float sum = 0.0f;
-    for (uint i = lane; i < shape.width; i += lanes) {
+    for (uint i = local; i < shape.width; i += threads) {
         const float scaled = ldexp(values[i], -exponent);
         sum += scaled * scaled;
     }
     sum = simd_sum(sum);
+    if (lane == 0) {
+        sums[simd] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = 0.0f;
+    for (uint s = 0; s < simds; ++s) {
+        sum += sums[s];
+    }
 
     // The scaled mean, against an `eps` brought into the same scale — which is
     // what lets the row's own factor cancel below rather than be multiplied
@@ -277,7 +331,7 @@ kernel void rms_norm(
         sum / (float)shape.width + ldexp(eps, -2 * exponent)
     );
 
-    for (uint i = lane; i < shape.width; i += lanes) {
+    for (uint i = local; i < shape.width; i += threads) {
         result[i] = ldexp(values[i], -exponent) * inverse * weight[i];
     }
 }
@@ -541,12 +595,12 @@ mod tests {
         );
     }
 
-    /// A width the simdgroup does not divide leaves lanes idle on the last
-    /// stride of every pass, and a row count the threadgroup does not divide
-    /// leaves whole simdgroups dispatched past the end of the work — which the
-    /// kernel's own row check is what turns away. Both at once.
+    /// A width no power of two divides leaves threads idle on the last stride
+    /// of every pass, and it leaves the two reductions with simdgroups that
+    /// contributed nothing — 37 values over 256 threads is seven simdgroups
+    /// holding one lane's worth each and one holding none.
     #[test]
-    fn a_ragged_width_and_a_ragged_grid_still_reproduce_the_cpu() {
+    fn a_width_narrower_than_the_threadgroup_still_reproduces_the_cpu() {
         let Some(device) = device() else { return };
         let norm = RmsNorm::new(&device).expect("the norm compiles");
         let (width, rows) = (37, 19);
@@ -554,12 +608,6 @@ mod tests {
         let x: Vec<f32> = (0..rows * width)
             .map(|i| ((i % 23) as f32 - 11.0) / 4.0)
             .collect();
-        assert_ne!(
-            rows * norm.kernel.simd_width() % THREADS_PER_GROUP,
-            0,
-            "a dispatch that filled its last threadgroup would not exercise the row check"
-        );
-
         let got = LayerNorm::new(&device, &norm, &weight, 1e-6)
             .expect("the weight uploads")
             .forward(&x)
@@ -567,6 +615,40 @@ mod tests {
 
         let deviation = deviation(&got, &on_the_cpu(&x, &weight, 1e-6));
         assert!(deviation <= TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// What a decode-shaped norm costs the device to run, which is the figure
+    /// that decides whether moving one here is worth a dispatch at all.
+    ///
+    /// A `[1, 4096]` norm is 16 KB read three times and nothing else, against a
+    /// `[1, 4096] @ [4096, 4096]ᵀ` projection's 8 MB of packed weights — so the
+    /// arithmetic is four hundred times smaller and the question is entirely
+    /// whether the grid is wide enough to hide the latency. Nothing asserts a
+    /// ratio; the numbers go to stderr for the commit message to quote.
+    #[test]
+    fn a_decode_shaped_norm_costs_less_than_the_submission_around_it() {
+        let Some(device) = device() else { return };
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let width = 4096;
+        let x: Vec<f32> = (0..width).map(|i| (i % 37) as f32 - 18.0).collect();
+        let layer =
+            LayerNorm::new(&device, &norm, &vec![1.0; width], 1e-6).expect("the weight uploads");
+
+        // Warm: the first dispatch of a fresh pipeline pays for the driver's
+        // first look at these buffers, which a decode loop pays once.
+        for _ in 0..2 {
+            layer.forward(&x).expect("the dispatch completes");
+        }
+
+        const CALLS: u32 = 64;
+        let started = std::time::Instant::now();
+        for _ in 0..CALLS {
+            layer.forward(&x).expect("the dispatch completes");
+        }
+        let each = started.elapsed() / CALLS;
+
+        eprintln!("a [1, {width}] norm submitted on its own: {each:.2?}");
+        assert!(each < std::time::Duration::from_millis(2), "{each:?}");
     }
 
     /// A row of the width the model actually runs, which is what says whether a
