@@ -5,8 +5,10 @@
 //! multiplies through, the experts every MoE layer routes into, and the five
 //! attention projections every layer holds — along with the feed-forward network
 //! the two dense layers hold where the other forty hold experts. Between them
-//! they are every weight this engine has a kernel for; what is left on the CPU
-//! is the attention step itself, the norms, the convolutions and the routers.
+//! they are every weight this engine has a kernel for, and each layer's input
+//! layernorm goes over with its projections because they are the only thing
+//! that reads it. What is left on the CPU is the attention step itself, each
+//! layer's second norm, the convolutions and the routers.
 //!
 //! Nothing downstream branches on the choice — not the generation loop, not the
 //! server, not the head's own arithmetic — which is what makes "the CPU path
@@ -30,29 +32,37 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
-use inkling_metal::{Device, ModelExperts, ModelProjections, PackedMatmul, PackedProjection};
+use inkling_metal::{
+    Device, ModelExperts, ModelProjections, PackedMatmul, PackedProjection, RmsNorm,
+};
 
 use crate::LABEL;
 use crate::args::Backend;
 
-/// What a Metal-backed run holds for its whole life: the device, and the
-/// compiled kernel every packed projection on it shares.
+/// What a Metal-backed run holds for its whole life: the device, and the two
+/// compiled kernels everything on it shares.
 ///
-/// Neither is about a weight. The kernel's source names no shape, so one of
-/// these serves the whole model — and both are opened before the checkpoint, so
-/// that a machine this cannot run on says so in a millisecond rather than after
-/// mapping 130 GiB.
+/// None of the three is about a weight. Neither kernel's source names a shape,
+/// so one of each serves the whole model — and all three are opened before the
+/// checkpoint, so that a machine this cannot run on says so in a millisecond
+/// rather than after mapping 130 GiB.
 #[derive(Debug)]
 pub struct Gpu {
     device: Device,
     matmul: PackedMatmul,
+    norm: RmsNorm,
 }
 
 impl Gpu {
     fn open() -> Result<Self> {
         let device = Device::open().context("opening a Metal device")?;
         let matmul = PackedMatmul::new(&device).context("compiling the packed matmul")?;
-        Ok(Self { device, matmul })
+        let norm = RmsNorm::new(&device).context("compiling the RMSNorm")?;
+        Ok(Self {
+            device,
+            matmul,
+            norm,
+        })
     }
 }
 
@@ -104,9 +114,15 @@ pub fn weights<'a>(
     .context("giving the expert banks to the Metal device")?;
 
     let packed = weights.layer_projections();
-    let projections =
-        ModelProjections::wrap(&gpu.device, &gpu.matmul, &packed, config.num_hidden_layers)
-            .context("giving the layers' projections to the Metal device")?;
+    let projections = ModelProjections::wrap(
+        &gpu.device,
+        &gpu.matmul,
+        &gpu.norm,
+        &packed,
+        config.num_hidden_layers,
+        config.rms_norm_eps,
+    )
+    .context("giving the layers' projections to the Metal device")?;
     eprintln!(
         "{:<LABEL$}metal, {rows} rows of lm_head, {} MoE layers' banks and all {} layers' \
          projections wrapped in {:.2?}",

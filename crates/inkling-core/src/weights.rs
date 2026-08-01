@@ -406,13 +406,22 @@ pub struct LayerBanks<'a> {
 
 /// One layer's own projections, still packed, from
 /// [`CheckpointWeights::layer_projections`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LayerPacked<'a> {
     pub layer: usize,
     pub attention: PackedAttention<'a>,
     /// The feed-forward network of a dense layer, and `None` where the layer
     /// routes to experts instead — which is [`LayerBanks`]'s question.
     pub dense_mlp: Option<PackedMlp<'a>>,
+    /// The weight of the norm those five projections consume the output of,
+    /// widened rather than packed — it is bfloat16 in the checkpoint and 16 KB
+    /// of it, so there is nothing here to leave in place.
+    ///
+    /// Handed over with the projections because it is theirs: nothing else in
+    /// the model reads what `input_layernorm` produces, so a backend holding the
+    /// five holds the norm in front of them or the value crosses back for
+    /// nobody. See [`Projections::normed_qkvr`].
+    pub input_layernorm: Vec<f32>,
 }
 
 /// Where a layer's own projections multiply, when it is not here.
@@ -538,6 +547,7 @@ impl<'a> CheckpointWeights<'a> {
                 };
                 LayerPacked {
                     layer,
+                    input_layernorm: self.widened(&format!("{module}.input_layernorm.weight")),
                     attention: PackedAttention {
                         q_proj: packed("self_attn.q_proj"),
                         k_proj: packed("self_attn.k_proj"),

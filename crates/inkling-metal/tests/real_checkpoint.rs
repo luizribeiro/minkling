@@ -27,6 +27,7 @@ use inkling_core::{
 };
 use inkling_metal::{
     Device, MetalError, ModelExperts, ModelProjections, PackedBank, PackedMatmul, PackedProjection,
+    RmsNorm,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -392,8 +393,8 @@ const GENERATED: usize = 8;
 /// not join *this process's* resident set the way a `dequantize_blocks_into` of
 /// the same bytes does — so each handover has taken the peak down rather than
 /// up. Measured over the same eight-token generation: 20.77 GiB with only the
-/// head on the device, 2.44 GiB with the experts there too, and 0.18 GiB now
-/// that the layers' own projections are.
+/// head on the device, 2.44 GiB with the experts there too, and 0.19 GiB now
+/// that the layers' own projections and input layernorms are.
 ///
 /// **32 GiB was slack and 1 GiB is a claim.** What is left resident is what the
 /// CPU still reads: the embedding rows a prompt asked for, the norms, the
@@ -419,15 +420,21 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// dispatches alone would watch the number that cannot change while the one
 /// that pays for it doubled underneath.
 ///
-/// Per layer: five attention projections in two submissions — the four that
-/// share the normed hidden state, then `o_proj` — and per MoE layer six expert
-/// dispatches in four, being each bank's gate and up together and then its
-/// down. A dense layer's feed-forward network is three in two. The head is one
-/// of each.
+/// Per layer: the input layernorm and the four projections that consume what it
+/// produced in one submission, then `o_proj` in a second — and per MoE layer six
+/// expert dispatches in four, being each bank's gate and up together and then
+/// its down. A dense layer's feed-forward network is three in two. The head is
+/// one of each.
+///
+/// **The norm is the term that says what moving an op onto the device costs
+/// here.** It is a dispatch a layer did not make before and a submission it did
+/// not need: it was encoded into the command buffer its four consumers were
+/// already going to be submitted in, which is the whole of why the second figure
+/// does not move.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
     (
-        5 * layers + 3 * dense + 6 * moe + 1,
+        6 * layers + 3 * dense + 6 * moe + 1,
         2 * layers + 2 * dense + 4 * moe + 1,
     )
 }
@@ -488,9 +495,16 @@ impl OnTheDevice {
         )
         .expect("the banks wrap");
         let packed = weights.layer_projections();
-        let projections =
-            ModelProjections::wrap(device, &matmul, &packed, config.num_hidden_layers)
-                .expect("the projections wrap");
+        let norm = RmsNorm::new(device).expect("the norm compiles");
+        let projections = ModelProjections::wrap(
+            device,
+            &matmul,
+            &norm,
+            &packed,
+            config.num_hidden_layers,
+            config.rms_norm_eps,
+        )
+        .expect("the projections wrap");
 
         let mut run = Self {
             expert_layers: experts.layers(),

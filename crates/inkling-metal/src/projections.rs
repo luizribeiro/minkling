@@ -19,17 +19,18 @@
 //! one expert every row goes through, and the only thing that stays packed is
 //! the weight itself.
 //!
-//! **One dispatch a projection, two submissions a layer.** Five dispatches a
-//! layer for attention and three for each of the two dense layers, which is 216
-//! of a decode step's 457 against the MoE's 240. What they cost, though, is set
-//! by how many command buffers they go in rather than by how many they are:
-//! `q`, `k`, `v` and `r` consume the same normed hidden state and nothing of
-//! each other, so they are one submission and `o_proj` — which multiplies what
-//! the attention step made of them — is the second. A feed-forward network is
-//! the same shape over gate, up and then down.
+//! **Two submissions a layer, whatever is in them.** `q`, `k`, `v` and `r`
+//! consume the same normed hidden state and nothing of each other, so they are
+//! one command buffer, and `o_proj` — which multiplies what the attention step
+//! made of them — is the second. A feed-forward network is the same shape over
+//! gate, up and then down. That is worth 26 ms of a decode step at 206 µs a
+//! submission, and it is the whole of what [`Batch`](crate::Batch) is for.
 //!
-//! That is worth 26 ms of a decode step at 206 µs a submission, and it is the
-//! whole of what [`Batch`](crate::Batch) is for.
+//! **The norm that makes their input is in the first of those two.** It is a
+//! sixth dispatch a layer and no submission at all, and what it produces stays
+//! in a device buffer the four read — see [`LayerProjections::normed_qkvr`],
+//! which is the first place in this engine where an activation is formed and
+//! consumed without the CPU seeing it.
 
 use inkling_core::attention::{Projections, Qkvr};
 use inkling_core::ops::{MlpProjections, Projection};
@@ -37,6 +38,7 @@ use inkling_core::weights::{LayerPacked, Packed, PackedAttention, PackedMlp, Pro
 
 use crate::device::Device;
 use crate::matmul::{MatmulError, PackedMatmul, PackedProjection, together};
+use crate::norm::{LayerNorm, RmsNorm};
 
 /// One attention layer's five projections on the device.
 ///
@@ -47,6 +49,13 @@ use crate::matmul::{MatmulError, PackedMatmul, PackedProjection, together};
 /// checkpoint's, and what changes is that no weight is ever decoded to memory.
 #[derive(Debug)]
 pub struct LayerProjections<'a> {
+    /// The norm whose output the first four consume, resident beside them.
+    ///
+    /// Here rather than left to the CPU because of what it lets the four do:
+    /// its answer stays in a device buffer they read directly, so the normed
+    /// hidden state is never a `Vec<f32>` anywhere — see
+    /// [`LayerProjections::normed_qkvr`].
+    input_layernorm: LayerNorm<'a>,
     q_proj: PackedProjection<'a>,
     k_proj: PackedProjection<'a>,
     v_proj: PackedProjection<'a>,
@@ -71,9 +80,13 @@ impl<'a> LayerProjections<'a> {
     pub fn wrap(
         device: &'a Device,
         matmul: &'a PackedMatmul,
+        norm: &'a RmsNorm,
         packed: &PackedAttention<'a>,
+        input_layernorm: &[f32],
+        eps: f32,
     ) -> Result<Self, MatmulError> {
         Ok(Self {
+            input_layernorm: LayerNorm::new(device, norm, input_layernorm, eps)?,
             q_proj: whole(device, matmul, &packed.q_proj)?,
             k_proj: whole(device, matmul, &packed.k_proj)?,
             v_proj: whole(device, matmul, &packed.v_proj)?,
@@ -100,6 +113,51 @@ impl Projections for LayerProjections<'_> {
             ])
         })
         .unwrap_or_else(|err| panic!("the layer's projections did not run: {err}"));
+        Qkvr { q, k, v, r }
+    }
+
+    /// The layer's input layernorm and those same four, in one command buffer,
+    /// with the normed state never leaving the device.
+    ///
+    /// **This is the pattern the rest of the residency is made of.** The four
+    /// dispatches read the buffer the norm's dispatch wrote — Metal's default
+    /// dispatch type is serial, so the ordering is the command buffer's — and
+    /// what used to be a `Vec<f32>` formed on the CPU, copied over four times
+    /// and dropped is now a value that exists only in device memory. The
+    /// submission count does not move: five dispatches where there were four,
+    /// in the one command buffer that already held them.
+    ///
+    /// `weight` and `eps` arrive and are checked rather than used: this holds
+    /// the same norm already, uploaded once at wrap time where the CPU path
+    /// widens its copy out of the mapping on every step.
+    ///
+    /// Two copies of one tensor, then, and what says they agree is that both are
+    /// `{layer}.input_layernorm.weight` widened out of the same read-only
+    /// mapping — [`CheckpointWeights`](inkling_core::CheckpointWeights) names it
+    /// once for the backend and once for the layer, and a checkpoint does not
+    /// change under a running process. The assertions cover the two things that
+    /// are cheap to check and would be a wrong answer rather than a panic: a
+    /// norm of another layer's width, and an `eps` from another config.
+    /// Comparing the values themselves would cost more per call than the
+    /// normalisation does.
+    fn normed_qkvr(&self, x: &[f32], weight: &[f32], eps: f32) -> Qkvr {
+        assert_eq!(
+            weight.len(),
+            self.input_layernorm.width(),
+            "the layer's norm against the one wrapped for it"
+        );
+        assert_eq!(eps, self.input_layernorm.eps(), "rms_norm_eps");
+
+        let [q, k, v, r] = together(self.q_proj.device(), |batch| {
+            let mut normed = self.input_layernorm.encode(batch, x)?;
+            Ok([
+                self.q_proj.encode_over(batch, &mut normed)?,
+                self.k_proj.encode_over(batch, &mut normed)?,
+                self.v_proj.encode_over(batch, &mut normed)?,
+                self.r_proj.encode_over(batch, &mut normed)?,
+            ])
+        })
+        .unwrap_or_else(|err| panic!("the layer's norm and projections did not run: {err}"));
         Qkvr { q, k, v, r }
     }
 
@@ -228,13 +286,22 @@ impl<'a> ModelProjections<'a> {
     pub fn wrap(
         device: &'a Device,
         matmul: &'a PackedMatmul,
+        norm: &'a RmsNorm,
         packed: &[LayerPacked<'a>],
         layers: usize,
+        eps: f32,
     ) -> Result<Self, MatmulError> {
         let mut wrapped: Vec<Option<Layer<'a>>> = (0..layers).map(|_| None).collect();
         for layer in packed {
             wrapped[layer.layer] = Some(Layer {
-                attention: LayerProjections::wrap(device, matmul, &layer.attention)?,
+                attention: LayerProjections::wrap(
+                    device,
+                    matmul,
+                    norm,
+                    &layer.attention,
+                    &layer.input_layernorm,
+                    eps,
+                )?,
                 dense_mlp: layer
                     .dense_mlp
                     .map(|mlp| DenseFfn::wrap(device, matmul, &mlp))
@@ -281,7 +348,7 @@ mod tests {
     use super::*;
     use inkling_core::Checkpoint;
     use inkling_core::fixture::{self, deviation};
-    use inkling_core::ops::DenseProjection;
+    use inkling_core::ops::{DenseProjection, rms_norm};
 
     use crate::testing::device;
 
@@ -308,10 +375,23 @@ mod tests {
         Packed::open(ckpt, name).expect("the fixture holds the slice packed")
     }
 
+    /// The width every tensor in the fixture maps from, which is the model's.
+    const IN_DIM: usize = 4096;
+
+    /// A stand-in for a layer's `rms_norm_eps`, which is not 1e-6 so that a path
+    /// defaulting to a round number would be a different answer.
+    const EPS: f32 = 1.5625e-5;
+
     /// A row spread over both signs, so that a reduction cancels the way a
     /// trained one does.
     fn row(in_dim: usize) -> Vec<f32> {
         (0..in_dim).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect()
+    }
+
+    /// A norm weight that is not all ones, so that a path which dropped it would
+    /// be a different answer rather than the same one.
+    fn layernorm(width: usize) -> Vec<f32> {
+        (0..width).map(|i| 0.5 + (i % 13) as f32 / 16.0).collect()
     }
 
     /// That every projection of `named` answers with the tensor it was named,
@@ -363,10 +443,17 @@ mod tests {
         let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
         let ckpt = fixture::open(fixture::MXFP4);
 
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
         for (r_proj, o_proj) in LAST_TWO {
-            let five =
-                LayerProjections::wrap(&device, &matmul, &attention(&ckpt, (r_proj, o_proj)))
-                    .expect("the five wrap");
+            let five = LayerProjections::wrap(
+                &device,
+                &matmul,
+                &norm,
+                &attention(&ckpt, (r_proj, o_proj)),
+                &layernorm(IN_DIM),
+                EPS,
+            )
+            .expect("the five wrap");
 
             each_answers(
                 &ckpt,
@@ -412,6 +499,70 @@ mod tests {
         );
     }
 
+    /// The layer's norm and the four projections that consume it, in one
+    /// command buffer, against normalising here and asking for the four.
+    ///
+    /// **The claim the whole seam rests on.** What the device path produces is
+    /// never seen by this process — the normed hidden state exists only in a
+    /// buffer between two dispatches — so the only way to say it is the right
+    /// value is to run the same four projections over a normed state formed
+    /// here and compare what came out the far end.
+    ///
+    /// Two rows rather than one, because a norm reduces over the last axis and a
+    /// kernel that reduced over the buffer would agree on a single row.
+    ///
+    /// The third answer is what says the norm happened at all: the same four
+    /// projections over the raw input, which is a layer that stands up and
+    /// attends to an unnormalised state.
+    #[test]
+    fn a_layers_norm_and_its_four_projections_answer_what_the_cpu_answers() {
+        let Some(device) = device() else { return };
+        let matmul = PackedMatmul::new(&device).expect("the packed matmul compiles");
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let ckpt = fixture::open(fixture::MXFP4);
+        let weight = layernorm(IN_DIM);
+
+        // The fixture's third tensor is a two-expert bank, which as a whole
+        // projection maps from 131072 — so the five here are the two that map
+        // from the model's own width, which is what asking the four for one
+        // input needs them to share.
+        let of = |name| packed(&ckpt, name);
+        let five = LayerProjections::wrap(
+            &device,
+            &matmul,
+            &norm,
+            &PackedAttention {
+                q_proj: of(TENSORS[0]),
+                k_proj: of(TENSORS[1]),
+                v_proj: of(TENSORS[0]),
+                r_proj: of(TENSORS[1]),
+                o_proj: of(TENSORS[0]),
+            },
+            &weight,
+            EPS,
+        )
+        .expect("the five wrap");
+
+        let x = [row(IN_DIM), row(IN_DIM).iter().map(|v| v * 3.0).collect()].concat();
+        let fused = five.normed_qkvr(&x, &weight, EPS);
+        let apart = five.qkvr(&rms_norm(&x, &weight, EPS));
+        let unnormed = five.qkvr(&x);
+
+        for (name, got, want, raw) in [
+            ("q", &fused.q, &apart.q, &unnormed.q),
+            ("k", &fused.k, &apart.k, &unnormed.k),
+            ("v", &fused.v, &apart.v, &unnormed.v),
+            ("r", &fused.r, &apart.r, &unnormed.r),
+        ] {
+            let agreed = deviation(got, want);
+            assert!(agreed <= TOLERANCE, "{name}: deviation {agreed:e}");
+            assert!(
+                deviation(got, raw) > TOLERANCE,
+                "{name}: the norm did not reach the answer"
+            );
+        }
+    }
+
     /// Which layer's projections answer for which layer, and which layers this
     /// answers for at all.
     ///
@@ -432,6 +583,7 @@ mod tests {
         let packed_layers = [
             LayerPacked {
                 layer: 0,
+                input_layernorm: layernorm(IN_DIM),
                 attention: attention(&ckpt, LAST_TWO[0]),
                 dense_mlp: Some(PackedMlp {
                     gate_proj: packed(&ckpt, TENSORS[0]),
@@ -441,12 +593,15 @@ mod tests {
             },
             LayerPacked {
                 layer: 2,
+                input_layernorm: layernorm(IN_DIM),
                 attention: attention(&ckpt, LAST_TWO[1]),
                 dense_mlp: None,
             },
         ];
-        let projections = ModelProjections::wrap(&device, &matmul, &packed_layers, LAYERS)
-            .expect("the layers wrap");
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let projections =
+            ModelProjections::wrap(&device, &matmul, &norm, &packed_layers, LAYERS, EPS)
+                .expect("the layers wrap");
 
         assert_eq!(projections.layers(), 2, "two of the five");
         assert_eq!(projections.dense_layers(), 1);

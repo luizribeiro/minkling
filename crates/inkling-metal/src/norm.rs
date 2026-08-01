@@ -54,6 +54,8 @@
 
 use std::cell::RefCell;
 
+use inkling_core::profile::{self, Op};
+
 use crate::buffer::Buffer;
 use crate::device::{Device, MetalError};
 use crate::kernel::{Batch, Grid, Kernel};
@@ -183,6 +185,7 @@ impl<'a> LayerNorm<'a> {
     /// dispatch reads, and there is no empty buffer to hand it — a norm over no
     /// tokens is a forward pass over no tokens.
     pub fn encode(&self, batch: &mut Batch<'_>, x: &[f32]) -> Result<Buffer<f32>, MetalError> {
+        let _timed = profile::scope(Op::Encode);
         assert_eq!(
             x.len() % self.width,
             0,
