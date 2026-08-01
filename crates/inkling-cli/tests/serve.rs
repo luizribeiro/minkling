@@ -8,7 +8,7 @@
 //! model's answer rather than the prompt continued, and that not one turn marker
 //! leaked into the field a client renders.
 //!
-//! Gated on `INKLINGRS_CHECKPOINT`, which is ~30 s to load and 16.7 GiB peak.
+//! Gated on `INKLINGRS_CHECKPOINT`, which is 0.3 s to load and 0.35 GiB peak.
 //! Unset, it reports a skip and passes.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -141,8 +141,8 @@ fn head_and_body(response: &str) -> (&str, &str) {
 /// model in a turn is what opens a channel.
 ///
 /// Everything else this server does is checked here too rather than in a test of
-/// its own, because a second test is a second checkpoint load: ~30 s and
-/// 16.7 GiB, and `cargo nextest` would run the two at once.
+/// its own, because a second test is a second server holding the whole model, and
+/// `cargo nextest` would run the two at once.
 #[test]
 fn a_chat_request_is_answered_with_the_models_own_turn_streamed_back() {
     let Some(dir) = checkpoint_dir() else { return };

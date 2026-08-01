@@ -8,7 +8,7 @@
 //!
 //! # One request at a time, and the next one waits
 //!
-//! The checkpoint is loaded once — ~30 s and 16.7 GiB peak — and every request is
+//! The checkpoint is loaded once — 0.3 s and 0.35 GiB peak — and every request is
 //! served against it in the order it arrived. There is no batching here, and
 //! saying otherwise would be the substantial lie: continuous batching is the
 //! reason this engine exists and it is a scheduler, not a request loop.

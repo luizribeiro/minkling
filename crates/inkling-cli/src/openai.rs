@@ -303,7 +303,9 @@ impl Completion {
 
 /// What `GET /v1/models` answers: the one checkpoint this process loaded.
 ///
-/// One, because loading it is ~30 s and 16.7 GiB and a process holds exactly one.
+/// One, because a process holds exactly one, and it holds it whole: the banks are
+/// wrapped where the checkpoint mapped them rather than copied, so what a second
+/// would cost is another 137 GB of mapping and not another 0.35 GiB.
 /// A client that lists models to pick one has a list of length one to pick from,
 /// which is the honest answer.
 pub fn models(model: &str, created: u64) -> String {
