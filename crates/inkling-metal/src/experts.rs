@@ -218,6 +218,31 @@ impl<'a> ExpertBanks<'a> {
         self.down_proj.encode_over(batch, chosen, &mut activated)
     }
 
+    /// The same bank over every row of `x`, once per expert `chosen` names in
+    /// turn — see [`PackedBank::encode_repeating`].
+    ///
+    /// **The shared bank's rows are not laid out either.** Every token goes
+    /// through every shared expert, so what the bank runs is the hidden state
+    /// read over again rather than a `[n_shared * tokens, hidden]` tensor
+    /// somebody built and copied over twice — once for `gate` and once for `up`.
+    /// What it reads instead is the buffer the router's gate and the routed bank
+    /// are already reading.
+    pub(crate) fn encode_repeated(
+        &self,
+        batch: &mut Batch<'_>,
+        chosen: &[u32],
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
+        let glu = [
+            self.gate_proj.encode_repeating(batch, chosen, x)?,
+            self.up_proj.encode_repeating(batch, chosen, x)?,
+        ];
+        let Some(mut activated) = self.activated(batch, glu)? else {
+            return Ok(Pending::empty());
+        };
+        self.down_proj.encode_over(batch, chosen, &mut activated)
+    }
+
     /// The same bank over an expert list a dispatch already left on the device,
     /// `per_source` of its rows reading each row of `x` — see
     /// [`PackedBank::encode_picked`].
@@ -351,6 +376,14 @@ impl<'a> LayerExperts<'a> {
     /// here and the rows they name are the hidden state read at a stride, so
     /// what this side is left to do with the gate's logits is weight a selection
     /// that has already run.
+    ///
+    /// **Neither bank's rows are a tensor this copies.** The hidden state is
+    /// uploaded once and read four ways: by the gate, by the routed bank's two
+    /// halves at the stride the routing implies, and by the shared bank's two
+    /// halves over again once per shared expert. What `shared` still carries is
+    /// the expert each of those rows goes through; the rows themselves are
+    /// `SparseMoe::shared_rows`'s promise that they are `x` laid end to end
+    /// after itself, which is what makes the modulo the right reading of them.
     fn encode(
         &self,
         x: &[f32],
@@ -365,7 +398,7 @@ impl<'a> LayerExperts<'a> {
         let mut picked = self.router.encode(&mut batch, &mut logits)?;
         let shared_out = self
             .shared
-            .encode(&mut batch, &shared_chosen, shared.rows())?;
+            .encode_repeated(&mut batch, &shared_chosen, &mut hidden)?;
         let routed_out = self.routed.encode_picked(
             &mut batch,
             &mut picked,
@@ -841,9 +874,11 @@ mod tests {
     /// waits for this side, so over forty MoE layers that is 120 round trips a
     /// decode step does not take.
     ///
-    /// Three fewer buffers, too: the hidden state is uploaded once for the gate
-    /// and both of the routed bank's halves to read, where the parts apart copy
-    /// it over for each of them.
+    /// Five fewer buffers, too: the hidden state is uploaded once for the gate,
+    /// both of the routed bank's halves and both of the shared bank's to read,
+    /// where the parts apart copy it over for each of them — and the shared
+    /// bank's copies are `n_shared` times the size, being every token once per
+    /// shared expert.
     #[test]
     fn the_whole_layer_costs_three_fewer_submissions_than_its_four_parts_apart() {
         let Some(device) = device() else { return };
@@ -865,11 +900,13 @@ mod tests {
                 .expect("the router stands up"),
         };
 
-        // Two tokens, and the shape `SparseMoe::forward` hands the shared bank:
-        // every token once per shared expert.
+        // Two tokens, and the shape `SparseMoe::shared_rows` hands the shared
+        // bank: every token once per shared expert, expert-major — which is `x`
+        // laid end to end after itself, and is what the layer reads at a modulo
+        // rather than copying over.
         let x = rows(2);
         let shared_chosen = [0usize, 0, 1, 1];
-        let shared_x = rows(shared_chosen.len());
+        let shared_x: Vec<f32> = x.iter().chain(&x).copied().collect();
         let shared = Gathered::new(DIM, &shared_chosen, &shared_x);
 
         let mut asked = None;
@@ -910,7 +947,7 @@ mod tests {
         );
 
         assert_eq!(together.0, apart.0, "the same dispatches");
-        assert_eq!(together, (10, 1, 11), "the layer's own cost");
+        assert_eq!(together, (10, 1, 9), "the layer's own cost");
         assert_eq!(apart, (10, 4, 14), "what the four parts cost apart");
     }
 

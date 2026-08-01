@@ -404,7 +404,7 @@ impl<'a> PackedBank<'a> {
     /// The scalars the kernel's `Shape` struct declares, in its order — the
     /// caller's to hold, because they are read where the dispatch is encoded and
     /// an array made here would be gone by then.
-    fn shape(&self, rows: usize, per_source: usize) -> [u32; SHAPE_FIELDS] {
+    fn shape(&self, rows: usize, per_source: usize, sources: usize) -> [u32; SHAPE_FIELDS] {
         let resident = self.resident.borrow();
         let stride = self.out_dim * self.in_dim;
         [
@@ -415,6 +415,7 @@ impl<'a> PackedBank<'a> {
                 per_source,
                 "the rows of a call that read one row of the input",
             ),
+            extent(sources, "the rows of the input"),
             extent(resident.codes.offset(), "where a bank's codes start"),
             extent(resident.scales.offset(), "where a bank's scales start"),
             extent(stride / CODES_PER_BYTE, "the packed bytes of an expert"),
@@ -450,8 +451,8 @@ impl<'a> PackedBank<'a> {
         x: &[f32],
     ) -> Result<Pending, MatmulError> {
         assert_eq!(
-            x.len(),
-            experts.len() * self.in_dim,
+            self.sources(x.len()),
+            experts.len(),
             "{} values are not {} rows of {}",
             x.len(),
             experts.len(),
@@ -521,14 +522,41 @@ impl<'a> PackedBank<'a> {
             "a row of a call reads some row of the input"
         );
         assert_eq!(
-            x.len(),
-            rows.div_ceil(per_source) * self.in_dim,
+            self.sources(x.len()),
+            rows.div_ceil(per_source),
             "{} values are not {} rows of {}",
             x.len(),
             rows.div_ceil(per_source),
             self.in_dim
         );
         self.dispatch(batch, rows, per_source, chosen.arg(), x)
+    }
+
+    /// The same multiply over rows a dispatch already left on the device, every
+    /// one of them read once per expert `experts` names in turn.
+    ///
+    /// **This is the shared bank's shape, and it is the same gather nobody
+    /// gathered.** Every token goes through every shared expert, so the rows the
+    /// bank runs are the input laid end to end after itself once per expert —
+    /// `[n_shared * tokens, in_dim]` of which every row is already `[tokens,
+    /// in_dim]` somewhere. Read at a modulo it is not laid out at all, and the
+    /// input can be the buffer the router's gate and the routed bank are reading
+    /// in the same command buffer.
+    ///
+    pub(crate) fn encode_repeating(
+        &self,
+        batch: &mut Batch<'_>,
+        experts: &[u32],
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
+        let _timed = profile::scope(Op::Encode);
+        let sources = self.sources(x.len());
+        assert!(
+            experts.is_empty() || (sources > 0 && experts.len() % sources == 0),
+            "{} rows are not whole passes over {sources} rows of input",
+            experts.len()
+        );
+        self.listed(batch, experts, x)
     }
 
     /// One dispatch encoded, without the scope its callers each open — so that
@@ -540,16 +568,34 @@ impl<'a> PackedBank<'a> {
         x: &mut Buffer<f32>,
     ) -> Result<Pending, MatmulError> {
         assert_eq!(
-            x.len(),
-            experts.len() * self.in_dim,
+            self.sources(x.len()),
+            experts.len(),
             "{} values are not {} rows of {}",
             x.len(),
             experts.len(),
             self.in_dim
         );
-        // Checked here because the kernel cannot: an index past the bank is an
-        // offset past the buffer, which a GPU read answers with whatever is
-        // there rather than with a fault.
+        self.listed(batch, experts, x)
+    }
+
+    /// A dispatch over an expert list this side holds, which is every one but
+    /// [`PackedBank::encode_picked`]'s.
+    ///
+    /// The range *is* checked here, and it has to be: the kernel cannot, because
+    /// an index past the bank is an offset past the buffer and a GPU read
+    /// answers that with whatever is there rather than with a fault. A list a
+    /// dispatch wrote is past this side and is why that one method is not
+    /// public.
+    ///
+    /// `per_source` is 1 for both callers. What separates them is only how many
+    /// rows of input the same list is spread over, which is
+    /// [`PackedBank::sources`] and is read off the buffer rather than passed.
+    fn listed(
+        &self,
+        batch: &mut Batch<'_>,
+        experts: &[u32],
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
         if let Some(past) = experts
             .iter()
             .find(|expert| **expert as usize >= self.experts)
@@ -567,6 +613,18 @@ impl<'a> PackedBank<'a> {
         self.dispatch(batch, experts.len(), 1, chosen.arg(), x)
     }
 
+    /// How many rows of this bank's input width `values` is, which is what the
+    /// kernel takes its modulo over.
+    fn sources(&self, values: usize) -> usize {
+        assert_eq!(
+            values % self.in_dim,
+            0,
+            "{values} values are not whole rows of {}",
+            self.in_dim
+        );
+        values / self.in_dim
+    }
+
     /// The dispatch itself, over an expert list wherever it lies.
     fn dispatch(
         &self,
@@ -582,7 +640,7 @@ impl<'a> PackedBank<'a> {
 
         // The shape is read out of `resident` and so is built before it is
         // borrowed mutably for the binding below.
-        let fields = self.shape(rows, per_source);
+        let fields = self.shape(rows, per_source, self.sources(x.len()));
         let mut shape = self.device.inline(&fields)?;
         let mut resident = self.resident.borrow_mut();
         let resident = &mut *resident;
@@ -772,7 +830,7 @@ constant float ELEMENTS[] = {{ {} }};
 }
 
 /// How many `uint`s the kernel's `Shape` struct declares.
-const SHAPE_FIELDS: usize = 8;
+const SHAPE_FIELDS: usize = 9;
 
 /// Everything of the kernel that the format does not decide.
 ///
@@ -812,25 +870,31 @@ struct Shape {
     uint in_dim;
     uint out_dim;
     uint per_source;
+    uint sources;
     uint code_base;
     uint scale_base;
     uint code_stride;
     uint scale_stride;
 };
 
-/// `out[i] = x[i / per_source] @ w[experts[i]]^T` over an
+/// `out[i] = x[(i / per_source) % sources] @ w[experts[i]]^T` over an
 /// `[experts, out_dim, in_dim]` bank.
 ///
 /// The expert is per row and not per dispatch, which is the whole of what a
 /// gather is: the six of 256 a token chose are six strides into the same bank,
 /// and the 250 it did not choose are addresses no thread forms.
 ///
-/// **`per_source` is the other half of that gather**, and it is why the rows a
-/// bank runs need not be a tensor anyone built. A token that reads six experts
-/// is six rows of this call and one row of `x`, so consecutive rows read the
-/// same input and the copy that would have laid them out end to end is an
-/// integer divide here. Everywhere else it is 1, which makes the divide the
-/// identity and every row its own.
+/// **The divide and the modulo are the other half of that gather**, and they are
+/// why the rows a bank runs need not be a tensor anyone built. A token that
+/// reads six experts is six rows of this call and one row of `x`, so consecutive
+/// rows read the same input; a bank every token reads once per expert is `x`
+/// laid end to end after itself, so a row `sources` further on reads the same
+/// input again. The routed bank is the first shape and the shared bank the
+/// second, and the copy that would have laid either out is two integer
+/// operations here.
+///
+/// A dispatch whose rows are its own input's takes `per_source` of 1 and
+/// `sources` of `rows`, which makes the divide and the modulo both the identity.
 kernel void packed_matmul(
     constant Shape &shape [[buffer(0)]],
     device const uint *experts [[buffer(1)]],
@@ -850,7 +914,7 @@ kernel void packed_matmul(
     const uint row = element / shape.out_dim;
     const uint col = element % shape.out_dim;
     const uint expert = experts[row];
-    const uint source = row / shape.per_source;
+    const uint source = (row / shape.per_source) % shape.sources;
     const uint bytes = shape.in_dim / CODES_PER_BYTE;
 
     float sum = weight_dot(
@@ -1441,6 +1505,79 @@ mod tests {
         assert_eq!(row(0), row(2), "one expert, one input, twice");
         assert_ne!(row(0), row(1), "the expert index is read off the row");
         assert_ne!(row(0), row(3), "the input row is read off the row");
+    }
+
+    /// The same gather with the input read over again rather than at a stride,
+    /// which is the shared bank's shape: every row of `x` through every expert
+    /// the list names, expert-major.
+    ///
+    /// Three passes over three rows rather than two over two, because two of
+    /// each cannot tell a modulo from the division beside it — `row % 2` and
+    /// `row / 2` disagree on only one of four rows, and both are the identity on
+    /// a call that wraps once. Nine rows over three make the two readings
+    /// disagree everywhere but the corners.
+    ///
+    /// Each row is checked against the projection its expert is, run alone over
+    /// the input row the modulo says it reads. A kernel that divided instead
+    /// would put row 3's answer — the second pass's first row — in the wrong
+    /// place, with numbers of exactly the right magnitude.
+    #[test]
+    fn a_repeating_dispatch_reads_every_row_of_its_input_once_per_expert() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        const EXPERTS: usize = 3;
+        const SOURCES: usize = 3;
+
+        let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, SOURCES);
+        let bank = PackedBank::upload(
+            &device,
+            &matmul,
+            EXPERTS,
+            IN_DIM,
+            OUT_DIM,
+            &case.packed(),
+            &case.scales,
+        )
+        .expect("the bank's shapes pair");
+
+        // What `SparseMoe::shared_rows` names: expert `row / sources` over input
+        // row `row % sources`.
+        let chosen: Vec<u32> = (0..EXPERTS * SOURCES)
+            .map(|row| (row / SOURCES) as u32)
+            .collect();
+        let x = &case.x[..SOURCES * IN_DIM];
+
+        let mut batch = device.batch().expect("a command buffer opens");
+        let mut input = device.buffer(x).expect("the input uploads");
+        let got = bank
+            .encode_repeating(&mut batch, &chosen, &mut input)
+            .expect("the dispatch encodes");
+        batch.wait().expect("the dispatch completes");
+        let got = got.take();
+        assert_eq!(got.len(), chosen.len() * OUT_DIM);
+
+        let codes_per_expert = OUT_DIM * IN_DIM / CODES_PER_BYTE;
+        let scales_per_expert = OUT_DIM * IN_DIM / GROUP_SIZE;
+        let packed = case.packed();
+        for (row, expert) in chosen.iter().enumerate() {
+            let at = *expert as usize;
+            let alone = PackedProjection::upload(
+                &device,
+                &matmul,
+                IN_DIM,
+                OUT_DIM,
+                &packed[at * codes_per_expert..][..codes_per_expert],
+                &case.scales[at * scales_per_expert..][..scales_per_expert],
+            )
+            .expect("one expert's shapes pair")
+            .multiply(&x[(row % SOURCES) * IN_DIM..][..IN_DIM])
+            .expect("the dispatch completes");
+            assert_eq!(got[row * OUT_DIM..][..OUT_DIM], alone[..], "row {row}");
+        }
+
+        let row = |i: usize| &got[i * OUT_DIM..][..OUT_DIM];
+        assert_ne!(row(0), row(1), "the input row is read off the row");
+        assert_ne!(row(0), row(3), "the expert is read off the row");
     }
 
     /// The one argument a real call sends past the inline threshold.
