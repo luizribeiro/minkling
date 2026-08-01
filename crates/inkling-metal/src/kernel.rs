@@ -312,6 +312,17 @@ impl Grid {
     }
 }
 
+/// A shape a kernel reads as a `uint`.
+///
+/// Here rather than beside the one kernel that first needed it, because every
+/// kernel that takes a shape needs the same check for the same reason:
+/// unreachable through any real call — four billion of anything is decades past
+/// what one allocation can hold — and a truncation would not fail. It would
+/// dispatch a grid for the wrong shape over buffers of the right one.
+pub(crate) fn extent(value: usize, what: &str) -> u32 {
+    u32::try_from(value).unwrap_or_else(|_| panic!("{value} is wider than a kernel's uint: {what}"))
+}
+
 fn one_dimensional(width: usize) -> MTLSize {
     MTLSize {
         width,

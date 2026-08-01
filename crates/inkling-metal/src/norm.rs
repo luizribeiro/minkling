@@ -58,7 +58,7 @@ use inkling_core::profile::{self, Op};
 
 use crate::buffer::Buffer;
 use crate::device::{Device, MetalError};
-use crate::kernel::{Batch, Grid, Kernel};
+use crate::kernel::{Batch, Grid, Kernel, extent};
 
 const ENTRY: &str = "rms_norm";
 
@@ -216,15 +216,6 @@ impl<'a> LayerNorm<'a> {
         )?;
         Ok(out)
     }
-}
-
-/// A shape the kernel reads as a `uint`.
-///
-/// Unreachable through any real norm — four billion channels is decades past
-/// what one allocation can hold — and a truncation would not fail: it would
-/// dispatch a grid for the wrong shape over buffers of the right one.
-fn extent(value: usize, what: &str) -> u32 {
-    u32::try_from(value).unwrap_or_else(|_| panic!("{value} is wider than a kernel's uint: {what}"))
 }
 
 /// The kernel, with the one constant the range argument rests on written into
