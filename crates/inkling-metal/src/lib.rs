@@ -13,11 +13,14 @@
 //! how many threads to run.
 //!
 //! On top of those sits the operation the whole engine is made of: [`matmul`],
-//! which multiplies against weights that stay MXFP4-packed. Beside it sits
-//! [`norm`], which is the first here that consumes activations rather than a
-//! weight — and so the first whose output is worth leaving on the device.
+//! which multiplies against weights that stay MXFP4-packed, and [`dense`],
+//! which is the same operation over the one weight the quantiser left in
+//! bfloat16. Beside them sits [`norm`], which is the first here that consumes
+//! activations rather than a weight — and so the first whose output is worth
+//! leaving on the device.
 
 pub mod buffer;
+pub mod dense;
 pub mod device;
 pub mod experts;
 pub mod kernel;
@@ -29,6 +32,7 @@ pub mod projections;
 mod testing;
 
 pub use buffer::{Arg, Buffer, Bytes, Element, Mapped};
+pub use dense::{DenseMatmul, DenseWeight};
 pub use device::{Device, MetalError};
 pub use experts::{ExpertBanks, LayerExperts, ModelExperts};
 pub use kernel::{Grid, Kernel};

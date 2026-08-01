@@ -20,6 +20,23 @@ pub fn device() -> Option<Device> {
     }
 }
 
+/// How far an answer lands from the exact one, as a fraction of the exact
+/// tensor's peak — [`inkling_core::fixture::deviation`]'s measure, against an
+/// f64 accumulation of the same products rather than against the other f32
+/// answer.
+///
+/// **This is what turns a disagreement into either float noise or a bug.** Both
+/// matmuls here decode exactly and neither rounds anywhere else, so a dispatch
+/// and the CPU differ only in the order they sum — and which of the two is
+/// drifting is a question only a third accumulation can answer.
+pub fn drift(got: &[f32], exact: &[f64]) -> f64 {
+    assert_eq!(got.len(), exact.len(), "length");
+    let scale = exact.iter().fold(0.0f64, |peak, w| peak.max(w.abs()));
+    got.iter().zip(exact).fold(0.0f64, |worst, (got, exact)| {
+        worst.max((f64::from(*got) - exact).abs())
+    }) / scale
+}
+
 /// `out = alpha * x + y`, the smallest kernel that still has to get every part
 /// of the plumbing right: a scalar and a count read through their own bindings,
 /// two arrays in, one array out, and a bounds check for the threads the last

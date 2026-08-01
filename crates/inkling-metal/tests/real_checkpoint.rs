@@ -23,11 +23,12 @@ use inkling_core::ops::linear;
 use inkling_core::profile::{self, Op, Profile};
 use inkling_core::quant::{BITS, dequantize_blocks_into};
 use inkling_core::{
-    Checkpoint, CheckpointWeights, Dtype, Ending, ModelCache, Packed as CorePacked, TensorView,
+    Bf16, Checkpoint, CheckpointWeights, Dtype, Ending, ModelCache, Packed as CorePacked,
+    TensorView,
 };
 use inkling_metal::{
-    Device, MetalError, ModelExperts, ModelProjections, PackedBank, PackedMatmul, PackedProjection,
-    RmsNorm,
+    DenseMatmul, DenseWeight, Device, MetalError, ModelExperts, ModelProjections, PackedBank,
+    PackedMatmul, PackedProjection, RmsNorm,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -39,6 +40,10 @@ const LM_HEAD: &str = "language_model.lm_head";
 /// One MoE layer's routed bank, `[256, 2048, 4096]`, for the other shape a
 /// projection comes in.
 const ROUTED_EXPERTS: &str = "language_model.model.layers.2.mlp.switch_mlp.gate_proj";
+
+/// The same layer's router gate, `[258, 4096]`, which is the one weight a
+/// matmul reads that the quantiser left in bfloat16.
+const ROUTER_GATE: &str = "language_model.model.layers.2.mlp.gate_weight";
 
 const HIDDEN: usize = 4096;
 
@@ -71,6 +76,25 @@ const CODES_PER_WORD: usize = u32::BITS as usize / BITS;
 /// invert while still producing weights of the right magnitude — 3.2, seven
 /// decades above.
 const TOLERANCE: f32 = 1e-6;
+
+/// How far the dense matmul may land from the CPU's answer over a trained
+/// bfloat16 gate.
+///
+/// The same account again, and a looser number than [`TOLERANCE`] for a reason
+/// the format decides. Widening bfloat16 is exact on both sides, so summation
+/// order is still all that separates them — but a gate's values carry no block
+/// scale to hold a row's terms near each other, and the trained ones span
+/// decades within a single row where a packed row's groups span a byte. A
+/// serial f32 reduction gives up more on terms that far apart, and it is the
+/// serial reduction that gives it up: the kernel sums 128 products a lane and
+/// reduces 32 lanes in a tree.
+///
+/// Worst observed when this landed: 7.1e-7 over eight rows of 258 outputs,
+/// which leaves a factor of four in hand. Against the mutation it has to catch
+/// — a value's two bytes read the other way round, which is the one fact about
+/// the format a kernel can invert — `dense::tests` measures 4.0, six decades
+/// above.
+const GATE_TOLERANCE: f32 = 3e-6;
 
 fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var_os(CHECKPOINT_VAR).map(PathBuf::from);
@@ -868,4 +892,76 @@ fn the_gathered_matmul_reproduces_the_cpu_over_a_routed_bank() {
         "one expert, one input, twice"
     );
     assert_ne!(got[..out_dim], got[out_dim..2 * out_dim]);
+}
+
+/// The one weight in the model the quantiser left alone, on the checkpoint's
+/// own bytes: a router's `[258, 4096]` bfloat16 gate against what the CPU makes
+/// of the same tensor widened.
+///
+/// What the hermetic cases in `dense::tests` cannot settle is the same thing
+/// they cannot settle for the packed matmul — a trained weight's spread of
+/// magnitudes, and where the checkpoint put it. The second is the sharper half
+/// here: the quant's shard headers are not padded, so a tensor can begin at an
+/// odd byte and a wrap promising two-byte elements could not be pointed at one.
+/// Reading it a byte at a time can, and the deviation is what says the pair of
+/// bytes widens to the value the CPU widened.
+///
+/// The last two rows are the shared experts and the two above them are routed —
+/// four rows the layer treats differently and the kernel does not — so a
+/// dispatch that stopped short of the shared pair, or started past the routed
+/// ones, is a wrong length rather than a near miss.
+#[test]
+fn the_dense_matmul_reproduces_the_cpu_over_a_real_router_gate() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let matmul = DenseMatmul::new(&device).expect("the dense matmul compiles");
+
+    let gate = Bf16::open(&ckpt, ROUTER_GATE).expect("the checkpoint holds the gate");
+    assert_eq!(gate.in_dim(), HIDDEN, "the gate maps from the hidden width");
+    assert!(
+        gate.out_dim() > 256,
+        "{} rows is not the routed experts and the shared ones",
+        gate.out_dim()
+    );
+    assert_eq!(
+        gate.bytes().as_ptr() as usize % size_of::<u16>(),
+        1,
+        "an even-aligned tensor would not exercise the reading this needs"
+    );
+
+    let started = Instant::now();
+    let resident = DenseWeight::wrap(&device, &matmul, &gate).expect("the gate wraps");
+    eprintln!(
+        "{ROUTER_GATE}: [{}, {HIDDEN}] bfloat16, {:.2} MB wrapped in {:.2?}",
+        gate.out_dim(),
+        gate.bytes().len() as f64 / 1e6,
+        started.elapsed()
+    );
+
+    // Eight rows, because the reference's own normed state is eight and a
+    // kernel that took its row index off the wrong axis would still fill the
+    // buffer.
+    let x = normed_state();
+    let rows = x.len() / HIDDEN;
+    let got = resident.multiply(&x).expect("the dispatch completes");
+    assert_eq!(
+        got.len(),
+        rows * gate.out_dim(),
+        "a logit per expert per row"
+    );
+
+    let widened = ckpt
+        .tensor(ROUTER_GATE)
+        .expect("the gate is there")
+        .to_f32()
+        .expect("the gate widens");
+    let want = linear(&x, &widened, HIDDEN);
+    let deviation = deviation(&got, &want);
+    eprintln!("[{rows}, {HIDDEN}] through the gate: deviation {deviation:e}");
+    assert!(deviation <= GATE_TOLERANCE, "deviation {deviation:e}");
+    assert!(
+        deviation > 0.0,
+        "an exact match would mean the two are not summing independently"
+    );
 }

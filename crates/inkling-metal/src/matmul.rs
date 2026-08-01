@@ -104,6 +104,14 @@ pub enum MatmulError {
         expected: usize,
         got: usize,
     },
+
+    #[error("{out_dim} rows of {in_dim} bfloat16 values are {expected} bytes, got {got}")]
+    WrongWeightLen {
+        in_dim: usize,
+        out_dim: usize,
+        expected: usize,
+        got: usize,
+    },
 }
 
 /// The compiled kernel, which every packed projection on a device shares.
@@ -181,6 +189,13 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// What a dispatch of another kernel left to be read, for the modules
+    /// beside this one that encode into the same [`Batch`] — see
+    /// [`crate::dense`].
+    pub(crate) fn holding(out: Buffer<f32>) -> Self {
+        Self { out: Some(out) }
+    }
+
     /// The values, once the batch this was encoded into has been waited for.
     pub fn take(self) -> Vec<f32> {
         let _timed = profile::scope(Op::Readback);
@@ -881,7 +896,7 @@ mod tests {
     use inkling_core::quant::dequantize_blocks;
     use inkling_core::weights::PackedRows;
 
-    use crate::testing::device;
+    use crate::testing::{device, drift};
 
     /// The reduction the checkpoint's projections are: `lm_head`, every
     /// attention projection and every expert reduce over 4096.
@@ -1001,17 +1016,6 @@ mod tests {
             }
             out
         }
-    }
-
-    /// How far an answer lands from the exact one, as a fraction of the exact
-    /// tensor's peak — [`deviation`]'s measure, against f64 rather than against
-    /// the other f32 answer.
-    fn drift(got: &[f32], exact: &[f64]) -> f64 {
-        assert_eq!(got.len(), exact.len(), "length");
-        let scale = exact.iter().fold(0.0f64, |peak, w| peak.max(w.abs()));
-        got.iter().zip(exact).fold(0.0f64, |worst, (got, exact)| {
-            worst.max((f64::from(*got) - exact).abs())
-        }) / scale
     }
 
     /// Everything a dispatch needs, so that no test opens a device twice.
