@@ -143,6 +143,9 @@ pub enum ArgError {
     #[error("{0} is not a count of at least one")]
     NotACount(String),
 
+    #[error("{0} is not a depth, which is zero or more")]
+    NotADepth(String),
+
     #[error("{0} is not a backend, which is cpu or metal")]
     UnknownBackend(String),
 }
@@ -192,6 +195,14 @@ fn count(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize, A
     }
 }
 
+/// A depth, which is a count that may be zero: `--speculate 0` is a generation
+/// that decodes one token at a time, which is exactly what the flag's absence
+/// asks for and is the one number [`count`] refuses.
+fn depth(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize, ArgError> {
+    let depth = value(flag, args)?;
+    depth.parse().map_err(|_| ArgError::NotADepth(depth))
+}
+
 fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
     let mut args = args.into_iter();
     let mut checkpoint = None;
@@ -205,7 +216,7 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
             "--prompt" | "-p" => prompt = Some(value(&arg, &mut args)?),
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
             "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
-            "--speculate" | "-k" => speculate = count(&arg, &mut args)?,
+            "--speculate" | "-k" => speculate = depth(&arg, &mut args)?,
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
             _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
             _ => return Err(ArgError::Unexpected(arg)),
@@ -355,6 +366,22 @@ mod tests {
         assert_eq!(with(&[]), 0);
         assert_eq!(with(&["--speculate", "2"]), 2);
         assert_eq!(with(&["-k", "8"]), 8);
+        // A depth of zero is what the absence of the flag means, so naming it
+        // is a request rather than the mistake a budget of zero is.
+        assert_eq!(with(&["--speculate", "0"]), 0);
+    }
+
+    /// A depth that is not a number is still refused, which is what says the
+    /// zero above is a case and not a parse that gave up.
+    #[test]
+    fn a_speculation_depth_that_is_not_a_number_is_refused() {
+        for depth in ["-1", "two", ""] {
+            assert_eq!(
+                generated(&["generate", "models/small", "-p", "Once", "-k", depth]),
+                Err(ArgError::NotADepth(depth.to_string())),
+                "--speculate {depth}"
+            );
+        }
     }
 
     /// The flags may come before the path as readily as after it. Nothing here
