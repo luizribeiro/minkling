@@ -160,6 +160,69 @@ pub fn device_time(
     profile::take().gpu() / calls as u32
 }
 
+/// A dispatch of the caller's grid with nothing in it, which is the floor under
+/// every figure a sweep here reports.
+///
+/// **A kernel measured against nothing cannot say how much of what it costs is
+/// its own.** The saxpy kernel over a count of zero returns on its first
+/// instruction in every thread, so a dispatch of it over the grid a real kernel
+/// runs is that kernel's launch and none of its work — which is what separates
+/// a row that is slow from a row that is small.
+///
+/// The grid is the caller's and has to be the one the real dispatch uses, down
+/// to the threadgroup width: what a launch costs grows with the threads in it,
+/// so a floor taken over a different grid is a floor under a different kernel.
+pub struct EmptyDispatch {
+    kernel: crate::kernel::Kernel,
+    alpha: crate::Buffer<f32>,
+    count: crate::Buffer<u32>,
+    x: crate::Buffer<f32>,
+    y: crate::Buffer<f32>,
+    out: crate::Buffer<f32>,
+}
+
+impl EmptyDispatch {
+    pub fn new(device: &Device) -> Self {
+        Self {
+            kernel: device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles"),
+            alpha: device.buffer(&[0.0f32]).expect("the buffer allocates"),
+            count: device.buffer(&[0u32]).expect("the buffer allocates"),
+            x: device.zeroed(1).expect("the buffer allocates"),
+            y: device.zeroed(1).expect("the buffer allocates"),
+            out: device.zeroed(1).expect("the buffer allocates"),
+        }
+    }
+
+    /// What the device's own clock makes of one such dispatch, over a command
+    /// buffer holding `calls` of them — the same arrangement, and for the same
+    /// reason, as [`device_time`].
+    pub fn cost(
+        &mut self,
+        device: &Device,
+        calls: usize,
+        grid: crate::kernel::Grid,
+    ) -> std::time::Duration {
+        let Self {
+            kernel,
+            alpha,
+            count,
+            x,
+            y,
+            out,
+        } = self;
+        device_time(device, calls, |batch| {
+            batch
+                .add(
+                    kernel,
+                    &[alpha.arg(), count.arg(), x.arg(), y.arg(), out.arg()],
+                    grid,
+                    0,
+                )
+                .expect("the empty dispatch encodes");
+        })
+    }
+}
+
 /// What one saxpy over `len` elements moves: `x` and `y` read, `out` written.
 ///
 /// Here rather than at each case because every dispatch has to declare what it

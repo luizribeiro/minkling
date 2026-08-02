@@ -532,6 +532,8 @@ kernel void short_conv(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use inkling_core::ShortConv;
     use inkling_core::fixture::{self, deviation};
@@ -1090,6 +1092,128 @@ mod tests {
         }
         assert_eq!(span.to_vec(), want);
         assert!(at < stride, "the span had no room left over to check");
+    }
+
+    /// **What each convolution a layer runs costs the device, and how much of it
+    /// is the dispatch rather than the convolution.**
+    ///
+    /// The per-kernel table says `short_conv` is 5.8% of a decode step's device
+    /// time for 2% of its bytes, which is a ranking and not a diagnosis. K1 ruled
+    /// out the one the norm had — these grids are 16 and 64 threadgroups where a
+    /// norm's group was one — so the question left is which of the two things a
+    /// small grid can be short of this is: the work, or the launch.
+    ///
+    /// The empty rows answer it. They dispatch a kernel that returns on its first
+    /// instruction over the same grid, so what separates an empty row from the
+    /// convolution beside it is everything the convolution does and nothing else.
+    /// The row counts then say whether the arithmetic is what a decode-shaped call
+    /// is paying for: a call over 97 rows does 97 times the convolutions of a call
+    /// over one, over a grid 97 times as wide.
+    ///
+    /// Read off the device's own clock over a command buffer of `CALLS`
+    /// dispatches rather than off the wall clock around one, for the reason
+    /// [`crate::norm`]'s own diagnosis is: a submission is 225 microseconds and
+    /// every figure here is under twenty.
+    ///
+    /// **A shape's convolution and a shape's floor are two measurements and are
+    /// interleaved as two**, because this machine's own state moves a figure by
+    /// more than the differences here are made of — and a floor always taken
+    /// straight after the heavier dispatch it is subtracted from would carry
+    /// whatever that dispatch left the machine in, in every round, in the same
+    /// direction.
+    ///
+    /// Nothing asserts a duration; the numbers go to stderr for the commit
+    /// message to quote.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_decode_steps_convolutions_cost_the_device() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let mut empty = crate::testing::EmptyDispatch::new(&device);
+        const CALLS: usize = 256;
+        const ROUNDS: usize = 5;
+        const TAPS: usize = 4;
+        // The checkpoint's own shapes: the key and value convolutions inside
+        // attention are over the KV heads, and the two on a layer's residual
+        // paths are over the hidden width.
+        const INSIDE: usize = 8 * 128;
+        const HIDDEN: usize = 4096;
+
+        // A thread to each channel of each timestep and one window's worth more,
+        // which is the grid `encode_over` dispatches with no slack held.
+        let grid = |rows: usize, channels: usize| {
+            Grid::new((rows + TAPS - 1) * channels, THREADS_PER_GROUP)
+        };
+
+        let cost = |rows: usize, channels: usize, carried: bool| -> Duration {
+            let weight: Vec<f32> = (0..channels * TAPS)
+                .map(|i| (i % 13) as f32 / 16.0 - 0.4)
+                .collect();
+            let layer =
+                LayerConv::new(&device, &conv, channels, &weight).expect("the kernel uploads");
+            let x: Vec<f32> = (0..rows * channels)
+                .map(|i| (i % 37) as f32 - 18.0)
+                .collect();
+            let mut input = device.buffer(&x).expect("the rows upload");
+            let mut residual = device.buffer(&x).expect("the residual uploads");
+            let mut out = device
+                .zeroed::<f32>(x.len())
+                .expect("the landing allocates");
+
+            crate::testing::device_time(&device, CALLS, |batch| {
+                layer
+                    .encode_over(
+                        batch,
+                        &mut input,
+                        carried.then_some(&mut residual),
+                        1.0,
+                        Landing {
+                            out: &mut out,
+                            groups: 1,
+                            stride: rows,
+                            base: 0,
+                        },
+                    )
+                    .expect("the convolution encodes");
+            })
+        };
+
+        let shapes = [
+            ("key or value, decode", 1, INSIDE, false),
+            ("residual path, decode", 1, HIDDEN, true),
+            ("residual path, 97", 97, HIDDEN, true),
+            ("residual path, 385", 385, HIDDEN, true),
+            ("residual path, 769", 769, HIDDEN, true),
+        ];
+        // Warm: the first dispatch of a fresh pipeline pays for the driver's
+        // first look at these buffers, which a decode loop pays once.
+        let mut taken = shapes.map(|(_, rows, channels, carried)| {
+            cost(rows, channels, carried);
+            (Vec::with_capacity(ROUNDS), Vec::with_capacity(ROUNDS))
+        });
+        for (_, rows, channels, _) in shapes {
+            empty.cost(&device, CALLS, grid(rows, channels));
+        }
+        for _ in 0..ROUNDS {
+            for (each, (_, rows, channels, carried)) in taken.iter_mut().zip(shapes) {
+                each.0.push(cost(rows, channels, carried));
+            }
+            for (each, (_, rows, channels, _)) in taken.iter_mut().zip(shapes) {
+                each.1
+                    .push(empty.cost(&device, CALLS, grid(rows, channels)));
+            }
+        }
+
+        for ((name, rows, channels, _), (spent, launch)) in shapes.iter().zip(&taken) {
+            let mean = |each: &Vec<Duration>| each.iter().sum::<Duration>() / each.len() as u32;
+            let (spent, launch) = (mean(spent), mean(launch));
+            let groups = grid(*rows, *channels).threads().div_ceil(THREADS_PER_GROUP);
+            eprintln!(
+                "{name:<22} [{rows}, {channels}] over {groups:>5} threadgroups: {spent:>8.2?} a \
+                 dispatch, {launch:>8.2?} of it the launch — {:>5.0}% the convolution",
+                100.0 * (spent.saturating_sub(launch)).as_secs_f64() / spent.as_secs_f64(),
+            );
+        }
     }
 
     /// A kernel of one tap carries no window and would leave the two buffers

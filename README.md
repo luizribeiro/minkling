@@ -164,11 +164,49 @@ a run as the dispatch can spare: 2.08 ms to 590 µs, 41 GB/s to 145, and a
 decode-shaped gate from 39 microseconds to 10. Neither added a dispatch and
 neither moved a token.
 
-**What is left says the same thing in the same voice.** `short_conv` is 5.8% for
-2% of the bytes and `fused_attention` 3.6% for 0.7%, and both are already 64 and
-32 threadgroups wide at decode — so whatever they are waiting on, it is not the
-one core the norm was on, and neither of the two remedies here is theirs. The
-matmul is 72% of a step, which is what keeps this table mostly one row.
+**What is left was diagnosed rather than attacked, and the two rows turned out
+not to be the same kind of row at all.** Both are already 64 and 32 threadgroups
+wide at decode, so K1 was right that neither waits on the one core the norm was
+on. What separates them is what an *empty* dispatch of the same grid costs — a
+kernel that returns on its first instruction, which is everything except the
+work:
+
+    short_conv, decode      grid    a dispatch   launch    the convolution
+    key or value        16 groups        3.63µs   1.42µs                61%
+    residual path       64 groups        4.51µs   2.01µs                55%
+
+    fused_attention     32 groups    a dispatch   launch        the step
+    over     8 keys                       9.31µs   1.81µs             80%
+    over    97 keys                      74.60µs   1.44µs             98%
+    over   512 keys                     368.50µs   1.90µs             99%
+    over  4096 keys                       2.57ms   1.29µs            100%
+
+**`short_conv` is a dead end and the numbers say how much of one.** Four a layer
+at those two shapes is 684 µs a step measured on their own, against the 1.28 ms
+the table charges them — which is 5.8% of the device's *sampled* time, 1.07 ms
+once the sampling bias comes off, and 3.6% of a 29.29 ms step. Why a dispatch
+measured beside its own kind costs less than the same dispatch measured inside a
+step is not attributed here. Either way about two fifths of it is a launch that a
+dispatch of any grid pays, so what a perfect convolution could reach is 1.4% to
+2.1% of a decode step. The only thing that removes a launch is removing a
+dispatch, and the four are four because they convolve four different things.
+**Nothing here was changed.**
+
+**`fused_attention`'s 3.6% is not a property of the kernel.** The launch is under
+2% of it past a hundred keys and the rest tracks the span: the marginal key costs
+0.62 µs between 97 and 4096, and the per-key figure falls from 1.18 µs at eight
+keys to 0.63 at four thousand as a 32-key tile stops being mostly empty. So what
+that row reports is the *context the profile is taken at*, which is the recorded
+prompt and eight generated tokens. Read off the rows above, the same 42 dispatches
+are 4.9 ms at the 155-key context the paired measurement below decodes over, and
+15.5 ms at 512. The kernel is not waiting on occupancy and it is not waiting on a
+floor. It is walking the span, and it walks all of it: 35 of the 42 layers cap at
+a 512-token window, and every key outside that window is scored anyway so that
+the softmax can discard it. That is M9's deferred finding arriving as this one's
+diagnosis, and it is where the work goes rather than into either of the remedies
+this table has used before.
+
+The matmul is 72% of a step, which is what keeps this table mostly one row.
 
 **And the row that is most of the table wanted the same remedy a third time.**
 A lane of the packed matmul read one byte of its weight row, and around that

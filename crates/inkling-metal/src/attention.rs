@@ -1868,6 +1868,92 @@ mod tests {
         }
     }
 
+    /// **What the attention step costs the device at a decode step's shape, and
+    /// how much of it is the dispatch rather than the step.**
+    ///
+    /// The case above times a submission around one call, which at these sizes is
+    /// mostly the submission; the per-kernel table times it inside a step but
+    /// under sampling, which charges every pass a boundary. This is the third
+    /// question and the one K1 left open: the grid is 32 threadgroups — one to
+    /// each query head — so what it is short of is not the norm's one core, and
+    /// the empty rows say whether it is the work or the launch.
+    ///
+    /// The empty rows dispatch a kernel that returns on its first instruction
+    /// over the same 32 threadgroups, so what separates them from the step beside
+    /// them is everything the step does. The key counts then say what the loop
+    /// over the span is worth: eight keys is the context every other measurement
+    /// in this crate is taken at, 512 is what a sliding layer caps at, and 4096 is
+    /// past anything a decode step here reaches.
+    ///
+    /// **A span's step and the floor under it are two measurements and are
+    /// interleaved as two**, for the reason [`crate::sconv`]'s own diagnosis
+    /// states: a floor always taken straight after the heavier dispatch it is
+    /// subtracted from would carry whatever that dispatch left the machine in, in
+    /// every round, in the same direction.
+    ///
+    /// Nothing asserts a duration; the numbers go to stderr for the commit
+    /// message to quote.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_decode_steps_attention_step_costs_the_device() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let mut empty = crate::testing::EmptyDispatch::new(&device);
+        const CALLS: usize = 128;
+        const ROUNDS: usize = 5;
+
+        // One threadgroup to each query of each head, which is the grid
+        // `encoding` dispatches over — taken from the case rather than written
+        // down, so that a floor cannot go on being subtracted from a step whose
+        // grid has moved out from under it.
+        let spans = [8, 97, 512, 4096];
+        let grid = |keys: usize| {
+            let case = decode_shaped(keys);
+            Grid::new(
+                case.config.heads * case.queries * THREADS_PER_GROUP,
+                THREADS_PER_GROUP,
+            )
+        };
+        let groups = grid(spans[0]).threads() / THREADS_PER_GROUP;
+
+        let cost = |keys: usize| -> Duration {
+            let case = decode_shaped(keys);
+            let layer = case.wrapped(&device, &attention);
+            // The dispatch's own output, held until the command buffer that
+            // writes it has completed.
+            let mut held = Vec::with_capacity(CALLS);
+            crate::testing::device_time(&device, CALLS, |batch| {
+                held.push(layer.encode(batch, case.step()).expect("the step encodes"));
+            })
+        };
+
+        // Warm: the first dispatch of a fresh pipeline pays for the driver's
+        // first look at these buffers, which a decode loop pays once.
+        let mut taken = spans.map(|keys| {
+            cost(keys);
+            (Vec::with_capacity(ROUNDS), Vec::with_capacity(ROUNDS))
+        });
+        empty.cost(&device, CALLS, grid(spans[0]));
+        for _ in 0..ROUNDS {
+            for (each, keys) in taken.iter_mut().zip(spans) {
+                each.0.push(cost(keys));
+            }
+            for (each, keys) in taken.iter_mut().zip(spans) {
+                each.1.push(empty.cost(&device, CALLS, grid(keys)));
+            }
+        }
+
+        for (keys, (spent, launch)) in spans.iter().zip(&taken) {
+            let mean = |each: &Vec<Duration>| each.iter().sum::<Duration>() / each.len() as u32;
+            let (spent, launch) = (mean(spent), mean(launch));
+            eprintln!(
+                "one query over {keys:>5} keys, {groups} threadgroups: {spent:>8.2?} a dispatch, \
+                 {launch:>8.2?} of it the launch — {:>5.0}% the step",
+                100.0 * (spent.saturating_sub(launch)).as_secs_f64() / spent.as_secs_f64(),
+            );
+        }
+    }
+
     /// A layer whose span grows past what it starts with, and a sequence long
     /// enough to make it: `LEAST_KEYS` slots and a few more.
     ///
