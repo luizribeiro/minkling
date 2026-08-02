@@ -35,10 +35,11 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
+use inkling_core::mtp::CheckpointHeads;
+use inkling_core::{Checkpoint, CheckpointWeights, Config, TextConfig};
 use inkling_metal::{
-    DenseMatmul, Device, ExpertKernels, LayerKernels, ModelLayers, MoeCombine, PackedProjection,
-    Router, RouterWeights, StackShape, SwiGlu,
+    DenseMatmul, Device, ExpertKernels, LayerKernels, ModelHeads, ModelLayers, MoeCombine,
+    PackedProjection, Router, RouterWeights, StackShape, SwiGlu,
 };
 
 use crate::LABEL;
@@ -178,4 +179,54 @@ pub fn weights<'a>(
     Ok(weights
         .with_head(Box::new(head))
         .with_backend(Box::new(layers)))
+}
+
+/// The multi-token prediction heads, with their multiplies wherever the backend
+/// puts them.
+///
+/// **Opened only when a run means to speculate**, because what they cost to
+/// have is what a caller who does not want them should not pay: 160 tensors of
+/// bfloat16, 4.2 GiB of mapping, and a scratch on the CPU path that is larger
+/// than everything else the process holds.
+///
+/// A checkpoint whose config declares no `mtp_config` has no heads to open, and
+/// a checkpoint that declares them and does not ship them is the error this
+/// returns — both of which a caller answers the same way, by decoding one token
+/// at a time.
+pub fn heads<'a>(
+    gpu: Option<&'a Gpu>,
+    ckpt: &'a Checkpoint,
+    config: &Config,
+    depth: usize,
+) -> Result<Option<CheckpointHeads<'a>>> {
+    if depth == 0 {
+        return Ok(None);
+    }
+    let mtp = config
+        .mtp_config
+        .as_ref()
+        .context("this checkpoint's config declares no MTP heads to speculate with")?;
+
+    let started = Instant::now();
+    let heads = CheckpointHeads::open(ckpt, &config.text_config, mtp)
+        .context("mapping the MTP heads, which this checkpoint's shards do not hold")?;
+    let Some(gpu) = gpu else {
+        eprintln!(
+            "{:<LABEL$}{} heads, {depth} deep, every weight widened on the way through",
+            "mtp",
+            heads.heads()
+        );
+        return Ok(Some(heads));
+    };
+
+    let packed = heads.head_projections();
+    let wrapped = ModelHeads::wrap(&gpu.device, &gpu.dense, gpu.kernels.attention(), &packed)
+        .context("giving the MTP heads to the Metal device")?;
+    eprintln!(
+        "{:<LABEL$}{} heads wrapped in {:.2?}, {depth} of them a round",
+        "mtp",
+        wrapped.heads(),
+        started.elapsed()
+    );
+    Ok(Some(heads.with_backend(Box::new(wrapped))))
 }

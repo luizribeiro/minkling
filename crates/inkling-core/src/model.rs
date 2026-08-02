@@ -237,11 +237,25 @@ impl<'a> Model<'a> {
             "a cache per layer of the model"
         );
 
-        let mut h = Passed::Rows(self.embed.forward(ids, |id| weights.embedding_row(id)));
+        let mut h = Passed::Rows(self.embeddings(ids, weights));
         for (index, cache) in cache.layers.iter_mut().enumerate() {
             h = weights.run_layer(index, cache, h.handed());
         }
         h.rows()
+    }
+
+    /// `[tokens]` ids as the `[tokens, hidden]` the stack would have started
+    /// from, which is `InklingModel.embed`: a row of the table per id, through
+    /// `embed_norm` where the config asks for one.
+    ///
+    /// Here rather than inside [`Model::forward`] alone because the MTP heads
+    /// read it too — a head is handed the embedding of a token one position
+    /// further ahead than the one the stack is running — and what they are
+    /// handed has to be the same value, from the same norm, as what the stack
+    /// begins with. See [`crate::mtp`], where feeding a head the *unnormed* row
+    /// instead is one of the wirings the acceptance study ruled out.
+    pub fn embeddings(&self, ids: &[usize], weights: &impl ModelWeights) -> Vec<f32> {
+        self.embed.forward(ids, |id| weights.embedding_row(id))
     }
 
     /// The final `norm`, which the stack leaves for its caller to apply — see

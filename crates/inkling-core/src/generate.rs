@@ -263,6 +263,20 @@ impl<'a> Generator<'a> {
             .collect()
     }
 
+    /// The id a greedy sampler takes from a hidden state the stack has already
+    /// produced, which is `speculative_argmax_from_hidden` in the reference.
+    ///
+    /// The state is the *pre*-final-norm one — what a layer of the stack
+    /// answers with, and what an MTP head answers with — so the norm is applied
+    /// here. What it is for is a head's guess: a head produces a hidden state
+    /// and the only way to learn which token that is is to put it through the
+    /// same final norm and the same 200058-row projection the model's own
+    /// answer goes through.
+    pub fn id_from_hidden(&self, hidden: &[f32]) -> usize {
+        let normed = self.model.final_norm(hidden);
+        self.picks(&normed, 1)[0]
+    }
+
     /// `prompt` prefilled, then tokens decoded greedily until `ending` says to
     /// stop, each handed to `sink` as it is decided and then fed back through
     /// the caches the step before it left behind.

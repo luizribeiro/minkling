@@ -60,9 +60,11 @@ use crate::attention::{
 };
 use crate::checkpoint::Checkpoint;
 use crate::config::{MtpConfig, TextConfig};
+use crate::generate::{Generator, Proposer, Round};
 use crate::layer::{
     DecoderCache, DecoderLayer, DecoderWeights, Hidden, LayerMlp, NoExperts, Passed,
 };
+use crate::model::{ModelCache, ModelWeights};
 use crate::ops::{DenseMlp, DenseProjection, MlpProjections, Projection, rms_norm};
 use crate::quant::Scratch;
 use crate::weights::{Bf16, WeightsError, widened};
@@ -497,6 +499,223 @@ impl<'a> CheckpointHeads<'a> {
     }
 }
 
+/// The heads as the thing a speculative round asks for its guesses: a chain of
+/// them over the rows the round committed.
+///
+/// # A round runs every head over every row it committed
+///
+/// Head `d` at row `j` consumes what head `d - 1` produced at row `j` and the
+/// embedding of the token `d + 1` positions further on — so a round hands head
+/// `d` the sequence `next ++ guesses` from offset `d`, which is committed
+/// tokens for as long as they last and the chain's own guesses after that. The
+/// guess a round *uses* is the last row's, which is the only one past the end
+/// of the sequence.
+///
+/// **The earlier rows are run for the cache rather than for the guess**, and
+/// they cost almost nothing to run: a head is bfloat16 weights read once
+/// whatever the row count, so a round that accepted three tokens runs its heads
+/// over four rows for about what one row costs. What that buys is that a head's
+/// attention sees every position the sequence has, rather than only the ones
+/// rounds happened to land on — which is the trajectory the acceptance study's
+/// figures were measured against.
+///
+/// # The frontier row is run and taken back
+///
+/// At the last row, head `d` embeds a token no head has been proved right about
+/// — the chain's own guess. So every head is rewound by one row at the end of a
+/// round, and the next round runs that position again with the token the model
+/// went on to produce. It costs one row of a head per round and keeps the heads
+/// standing on what the model actually did.
+///
+/// Neither of those can cost a token: [`Proposer`] is asked for guesses and the
+/// loop above verifies them.
+pub struct MtpProposer<'a, W> {
+    heads: &'a CheckpointHeads<'a>,
+    generator: Generator<'a>,
+    weights: &'a W,
+    /// One decoder cache per head, able to give the frontier row back.
+    caches: ModelCache,
+    depth: usize,
+    /// The row the round before this one ran and took back: the hidden state
+    /// the stack produced there, and the token that follows it.
+    carried: Option<Carried>,
+    guesses: Vec<usize>,
+    /// Rows accepted and rows guessed, which is acceptance as this run measures
+    /// it — see [`MtpProposer::accepted`].
+    accepted: Vec<usize>,
+    proposed: Vec<usize>,
+    /// Rounds this has been asked for guesses by, which is every round of the
+    /// generation but the one it ended in.
+    rounds: usize,
+}
+
+/// The frontier row of the round before this one, which is run again because
+/// what it embedded was a guess.
+struct Carried {
+    hidden: Vec<f32>,
+    next: usize,
+}
+
+impl<'a, W: ModelWeights> MtpProposer<'a, W> {
+    /// The heads as a proposer of at most `depth` tokens a round.
+    ///
+    /// `generator` is what turns a head's hidden state into a token — the
+    /// model's own final norm and `lm_head`, which is what makes a head's guess
+    /// comparable to the model's answer — and `weights` is what the embedding
+    /// rows come from.
+    pub fn new(
+        heads: &'a CheckpointHeads<'a>,
+        generator: Generator<'a>,
+        weights: &'a W,
+        depth: usize,
+    ) -> Self {
+        assert!(
+            depth <= heads.heads(),
+            "{depth} tokens a round from {} heads",
+            heads.heads()
+        );
+        Self {
+            caches: ModelCache::speculating(heads.config(), FRONTIER),
+            heads,
+            generator,
+            weights,
+            depth,
+            carried: None,
+            guesses: Vec::new(),
+            accepted: Vec::new(),
+            proposed: Vec::new(),
+            rounds: 0,
+        }
+    }
+
+    /// How many rounds the generation took, which is what its tokens divide by
+    /// to say what a round banked.
+    ///
+    /// One more than the rounds this was asked to guess in: every round ends by
+    /// asking, except the one the generation ended in.
+    pub fn rounds(&self) -> usize {
+        self.rounds + 1
+    }
+
+    /// How many of the tokens this guessed at each depth the model went on to
+    /// agree with, and how many it guessed at all.
+    ///
+    /// Kept because it is the number that decides the depth worth running, and
+    /// it is a property of the workload rather than of the engine — the study
+    /// measured 99.7% at depth 1 on enumeration and 44.9% on prose. A caller
+    /// reports it; nothing here reads it.
+    pub fn accepted(&self) -> (&[usize], &[usize]) {
+        (&self.accepted, &self.proposed)
+    }
+
+    /// The same as a rate per depth, which is what a report prints and what a
+    /// depth is chosen from.
+    ///
+    /// **Joint rather than marginal**, and it cannot be otherwise in an engine:
+    /// a round whose first guess was rejected never learns what its second was
+    /// worth, because the position that guess was about is not the position the
+    /// model went to. The acceptance study's teacher-forced replay could
+    /// measure both; what is here is what was banked, which is also what the
+    /// speedup is made of.
+    pub fn rates(&self) -> Vec<f64> {
+        self.proposed
+            .iter()
+            .zip(&self.accepted)
+            .map(|(asked, got)| match asked {
+                0 => 0.0,
+                asked => *got as f64 / *asked as f64,
+            })
+            .collect()
+    }
+
+    /// What the round's rows are, once the row taken back at the end of the
+    /// last round is put in front of them.
+    fn rows(&self, round: &Round<'_>) -> (Vec<f32>, Vec<usize>) {
+        let mut hidden = Vec::with_capacity(round.hidden.len() + self.heads.config().hidden_size);
+        let mut next = Vec::with_capacity(round.next.len() + 1);
+        if let Some(carried) = &self.carried {
+            hidden.extend_from_slice(&carried.hidden);
+            next.push(carried.next);
+        }
+        hidden.extend_from_slice(round.hidden);
+        next.extend_from_slice(round.next);
+        (hidden, next)
+    }
+
+    /// What the model went on to do with the guesses of the round before this
+    /// one, read off the tokens it committed.
+    fn score(&mut self, next: &[usize]) {
+        let banked = next.len().saturating_sub(1);
+        for (depth, guess) in self.guesses.iter().enumerate() {
+            if self.proposed.len() <= depth {
+                self.proposed.push(0);
+                self.accepted.push(0);
+            }
+            self.proposed[depth] += 1;
+            self.accepted[depth] += usize::from(depth < banked && next[depth + 1] == *guess);
+        }
+    }
+}
+
+/// How many rows a round takes back from every head, which is the one whose
+/// embedding was the chain's own guess.
+const FRONTIER: usize = 1;
+
+impl<W: ModelWeights> Proposer for MtpProposer<'_, W> {
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// **A round that asks for fewer than the last one leaves the heads past
+    /// it where they are**, which is right for the one case that happens — a
+    /// generation whose budget is running out, and which will not ask again —
+    /// and would be wrong for a depth that went back up: those heads' caches
+    /// would be missing the rows the shallower rounds ran. Nothing chooses a
+    /// depth adaptively yet; whatever does has to run the heads it skipped or
+    /// start their caches over.
+    fn propose(&mut self, round: Round<'_>) -> &[usize] {
+        self.rounds += 1;
+        let (mut chained, mut tokens) = self.rows(&round);
+        self.score(&tokens);
+        let hidden = self.heads.config().hidden_size;
+        let rows = tokens.len();
+        assert_eq!(chained.len(), rows * hidden, "a hidden state per row");
+
+        self.guesses.clear();
+        for head in 0..round.depth {
+            let embed = self
+                .generator
+                .model()
+                .embeddings(&tokens[head..head + rows], self.weights);
+            chained = self
+                .heads
+                .forward(head, self.caches.layer(head), &chained, &embed);
+            let guess = self
+                .generator
+                .id_from_hidden(&chained[(rows - 1) * hidden..]);
+            self.guesses.push(guess);
+            tokens.push(guess);
+        }
+
+        // The frontier row again next time, against the token the model
+        // produced rather than the one this chain guessed.
+        for head in 0..round.depth {
+            self.caches.layer(head).rewind(FRONTIER);
+        }
+        self.carried = Some(Carried {
+            hidden: chained_row(round.hidden, hidden),
+            next: *round.next.last().expect("a round commits a row"),
+        });
+        &self.guesses
+    }
+}
+
+/// The last row of a round's hidden state, which is the row the next round runs
+/// again.
+fn chained_row(hidden: &[f32], width: usize) -> Vec<f32> {
+    hidden[hidden.len() - width..].to_vec()
+}
+
 /// A head's projection, wherever it is multiplied.
 enum Handed<'a> {
     Backend(&'a dyn Projection),
@@ -609,7 +828,7 @@ mod tests {
     use super::*;
     use crate::attention::LogScaling;
     use crate::config::Config;
-    use crate::fixture::{self, LayerTensors, deviation};
+    use crate::fixture::{self, LayerTensors, Stack, deviation};
 
     /// Two synthetic heads and the two calls mlx-vlm drove each of them with,
     /// from `just dump-mtp-fixture`.
@@ -1120,6 +1339,76 @@ mod tests {
             self.data.len()
         }
     }
+
+    /// **The heads driven through the loop they exist for**: a generation that
+    /// chains them produces the tokens a generation that does not chain them
+    /// produces.
+    ///
+    /// `speculation_changes_no_token` in [`crate::generate`] says this of the
+    /// loop against proposers written to be right and wrong on cue; what this
+    /// adds is the proposer nobody wrote by hand — the chain, its carried row,
+    /// the embedding each head is handed, and the rewind at the end of every
+    /// round, none of which the loop knows anything about.
+    ///
+    /// The heads here are the fixture's and the model is the synthetic stack's,
+    /// which are two different models: what a head guesses is nonsense, and
+    /// that is the point of running it. A proposer whose guesses are wrong is
+    /// the case an engine has to be right about — 44.9% of them are, on prose —
+    /// and the tokens are the model's either way.
+    #[test]
+    fn a_generation_that_chains_the_heads_produces_the_tokens_it_produces_without_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mtp.safetensors");
+        write_heads(&path);
+        let ckpt = crate::Checkpoint::open(&path).expect("the shard opens");
+        let config = fixture_config();
+        let heads = CheckpointHeads::open(
+            &ckpt,
+            &config.text_config,
+            config.mtp_config.as_ref().expect("an mtp_config"),
+        )
+        .expect("the heads open");
+
+        let stack = Stack::load();
+        let head = stack.head();
+        let generator = Generator::new(
+            stack.model(),
+            crate::LmHead::for_config(&stack.config),
+            &head,
+        );
+        let ending = crate::generate::Ending {
+            budget: TOKENS,
+            eos: None,
+        };
+        let decoded = |depth: usize| {
+            let cache = &mut ModelCache::speculating(&stack.config, depth);
+            let mut proposer = MtpProposer::new(&heads, generator, &stack, depth);
+            let mut tokens = Vec::new();
+            generator.speculate(cache, &stack.ids, ending, &stack, &mut proposer, |id| {
+                tokens.push(id);
+                std::ops::ControlFlow::Continue(())
+            });
+            (tokens, proposer.rounds(), proposer.rates())
+        };
+
+        let (alone, rounds, rates) = decoded(0);
+        assert_eq!(alone.len(), TOKENS);
+        assert_eq!(rounds, TOKENS, "a round a token, which is decoding");
+        assert!(rates.is_empty(), "a proposer of no depth guessed something");
+
+        for depth in 1..=heads.heads() {
+            let (tokens, rounds, rates) = decoded(depth);
+            assert_eq!(tokens, alone, "chaining {depth} heads changed the tokens");
+            assert_eq!(rates.len(), depth, "a rate per head asked");
+            assert!(rounds <= TOKENS, "{rounds} rounds for {TOKENS} tokens");
+        }
+    }
+
+    /// How many tokens the chained cases decode. Enough that a round reads what
+    /// more than one round before it left — a head's convolution window is
+    /// three inputs deep — and that the rewind at the end of every round has to
+    /// have been right several times over.
+    const TOKENS: usize = 6;
 
     /// The two sequences a head consumes are not the same tensor, and a head
     /// that read one of them twice would still run — the shapes are equal.

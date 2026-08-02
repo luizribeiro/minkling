@@ -51,7 +51,8 @@ use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use inkling_core::{Checkpoint, Ending, ModelCache, Stop, Tokenizer};
+use inkling_core::mtp::MtpProposer;
+use inkling_core::{Checkpoint, Ending, ModelCache, ModelWeights, Stop, Tokenizer};
 
 use crate::LABEL;
 use crate::args::Generate;
@@ -71,31 +72,68 @@ pub fn run(args: &Generate) -> Result<()> {
     }
     eprintln!("{:<LABEL$}{} tokens", "prompt", ids.len());
 
-    let speculation = 0;
-
     // Before the checkpoint is mapped, so that a backend this machine cannot
     // give ends the command in a millisecond rather than after a 130 GiB load.
     let gpu = backend::open(args.backend)?;
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
-    let weights = backend::weights(gpu.as_ref(), &checkpoint, &config.text_config, speculation)?;
+    let weights = backend::weights(
+        gpu.as_ref(),
+        &checkpoint,
+        &config.text_config,
+        args.speculate,
+    )?;
+    let heads = backend::heads(gpu.as_ref(), &checkpoint, &config, args.speculate)?;
     let generator = weights.generator();
     let ending = Ending {
         budget: args.max_tokens,
         eos: Some(tokenizer.eos() as usize),
     };
-    let cache = &mut ModelCache::new(&config.text_config);
+    // The slack every layer's convolution windows keep is the depth this run
+    // speculates to, because that is the most a round can have to take back.
+    let cache = &mut ModelCache::speculating(&config.text_config, args.speculate);
 
     // The clock starts here rather than a line earlier: the first step is the
     // prompt's prefill and is reported as such, and everything before it — the
     // mapping, the tokenizer, the cache — is setup nobody times a generation by.
     let mut text = tokenizer.stream();
     let mut out = Output::new(io::stdout().lock());
-    let stop = generator.stream(cache, &ids, ending, &weights, |id| {
-        out.push(text.push(id as u32).map_err(anyhow::Error::from))
-    });
+    let mut proposer = heads
+        .as_ref()
+        .map(|heads| MtpProposer::new(heads, generator, &weights, args.speculate));
+    let mut sink = |id: usize| out.push(text.push(id as u32).map_err(anyhow::Error::from));
+    let stop = match proposer.as_mut() {
+        Some(proposer) => generator.speculate(cache, &ids, ending, &weights, proposer, &mut sink),
+        None => generator.stream(cache, &ids, ending, &weights, &mut sink),
+    };
+    if let Some(proposer) = &proposer {
+        report_acceptance(proposer);
+    }
     // Bytes the last token left half a character with. A generation the budget
     // cut off mid-character has them, and holding them back would lose them.
     out.finish(&text.finish(), stop, tokenizer.eos())
+}
+
+/// What the heads guessed and what the model agreed with, per depth.
+///
+/// **Acceptance is a property of the workload, not of the engine**, and it is
+/// the number that decides the depth worth running — the study measured 99.7%
+/// at the first head on enumeration against 44.9% on prose. So it goes to
+/// stderr beside the timings rather than into a table anywhere, and a run
+/// reports its own.
+fn report_acceptance<W: ModelWeights>(proposer: &MtpProposer<'_, W>) {
+    let (accepted, proposed) = proposer.accepted();
+    let curve: Vec<String> = proposer
+        .rates()
+        .iter()
+        .map(|rate| format!("{:.0}%", 100.0 * rate))
+        .collect();
+    let banked: usize = accepted.iter().sum();
+    eprintln!(
+        "{:<LABEL$}{banked} of {} guesses accepted — by depth {}",
+        "mtp",
+        proposed.iter().sum::<usize>(),
+        curve.join(" ")
+    );
 }
 
 /// Where a generation goes: the text to `out` as each token arrives, what it

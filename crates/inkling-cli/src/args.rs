@@ -68,6 +68,14 @@ pub struct Generate {
     pub max_tokens: usize,
     /// Where the weights are multiplied against.
     pub backend: Backend,
+    /// How many tokens a round guesses ahead with the multi-token prediction
+    /// heads, and zero for a generation that decodes one at a time.
+    ///
+    /// A number rather than a flag because the depth that pays is the whole
+    /// question — the study measured the best pooled depth at 2 and the payoff
+    /// varying sixfold across workloads — and because the heads are 4.2 GiB a
+    /// caller has a right not to load.
+    pub speculate: usize,
 }
 
 /// A server, as a command line describes one.
@@ -108,7 +116,7 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
 pub const USAGE: &str = "usage:\n  \
     inklingrs inspect <config.json>\n  \
     inklingrs generate <checkpoint-dir> --prompt <text> [--max-tokens <n>] \
-        [--backend cpu|metal]\n  \
+        [--backend cpu|metal] [--speculate <k>]\n  \
     inklingrs serve <checkpoint-dir> [--address <host:port>] [--max-tokens <n>] \
         [--backend cpu|metal]";
 
@@ -190,12 +198,14 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
     let mut prompt = None;
     let mut max_tokens = DEFAULT_MAX_TOKENS;
     let mut backend = Backend::default();
+    let mut speculate = 0;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--prompt" | "-p" => prompt = Some(value(&arg, &mut args)?),
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
             "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
+            "--speculate" | "-k" => speculate = count(&arg, &mut args)?,
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
             _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
             _ => return Err(ArgError::Unexpected(arg)),
@@ -218,6 +228,7 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
             })?,
         max_tokens,
         backend,
+        speculate,
     }))
 }
 
@@ -327,8 +338,23 @@ mod tests {
                 prompt: "Once".to_string(),
                 max_tokens: 3,
                 backend: Backend::Metal,
+                speculate: 0,
             })
         );
+    }
+
+    /// The heads are off unless a depth asks for them, which is what keeps a
+    /// generation that names none from loading 4.2 GiB it will not multiply.
+    #[test]
+    fn generate_speculates_only_when_a_depth_says_to() {
+        let with = |flag: &[&str]| {
+            let mut args = vec!["generate", "models/small", "--prompt", "Once"];
+            args.extend_from_slice(flag);
+            generated(&args).expect("parses").speculate
+        };
+        assert_eq!(with(&[]), 0);
+        assert_eq!(with(&["--speculate", "2"]), 2);
+        assert_eq!(with(&["-k", "8"]), 8);
     }
 
     /// The flags may come before the path as readily as after it. Nothing here

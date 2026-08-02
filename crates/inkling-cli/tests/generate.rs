@@ -120,6 +120,69 @@ fn either_backend_writes_the_oracles_continuation_of_the_recorded_prompt() {
     }
 }
 
+/// **The whole claim about speculation, as a caller can check it**: the same
+/// command with `--speculate` writes the same text.
+///
+/// The oracle's own recorded continuation, against a run that guessed its way
+/// through it with the multi-token prediction heads — every token verified by
+/// the model in a block, the ones it disagreed with taken back out of
+/// forty-two layers of keys and a hundred and sixty-eight convolution windows.
+/// A latency optimisation that changed a token would be a wrong engine, and
+/// this is the only place where the tokens, the heads, the rollback and the
+/// text are all real at once.
+///
+/// Eight tokens rather than [`GENERATED`]'s three, because a round can bank
+/// several: three would be one round on this prompt and would say nothing about
+/// the second one, where the heads stand on a cache the first round rewound.
+/// Metal only, because the CPU path widens 1.1 GB a head to multiply against
+/// and would put a minute on each of the eight tokens.
+#[test]
+fn speculating_writes_the_text_that_decoding_one_token_at_a_time_writes() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let tokenizer =
+        Tokenizer::open(&dir, &fixture::config(&dir)).expect("the checkpoint's tokenizer opens");
+    let activations = fixture::open(ACTIVATIONS);
+    let prompt = tokenizer
+        .decode(&recorded(&activations, "input_ids"))
+        .expect("the recorded ids decode");
+
+    let oracle = recorded(&activations, "greedy_continuation");
+    let want = tokenizer.decode(&oracle).expect("the continuation decodes");
+    let tokens = oracle.len().to_string();
+
+    let generated = |depth: usize| {
+        let mut args = vec![
+            "generate",
+            dir.to_str().expect("a printable checkpoint path"),
+            "--prompt",
+            &prompt,
+            "--max-tokens",
+            &tokens,
+            "--backend",
+            "metal",
+        ];
+        let depth = depth.to_string();
+        if depth != "0" {
+            args.extend(["--speculate", &depth]);
+        }
+        let output = inklingrs(&args);
+        eprintln!("speculating {depth} ->\n{}", stderr(&output));
+        assert!(output.status.success(), "{}", stderr(&output));
+        (stdout(&output).to_string(), stderr(&output).to_string())
+    };
+
+    let (alone, _) = generated(0);
+    assert_eq!(alone, want, "the oracle's own continuation");
+    for depth in [1, 2, 4] {
+        let (text, report) = generated(depth);
+        assert_eq!(text, want, "speculating {depth} deep");
+        assert!(
+            report.contains("guesses accepted"),
+            "the report does not say what the heads guessed: {report}"
+        );
+    }
+}
+
 /// A path that is not a checkpoint, which is what a typo makes. It has to be
 /// refused by name rather than by a panic out of a loader.
 #[test]
