@@ -1109,18 +1109,20 @@ final norm were on the device beside it.
 
 **Speculation pays again at three depths where it paid at one.** Over 64 tokens
 of a structured prompt, three passes round-robin over the depths so that a drift
-moves them all, best pass each:
+moves them all, best pass each — and the whole sweep three times, so that every
+figure here is the mean of three of those:
 
     k                      0      1      2      3      4
-    ms/token           21.14  19.11  19.75  20.14  24.03
+    ms/token           21.14  19.10  19.75  20.23  24.97
     tokens a round      1.000  1.829  2.560  3.048  3.368
     speedup             1.000  1.107  1.070  1.045  0.847
     accepted, by depth         85%  91/74% 84/74/63% 82/65/53/47%
 
-**Three alternating pairs against the six submissions a head used to take, the
-order of the two halves flipped each pair**: 19.89, 21.05, 21.73 and 25.57 ms a
-token become 19.10, 19.75, 20.23 and 24.97 at `k` of 1, 2, 3 and 4. Every pair
-moves the same way at every depth, and the two ranges are apart at 1, 2 and 3 —
+**Those three sweeps are three alternating pairs against the six submissions a
+head used to take, the order of the two halves flipped each pair**: 19.89,
+21.05, 21.73 and 25.57 ms a token become the row above at `k` of 1, 2, 3 and 4.
+Every pair moves the same way at every depth, and the two ranges are apart at
+1, 2 and 3 —
 19.88-19.89 against 19.06-19.13, 20.96-21.14 against 19.62-19.88, 21.35-22.03
 against 20.13-20.41. **At `k = 4` they are not**, 25.30-25.93 against
 24.03-25.47, so the depth speculation still loses at is the one depth this
@@ -1147,7 +1149,7 @@ where it spent 13.9 of 66.
 against the 1.22×, 1.21× and 1.23× the same arithmetic puts them at over the
 three pairs' own `before` half. So the ceiling is the workload's — acceptance
 and what a block costs to verify decide it, and neither moved — and what still
-separates `k = 1` from it is 0.12 where it was 0.16. This file said 1.28× when
+separates `k = 1` from it is 0.12 where it was 0.15. This file said 1.28× when
 it last stated that ceiling, off a one-head chain of 6.1 ms that three
 alternating pairs now put at 4.59.
 
