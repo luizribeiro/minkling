@@ -57,7 +57,7 @@ use crate::attention::{AttentionError, FusedAttention, KeyValues, LayerAttention
 use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
 use crate::experts::{ExpertKernels, LayerExperts};
-use crate::kernel::Batch;
+use crate::kernel::{Batch, Submitted};
 use crate::matmul::{MatmulError, PackedMatmul, PackedProjection, Pending, together};
 use crate::norm::{LayerNorm, RmsNorm};
 use crate::sconv::{LayerConv, ShortConvolution};
@@ -685,6 +685,15 @@ pub struct ModelLayers<'a> {
     /// belongs to the call that started it and not to this, which is borrowed
     /// immutably by every layer it holds.
     carried: RefCell<Option<Carried<'a>>>,
+    /// The run's command buffers that have been committed and not yet waited
+    /// for, oldest first — which is the order one queue runs them in and the
+    /// order they are waited for in.
+    ///
+    /// Empty between runs, and that is what
+    /// [`LayerBackend::rewind`](inkling_core::LayerBackend::rewind) asserts on
+    /// beside the open buffer: a window this side shifts is a window a dispatch
+    /// still in flight may be reading.
+    flight: RefCell<Vec<Submitted<'a>>>,
 }
 
 /// A run of layers part way through: the command buffer they are being encoded
@@ -751,6 +760,30 @@ impl std::fmt::Debug for Carried<'_> {
 /// what keeps a prefill out: ten rows already pass this, so any prompt reaches
 /// it at its first layer and stays a submission a layer.
 const RETAINED_BUDGET: u64 = 160 << 20;
+
+/// How many dispatches a run encodes into one command buffer before committing
+/// it and carrying on into the next, without waiting for either.
+///
+/// **A command buffer executes nothing until it is committed**, so a run that
+/// commits once at the end has the device idle for every microsecond it spent
+/// encoding — 4.4 ms of a 26.4 ms decode step, ahead of an 18.6 ms wait rather
+/// than inside it. Committing part way through is what puts the two beside each
+/// other, and the arithmetic says the CPU wins the race easily: a decode step's
+/// dispatches are 4.5 µs each to encode and 16 µs each to run, so once the first
+/// buffer is in flight nothing this process does can fall behind the device.
+///
+/// **So what this number decides is the ramp and not the overlap**: it is how
+/// much encoding happens before the GPU has anything at all, against a fixed
+/// cost per command buffer the driver charges whatever is in it. Both ends are
+/// visible in a sweep of it over a decode step — 43 submissions read 20.93 ms
+/// and 3 read 22.28, where 15 read 19.88 — and the middle of that range is flat
+/// enough that no two runs order it the same way, so this is chosen as about
+/// three layers rather than fitted to the best figure.
+///
+/// It is dispatches rather than layers because both costs it trades are per
+/// dispatch, and because a run may be handed a block of nine rows as easily as
+/// one and the dispatches are the same either way.
+pub const DISPATCHES_A_SUBMISSION: usize = 64;
 
 /// One whole decoder layer on the device: its attention, the convolution and
 /// residual add behind that, the second norm, its MLP, and the convolution and
@@ -862,6 +895,7 @@ impl<'a> ModelLayers<'a> {
             device,
             budget: RETAINED_BUDGET,
             carried: RefCell::new(None),
+            flight: RefCell::new(Vec::new()),
         })
     }
 
@@ -942,8 +976,8 @@ impl LayerBackend for ModelLayers<'_> {
     /// caller reads back before it can know there is anything to take back.
     fn rewind(&self, rows: usize) {
         assert!(
-            self.carried.borrow().is_none(),
-            "a rewind while a run of layers is still being encoded"
+            self.carried.borrow().is_none() && self.flight.borrow().is_empty(),
+            "a rewind while a run of layers is still being encoded or still in flight"
         );
         for layer in self.layers.iter().flatten() {
             layer.rewind(rows);
@@ -1021,6 +1055,15 @@ impl<'a> ModelLayers<'a> {
                 (run.batch, run.rows, run.opened)
             }
             None => {
+                // A run that opens while another's buffers are still in flight
+                // would allocate against a budget that has already been spent
+                // and would attend over a span a running dispatch is still
+                // appending to. Every way a run can end drains them, so this
+                // holds by construction and is asserted where it would break.
+                debug_assert!(
+                    self.flight.borrow().is_empty(),
+                    "a run of layers opened while another was still in flight"
+                );
                 // Read before the row this call is handed is allocated, so that
                 // the first thing a run holds is charged to it.
                 let opened = self.device.allocated_bytes();
@@ -1035,7 +1078,7 @@ impl<'a> ModelLayers<'a> {
         let rows = held.encode_into(&mut batch, cache, step, &mut x)?;
         if self.carries(layer, self.device.allocated_bytes() - opened) {
             *carried = Some(Carried {
-                batch,
+                batch: self.relayed(batch)?,
                 at: layer,
                 rows,
                 opened,
@@ -1043,8 +1086,53 @@ impl<'a> ModelLayers<'a> {
             return Ok(Passed::Carried(step.queries));
         }
 
-        batch.wait()?;
+        self.flight.borrow_mut().push(batch.submit());
+        self.landed()?;
         Ok(Passed::Rows(profile::timed(Op::Readback, || rows.to_vec())))
+    }
+
+    /// The buffer the rest of the run encodes into: the one it is holding, or a
+    /// fresh one where that has enough in it to be worth the device starting on
+    /// — see [`DISPATCHES_A_SUBMISSION`].
+    ///
+    /// The committed one is not waited for. Ordering is the queue's, so what the
+    /// next buffer's first dispatch reads is what this one's last dispatch
+    /// wrote, and what the run is holding is unchanged: a command buffer retains
+    /// what is bound into it until it completes, whether or not anybody is
+    /// waiting, which is what makes [`ModelLayers::carries`]'s budget still the
+    /// bound on all of them together.
+    /// The buffer the next one is opened before this one is committed, so that
+    /// a device that will not open one leaves nothing in flight to be waited
+    /// for by a run that has already given up.
+    fn relayed(&self, batch: Batch<'a>) -> Result<Batch<'a>, ProjectionError> {
+        if batch.dispatches() < DISPATCHES_A_SUBMISSION {
+            return Ok(batch);
+        }
+        let next = self.device.batch()?;
+        self.flight.borrow_mut().push(batch.submit());
+        Ok(next)
+    }
+
+    /// Every command buffer the run committed, waited for oldest first.
+    ///
+    /// One queue runs them in that order, so waiting for the last would be
+    /// enough to know they had all finished — but not enough to know none of
+    /// them failed, and not enough to charge each what it cost. So each is
+    /// waited for, and all but the last of them are already done.
+    ///
+    /// **Every one of them, and the first failure reported afterwards.** A `?`
+    /// inside the loop would leave the buffers behind a failing one committed
+    /// and never waited for, and would empty `flight` as it unwound — so the
+    /// next rewind would find nothing in flight and shift a window a running
+    /// dispatch is still reading.
+    fn landed(&self) -> Result<(), ProjectionError> {
+        let mut failed = None;
+        for submitted in self.flight.borrow_mut().drain(..) {
+            if let Err(err) = submitted.wait() {
+                failed.get_or_insert(err);
+            }
+        }
+        failed.map_or(Ok(()), |err| Err(err.into()))
     }
 }
 
@@ -1750,13 +1838,25 @@ mod tests {
         /// carries everything — the middle layer is the only one that both
         /// consumes a carried buffer and leaves one.
         fn stack(&self, weights: &NarrowWeights, budget: u64) -> ModelLayers<'a> {
+            self.stack_of(weights, budget, &[0, 0x99, 0xdd])
+        }
+
+        /// A stack a salt to the layer, for a case that needs more of them than
+        /// the three a carried run is settled by: a run also splits at a
+        /// dispatch count, and one of these layers is eighteen dispatches, so a
+        /// stack that reaches [`DISPATCHES_A_SUBMISSION`] has to be longer than
+        /// the stack that says what carrying means.
+        ///
+        /// Every salt different, for [`Narrow::layer`]'s reason: a stack of one
+        /// layer repeated cannot tell a run that ran them in order from one that
+        /// did not.
+        fn stack_of(&self, weights: &NarrowWeights, budget: u64, salts: &[u32]) -> ModelLayers<'a> {
             stack(
                 self.device,
-                vec![
-                    self.layer(weights, 0),
-                    self.layer(weights, 0x99),
-                    self.layer(weights, 0xdd),
-                ],
+                salts
+                    .iter()
+                    .map(|salt| self.layer(weights, *salt))
+                    .collect(),
                 budget,
             )
         }
@@ -2012,6 +2112,53 @@ mod tests {
         }
     }
 
+    /// **A run long enough commits part way through and keeps encoding into the
+    /// next command buffer**, and what comes out is what the same layers answer
+    /// one submission at a time.
+    ///
+    /// Five layers because that is what it takes: one of these is eighteen
+    /// dispatches, so a run splits after the fourth and the fifth is what makes
+    /// the second buffer a buffer somebody carries into rather than the tail of
+    /// the first. Three layers, which every case above is settled by, never
+    /// reach [`DISPATCHES_A_SUBMISSION`] at all.
+    ///
+    /// The answers are compared because the split is a scheduling decision and
+    /// has to be nothing else. The submissions are compared because that is the
+    /// decision: a run that stopped splitting would still answer this.
+    #[test]
+    fn a_run_that_reaches_its_dispatch_count_commits_and_carries_on_encoding() {
+        let Some(device) = device() else { return };
+        let kernels = LayerKernels::compile(&device).expect("the kernels compile");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
+        let narrow = Narrow {
+            device: &device,
+            kernels: &kernels,
+            swiglu: &swiglu,
+            slack: 0,
+        };
+        let weights = NarrowWeights::new();
+        let stack = narrow.stack_of(&weights, RETAINED_BUDGET, &[0, 0x99, 0xdd, 0x33, 0x77]);
+        let run = Merged::over(&stack, &weights);
+        const ROWS: usize = 2;
+
+        let (_, split) = run.retaining(&device, Some(&stack as &dyn DecoderDevice), ROWS);
+        assert_eq!(
+            split, 2,
+            "five layers of eighteen dispatches against a split at {DISPATCHES_A_SUBMISSION}"
+        );
+
+        let merged = run.sequence(Some(&stack as &dyn DecoderDevice), ROWS);
+        let apart = run.sequence(None, ROWS);
+        for (what, got, want) in [
+            ("the first call", &merged.0, &apart.0),
+            ("the second", &merged.1, &apart.1),
+        ] {
+            let agreed = deviation(got, want);
+            assert!(agreed <= TOLERANCE, "{what}: {agreed:e}");
+        }
+        assert_ne!(merged.0, merged.1, "a second call that read no state");
+    }
+
     /// **What ends a run is the bytes it is holding**, and the same three layers
     /// over the same rows are one command buffer, two or three depending only on
     /// what they are allowed to hold.
@@ -2080,7 +2227,7 @@ mod tests {
 
     impl<'a> Merged<'a> {
         fn over(stack: &'a ModelLayers<'_>, weights: &'a NarrowWeights) -> Self {
-            let layers = (0..3)
+            let layers = (0..stack.layers())
                 .map(|at| {
                     let held = stack.layer(at).expect("the layer is here");
                     DecoderLayer::new(
@@ -2105,11 +2252,11 @@ mod tests {
             device: Option<&dyn DecoderDevice>,
             rows: usize,
         ) -> (Vec<f32>, Vec<f32>) {
-            let caches = &mut [
-                self.layers[0].cache(),
-                self.layers[1].cache(),
-                self.layers[2].cache(),
-            ];
+            let caches = &mut self
+                .layers
+                .iter()
+                .map(DecoderLayer::cache)
+                .collect::<Vec<DecoderCache>>();
             let mut through = |x: &[f32]| {
                 let mut h = Passed::Rows(x.to_vec());
                 for (at, layer) in self.layers.iter().enumerate() {
@@ -2245,6 +2392,7 @@ mod tests {
             device,
             budget,
             carried: RefCell::new(None),
+            flight: RefCell::new(Vec::new()),
         }
     }
 

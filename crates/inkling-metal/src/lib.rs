@@ -56,7 +56,8 @@ pub use kernel::{Batch, Grid, Kernel, Submitted};
 pub use matmul::{MatmulError, PackedBank, PackedMatmul, PackedProjection};
 pub use norm::{LayerNorm, RmsNorm};
 pub use projections::{
-    DenseFfn, LayerDevice, LayerKernels, LayerProjections, ModelLayers, StackShape,
+    DISPATCHES_A_SUBMISSION, DenseFfn, LayerDevice, LayerKernels, LayerProjections, ModelLayers,
+    StackShape,
 };
 pub use router::{LayerRouter, Router, RouterWeights, RoutingWeights};
 pub use sconv::{LayerConv, ShortConvolution};

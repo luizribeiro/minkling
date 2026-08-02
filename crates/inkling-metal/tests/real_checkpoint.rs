@@ -34,9 +34,9 @@ use inkling_core::{
     Tokenizer, split_heads,
 };
 use inkling_metal::{
-    DenseMatmul, DenseWeight, Device, ExpertKernels, LayerKernels, LayerProjections, LayerRouter,
-    MetalError, ModelHeads, ModelLayers, MoeCombine, PackedBank, PackedMatmul, PackedProjection,
-    RoundTrip, Router, RouterWeights, StackShape, SwiGlu,
+    DISPATCHES_A_SUBMISSION, DenseMatmul, DenseWeight, Device, ExpertKernels, LayerKernels,
+    LayerProjections, LayerRouter, MetalError, ModelHeads, ModelLayers, MoeCombine, PackedBank,
+    PackedMatmul, PackedProjection, RoundTrip, Router, RouterWeights, StackShape, SwiGlu,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -527,22 +527,37 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// feed-forward network four where a MoE layer's two banks and the router around
 /// them are twelve. The head is one of each.
 ///
-/// **Not one of them costs a submission.** The whole chain from the hidden state
+/// **Not one of them costs a round trip.** The whole chain from the hidden state
 /// a layer is handed to the one it passes on is buffers a next dispatch reads —
 /// including the four values that outlive the call, three convolutions' windows
 /// and the span of keys and values, which is why they had to become the layer's
 /// before the rest could follow. And what a layer passes on is what the next
-/// layer reads, so the command buffer does not end where the layer does either:
-/// a decode step is **two submissions**, one for the forty-two layers and one
-/// for the head, where it was 43 and 87 and 249.
+/// layer reads, so the command buffer does not end where the layer does either.
+///
+/// **What decides how many command buffers it does end in is
+/// `DISPATCHES_A_SUBMISSION`**, and the same greedy rule is walked here: a run
+/// commits at the first layer boundary past that many dispatches and carries on
+/// encoding into the next buffer without waiting for it. So the count is a
+/// scheduling decision rather than a property of the stack — which is exactly
+/// why it is asserted, since a layer that started forcing a *wait* would leave
+/// this number where it is and the step nowhere near it.
 ///
 /// A prefill wide enough that one layer reaches the bytes a run may hold is
 /// still one a layer, and deliberately — see `ModelLayers::carries`, where what
 /// a merged run holds is traded against what it saves. This counts a decode
 /// step, whose forty-two layers are far under that budget.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
-    let moe = layers - dense;
-    (14 * layers + 4 * dense + 12 * moe + 1, 2)
+    let width = |layer: u64| if layer < dense { 14 + 4 } else { 14 + 12 };
+    let (mut dispatches, mut encoded, mut submissions) = (0, 0, 1);
+    for layer in 0..layers {
+        dispatches += width(layer);
+        encoded += width(layer);
+        if layer + 1 < layers && encoded >= DISPATCHES_A_SUBMISSION as u64 {
+            submissions += 1;
+            encoded = 0;
+        }
+    }
+    (dispatches + 1, submissions + 1)
 }
 
 /// One run of the engine with every weight it has a kernel for on the device,
@@ -872,13 +887,18 @@ fn decode_step_table(run: &OnTheDevice) -> String {
         format!("{:.2?}", step.saturating_sub(accounted)),
         share(step.saturating_sub(accounted))
     ));
+    // Of the step and not of the wait, which it may now exceed: a run commits
+    // part way through and keeps encoding, so a command buffer executes while
+    // this process is charging its time to `dispatch encode` rather than to
+    // `submit and wait`. The share of the step is what does not depend on that.
     table.push(format!(
-        "  of which the device reported executing for {:.2?} ({:.1}% of the step, {:.1}% of the \
-         submissions)",
+        "  of which the device reported executing for {:.2?}, {:.1}% of the step and {:.1}% of \
+         the {:.2?} spent waiting for it",
         run.profile.gpu(),
         share(run.profile.gpu()),
         100.0 * run.profile.gpu().as_secs_f64()
             / run.profile.elapsed(Op::Submit).as_secs_f64().max(f64::MIN),
+        run.profile.elapsed(Op::Submit),
     ));
 
     let kernels = run.profile.kernels();
@@ -929,15 +949,17 @@ fn decode_step_table(run: &OnTheDevice) -> String {
 /// there is to divide up. **The rows** are self time — see
 /// [`inkling_core::profile`] — so they sum to what is accounted for and the
 /// remainder is what nothing here has a scope around. And **the GPU's own
-/// clock** sits inside `submit and wait` rather than beside it: the device
-/// timestamps each command buffer, so the difference between that figure and
-/// the row it is inside is the part of every round trip that was not the GPU
-/// executing.
+/// clock** is inside the *step* rather than inside `submit and wait`: it was
+/// inside the wait while a submission was a stall, and a run that commits part
+/// way through and keeps encoding has the device executing against a row this
+/// process is charging elsewhere. The two figures crossing is what that change
+/// looks like from here, and the step is the denominator that survives it.
 ///
 /// Nothing asserts a share. What is asserted is that the accounting adds up —
-/// the rows cannot exceed the wall time they were measured inside, and what
-/// they leave over stays small enough for the table to be a description of the
-/// step rather than of a fraction of it.
+/// the rows cannot exceed the wall time they were measured inside, the device
+/// cannot have executed for longer than the step that waited for it, and what
+/// the rows leave over stays small enough for the table to be a description of
+/// the step rather than of a fraction of it.
 #[test]
 #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
 fn where_a_decode_step_spends_its_time() {
@@ -954,8 +976,9 @@ fn where_a_decode_step_spends_its_time() {
         "the rows sum to {accounted:.2?} inside a {step:.2?} step"
     );
     assert!(
-        run.profile.gpu() < run.profile.elapsed(Op::Submit),
-        "the device reported executing for longer than the wait around it"
+        run.profile.gpu() < step,
+        "the device reported executing for {:.2?} of a {step:.2?} step",
+        run.profile.gpu()
     );
     // **A decode step reads no weight at all.** Every packed one is a dispatch
     // against bytes nothing decodes, and every bfloat16 one was widened at
@@ -1039,10 +1062,13 @@ fn what_a_decode_steps_round_trips_are_waiting_on() {
 
     let waited: Duration = run.round_trips.iter().map(|trip| trip.waited).sum();
     let executed: Duration = run.round_trips.iter().map(|trip| trip.executed).sum();
+    // Against the device's count and not the profile's: `Op::Submit` is charged
+    // at both ends of a command buffer that is committed and waited for
+    // separately, so its calls are the ends and these are the buffers.
     assert_eq!(
         run.round_trips.len() as u64,
-        run.profile.calls(Op::Submit) * u64::from(steps),
-        "a trip was recorded for a wait the profile did not see, or the other way round"
+        run.per_decode_step().1 * u64::from(steps),
+        "a trip was recorded for a submission the device did not count, or the other way round"
     );
     // The two clocks around one wait: `Op::Submit` is a scope that closes after
     // the trip is recorded, so it is the larger of the two by whatever the
