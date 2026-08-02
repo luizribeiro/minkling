@@ -773,15 +773,8 @@ impl OnTheDevice {
             .with_backend(Box::new(layers));
         let generator = weights.generator();
 
-        let counters = |run: &mut Self| {
-            run.submitted.push((
-                device.dispatches(),
-                device.submissions(),
-                device.allocations(),
-                device.allocated_bytes(),
-            ));
-        };
-        counters(&mut run);
+        let read = |run: &mut Self| run.submitted.push(counters(device));
+        read(&mut run);
         let mut step = Instant::now();
         generator.stream(
             &mut ModelCache::new(&config),
@@ -793,7 +786,7 @@ impl OnTheDevice {
             &weights,
             |id| {
                 run.steps.push(step.elapsed());
-                counters(&mut run);
+                read(&mut run);
                 run.peak = run.peak.max(fixture::resident_bytes());
                 run.got.push(id);
                 if run.steps.len() == 1 && !asked.charges_the_prefill() {
@@ -845,12 +838,7 @@ impl OnTheDevice {
         let [.., before, after] = &self.submitted[..=self.steps.len()] else {
             panic!("the counters are read once before the loop and once a step, so there are two")
         };
-        (
-            after.0 - before.0,
-            after.1 - before.1,
-            after.2 - before.2,
-            after.3 - before.3,
-        )
+        since(*before, *after)
     }
 
     /// The same two for a decode step, which is what the cases about one call
@@ -870,6 +858,43 @@ impl OnTheDevice {
         );
         self
     }
+
+    /// This run's charged regime, for the tables that read one.
+    fn measured(&self) -> Measured<'_> {
+        Measured {
+            regime: if self.asked.charges_the_prefill() {
+                format!("prefill of {} tokens", self.prompt)
+            } else {
+                "decode step".to_string()
+            },
+            step: self.each_charged_step(),
+            steps: self.charged_steps(),
+            counters: self.per_charged_step(),
+            profile: &self.profile,
+            round_trips: &self.round_trips,
+        }
+    }
+}
+
+/// The device's four running totals, which one unit of work is the difference
+/// across.
+fn counters(device: &Device) -> (u64, u64, u64, u64) {
+    (
+        device.dispatches(),
+        device.submissions(),
+        device.allocations(),
+        device.allocated_bytes(),
+    )
+}
+
+/// What happened between two readings of them.
+fn since(before: (u64, u64, u64, u64), after: (u64, u64, u64, u64)) -> (u64, u64, u64, u64) {
+    (
+        after.0 - before.0,
+        after.1 - before.1,
+        after.2 - before.2,
+        after.3 - before.3,
+    )
 }
 
 /// The engine, with every weight it has a kernel for on the GPU, against the
@@ -991,13 +1016,36 @@ fn sampling_device() -> Option<(PathBuf, Device)> {
 /// thing — the count is what says the table describes the whole step, and the
 /// bytes are what the achieved column divides — and a case that took one without
 /// the other would be describing a fraction of a step in bytes.
-fn what_was_sampled(run: &OnTheDevice) -> (u64, u64) {
-    let kernels = run.profile.kernels();
+fn what_was_sampled(profile: &Profile) -> (u64, u64) {
+    let kernels = profile.kernels();
     assert!(!kernels.is_empty(), "nothing was sampled");
     (
         kernels.iter().map(|(_, each)| each.calls).sum(),
         kernels.iter().map(|(_, each)| each.bytes).sum(),
     )
+}
+
+/// One regime's repeated unit of work, in the shape the two tables below read
+/// it: what one of them took, what it dispatched and submitted, and where its
+/// time went.
+///
+/// **The tables are written against this rather than against the run that
+/// produced it**, because a decode step, a prefill and a chain of heads are
+/// three regimes measured three different ways — a generation's steps, one
+/// prefill, and a round repeated against a warm cache — and the whole use the
+/// tables are put to is reading one against another.
+struct Measured<'a> {
+    /// What a row of the header calls the unit, which is the only thing in here
+    /// that knows which regime this is.
+    regime: String,
+    step: Duration,
+    /// How many of them the profile was summed over, which is what the round
+    /// trips divide by.
+    steps: u32,
+    /// The `(dispatches, submissions, allocations, allocated bytes)` of one.
+    counters: (u64, u64, u64, u64),
+    profile: &'a Profile,
+    round_trips: &'a [RoundTrip],
 }
 
 /// What this machine's memory will hand a kernel per second, as the ceiling the
@@ -1020,17 +1068,17 @@ const MEMORY_BANDWIDTH: f64 = 819e9;
 /// executed for, which is a share of the wait, which is a share of the step.
 ///
 /// **One function rather than one per regime**, because the question a prefill
-/// is read for is which rows differ from a decode step's — and two tables that
-/// could rank, divide or round differently could not answer it.
-fn step_table(run: &OnTheDevice) -> String {
-    let step = run.each_charged_step();
-    let (dispatches, submissions, allocations, bytes) = run.per_charged_step();
+/// or a chain of heads is read for is which rows differ from a decode step's —
+/// and two tables that could rank, divide or round differently could not answer
+/// it.
+fn step_table(run: &Measured<'_>) -> String {
+    let &Measured {
+        step,
+        counters: (dispatches, submissions, allocations, bytes),
+        ..
+    } = run;
+    let regime = &run.regime;
     let accounted = run.profile.total();
-    let regime = if run.asked.charges_the_prefill() {
-        format!("prefill of {} tokens", run.prompt)
-    } else {
-        "decode step".to_string()
-    };
 
     let share = |part: Duration| 100.0 * part.as_secs_f64() / step.as_secs_f64();
     let mut table = vec![format!(
@@ -1128,17 +1176,17 @@ fn step_table(run: &OnTheDevice) -> String {
 /// one — and what tells a prefill's forty-two apart from the head's, without
 /// this having to know the order. A mean over shapes that differ that much
 /// describes none of them.
-fn round_trip_table(run: &OnTheDevice) -> String {
-    let steps = run.charged_steps();
+fn round_trip_table(run: &Measured<'_>) -> String {
+    let steps = run.steps;
     let mut shapes: BTreeMap<usize, Vec<RoundTrip>> = BTreeMap::new();
-    for trip in &run.round_trips {
+    for trip in run.round_trips {
         shapes.entry(trip.dispatches).or_default().push(*trip);
     }
 
     let mut table = vec![format!(
         "a {:.2?} step, of which {:.2?} is the {} submissions it waits for\n  \
          {:<11}{:>8}{:>11}{:>11}{:>10}{:>11}{:>14}",
-        run.each_charged_step(),
+        run.step,
         run.profile.elapsed(Op::Submit),
         run.round_trips.len() as u32 / steps,
         "dispatches",
@@ -1199,7 +1247,7 @@ fn where_a_decode_step_spends_its_time() {
     let run = OnTheDevice::generate(&dir, &device);
     let step = run.each_decode_step();
     let accounted = run.profile.total();
-    eprintln!("{}", step_table(&run));
+    eprintln!("{}", step_table(&run.measured()));
 
     assert!(
         accounted <= step,
@@ -1256,7 +1304,7 @@ fn what_a_decode_steps_round_trips_are_waiting_on() {
 
     let run = OnTheDevice::generate(&dir, &device);
     let steps = run.decode_steps();
-    eprintln!("{}", round_trip_table(&run));
+    eprintln!("{}", round_trip_table(&run.measured()));
 
     let waited: Duration = run.round_trips.iter().map(|trip| trip.waited).sum();
     let executed: Duration = run.round_trips.iter().map(|trip| trip.executed).sum();
@@ -1319,7 +1367,7 @@ fn which_kernels_own_a_decode_step() {
     // close they sum to the device time of a step nobody was asking about.
     let unsampled = OnTheDevice::generate(&dir, &device).profile.gpu();
     let run = OnTheDevice::generating(&dir, &device, true);
-    eprintln!("{}", step_table(&run));
+    eprintln!("{}", step_table(&run.measured()));
     eprintln!(
         "  against {unsampled:.2?} of device time with nothing sampling, so the rows carry \
          {:+.1}% of asking",
@@ -1332,7 +1380,7 @@ fn which_kernels_own_a_decode_step() {
     // token reads six of each MoE layer's 256 experts and both shared ones plus
     // every layer's own projections, which the checkpoint's shapes put at 5.9 GB
     // of packed bytes.
-    let (timed, moved) = what_was_sampled(&run);
+    let (timed, moved) = what_was_sampled(&run.profile);
     assert!(
         (5e9..7e9).contains(&(moved as f64)),
         "a decode step moved {:.2} GB, where the checkpoint's active weights are 5.9",
@@ -1414,7 +1462,7 @@ fn where_a_prefill_spends_its_time() {
         eprintln!(
             "{}\n  against {:.2?} then {:.2?} of prefill and {:.2?} then {:.2?} of device time \
              with nothing sampling, so the rows carry {:+.1}% of asking\n{}",
-            step_table(&run),
+            step_table(&run.measured()),
             first.each_charged_step(),
             unsampled.each_charged_step(),
             first.profile.gpu(),
@@ -1422,10 +1470,10 @@ fn where_a_prefill_spends_its_time() {
             100.0
                 * (run.profile.dispatched().as_secs_f64() / unsampled.profile.gpu().as_secs_f64()
                     - 1.0),
-            round_trip_table(&run),
+            round_trip_table(&run.measured()),
         );
 
-        let (timed, _) = what_was_sampled(&run);
+        let (timed, _) = what_was_sampled(&run.profile);
         // The same two bounds a decode step's table is held to: the rows are
         // self time inside the wall time they were measured in, and the device
         // cannot have executed for longer than the step that waited for it.
@@ -1533,7 +1581,7 @@ fn what_a_prefill_costs_at_each_length() {
         let first = OnTheDevice::prefilling(&dir, &device, tokens, false);
         let run = OnTheDevice::prefilling(&dir, &device, tokens, false);
         let sampled = OnTheDevice::prefilling(&dir, &device, tokens, true);
-        let (timed, moved) = what_was_sampled(&sampled);
+        let (timed, moved) = what_was_sampled(&sampled.profile);
         let (dispatches, submissions, buffers, bytes) = run.per_charged_step();
 
         eprintln!(
@@ -2189,7 +2237,7 @@ fn what_a_speculative_round_costs_and_what_it_buys() {
     eprintln!("{:>7}  {:>10}  {:>10}", "heads", "chain", "xdecode");
     for depth in 1..=DEPTHS {
         let heads = gpu.heads(&ckpt, text, mtp);
-        let cost = time_chain(&held, &heads, text, &ids, depth);
+        let cost = time_chain(&device, &held, &heads, text, &ids, depth).each;
         eprintln!(
             "{depth:>7}  {:>10.2?}  {:>10.3}",
             cost,
@@ -2255,6 +2303,110 @@ fn what_a_speculative_round_costs_and_what_it_buys() {
             run.depth
         );
     }
+}
+
+/// **Which kernels own the milliseconds a chain of heads costs**, and in how
+/// many submissions — the question the sweep above prints one number for.
+///
+/// That number is the one figure of this engine's that has gone backwards. Four
+/// kernel milestones went into the main step and none of them touched the
+/// chain: a decode step fell 30% while the chain moved 37.92 ms to 37.63, so the
+/// depth that paid 1.31× pays 1.00×. What the sweep cannot say is *why*, and
+/// this project's record at answering that by reasoning is written down —
+/// `lm_head` was predicted at 54% of a step and measured 7.6%.
+///
+/// So the chain is put through the same two tables a decode step and a prefill
+/// go through, at the depth the sweep prices it at. What that comparison is for
+/// is the shape rather than the size: a decode step is 1077 dispatches in 15
+/// submissions because a run of layers commits as it fills a buffer and waits
+/// once, and a head hands the device its eight multiplies one command buffer at
+/// a time.
+///
+/// Nothing asserts a share. What is asserted is that the table describes the
+/// chain — every dispatch timed, and the rows summing inside the wall time they
+/// were measured in.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn which_kernels_own_a_chain_of_heads() {
+    let Some((dir, device)) = sampling_device() else {
+        return;
+    };
+
+    let config = fixture::config(&dir);
+    let text = &config.text_config;
+    let mtp = config.mtp_config.as_ref().expect("an mtp_config");
+    let tokenizer = Tokenizer::open(&dir, &config).expect("the tokenizer opens");
+    let ids: Vec<usize> = tokenizer
+        .encode(SPECULATIVE_PROMPT)
+        .expect("the prompt encodes")
+        .into_iter()
+        .map(|id| id as usize)
+        .collect();
+
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+    let held = gpu.wrap(&ckpt, text, 0);
+    let heads = gpu.heads(&ckpt, text, mtp);
+
+    // The unsampled chain first, for the reason `which_kernels_own_a_decode_step`
+    // takes one: what the rows below are worth is how close they sum to the
+    // device time of a chain nobody was asking about. It is also what faults the
+    // heads' 4.2 GiB of mapping in — `time_chain` runs a round before its own
+    // clock starts, so that cost lands on neither of the two figures.
+    device
+        .time_each_dispatch(false)
+        .expect("the device times a dispatch");
+    device.record_round_trips(true);
+    let unsampled = time_chain(&device, &held, &heads, text, &ids, DEPTHS);
+    device
+        .time_each_dispatch(true)
+        .expect("the device times a dispatch");
+    let sampled = time_chain(&device, &held, &heads, text, &ids, DEPTHS);
+    device
+        .time_each_dispatch(false)
+        .expect("the device times a dispatch");
+    device.record_round_trips(false);
+
+    eprintln!("{}", step_table(&sampled.measured()));
+    eprintln!(
+        "  against a {:.2?} chain and {:.2?} of device time with nothing sampling, so the rows \
+         carry {:+.1}% of asking",
+        unsampled.each,
+        unsampled.profile.gpu(),
+        100.0
+            * (sampled.profile.dispatched().as_secs_f64() / unsampled.profile.gpu().as_secs_f64()
+                - 1.0)
+    );
+    eprintln!("{}", round_trip_table(&unsampled.measured()));
+
+    let (timed, moved) = what_was_sampled(&sampled.profile);
+    let (dispatches, submissions, ..) = sampled.counters;
+    eprintln!(
+        "  {:.2} GB over {dispatches} dispatches in {submissions} submissions, which is {:.1} \
+         dispatches a submission against a decode step's {:.1}",
+        moved as f64 / 1e9,
+        dispatches as f64 / submissions as f64,
+        1077.0 / 15.0,
+    );
+
+    // Every dispatch the chain encoded came back with a pair of timestamps. A
+    // device that dropped one writes `MTLCounterErrorValue` and this side
+    // charges it nothing, which would be a row quietly short rather than a
+    // failure — so the count is what says the table describes the whole chain.
+    assert_eq!(timed, dispatches, "a chain's dispatches were not all timed");
+    // A chain reads each head's own 532 MiB of bfloat16 once and `lm_head` once
+    // a head, which the checkpoint's shapes put at about a gigabyte a head.
+    assert!(
+        (6e9..12e9).contains(&(moved as f64)),
+        "a chain of {DEPTHS} heads moved {:.2} GB, where the shapes put a head at about one",
+        moved as f64 / 1e9,
+    );
+    let accounted = sampled.profile.total();
+    assert!(
+        accounted <= sampled.each,
+        "the rows sum to {accounted:.2?} inside a {:.2?} chain",
+        sampled.each
+    );
 }
 
 /// The kernels a speculative run compiles, held so that the weights wrapped
@@ -2412,19 +2564,24 @@ impl Decoded {
 }
 
 /// What `depth` heads cost to run over one row, which is what a round pays to
-/// have guessed.
+/// have guessed, and where that went.
 ///
 /// A row rather than a block, because it is the shape a round has when nothing
 /// was accepted — and because what grows with the rows is the head's own
 /// attention rather than its weights, which are read once whatever the row
 /// count.
+///
+/// **The accounts are cleared after the warm round and read after the timed
+/// ones**, so what comes back describes the same rounds the duration does: the
+/// prefill in front of them is a submission a layer and would drown every row.
 fn time_chain(
+    device: &Device,
     weights: &CheckpointWeights<'_>,
     heads: &CheckpointHeads<'_>,
     config: &inkling_core::TextConfig,
     ids: &[usize],
     depth: usize,
-) -> Duration {
+) -> Chain {
     let generator = weights.generator();
     let cache = &mut ModelCache::speculating(config, 0);
     let hidden = generator
@@ -2442,11 +2599,56 @@ fn time_chain(
         });
     };
     round(&mut proposer);
+
+    profile::take();
+    device.round_trips();
+    let before = counters(device);
     let started = Instant::now();
     for _ in 0..REPEATS {
         round(&mut proposer);
     }
-    started.elapsed() / REPEATS as u32
+    let elapsed = started.elapsed();
+    let (dispatches, submissions, allocations, bytes) = since(before, counters(device));
+    let each = |total: u64| total / REPEATS as u64;
+    Chain {
+        depth,
+        each: elapsed / REPEATS as u32,
+        counters: (
+            each(dispatches),
+            each(submissions),
+            each(allocations),
+            each(bytes),
+        ),
+        profile: profile::take().per_step(REPEATS as u32),
+        round_trips: device.round_trips(),
+    }
+}
+
+/// One chain of heads, priced the way a decode step is.
+struct Chain {
+    depth: usize,
+    each: Duration,
+    counters: (u64, u64, u64, u64),
+    profile: Profile,
+    round_trips: Vec<RoundTrip>,
+}
+
+impl Chain {
+    /// The chain as the tables read a regime, which is where it is put beside a
+    /// decode step and a prefill.
+    ///
+    /// The round trips are what the timed rounds recorded between them, so they
+    /// divide by the rounds exactly as the profile already has.
+    fn measured(&self) -> Measured<'_> {
+        Measured {
+            regime: format!("chain of {} heads over one row", self.depth),
+            step: self.each,
+            steps: REPEATS as u32,
+            counters: self.counters,
+            profile: &self.profile,
+            round_trips: &self.round_trips,
+        }
+    }
 }
 
 /// What a forward pass over `tokens` costs against a cache holding `ids`, which
