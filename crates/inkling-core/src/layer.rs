@@ -337,11 +337,37 @@ impl DecoderCache {
     /// [`DecoderLayer`], because the stack allocates all forty-two of these
     /// before it decodes any layer's weights.
     pub fn new(config: AttentionConfig, hidden: usize, kernel_size: usize) -> Self {
+        Self::speculating(config, hidden, kernel_size, 0)
+    }
+
+    /// The same, able to give back `slack` timesteps — which is what a
+    /// speculative round needs of a layer when the tokens it guessed are not
+    /// the ones the model went on to produce. See [`DecoderCache::rewind`].
+    pub fn speculating(
+        config: AttentionConfig,
+        hidden: usize,
+        kernel_size: usize,
+        slack: usize,
+    ) -> Self {
         Self {
-            attention: AttentionCache::new(config, kernel_size),
-            attn_sconv: ConvState::new(hidden, kernel_size),
-            mlp_sconv: ConvState::new(hidden, kernel_size),
+            attention: AttentionCache::speculating(config, kernel_size, slack),
+            attn_sconv: ConvState::with_slack(hidden, kernel_size, slack),
+            mlp_sconv: ConvState::with_slack(hidden, kernel_size, slack),
         }
+    }
+
+    /// Take back the last `rows` timesteps, in all four of the places this
+    /// layer put them: the keys, the values, and the four convolution windows.
+    ///
+    /// **A layer's state is the whole of what a rejected token has to be taken
+    /// out of**, which is what makes this a method here rather than four calls
+    /// at the seam above. A rewind that missed one of the four would leave a
+    /// layer that still runs — the shapes do not change — and a sequence whose
+    /// position is one thing to its keys and another to its convolutions.
+    pub fn rewind(&mut self, rows: usize) {
+        self.attention.rewind(rows);
+        self.attn_sconv.rewind(rows);
+        self.mlp_sconv.rewind(rows);
     }
 }
 

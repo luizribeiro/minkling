@@ -113,16 +113,47 @@ impl ModelCache {
     /// layer's window widths and key strides are shapes, and asking a layer for
     /// them would mean decoding it first.
     pub fn new(config: &TextConfig) -> Self {
+        Self::speculating(config, 0)
+    }
+
+    /// The same, able to give back `slack` timesteps in every layer.
+    ///
+    /// What that costs is `slack` more timesteps in each of a layer's four
+    /// convolution windows and nothing anywhere else — 21 KB a layer at the
+    /// checkpoint's widths and a slack of eight, which is a tenth of what the
+    /// same layer's keys cost at 64 tokens. A generation that speculates
+    /// nothing asks for none, so a decode step carries what it always carried.
+    pub fn speculating(config: &TextConfig, slack: usize) -> Self {
         Self {
             layers: (0..config.num_hidden_layers)
                 .map(|layer| {
-                    DecoderCache::new(
+                    DecoderCache::speculating(
                         AttentionConfig::for_layer(config, layer),
                         config.hidden_size,
                         config.sconv_kernel_size,
+                        slack,
                     )
                 })
                 .collect(),
+        }
+    }
+
+    /// One layer's state, for a caller that runs a layer rather than the stack
+    /// — which the multi-token prediction heads are: a head is a decoder layer
+    /// and carries a decoder layer's cache. See [`crate::mtp`].
+    pub fn layer(&mut self, index: usize) -> &mut DecoderCache {
+        &mut self.layers[index]
+    }
+
+    /// Take back the last `rows` timesteps in every layer, which is what a
+    /// speculative round does with the tokens the model did not agree with.
+    ///
+    /// **Every layer or none.** A stack rewound unevenly would attend over a
+    /// different number of keys per layer for the same position, and would
+    /// still answer.
+    pub fn rewind(&mut self, rows: usize) {
+        for layer in &mut self.layers {
+            layer.rewind(rows);
         }
     }
 
@@ -408,6 +439,59 @@ mod tests {
                 want.what
             );
         }
+    }
+
+    /// The property the whole speculative loop rests on, stated on the stack:
+    /// tokens fed, taken back and replaced are the same sequence as tokens that
+    /// were never fed.
+    ///
+    /// Exact equality rather than a tolerance, for the reason
+    /// [`crate::generate`]'s split test demands it — both sides multiply the
+    /// same numbers in the same order. That is what makes speculation a latency
+    /// optimisation rather than an approximation: what a rejected token leaves
+    /// behind in five layers of keys and twenty convolution windows is nothing
+    /// at all.
+    ///
+    /// Every layer, because a rewind that missed one is a stack that still
+    /// answers — see [`ModelCache::rewind`] — and the values are what say
+    /// otherwise.
+    #[test]
+    fn rewinding_the_tokens_a_pass_fed_leaves_the_stack_where_they_found_it() {
+        let stack = Stack::load();
+        let sequence = stack.sequence();
+        let model = stack.model();
+
+        for split in 1..sequence.len() {
+            let taken = sequence.len() - split;
+            let wrong: Vec<usize> = sequence[split..]
+                .iter()
+                .map(|id| (id + 1) % stack.config.vocab_size)
+                .collect();
+            assert_ne!(wrong, sequence[split..], "tokens a rewind has to undo");
+
+            let cache = &mut ModelCache::speculating(&stack.config, taken);
+            model.forward(cache, &sequence[..split], &stack);
+            model.forward(cache, &wrong, &stack);
+            cache.rewind(taken);
+            let after = model.forward(cache, &sequence[split..], &stack);
+
+            let clean = &mut ModelCache::speculating(&stack.config, taken);
+            model.forward(clean, &sequence[..split], &stack);
+            let want = model.forward(clean, &sequence[split..], &stack);
+            assert_eq!(after, want, "{taken} tokens taken back at {split}");
+        }
+    }
+
+    /// A stack that never speculates asks for no slack, and asking one that did
+    /// not to give a token back is refused rather than answered out of a window
+    /// that no longer holds it.
+    #[test]
+    #[should_panic(expected = "a rewind of 1 against 0")]
+    fn rewinding_a_cache_that_kept_no_slack_is_refused() {
+        let stack = Stack::load();
+        let cache = &mut ModelCache::new(&stack.config);
+        stack.model().forward(cache, &stack.ids, &stack);
+        cache.rewind(1);
     }
 
     /// What a forward pass is made of, counted rather than described.

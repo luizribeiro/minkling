@@ -746,10 +746,18 @@ impl AttentionCache {
     /// weight — and at Inkling-Small's size, standing a layer up to ask it for
     /// one would mean decoding 176 MB of projections to learn two integers.
     pub fn new(config: AttentionConfig, kernel_size: usize) -> Self {
+        Self::speculating(config, kernel_size, 0)
+    }
+
+    /// The same, able to give back `slack` timesteps — which for the keys is
+    /// free and for the two convolution windows is what
+    /// [`ConvState::with_slack`] costs.
+    pub fn speculating(config: AttentionConfig, kernel_size: usize, slack: usize) -> Self {
         let channels = config.kv_channels();
+        let window = || ConvState::with_slack(channels, kernel_size, slack);
         Self {
-            k_sconv: ConvState::new(channels, kernel_size),
-            v_sconv: ConvState::new(channels, kernel_size),
+            k_sconv: window(),
+            v_sconv: window(),
             keys: Vec::new(),
             values: Vec::new(),
             cached: 0,
@@ -785,6 +793,39 @@ impl AttentionCache {
     /// both paths.
     pub fn appended(&mut self, rows: usize) {
         self.cached += rows;
+    }
+
+    /// Take back the last `rows` timesteps: the keys and values they left, and
+    /// the two convolution windows they advanced.
+    ///
+    /// **The keys are the easy half and the windows are the reason this is
+    /// interesting.** A key is addressed by its position, so unwanting one is
+    /// arithmetic on a count — nothing reads past what the sequence has seen.
+    /// A convolution window holds no positions at all, which is why it has to
+    /// have kept more than it reads to be able to answer this; see
+    /// [`ConvState::rewind`].
+    ///
+    /// A backend holding the span itself is told the same thing separately —
+    /// the count here is what a sequence carries, and where the keys are is
+    /// whoever holds them's business.
+    pub fn rewind(&mut self, rows: usize) {
+        assert!(
+            rows <= self.cached,
+            "a rewind of {rows} against a sequence that has seen {}",
+            self.cached
+        );
+        self.cached -= rows;
+        for state in [&mut self.k_sconv, &mut self.v_sconv] {
+            state.rewind(rows);
+        }
+
+        // Empty where a backend holds the span, and the sequence's whole state
+        // where it does not — see `AttentionCache::keys`.
+        let (seen, left) = (self.cached + rows, self.cached);
+        for values in [&mut self.keys, &mut self.values] {
+            let stride = values.len() / seen.max(1);
+            values.truncate(left * stride);
+        }
     }
 }
 

@@ -21,16 +21,37 @@ pub struct ShortConv<'a> {
     weight: &'a [f32],
 }
 
-/// The last `kernel_size - 1` inputs of one sequence, `[kernel_size - 1,
-/// channels]` row-major.
+/// The inputs of one sequence a short convolution still holds, `[window +
+/// slack, channels]` row-major and oldest last-but-one — the newest row is the
+/// last.
 ///
-/// This is the whole of a short convolution's history. It cannot be trimmed to
-/// a shorter window the way a KV cache can, so a rejected speculative token
-/// needs the state restored and replayed rather than truncated.
+/// **The window itself cannot be trimmed.** It is the last `kernel_size - 1`
+/// inputs and holds no positions, so a rejected speculative token cannot be
+/// taken out of it the way a key can be taken out of a KV cache: what a
+/// shortened window would need is the input *before* the ones it holds, and
+/// that input is gone. mlx-vlm's own comment says the answer is to restore the
+/// state and replay, which costs a forward pass over the accepted tokens on
+/// every round that rejects one — against a decode step this engine is trying
+/// to spend less than.
+///
+/// **So it keeps more than it reads.** `slack` further timesteps behind the
+/// window makes a rejection a rewind: dropping the last `r` inputs leaves a
+/// window that is still `kernel_size - 1` real inputs as long as `r` is within
+/// the slack, and nothing has to be replayed to rebuild it. A sequence that
+/// never speculates asks for none and holds exactly what it did before.
 #[derive(Debug, Clone)]
 pub struct ConvState {
     channels: usize,
+    /// The `kernel_size - 1` timesteps a convolution reads, which is the tail
+    /// of `history`.
+    window: usize,
     history: Vec<f32>,
+    /// How many trailing rows of `history` are this sequence's own.
+    ///
+    /// A rewind shifts the rest along and leaves the front holding rows that
+    /// belong to nothing, so this is what says how far back one may go again —
+    /// see [`ConvState::rewind`].
+    kept: usize,
 }
 
 impl ConvState {
@@ -41,16 +62,67 @@ impl ConvState {
     /// stack of forty-two layers allocates every cache it will need before it
     /// has decoded a single weight.
     pub fn new(channels: usize, kernel_size: usize) -> Self {
+        Self::with_slack(channels, kernel_size, 0)
+    }
+
+    /// The same, holding `slack` timesteps further back than the convolution
+    /// reads so that a speculative round can be rewound rather than replayed.
+    ///
+    /// The zeros are the sequence's as much as any input is — they are the
+    /// padding that makes the first output causal — so a rewind at the start of
+    /// a sequence is allowed and gives back the same window.
+    pub fn with_slack(channels: usize, kernel_size: usize, slack: usize) -> Self {
         assert!(kernel_size > 0, "a kernel needs at least one tap");
+        let window = kernel_size - 1;
         Self {
             channels,
-            history: vec![0.0; (kernel_size - 1) * channels],
+            window,
+            history: vec![0.0; (window + slack) * channels],
+            kept: window + slack,
         }
     }
 
-    /// The `kernel_size - 1` timesteps preceding the next input, oldest first.
+    /// The `kernel_size - 1` timesteps preceding the next input, oldest first,
+    /// which is the whole of what the convolution reads.
     pub fn history(&self) -> &[f32] {
-        &self.history
+        &self.history[(self.rows() - self.window) * self.channels..]
+    }
+
+    /// Timesteps this holds at all, which is the window plus its slack.
+    fn rows(&self) -> usize {
+        match self.channels {
+            0 => 0,
+            channels => self.history.len() / channels,
+        }
+    }
+
+    /// Timesteps this holds behind the window the convolution reads.
+    fn slack(&self) -> usize {
+        self.rows() - self.window
+    }
+
+    /// How many timesteps may still be taken back, which is what the slack
+    /// bought and what a rewind spends.
+    pub fn rewindable(&self) -> usize {
+        self.kept - self.window
+    }
+
+    /// Take back the last `rows` inputs, leaving the window the convolution
+    /// would have had without them.
+    ///
+    /// The rest shift along, which leaves the front of the history holding rows
+    /// that are nobody's — so what this can give back is bounded by
+    /// [`ConvState::rewindable`] rather than by the slack alone, and a call
+    /// past that is refused rather than answered from them.
+    pub fn rewind(&mut self, rows: usize) {
+        assert!(
+            rows <= self.rewindable(),
+            "a rewind of {rows} against {} the window can give back",
+            self.rewindable()
+        );
+        let kept = (self.rows() - rows) * self.channels;
+        self.history.copy_within(..kept, rows * self.channels);
+        self.kept -= rows;
     }
 }
 
@@ -116,17 +188,25 @@ impl<'a> ShortConv<'a> {
         }
 
         let padded = self.pad(state, x, mask);
-        let mut out = self.convolve(&padded, rows);
+        let mut out = self.convolve(&padded[state.slack() * self.channels..], rows);
         for (out, residual) in out.iter_mut().zip(x) {
             *out += residual;
         }
 
         let tail = padded.len() - state.history.len();
         state.history.copy_from_slice(&padded[tail..]);
+        state.kept = (state.kept + rows).min(state.rows());
         out
     }
 
-    /// `history ++ masked(x)`, the window every output row is cut from.
+    /// Everything this convolution holds followed by `masked(x)`, which is the
+    /// sequence every output row is cut from and the tail of which is what the
+    /// call leaves behind.
+    ///
+    /// It is the whole history rather than the window because of what the tail
+    /// has to be: a call shorter than the slack cannot fill it, so part of what
+    /// it keeps is part of what it was given — the same case, one window
+    /// further out, as a decode step that cannot fill a four-tap window.
     fn pad(&self, state: &ConvState, x: &[f32], mask: Option<&[bool]>) -> Vec<f32> {
         let mut padded = Vec::with_capacity(state.history.len() + x.len());
         padded.extend_from_slice(&state.history);
@@ -313,6 +393,66 @@ mod tests {
     /// The fixture's `streamed` is mlx-vlm's own one-timestep-at-a-time answer,
     /// so the split is checked against the reference's cache path and not only
     /// against this port's whole-sequence one.
+    /// The streaming property, across a rejection: rows fed, taken back and
+    /// replaced are the same sequence as rows that were never fed at all.
+    ///
+    /// Exact equality rather than a tolerance, for the reason the split test
+    /// demands it — both sides multiply the same numbers in the same order, and
+    /// the only thing a rewind changes is which call put a value in the window.
+    /// That is the whole claim: a rewind is not an approximation of the replay
+    /// it replaces.
+    ///
+    /// Driven at every split of the fixture's sequence, and with wrong rows in
+    /// place of the right ones rather than nothing at all — a state that failed
+    /// to take them back would keep *their* values in its window, which is
+    /// exactly what a rejected speculative token leaves behind.
+    #[test]
+    fn rewinding_the_rows_a_call_fed_leaves_the_window_it_had_before_them() {
+        let fx = Synthetic::load();
+        let (weight, input) = (fx.tensor("weight"), fx.tensor("input"));
+        let conv = ShortConv::new(fx.channels, &weight);
+        let sequence = fx.sequence(&input, 0);
+        let rows = sequence.len() / fx.channels;
+        let wrong: Vec<f32> = sequence.iter().map(|value| -3.0 * value).collect();
+
+        for split in 1..rows {
+            let taken = rows - split;
+            let slack = |slack| ConvState::with_slack(fx.channels, fx.kernel_size, slack);
+
+            let mut state = slack(taken);
+            conv.forward(&mut state, &sequence[..split * fx.channels], None);
+            conv.forward(&mut state, &wrong[split * fx.channels..], None);
+            state.rewind(taken);
+            let after = conv.forward(&mut state, &sequence[split * fx.channels..], None);
+
+            let mut clean = slack(taken);
+            conv.forward(&mut clean, &sequence[..split * fx.channels], None);
+            let want = conv.forward(&mut clean, &sequence[split * fx.channels..], None);
+
+            assert_eq!(after, want, "{taken} rows taken back at {split}");
+            assert_eq!(state.history(), clean.history(), "the window at {split}");
+        }
+    }
+
+    /// A rewind is bounded by what the slack bought, and asking for more is
+    /// refused rather than answered out of rows that belong to nobody.
+    #[test]
+    #[should_panic(expected = "a rewind of 3 against 2")]
+    fn a_rewind_past_the_slack_is_refused() {
+        ConvState::with_slack(4, 4, 2).rewind(3);
+    }
+
+    /// A sequence that never speculates asks for no slack and holds what it
+    /// always held, which is what says the machinery costs a decode step
+    /// nothing.
+    #[test]
+    fn a_state_without_slack_holds_the_window_and_nothing_else() {
+        let state = ConvState::new(8, 4);
+        assert_eq!(state.history().len(), 3 * 8);
+        assert_eq!(state.rewindable(), 0);
+        assert_eq!(state.rows(), 3);
+    }
+
     #[test]
     fn streaming_a_sequence_matches_feeding_it_whole() {
         let fx = Synthetic::load();
