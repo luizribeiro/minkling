@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use inkling_cli::args::Backend;
 use inkling_cli::{backend, config};
+use inkling_core::generate::{Proposer, Round};
 use inkling_core::mtp::{CheckpointHeads, MtpProposer};
 use inkling_core::workload::{DECODED, STRUCTURED_PROMPT, SWEPT, tiled};
 use inkling_core::{
@@ -58,6 +59,7 @@ const USAGE: &str = "usage:\n  \
     bench decode  <checkpoint> [--tokens <n>]\n  \
     bench prefill <checkpoint> [--tokens <n>]\n  \
     bench sweep   <checkpoint> [--tokens <n>] [--depth <k>]\n  \
+    bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
 
 /// What an invocation nobody could parse exits with, apart from one that ran and
@@ -144,11 +146,23 @@ enum Job {
         tokens: usize,
         depth: usize,
     },
-    /// The harness: two executables that already exist, run against each other.
+    /// The harness: two commands that already exist, run against each other.
     Alternate {
         pairs: usize,
-        arms: [PathBuf; 2],
+        /// Each arm's own command line — an executable, and any arguments only
+        /// that arm takes. Two builds against one checkpoint is a path apiece;
+        /// one build against two checkpoints is the same path twice with a
+        /// different directory after it, which is the shape a change to the
+        /// weights rather than to the code has.
+        arms: [Vec<String>; 2],
         args: Vec<String>,
+    },
+    /// Two chains of heads asked the same question at every round of one
+    /// generation, and how often they answer it differently.
+    Guesses {
+        checkpoints: [PathBuf; 2],
+        tokens: usize,
+        depth: usize,
     },
 }
 
@@ -156,15 +170,18 @@ impl Job {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut args = args.into_iter();
         let what = match args.next().as_deref() {
-            Some("decode") => What::Decode,
-            Some("prefill") => What::Prefill,
-            Some("sweep") => What::Sweep,
+            Some("decode") => Some(What::Decode),
+            Some("prefill") => Some(What::Prefill),
+            Some("sweep") => Some(What::Sweep),
             Some("alternate") => return Self::alternating(args),
-            Some(word) => bail!("{word} is not one of decode, prefill, sweep or alternate"),
+            Some("guesses") => None,
+            Some(word) => {
+                bail!("{word} is not one of decode, prefill, sweep, guesses or alternate")
+            }
             None => bail!("no measurement given"),
         };
 
-        let mut checkpoint = None;
+        let mut checkpoints = Vec::new();
         let mut tokens = None;
         let mut depth = SWEPT;
         while let Some(arg) = args.next() {
@@ -172,13 +189,29 @@ impl Job {
                 "--tokens" | "-n" => tokens = Some(count(&arg, &mut args)?),
                 "--depth" | "-k" => depth = count(&arg, &mut args)?,
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
-                _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
-                _ => bail!("unexpected argument {arg}"),
+                _ => checkpoints.push(PathBuf::from(arg)),
             }
         }
+        let Some(what) = what else {
+            let [a, b] = <[PathBuf; 2]>::try_from(checkpoints).map_err(|given: Vec<PathBuf>| {
+                anyhow::anyhow!("guesses takes two checkpoints, given {}", given.len())
+            })?;
+            return Ok(Self::Guesses {
+                checkpoints: [a, b],
+                tokens: tokens.unwrap_or(DECODED),
+                depth,
+            });
+        };
+        let [checkpoint] =
+            <[PathBuf; 1]>::try_from(checkpoints).map_err(|given: Vec<PathBuf>| {
+                anyhow::anyhow!(
+                    "a measurement takes one checkpoint directory, given {}",
+                    given.len()
+                )
+            })?;
         Ok(Self::Measure {
             what,
-            checkpoint: checkpoint.context("no path to a checkpoint directory")?,
+            checkpoint,
             tokens: tokens.unwrap_or(match what {
                 What::Prefill => PREFILLED,
                 _ => DECODED,
@@ -202,11 +235,14 @@ impl Job {
                     break;
                 }
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
-                _ => arms.push(PathBuf::from(arg)),
+                // An arm is a command line rather than a path, so that what
+                // differs between the two can be an argument as readily as an
+                // executable.
+                _ => arms.push(arg.split_whitespace().map(str::to_string).collect()),
             }
         }
-        let [a, b] = <[PathBuf; 2]>::try_from(arms).map_err(|arms: Vec<PathBuf>| {
-            anyhow::anyhow!("alternate takes two executables, given {}", arms.len())
+        let [a, b] = <[Vec<String>; 2]>::try_from(arms).map_err(|arms: Vec<Vec<String>>| {
+            anyhow::anyhow!("alternate takes two commands, given {}", arms.len())
         })?;
         Ok(Self::Alternate {
             pairs,
@@ -229,6 +265,16 @@ impl Job {
                 Ok(())
             }
             Self::Alternate { pairs, arms, args } => alternate(*pairs, arms, args),
+            Self::Guesses {
+                checkpoints,
+                tokens,
+                depth,
+            } => {
+                for reading in guesses(checkpoints, *tokens, *depth)? {
+                    println!("{}", reading.line());
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -382,6 +428,61 @@ fn measure(what: What, dir: &Path, tokens: usize, depth: usize) -> Result<Vec<Re
     Ok(taken)
 }
 
+/// Two chains of heads asked the same question at every round, and how often
+/// they answer it differently.
+///
+/// **This is the gate a change to the heads has to pass before any timing claim,
+/// and it is not the tokens.** No token can move: the model verifies every
+/// guess, so a worse head produces a rejected guess rather than a wrong output.
+/// What is at risk is acceptance, and acceptance is the whole of the speedup —
+/// so what has to be held against the original is the guesses themselves.
+///
+/// **One generation and one stack.** The first checkpoint's heads are the ones
+/// the generation runs on, so the rounds are its rounds; the second is asked the
+/// same [`Round`] at every one of them and its answer is compared and thrown
+/// away. Both are chained from the same hidden states through the same stack and
+/// the same embeddings, so the heads are the only thing that differs — and both
+/// chains see every round, so neither one's own carried state falls behind.
+struct Held<P: Proposer> {
+    /// The chain whose guesses the generation runs on.
+    ran: P,
+    /// The chain asked the same question and answered nowhere.
+    against: P,
+    /// Per depth: how many guesses the two were both asked for, and how many of
+    /// those they answered differently.
+    asked: Vec<usize>,
+    diverged: Vec<usize>,
+    guessed: Vec<usize>,
+}
+
+impl<P: Proposer> Held<P> {
+    fn new(ran: P, against: P, depth: usize) -> Self {
+        Self {
+            ran,
+            against,
+            asked: vec![0; depth],
+            diverged: vec![0; depth],
+            guessed: Vec::new(),
+        }
+    }
+}
+
+impl<P: Proposer> Proposer for Held<P> {
+    fn depth(&self) -> usize {
+        self.ran.depth()
+    }
+
+    fn propose(&mut self, round: Round<'_>) -> &[usize] {
+        let against: Vec<usize> = self.against.propose(round).to_vec();
+        self.guessed = self.ran.propose(round).to_vec();
+        for (at, (ran, against)) in self.guessed.iter().zip(&against).enumerate() {
+            self.asked[at] += 1;
+            self.diverged[at] += usize::from(ran != against);
+        }
+        &self.guessed
+    }
+}
+
 /// One generation of `budget` tokens, timed a step at a time.
 fn generate(
     weights: &CheckpointWeights<'_>,
@@ -435,18 +536,90 @@ fn generate(
     }
 }
 
+/// The two checkpoints' heads held against each other over one generation.
+///
+/// The stack, the embeddings and the tokenizer are the *first* checkpoint's for
+/// both chains. That is not a shortcut: a checkpoint whose heads were quantised
+/// afterwards is the same stack with a different shard beside it, and reading
+/// the stack twice would be reading the same bytes twice under a second name.
+fn guesses(dirs: &[PathBuf; 2], tokens: usize, depth: usize) -> Result<Vec<Reading>> {
+    let config = config::of_checkpoint(&dirs[0])?;
+    let text = &config.text_config;
+    let tokenizer = Tokenizer::open(&dirs[0], &config)?;
+    let ids: Vec<usize> = tokenizer
+        .encode(STRUCTURED_PROMPT)?
+        .into_iter()
+        .map(|id| id as usize)
+        .collect();
+
+    let gpu = backend::open(Backend::Metal)?;
+    let stack = Checkpoint::open(&dirs[0])?;
+    let beside = Checkpoint::open(&dirs[1])?;
+    let weights = backend::weights(gpu.as_ref(), &stack, text, depth)?;
+    let tail = backend::tail_weights(&weights, text);
+    let ran = backend::heads(gpu.as_ref(), &stack, &config, depth, &tail)?
+        .context("the first checkpoint has no heads to guess with")?;
+    let against = backend::heads(gpu.as_ref(), &beside, &config, depth, &tail)?
+        .context("the second checkpoint has no heads to guess with")?;
+
+    let generator = weights.generator();
+    let mut held = Held::new(
+        MtpProposer::new(&ran, generator, &weights, depth),
+        MtpProposer::new(&against, generator, &weights, depth),
+        depth,
+    );
+    let cache = &mut ModelCache::speculating(text, depth);
+    let mut banked = 0;
+    generator.speculate(
+        cache,
+        &ids,
+        Ending {
+            budget: tokens,
+            eos: None,
+        },
+        &weights,
+        &mut held,
+        |_| {
+            banked += 1;
+            ControlFlow::Continue(())
+        },
+    );
+
+    let mut taken = vec![Reading::new("tokens", banked as f64, "banked")];
+    for (at, (asked, diverged)) in held.asked.iter().zip(&held.diverged).enumerate() {
+        taken.push(Reading::new(
+            format!("asked{}", at + 1),
+            *asked as f64,
+            "guesses",
+        ));
+        taken.push(Reading::new(
+            format!("diverged{}", at + 1),
+            *diverged as f64,
+            "guesses",
+        ));
+    }
+    let (asked, diverged): (usize, usize) = (held.asked.iter().sum(), held.diverged.iter().sum());
+    taken.push(Reading::new("asked", asked as f64, "guesses"));
+    taken.push(Reading::new("diverged", diverged as f64, "guesses"));
+    taken.push(Reading::new(
+        "diverged.share",
+        100.0 * diverged as f64 / asked.max(1) as f64,
+        "%",
+    ));
+    Ok(taken)
+}
+
 /// Two executables, run against each other for `pairs` pairs with the order
 /// flipped each pair.
-fn alternate(pairs: usize, arms: &[PathBuf; 2], args: &[String]) -> Result<()> {
+fn alternate(pairs: usize, arms: &[Vec<String>; 2], args: &[String]) -> Result<()> {
     let mut taken: [Vec<Vec<Reading>>; 2] = [Vec::new(), Vec::new()];
     for pair in 0..pairs {
         // Flipped, so that neither arm always runs on the other's warm page
         // cache and a drift over the sitting lands on both of them.
         let order = if pair % 2 == 0 { [0, 1] } else { [1, 0] };
         for arm in order {
-            let readings = ask(&arms[arm], args).with_context(|| {
-                format!("running {} for pair {}", arms[arm].display(), pair + 1)
-            })?;
+            let readings = ask(&arms[arm], args)
+                .with_context(|| format!("running {} for pair {}", named(&arms[arm]), pair + 1))?;
             eprintln!(
                 "pair {} of {pairs}, arm {}: {}",
                 pair + 1,
@@ -471,20 +644,35 @@ fn alternate(pairs: usize, arms: &[PathBuf; 2], args: &[String]) -> Result<()> {
 /// backend it wrapped, what it is part way through — reaches the terminal while
 /// it is still running, and a sweep that takes a minute an arm is not silent for
 /// it.
-fn ask(arm: &Path, args: &[String]) -> Result<Vec<Reading>> {
-    let ran = Command::new(arm)
+fn ask(arm: &[String], args: &[String]) -> Result<Vec<Reading>> {
+    let [program, own @ ..] = arm else {
+        bail!("an arm with no executable in it")
+    };
+    // An arm is one shell word split on whitespace, so a program under a
+    // directory whose name has a space in it arrives here cut in half — and
+    // would otherwise run something else, or the right thing with a stray
+    // argument. Anything that names a path has to be one.
+    if program.contains('/') && !Path::new(program).is_file() {
+        bail!("{program} is not a file, in the arm {:?}", named(arm));
+    }
+    let ran = Command::new(program)
+        // The shared arguments first and the arm's own after them: the shared
+        // ones open with the measurement's name and an arm's own are what that
+        // measurement is taken against, which is where a positional goes.
         .args(args)
+        .args(own)
         .stderr(Stdio::inherit())
         .output()
-        .with_context(|| format!("{} did not start", arm.display()))?;
+        .with_context(|| format!("{program} did not start"))?;
     if !ran.status.success() {
-        bail!(
-            "{} exited {}, saying what is above",
-            arm.display(),
-            ran.status
-        );
+        bail!("{program} exited {}, saying what is above", ran.status);
     }
     readings(&String::from_utf8_lossy(&ran.stdout))
+}
+
+/// An arm as it is written back to whoever asked for it.
+fn named(arm: &[String]) -> String {
+    arm.join(" ")
 }
 
 /// What the two arms said about one metric.
@@ -573,14 +761,9 @@ fn compare(taken: &[Vec<Vec<Reading>>; 2]) -> Result<Vec<Comparison>> {
         .collect())
 }
 
-fn report(arms: &[PathBuf; 2], compared: &[Comparison]) -> String {
+fn report(arms: &[Vec<String>; 2], compared: &[Comparison]) -> String {
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "\na  {}\nb  {}\n",
-        arms[0].display(),
-        arms[1].display()
-    );
+    let _ = writeln!(out, "\na  {}\nb  {}\n", named(&arms[0]), named(&arms[1]));
     let _ = writeln!(
         out,
         "  {:<16}{:>6}{:>11}{:>11}{:>9}  {:<17}{:<17}{:<9}{:<12}claim",
@@ -723,7 +906,7 @@ mod tests {
             parsed,
             Job::Alternate {
                 pairs: 3,
-                arms: [PathBuf::from("a/bench"), PathBuf::from("b/bench")],
+                arms: [vec!["a/bench".to_string()], vec!["b/bench".to_string()]],
                 args: ["prefill", "--tokens", "769"].map(str::to_string).to_vec(),
             }
         );
@@ -764,6 +947,11 @@ mod tests {
         path
     }
 
+    /// An arm's command line, as the harness holds one.
+    fn command(path: &Path) -> Vec<String> {
+        vec![path.display().to_string()]
+    }
+
     /// The arms swap places every pair, which is the whole reason this runs them
     /// itself rather than running all of one and then all of the other.
     #[test]
@@ -772,12 +960,138 @@ mod tests {
         let a = arm(dir.path(), "a", 20.0);
         let b = arm(dir.path(), "b", 19.0);
 
-        alternate(3, &[a, b], &[]).expect("the arms run");
+        alternate(3, &[command(&a), command(&b)], &[]).expect("the arms run");
 
         assert_eq!(
             fs::read_to_string(dir.path().join("order")).expect("the order is recorded"),
             "a\nb\nb\na\na\nb\n"
         );
+    }
+
+    /// **An arm may carry arguments of its own**, which is what a change to the
+    /// weights rather than to the code looks like here: one executable, two
+    /// checkpoints, and the measurement shared between them.
+    #[test]
+    fn an_arm_may_be_a_command_line_rather_than_a_path() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let arm = dir.path().join("arm");
+        // Reads its last argument, which is where an arm's own land.
+        fs::write(
+            &arm,
+            "#!/bin/sh\nfor value; do :; done\necho \"decode $value ms\"\n",
+        )
+        .expect("the arm is written");
+        fs::set_permissions(&arm, fs::Permissions::from_mode(0o755)).expect("the arm is runnable");
+
+        let with = |value: &str| vec![arm.display().to_string(), value.to_string()];
+        alternate(2, &[with("20"), with("19")], &[]).expect("the arms run");
+
+        // The shared arguments come first, so an arm's own are the last words
+        // of its command line however many are shared.
+        let readings = ask(&with("20"), &["ignored".to_string()]).expect("the arm answers");
+        assert_eq!(readings, [Reading::new("decode", 20.0, "ms")]);
+    }
+
+    /// A proposer that answers from a list, which is what the two chains of a
+    /// `guesses` run are to the counting between them.
+    struct Said {
+        rounds: std::cell::Cell<usize>,
+        said: Vec<Vec<usize>>,
+    }
+
+    impl Said {
+        fn new(said: &[&[usize]]) -> Self {
+            Self {
+                rounds: std::cell::Cell::new(0),
+                said: said.iter().map(|round| round.to_vec()).collect(),
+            }
+        }
+    }
+
+    impl Proposer for Said {
+        fn depth(&self) -> usize {
+            self.said.first().map_or(0, Vec::len)
+        }
+
+        fn propose(&mut self, _: Round<'_>) -> &[usize] {
+            let round = self.rounds.get();
+            self.rounds.set(round + 1);
+            &self.said[round]
+        }
+    }
+
+    /// **The gate counts per depth**, because a chain that agrees about its
+    /// first guess and diverges deeper is a different result from one that
+    /// diverges at the first: the first head is where most of the acceptance is.
+    #[test]
+    fn holding_two_chains_together_counts_where_they_answered_differently() {
+        let mut held = Held::new(
+            Said::new(&[&[1, 2, 3], &[4, 5, 6]]),
+            Said::new(&[&[1, 9, 3], &[4, 5, 7]]),
+            3,
+        );
+        let round = Round {
+            hidden: &[],
+            next: &[],
+            depth: 3,
+        };
+
+        // The guesses the generation runs on are the first chain's, whatever the
+        // second said: a comparison that fed the second's back would be
+        // measuring a generation nobody asked for.
+        assert_eq!(held.propose(round), [1, 2, 3]);
+        assert_eq!(held.propose(round), [4, 5, 6]);
+
+        assert_eq!(held.asked, [2, 2, 2]);
+        assert_eq!(held.diverged, [0, 1, 1]);
+    }
+
+    /// A round shallower than the chain — the last round of a generation whose
+    /// budget is running out — is counted at the depths it reached and at no
+    /// others.
+    #[test]
+    fn a_round_that_asked_for_fewer_guesses_is_counted_at_the_depths_it_asked_at() {
+        let mut held = Held::new(Said::new(&[&[1]]), Said::new(&[&[2]]), 3);
+        held.propose(Round {
+            hidden: &[],
+            next: &[],
+            depth: 1,
+        });
+
+        assert_eq!(held.asked, [1, 0, 0]);
+        assert_eq!(held.diverged, [1, 0, 0]);
+    }
+
+    /// The one measurement that takes two checkpoints rather than one, and the
+    /// one that takes neither more nor fewer.
+    #[test]
+    fn guesses_takes_two_checkpoints() {
+        assert_eq!(
+            Job::parse(["guesses", "models/one", "models/two", "-k", "2"].map(str::to_string))
+                .expect("parses"),
+            Job::Guesses {
+                checkpoints: [PathBuf::from("models/one"), PathBuf::from("models/two")],
+                tokens: DECODED,
+                depth: 2,
+            }
+        );
+        for given in [vec!["models/one"], vec!["a", "b", "c"]] {
+            let mut args = vec!["guesses".to_string()];
+            args.extend(given.iter().map(|dir| dir.to_string()));
+            assert!(Job::parse(args).is_err(), "{given:?} parsed");
+        }
+        // And a measurement takes one, where it used to take the first and
+        // ignore the rest.
+        assert!(Job::parse(["decode", "a", "b"].map(str::to_string)).is_err());
+    }
+
+    /// An arm is split on whitespace, so a program under a directory with a
+    /// space in its name is one this cannot run — and says so rather than
+    /// running whatever the first half names.
+    #[test]
+    fn an_arm_whose_path_was_cut_in_half_is_refused() {
+        let err = ask(&["/no/such/bench".to_string()], &[]).expect_err("refused");
+        assert!(format!("{err:#}").contains("is not a file"), "{err:#}");
     }
 
     fn readings_of(values: &[f64]) -> Vec<Vec<Reading>> {
@@ -823,7 +1137,9 @@ mod tests {
         assert_eq!((compared[0].agreed, compared[0].pairs), (2, 3));
         assert!(compared[0].overlap);
         assert!(!compared[0].stands());
-        assert!(report(&[PathBuf::from("a"), PathBuf::from("b")], &compared).contains("no claim"));
+        assert!(
+            report(&[vec!["a".to_string()], vec!["b".to_string()]], &compared).contains("no claim")
+        );
     }
 
     /// Two arms reporting different metrics cannot be compared row for row, and

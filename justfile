@@ -119,6 +119,25 @@ bench a b *measurement:
     "$root/target/debug/bench" alternate --pairs {{ pairs }} "$a" "$b" \
         -- {{ measurement }} "{{ absolute_path(checkpoint) }}"
 
+# Weigh two checkpoints against each other with one build, which is the shape a
+# change to the weights has:
+#
+#   just bench-weights models/Inkling-Small-mxfp4 models/Inkling-Small-mxfp4-mtp4 sweep
+#
+# The same alternation and the same report as `just bench` — an arm is a command
+# line, so what differs between the two can be an argument as readily as an
+# executable. The build is the working tree's, once, for both arms.
+bench-weights a b *measurement:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    cargo build --quiet --bin bench
+    bin="$root/target/bench/bin/working-tree"
+    mkdir -p "$(dirname "$bin")"
+    cp "$root/target/debug/bench" "$bin"
+    "$root/target/debug/bench" alternate --pairs {{ pairs }} \
+        "$bin {{ absolute_path(a) }}" "$bin {{ absolute_path(b) }}" -- {{ measurement }}
+
 fmt:
     cargo fmt --all
     cargo clippy --all-targets -- -D warnings
