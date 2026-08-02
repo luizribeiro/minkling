@@ -1187,8 +1187,9 @@ measurement**, at two widths out of three; what separates them is unmeasured, an
 the sweep is the one that describes a run. Those six figures are that commit's
 own pair; the tables above are what the two cost now.
 
-A head's guess costs 3.2 ms and reads 995 MB — its own 532 MiB, and `lm_head`
-again to turn a hidden state into a token. **How that divides was inferred here
+A head's guess cost 3.2 ms and read 995 MB — its own 532 MiB, and `lm_head` again
+to turn a hidden state into a token; its own half of that is 141 MiB now, for
+the reason "Quantising the heads" below gives. **How that divides was inferred here
 for two milestones, measured against the inference and found to disagree with
 it, and has now been moved**: at six submissions a guess the device executed for
 2.2 ms of 4.5 and the other 2.3 were the round trips and this process's own work
@@ -1198,26 +1199,39 @@ ms of wait, and at one submission for both it is 2.28 inside 2.58. The study cal
 Rust"; mlx-vlm was near the old figure at 3.9 ms — on the 8-bit checkpoint, whose
 heads are these heads byte for byte but whose `lm_head`, which a guess also
 reads, its quantiser left in the original precision. **Only the `lm_head` half
-of those bytes is the packed matmul's**, and reading four to a lane took that
-dispatch 1.57 ms to 1.46 and the guess 4.85 to 4.70 — the same tenth of a
-millisecond arriving twice, which is what says the head's own bfloat16 tensors
-are the other half.
+of those bytes was the packed matmul's** when that was measured, and reading four
+to a lane took that dispatch 1.57 ms to 1.46 and the guess 4.85 to 4.70 — the
+same tenth of a millisecond arriving twice, which is what said the head's own
+bfloat16 tensors were the other half. Both halves are the packed matmul's now.
 
 **And now where a chain's milliseconds go, which is a question this file had
 answered for a decode step and a prefill and never once asked of the heads.**
-The same tables, over the eight heads at one row, sampled:
+The same tables, over the eight heads at one row, sampled — as they read before
+the heads were packed, and as they read now:
 
     kernel            calls    device   share       moved   achieved  of peak
-    dense_matmul         72   12.55ms   67.0%   4469.46 MB   356 GB/s     43%
-    packed_matmul         8    5.26ms   28.1%   3489.14 MB   663 GB/s     81%
-    rms_norm             40  454.14µs    2.4%      2.37 MB     5 GB/s      1%
-    short_conv           32  305.85µs    1.6%      5.77 MB    19 GB/s      2%
-    fused_attention       8  125.51µs    0.7%      1.05 MB     8 GB/s      1%
-    swiglu                8   46.28µs    0.2%      3.15 MB    68 GB/s      8%
+    dense_matmul         72   12.87ms   65.6%   4469.46 MB   347 GB/s     42%
+    packed_matmul         8    5.75ms   29.3%   3489.14 MB   607 GB/s     74%
+    rms_norm             40  495.23µs    2.5%      2.37 MB     5 GB/s      1%
+    short_conv           32  320.42µs    1.6%      5.77 MB    18 GB/s      2%
+    fused_attention       8  131.81µs    0.7%      1.05 MB     8 GB/s      1%
+    swiglu                8   47.62µs    0.2%      3.15 MB    66 GB/s      8%
 
-**A chain of eight heads reads 7.96 GB where a decode step reads 5.9**, and 4.5
-of those are bfloat16 the quantisers never touched — so two thirds of the
-chain's device time is the one kernel in the model reading a format nobody
+    packed_matmul        80    9.79ms   91.9%   5866.69 MB   599 GB/s     73%
+    rms_norm             40  429.10µs    4.0%      2.37 MB     6 GB/s      1%
+    short_conv           32  268.69µs    2.5%      5.77 MB    21 GB/s      3%
+    fused_attention       8  118.52µs    1.1%      1.05 MB     9 GB/s      1%
+    swiglu                8   45.62µs    0.4%      3.15 MB    69 GB/s      8%
+
+**The row that was two thirds of the table is not a smaller row, it is absent.**
+`dense_matmul` was the only kernel in the model reading a format nobody packed,
+and there is no such format in a chain any more: the eighty calls of the second
+table are the seventy-two that were `dense_matmul`'s and the eight `lm_head`
+already was. What the two tables are of is under "Quantising the heads" below.
+
+**A chain of eight heads read 7.96 GB where a decode step reads 5.9**, and 4.5
+of those were bfloat16 the quantisers never touched — so two thirds of the
+chain's device time was the one kernel in the model reading a format nobody
 packed. The two big rows are the same chain and the same bytes, and the packed
 kernel beside it is at nearly twice the rate. That was the first half of
 the answer and it is taken: four values to a lane, which is the lever the decode
@@ -1279,69 +1293,196 @@ sampled readings put it between 2.2 and 7.2 ms, tracking the drift of the runs
 around it rather than the work, which is why a device argmax is described at the
 end of "The tail of a step" rather than costed here.
 
-**And what is left of the chain is stated rather than attempted.** Of 27.4 ms
-the device executes 18.2, and 12.6 of those are `dense_matmul` reading the 4.5
+**What was left of the chain was the format, and it is taken below.** Of 27.4 ms
+the device executed 18.2, and 12.6 of those were `dense_matmul` reading the 4.5
 GB of bfloat16 the quantisers never touched — so the largest thing left in a
-chain is not a round trip at all but the format the MTP shard ships in, which
-`models/Inkling-Small-mxfp4/mtp.safetensors` carries verbatim from the BF16
-original. **That is not taken here.** It changes what a head computes, where
-merging its submissions cannot: no token can move, because the model verifies
-every guess and a wrong guess costs a round its speedup and nothing else — but
-*acceptance* can move, and acceptance is what the speedup is made of, so it
-needs the heads' guesses held against the bfloat16 chain's before any timing
-claim. Of the 2.4 ms of wait that is not execution, the eight `lm_head`
-submissions used to be half — and they are not there any more, because the
-model's own final norm is on the device beside them.
+chain was not a round trip at all but the format the MTP shard ships in. Of the
+2.4 ms of wait that is not execution, the eight `lm_head` submissions used to be
+half — and they are not there any more, because the model's own final norm is on
+the device beside them.
 
-**Speculation pays again at three depths where it paid at one.** Over 64 tokens
-of a structured prompt, three passes round-robin over the depths so that a drift
-moves them all, best pass each — and the whole sweep three times, so that every
-figure here is the mean of three of those:
+## Quantising the heads
+
+**The heads were the one part of this checkpoint nobody had ever quantised.**
+Every quantiser dropped or skipped `model.mtp.*`, so the shard beside an MXFP4
+stack is the BF16 original's 160 tensors byte for byte — and one kernel reading
+those 4.5 GB was two thirds of a chain's device time. `just quantize-mtp` writes
+them in the format the stack is already in.
+
+**MXFP4 and not 8-bit, and the reason is which side the work is on.** `just
+quantize` produces 8-bit affine and is what built `Inkling-Small-8bit`, so on
+the *writing* side 8-bit is the format this repo already has. On the reading
+side it has exactly one: `inkling_core::quant` is MXFP4 — E2M1, group 32, E8M0
+scales — and so is every kernel that multiplies without decoding. 8-bit heads
+would have been a second dequantiser, a second kernel and an equivalence
+argument for both; MXFP4 heads are none of those, because the packed matmul
+every projection of the stack goes through already reads them. What it cost
+instead was the quantiser, and that turned out to be `mx.quantize(mode="mxfp4")`
+— MLX's own, which is what produced the stack these heads sit beside, so the
+codes written are the codes the dequantiser is pinned to rather than a second
+implementation of the same table. **Eight tensors a head**: the norms, the
+convolution kernels and the relative-position table are 260 KB a head against
+532 MiB and no matmul reads them.
+
+**It is a new quantisation and not a re-quantisation**, which is what makes the
+gate below the whole of the milestone: these are original-precision weights, so
+nothing about them has been through a quantiser before and there is no earlier
+loss to compare against. 4.157 GiB of bfloat16 become **1.105 GiB of codes and
+scales, 3.76×**, and the relative error the codes carry is 0.118 to 0.134 per
+tensor with the worst at `input_proj` — a figure `--check` prints per tensor,
+because what acceptance is at risk from is exactly that and a single tensor
+taking it far worse than the rest is the thing to know before any of this runs.
+
+**The bfloat16 shard is not touched and must not be.** It is the oracle the
+packed heads' guesses are held against, and the two checkpoints are the same
+140 GB stack read twice: `models/Inkling-Small-mxfp4-mtp4` is forty symlinks and
+one shard of its own, so what this costs on disk is **1.10 GiB beside a 131 GB
+checkpoint**. A loader maps every `*.safetensors` in a directory, which is why
+the packed heads are a directory rather than a second shard beside the first.
+
+**The two formats are one question per weight.** What says a weight is packed is
+the `.scales` tensor beside it, asked per weight rather than per shard, and
+`Multiply` is where the two meet on the device — so nothing a head is multiplied
+*into* changed: the norms, the convolutions, the attention step and the command
+buffer all nineteen dispatches share are the layer's own either way. The one
+weight the two formats disagree about the shape of is the SwiGLU. A bfloat16
+shard fuses its gate and its up interleaved row by row and the kernel reads
+every other row; a packed pair cannot be strided through — codes, group
+boundaries and scale bytes would all have to be — so a packed shard holds the
+two apart, which changes nothing about either: a group spans 32 values of a row,
+and which rows are in a tensor is not something quantisation can see.
+
+### The gate is acceptance, and it is not the tokens
+
+**No token can move.** The model verifies every guess, so a worse head produces
+a rejected guess rather than a wrong output — which is real safety and is also
+why the usual test is blind here. What is at risk is *acceptance*, and
+acceptance is the whole of the speedup. So the two chains are held against each
+other before any timing claim: one generation, one stack, one set of embeddings,
+both chains asked the same round at every round of it, and the count of where
+they answered differently reported by depth. `just guesses <a> <b>` is that —
+the one measurement in this file that compares answers rather than durations —
+and over 64 tokens of the structured prompt:
+
+    depth                    1      2      3      4     all
+    guesses                 18     18     18     17      71
+    diverged                 0      3      3      4      10
+
+**The first head guesses what the bfloat16 first head guesses, every time.**
+That is where most of the acceptance is — 85% at depth 1 against 47% at depth 4
+— and it is the depth that decides whether speculation pays at all. Of the
+seventy-one guesses the two chains were both asked for, ten differ, all of them
+past the first head. Driven the other way round — the packed chain proposing and
+the bfloat16 one answering beside it — the same run reads 0, 3, 2 and 4 against
+the same 18, 18, 18 and 17, so which of the two the generation belongs to moves
+one guess.
+
+**And acceptance itself barely moved**, measured in the same sitting as the
+timings below, five alternating pairs with the order flipped each pair:
+
+    k                         1        2           3              4
+    bfloat16 heads          85%   91/74%   84/74/63%   82/65/53/47%
+    packed heads            85%   87/78%   85/65/55%   82/65/53/47%
+    tokens a round, bf16  1.829    2.560       3.048          3.368
+    tokens a round, mxfp4 1.829    2.560       2.909          3.368
+
+**Identical at `k = 1` and at `k = 4`, to the digit, at every depth of both.**
+At `k = 2` the two depths trade — 91/74 against 87/78 — and bank exactly the
+same 2.560 tokens a round, so what changed there is which of the two guesses was
+the one rejected. **`k = 3` is the one that lost anything**: 3.048 tokens a round
+to 2.909, 4.6% fewer, which over the same 64 tokens is twenty-two rounds where it
+was twenty-one. That is the
+trade, stated rather than left for the reader: at `k = 3` the packed chain is
+8.8% cheaper a token and banks 4.6% fewer tokens a round, and the first of those
+is larger than the second — which is why the depth still comes out ahead, at
+1.131× against 1.034×.
+
+### What the heads' format is worth
+
+**Over five alternating pairs, one build against two checkpoints, the order
+flipped each pair** — `just bench-weights models/Inkling-Small-mxfp4
+models/Inkling-Small-mxfp4-mtp4 sweep`, which is one sitting and one stack with
+the heads the only thing that differs:
 
     k                      0      1      2      3      4
-    ms/token           20.85  18.82  19.39  19.92  24.74
-    tokens a round      1.000  1.829  2.560  3.048  3.368
-    speedup             1.000  1.108  1.075  1.047  0.843
-    accepted, by depth         85%  91/74% 84/74/63% 82/65/53/47%
+    bfloat16 ms/token  20.95  19.01  19.86  20.28  25.19
+    packed   ms/token  20.91  18.11  17.77  18.49  21.79
+    bfloat16 speedup   1.000  1.102  1.055  1.034  0.832
+    packed   speedup   1.000  1.155  1.177  1.131  0.960
+    device, bfloat16   19.50  16.83  16.86  16.79  20.75
+    device, packed     19.49  15.89  14.99  15.04  17.55
 
-**Those three sweeps are three alternating pairs against the tail on this side,
-the order of the two halves flipped each pair**: 21.18, 19.01, 19.74, 20.12 and
-25.28 ms a token become the row above at `k` of 0 through 4. Every pair moves the
-same way at every depth, and the two ranges are apart at 0, 1 and 2 —
-21.16-21.22 against 20.77-20.90, 18.97-19.05 against 18.78-18.88, 19.55-19.88
-against 19.34-19.49. **At `k = 3` they overlap** over three hundredths of a millisecond,
-20.07-20.18 against 19.77-20.10, and **at `k = 4` one pair falls the other way**,
-24.88-25.62 against 24.42-24.96 — so the depth speculation still loses at is
-again the one depth a milestone claims nothing about. The chain is 27.44 ms to
-25.32 at eight heads, ranges apart. Acceptance is untouched, to three decimals,
-because the prompt and the model are the same.
+**Every depth that speculates moved, every pair moved the same way, and no two
+ranges overlap** — 18.906-19.132 against 17.910-18.624 at `k = 1`,
+19.498-20.077 against 17.362-18.270 at `k = 2`, 19.578-20.671 against
+18.229-18.892 at `k = 3` and 24.485-26.051 against 20.957-22.823 at `k = 4`.
+**And `k = 0` did not**, in the same sitting: 20.953 against 20.907 with the
+ranges lying across each other and three of the five pairs falling the other
+way, which is the control this comparison has and the reason it was run at a
+depth that maps no head at all.
 
-**Every row of that table moved and the speedups did not**, which is the shape of
-what a round trip off the end of a forward pass is worth: `k = 0` is one pass and
-one tail a token, and `k = 3` is one pass and four tails over three tokens, so
-the saving is about the same per token at every depth and cancels in the ratio.
-1.114 / 1.074 / 1.053 / 0.838 became 1.108 / 1.075 / 1.047 / 0.843, which is no
-change at all.
+**`k = 2` is what pays best now and it pays 1.18×**, where before it was `k = 1`
+at 1.10×. Three depths pay more than the best depth used to, `k = 3` has gone
+from 1.034× to 1.131×, and **`k = 4` is 0.96× where it was 0.83×** — still a
+loss, and now a loss by four percent rather than by seventeen. The whole shape of
+the curve changed: what a round pays to guess fell by enough that the depth worth
+running moved outward, which is the first time in this file that has happened.
 
-**And the unspeculated step came down with them**, which is the other half of
-what the tail is for: 21.18 ms to 20.86 over the same three pairs, ranges
-21.14-21.23 against 20.83-20.89, and 21.23 to 20.90 for a run that keeps four
-timesteps of slack in every window. Both agree with the `k = 0` row above and
-with the round-trip row "The tail of a step" removes.
+**The device's own clock moved with it and by more**, which is what says this is
+the weights rather than the scheduling: 16.86 ms to 14.99 at `k = 2` and 20.75 to
+17.55 at `k = 4`. A chain of eight heads over one row is **25.21 ms to 17.28**,
+each sitting's own, and its device time **18.92 ms to 10.26** — 8.7 ms of
+execution off a chain, where `dense_matmul` was charged 12.9. **The time fell by
+more than the bytes did**, 1.84× against the 1.35× the declared column reads
+(7.96 GB to 5.88), and the rates are why: the kernel that replaced the bfloat16
+one runs at 599 GB/s where it reached 347. A chain's `lm_head` is 3.5 GB of those
+reads, was packed all along, and did not move at all.
 
-**`k = 1` is what pays best and it pays 1.11×**, and `k = 2` and `k = 3` are
-worth running at 1.075× and 1.047×. What changed is not acceptance and not the
-block: a `k = 1` round spends 3.6 of its 34 ms guessing where it spent 4.1 of 35,
-and a `k = 3` round 9.5 of its 61 ms where it spent 10.3 of 61.
+**A round saves more than the chain-over-one-row table can explain**, and this
+file has the same shape of finding on record. At `k = 2` a round banks 2.560
+tokens and costs 50.8 ms against 45.5, which is 5.35 ms; the chain of two heads
+over one row is 6.33 ms against 4.41, which is 1.92. A proposer runs its heads
+over *every* row the round committed rather than over the last one alone — see
+`Round`'s own paragraph — so a chain timed over one row is a lower bound on what
+a round pays for it, and the factor between the two figures is about the rows.
+That is the same "a block timed against a warm cache and the round a generation
+pays are not the same measurement" the tables above already carry, met from the
+other side.
 
-**A chain that cost nothing would put those three at 1.24×, 1.24× and 1.24×**,
-against the 1.26×, 1.25× and 1.27× the same arithmetic puts them at over the
-three pairs' own `before` half. **The ceiling fell and that is not a
-regression**: what it is a ratio *of* fell. A free chain leaves the same 16.8
-ms/token either side — 16.86, 16.83 and 16.80 against 16.80, 16.89 and 16.74 —
-so what a block costs to verify per token did not move, and the ceiling divides
-it into a `k = 0` step that did. What still separates `k = 1` from it is 0.13
-where the same sitting puts the figure before at 0.15.
+**The free-chain ceiling this file has quoted since S1 cannot be quoted here, and
+that is a finding rather than an omission.** It is arrived at by taking the
+chain-over-one-row figure off a depth's ms/token, and doing that on both sides of
+this sitting puts the floor at 16.7 and 16.9 ms/token with the bfloat16 heads and
+at 15.7 and 15.4 with the packed ones. **A free chain has to leave the same floor
+either side** — what it is a floor *of* is the block a round verifies, and the
+block is the same forward pass through the same stack — so the 1.3 ms between
+those two is the one-row figure being wrong about what a round pays for its
+chain, by the amount the paragraph above predicts. No ceiling in this section is
+stated from it.
+
+**And nothing else about a round changed.** Tokens a round are identical at three
+of the four depths, the block a round verifies is the same forward pass through
+the same stack, and the recorded continuation is the recorded continuation: the
+whole gated suite passes against the packed-head checkpoint, which includes the
+cases asserting that 48 tokens of a longer prompt are byte for byte what they are
+at `k` of 0, 1, 2 and 4, and that `--backend cpu` answers what it answered. **The
+peak resident set did not move and would not**: neither format is copied onto the
+device, so `inklingrs generate` over eight tokens peaks at 402.6-403.1 MB with the
+bfloat16 heads and 402.8-405.7 with the packed ones over three pairs, and a run
+speculating two deep at 422.2-422.3 against 422.8-425.2.
+
+**And the code that reads either format cost the unspeculated path nothing**,
+which is the other half of the same claim and a different comparison: two builds
+against the one bfloat16 checkpoint, seven alternating pairs. A decode step is
+20.952 ms against 20.906 with the ranges lying across each other and four of the
+seven pairs falling one way, and the device's own clock 19.530 against 19.498 the
+same way — no claim by this file's own standard, which is what a change that maps
+no head at `k = 0` should read as. A 385-token prefill is 3.19 s against 3.30
+over three pairs, ranges across; its device time is 1.8477 s against 1.8482,
+which the same rule calls a claim over 0.03% and which is nothing — **the two
+tests are necessary and how large a difference is remains the reader's**, and at
+three pairs on a figure this repeatable the ranges will sit apart over a
+rounding.
 
 **Against mlx-vlm, measured in one sitting on 2 August 2026.** Both engines were
 given the same 27-token prompt — the string mlx-vlm's own chat template renders
@@ -1375,7 +1516,7 @@ the step this engine had then.
 
 **That sitting predates the merged head above and has not been retaken**, which
 is what the `k = 2` row is worth reading as: the chain it paid for was 36 ms and
-is 27, and what that comes to at 66% acceptance on this prompt is not a number
+is 17, and what that comes to at 66% acceptance on this prompt is not a number
 this file has, because a cross-engine claim needs both sides measured in one
 sitting and the reference has not been run since. The `k = 0` row is the one the
 merge cannot have moved, and the sweep above says it did not.
@@ -1424,7 +1565,7 @@ scratch, and asks its windows for no slack at all.
 
 The MXFP4 quant (`mlx-community/Inkling-Small-mxfp4`, 140 GB) is what the engine
 runs, and the 160 `model.mtp.*` tensors are not in it — they were dropped during
-quantisation. **They are not a quantisation of anything.** Every quant that kept
+quantisation. **They were not a quantisation of anything.** Every quant that kept
 them kept them in bfloat16, and the 8-bit quant's `mtp.safetensors` is the BF16
 original's own 160 tensors *byte for byte*, all 4.5 GB of them compared. So the
 heads pair with any stack quantised from the same original, and giving this one
@@ -1433,6 +1574,14 @@ original to keep them is hours and would write out these same bytes. What it
 costs is that the heads see an mxfp4 stack's hidden states rather than the
 8-bit stack the acceptance study measured, which is why acceptance is measured
 here again rather than inherited.
+
+**They can be one now, and `just quantize-mtp` is what makes them one**: the same
+heads packed MXFP4 into a checkpoint of forty symlinks and a 1.10 GiB shard of
+its own, which is a *new* quantisation of original-precision weights rather than
+a conversion of an existing one. Both checkpoints are kept and both load — what
+says which format a weight is in is the `.scales` tensor beside it — because the
+bfloat16 shard is the oracle the packed heads' guesses are held against. See
+"Quantising the heads" above for what that is worth and what it cost.
 
 **So every MTP number in this file was taken on the mxfp4 checkpoint with that
 copied shard sitting beside its index, and none of them can be reproduced
