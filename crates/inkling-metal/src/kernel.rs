@@ -287,13 +287,79 @@ impl<'a> Batch<'a> {
         Ok(self.encoder.as_ref().expect("a pass is open"))
     }
 
+    /// How many dispatches are in this so far, which is what a caller deciding
+    /// whether it is worth committing yet has to go on.
+    pub fn dispatches(&self) -> usize {
+        self.dispatches
+    }
+
     /// Submit everything encoded and wait for all of it.
-    pub fn wait(mut self) -> Result<(), MetalError> {
+    pub fn wait(self) -> Result<(), MetalError> {
+        self.submit().wait()
+    }
+
+    /// Submit everything encoded and do not wait for it.
+    ///
+    /// **What a caller does with the gap is encode the next command buffer**,
+    /// which is the one thing this process has to do that the GPU is not waiting
+    /// on. A dispatch costs 4.5 µs to encode and 16 µs to run at a decode step's
+    /// shapes, so a caller that commits part way through stays ahead of the
+    /// device for the rest of the call — see
+    /// [`ModelLayers`](crate::ModelLayers), which is the caller this exists for.
+    ///
+    /// Nothing about ordering changes. One queue executes its command buffers in
+    /// the order they were committed, so a dispatch here still reads what the
+    /// dispatch before it wrote whichever buffer either of them went in. What
+    /// does change is that **the buffers this retains are held until the
+    /// [`Submitted::wait`]**, not until the next one — which is why a caller that
+    /// leaves several in flight is the one that has to bound what they hold.
+    pub fn submit(mut self) -> Submitted<'a> {
         let _timed = profile::scope(Op::Submit);
         self.end();
-        let committed = std::time::Instant::now();
         self.commands.commit();
+        self.device.counted(self.dispatches);
+        Submitted {
+            device: self.device,
+            commands: self.commands.clone(),
+            samples: self.samples.take(),
+            entry: self.entry.take(),
+            dispatches: self.dispatches,
+        }
+    }
 
+    /// The open pass closed, which has to happen before the buffer is committed
+    /// and before another pass opens, and exactly once for each.
+    fn end(&mut self) {
+        if let Some(encoder) = self.encoder.take() {
+            encoder.endEncoding();
+        }
+    }
+}
+
+/// A command buffer committed and not yet waited for.
+///
+/// Waiting is still what makes [`Buffer::as_slice`](crate::Buffer::as_slice)
+/// safe to read, and it is still the whole of what a caller gets out of one.
+/// What separating the two adds is that the wait can happen later than the
+/// commit, and everything encoded between them runs on this process while the
+/// device runs what was committed.
+///
+/// What a reader of one in flight wants is how much is in it, which is what a
+/// caller holding several decides against; nothing else here is printable.
+#[derive(Debug)]
+pub struct Submitted<'a> {
+    device: &'a Device,
+    commands: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    samples: Option<Sampled>,
+    entry: Option<String>,
+    dispatches: usize,
+}
+
+impl Submitted<'_> {
+    /// Wait for it, and charge what it cost.
+    pub fn wait(self) -> Result<(), MetalError> {
+        let _timed = profile::scope(Op::Submit);
+        let blocked = std::time::Instant::now();
         // The GPU watchdog kills a command buffer that runs too long, and this
         // project has already met it once: `mlx_lm` mapping tensors off NFS at
         // ~80 MB/s took a kernel past the limit and the driver returned
@@ -305,8 +371,7 @@ impl<'a> Batch<'a> {
         // layer in one is asking for the sum to finish in time. A decode step's
         // largest is four projections at 105 µs each, four decades below it.
         self.commands.waitUntilCompleted();
-        let waited = committed.elapsed();
-        self.device.counted(self.dispatches);
+        let waited = blocked.elapsed();
         // One reading of the device's clock, charged to the profile and handed
         // to the record, so that the two figures are the same figure and a case
         // that reads them against each other is reading one measurement.
@@ -355,14 +420,6 @@ impl<'a> Batch<'a> {
             ),
             queued: since(self.commands.kernelEndTime(), self.commands.GPUStartTime()),
             executed,
-        }
-    }
-
-    /// The open pass closed, which has to happen before the buffer is committed
-    /// and before another pass opens, and exactly once for each.
-    fn end(&mut self) {
-        if let Some(encoder) = self.encoder.take() {
-            encoder.endEncoding();
         }
     }
 }
@@ -789,6 +846,70 @@ mod tests {
             .map(|(x, y)| ALPHA * x + y)
             .collect();
         assert_eq!(chained.out.to_vec(), want);
+    }
+
+    /// **The same sequence across two command buffers, the first committed and
+    /// not waited for**, which is the whole of what lets a caller keep encoding
+    /// while the device runs what it has already been given.
+    ///
+    /// One queue is a serial ordering — see [`Device`], where the queue is
+    /// opened once for that reason — so the second buffer's dispatch runs after
+    /// the first's and reads what it wrote. What is not obvious is that this
+    /// holds while the first is still *running*: the second is encoded, bound
+    /// and committed against a buffer nothing on this side has waited for.
+    ///
+    /// The answer is the case above's, exactly, which is what says the split
+    /// changed the scheduling and not the arithmetic.
+    #[test]
+    fn a_dispatch_reads_what_a_command_buffer_nobody_waited_for_wrote() {
+        let Some(device) = device() else { return };
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        let mut saxpy = Saxpy::new(&device, LEN);
+        let mut chained = Saxpy::new(&device, LEN);
+        let submissions = device.submissions();
+
+        let mut first = device.batch().expect("a command buffer opens");
+        first
+            .add(
+                &kernel,
+                &saxpy.args(),
+                Grid::new(LEN, THREADS_PER_GROUP),
+                saxpy_moves(LEN),
+            )
+            .expect("the dispatch encodes");
+        let running = first.submit();
+
+        let mut second = device.batch().expect("a command buffer opens");
+        let args = [
+            chained.alpha.arg(),
+            chained.count.arg(),
+            saxpy.out.arg(),
+            chained.y.arg(),
+            chained.out.arg(),
+        ];
+        second
+            .add(
+                &kernel,
+                &args,
+                Grid::new(LEN, THREADS_PER_GROUP),
+                saxpy_moves(LEN),
+            )
+            .expect("the dispatch encodes");
+        running.wait().expect("the first completes");
+        second.wait().expect("the second completes");
+
+        let want: Vec<f32> = saxpy
+            .on_the_cpu()
+            .iter()
+            .zip(chained.y.as_slice())
+            .map(|(x, y)| ALPHA * x + y)
+            .collect();
+        assert_eq!(chained.out.to_vec(), want);
+        assert_eq!(
+            device.submissions() - submissions,
+            2,
+            "the commit is what counts a submission, not the wait"
+        );
     }
 
     /// **A timed dispatch is a pass of its own and not a command buffer of its

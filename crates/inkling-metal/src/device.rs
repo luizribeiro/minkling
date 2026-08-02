@@ -83,9 +83,14 @@ pub enum MetalError {
 pub struct RoundTrip {
     /// How many dispatches were in it.
     pub dispatches: usize,
-    /// This process's clock from just before the commit to the wait returning,
-    /// which is what the buffer cost the caller and what the three below divide
-    /// up.
+    /// What this process blocked for.
+    ///
+    /// **Not the buffer's whole life**, and the difference is the point: a
+    /// buffer committed and waited for in the same breath is blocked on for all
+    /// of it, and one committed while there was still encoding to do is blocked
+    /// on for whatever was left when the caller ran out of other work. So a row
+    /// whose `executed` is larger than this is a submission that ran while this
+    /// process was busy, which is a thing a table should be able to show.
     pub waited: Duration,
     /// What the driver spent turning a committed buffer into work the GPU could
     /// start — `kernelEndTime - kernelStartTime`, which grows with the
@@ -102,11 +107,12 @@ impl RoundTrip {
     /// The part of the wait that was none of the three: the commit reaching the
     /// driver, and this thread being woken once the buffer completed.
     ///
-    /// Saturating because the two clocks are not the same clock. Nothing here
-    /// converts between them — the wall time is `Instant`'s and the rest is
-    /// `CFTimeInterval`'s — so what this subtracts is three durations from a
-    /// fourth, and a round trip whose parts came to more than the whole would be
-    /// a resolution artefact rather than a negative interval.
+    /// Nothing for a submission that overlapped its caller's own work, since
+    /// the three then account for more than the wait rather than less. Nothing
+    /// too where the two clocks disagree in their last microsecond, which they
+    /// may: the wait is `Instant`'s and the rest is the driver's, and neither a
+    /// buffer that ran early nor a rounding is a reason to build a negative
+    /// interval.
     pub fn unattributed(&self) -> Duration {
         self.waited
             .saturating_sub(self.scheduled + self.queued + self.executed)

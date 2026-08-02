@@ -105,8 +105,13 @@ pub enum Op {
     /// command buffer rather than in an allocation, so what is charged here for
     /// them is the copy and not a `newBufferWithLength:`.
     Encode,
-    /// A command buffer committed and waited for. This is the round trip
-    /// [`Profile::gpu`] is the inner part of.
+    /// A command buffer committed, and a command buffer waited for. This is the
+    /// round trip [`Profile::gpu`] is the inner part of.
+    ///
+    /// **Two calls a buffer where the two happen apart**, which is a backend
+    /// that commits one and keeps encoding into the next: the commit and the
+    /// wait are then two intervals with the caller's own work between them, and
+    /// a single scope around both would charge that work here.
     Submit,
     /// What a dispatch produced, copied off the device.
     Readback,
