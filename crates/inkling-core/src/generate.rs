@@ -115,6 +115,72 @@ pub enum Stop {
     Sink,
 }
 
+/// Where a round's guesses come from.
+///
+/// **A guess is never load-bearing**, and that is the whole of what this trait
+/// promises the loop above: whatever it answers, the model is asked what
+/// follows each of those tokens and only the prefix it agrees with is kept. So
+/// a proposer that is wrong costs a round its speedup and cannot cost it a
+/// token — which is what lets [`crate::mtp`]'s heads guess from their own
+/// guesses, and what lets the tests here drive this loop with a proposer that
+/// is deliberately, systematically wrong.
+///
+/// It is `&mut self` because a proposer has state of its own: the MTP heads
+/// carry a cache apiece, chained across rounds, and a round is where they are
+/// advanced.
+pub trait Proposer {
+    /// How many tokens this can guess at most, which the loop takes as the
+    /// ceiling on a round's block.
+    fn depth(&self) -> usize;
+
+    /// Up to `round.depth` tokens after the last row of `round`.
+    ///
+    /// Fewer is allowed and none is allowed: a round of one token is an
+    /// ordinary decode step, which is what a proposer that has nothing to say
+    /// leaves behind.
+    fn propose(&mut self, round: Round<'_>) -> &[usize];
+}
+
+/// What a round hands its proposer: the rows it committed, and what follows
+/// each of them.
+///
+/// **Every row, not only the last.** A proposer that carries state — the heads
+/// do — has to see the positions the round accepted, or its own history skips
+/// the tokens speculation bought and stops being the history the model has. The
+/// rows a rejection took back are not here, because they are not the sequence.
+#[derive(Debug, Clone, Copy)]
+pub struct Round<'a> {
+    /// `[rows, hidden]`, the **post-final-norm** hidden state of each row the
+    /// round committed — which is what an MTP head is chained from, and is
+    /// already normed here because the loop needed the same tensor to make its
+    /// own logits out of.
+    pub hidden: &'a [f32],
+    /// The token that follows each of those rows. The last is the one the model
+    /// has just produced and the loop has yet to feed, so a proposer guessing
+    /// what comes after it is guessing past the end of the sequence rather than
+    /// alongside it.
+    pub next: &'a [usize],
+    /// How many tokens this round can use, which is the proposer's own depth
+    /// capped by the budget the generation has left. Zero is a generation about
+    /// to end.
+    pub depth: usize,
+}
+
+/// The proposer of a generation that does not speculate, which guesses nothing
+/// and is what [`Generator::stream`] runs.
+#[derive(Debug, Clone, Copy)]
+pub struct Alone;
+
+impl Proposer for Alone {
+    fn depth(&self) -> usize {
+        0
+    }
+
+    fn propose(&mut self, _: Round<'_>) -> &[usize] {
+        &[]
+    }
+}
+
 /// The model and its head, as the thing that turns ids into ids.
 ///
 /// `LanguageModel` is the two of them together — the stack, its final norm, and
@@ -178,9 +244,33 @@ impl<'a> Generator<'a> {
             .forward(&self.model.final_norm(last), self.head_weights)
     }
 
+    /// The `[rows, vocab]` logits of the **last** `rows` of what the stack
+    /// produced, and the ids a greedy sampler takes from them.
+    ///
+    /// Every row of a speculative block is a question — "what does the model
+    /// say follows what was fed up to here" — and the answers are what the
+    /// block is checked against. The rows in front of it are not: at a prefill
+    /// they are the prompt, whose every position would be a pass over 200058
+    /// rows of the head to answer a question nothing asks, and whose logits at
+    /// a 769-token prompt would be 615 MB.
+    fn picks(&self, normed: &[f32], rows: usize) -> Vec<usize> {
+        let hidden = self.model.hidden();
+        let block = &normed[normed.len() - rows * hidden..];
+        let logits = self.head.forward(block, self.head_weights);
+        logits
+            .chunks_exact(logits.len() / rows)
+            .map(greedy)
+            .collect()
+    }
+
     /// `prompt` prefilled, then tokens decoded greedily until `ending` says to
     /// stop, each handed to `sink` as it is decided and then fed back through
     /// the caches the step before it left behind.
+    ///
+    /// This is [`Generator::speculate`] against a proposer that guesses
+    /// nothing, and it is *the same loop* rather than a simpler one beside it —
+    /// which is what makes "speculation changes no token" a claim about the
+    /// proposer rather than about two implementations of a generation.
     ///
     /// The prompt is prefilled by the first step rather than by a step of its
     /// own, so that step's cost is a prefill's and every later one's is a
@@ -211,18 +301,119 @@ impl<'a> Generator<'a> {
         prompt: &[usize],
         ending: Ending,
         weights: &impl ModelWeights,
+        sink: impl FnMut(usize) -> ControlFlow<()>,
+    ) -> Stop {
+        self.speculate(cache, prompt, ending, weights, &mut Alone, sink)
+    }
+
+    /// The same generation, with `proposer` allowed to guess ahead.
+    ///
+    /// # A round, and why it is the same tokens
+    ///
+    /// A round feeds the model the token it owes plus the `k` a proposer
+    /// guessed after it, and reads the argmax at every one of those `k + 1`
+    /// positions. Position `i` of that block answers *what follows everything
+    /// fed up to and including row `i`* — which, for as long as the guesses
+    /// were right, is exactly the question the next decode step would have
+    /// asked. So the block's answers are checked against the guesses in order,
+    /// the longest agreeing prefix is kept, and the first answer that disagreed
+    /// is kept too: it is the model's own next token, arrived at from a prefix
+    /// the model agrees with.
+    ///
+    /// **Nothing here trusts a guess.** A round emits the tokens the model
+    /// produced, in the order it produces them, and a proposer that guessed
+    /// nothing right still emits one — the same one a decode step would have.
+    /// What a good guess buys is that several of them came out of one forward
+    /// pass. That is the whole of the argument that this is a latency
+    /// optimisation rather than an approximation, and
+    /// `speculation_changes_no_token` is it stated as a test.
+    ///
+    /// # What the rejected tokens leave behind
+    ///
+    /// The block was *fed*: every layer's keys, and every one of its four
+    /// convolution windows, moved for tokens that turned out to be wrong. They
+    /// are taken back before the round ends — see
+    /// [`ModelWeights::rewind`](crate::model::ModelWeights::rewind) — which is
+    /// what makes the cache this leaves the cache a generation of the same
+    /// tokens would have left, and what the caller has to have asked for by
+    /// building a cache that keeps enough slack to give them back.
+    ///
+    /// A token that reaches the sink is never in the cache when this returns
+    /// with it, which is the property [`Generator::stream`] already had: a
+    /// generation that stops on an end-of-sequence id leaves a cache holding the
+    /// message and not its terminator, whether or not the terminator was
+    /// guessed.
+    pub fn speculate(
+        &self,
+        cache: &mut ModelCache,
+        prompt: &[usize],
+        ending: Ending,
+        weights: &impl ModelWeights,
+        proposer: &mut impl Proposer,
         mut sink: impl FnMut(usize) -> ControlFlow<()>,
     ) -> Stop {
+        let hidden = self.model.hidden();
         let mut ids = prompt.to_vec();
-        for _ in 0..ending.budget {
-            let id = greedy(&self.logits(cache, &ids, weights));
-            if sink(id).is_break() {
-                return Stop::Sink;
+        let mut guesses: Vec<usize> = Vec::new();
+        let mut left = ending.budget;
+
+        while left > 0 {
+            assert!(!ids.is_empty(), "a forward pass over no tokens");
+            let (rows, block) = (ids.len(), guesses.len() + 1);
+            let base = rows - block;
+
+            let normed = self
+                .model
+                .final_norm(&self.model.forward(cache, &ids, weights));
+            let picks = self.picks(&normed, block);
+            let agreed = guesses
+                .iter()
+                .zip(&picks)
+                .take_while(|(guess, pick)| guess == pick)
+                .count();
+
+            // What the round produced: the guesses the model agreed with, and
+            // its own answer to the first position it did not.
+            let mut produced = guesses[..agreed].to_vec();
+            produced.push(picks[agreed]);
+
+            let mut stop = None;
+            let mut kept = base + 1;
+            for (at, id) in produced.iter().enumerate() {
+                kept = base + 1 + at;
+                left -= 1;
+                stop = match () {
+                    _ if sink(*id).is_break() => Some(Stop::Sink),
+                    _ if Some(*id) == ending.eos => Some(Stop::EndOfSequence),
+                    _ if left == 0 => Some(Stop::Budget),
+                    _ => None,
+                };
+                if stop.is_some() {
+                    break;
+                }
             }
-            if Some(id) == ending.eos {
-                return Stop::EndOfSequence;
+            weights.rewind(cache, rows - kept);
+            if let Some(stop) = stop {
+                return stop;
             }
-            ids = vec![id];
+
+            // The rows the round kept, and the token that follows each of them
+            // — which for the last is the one the model has just produced and
+            // this loop has yet to feed.
+            let pending = produced[produced.len() - 1];
+            let mut next = ids[1..kept].to_vec();
+            next.push(pending);
+            guesses = proposer
+                .propose(Round {
+                    hidden: &normed[..kept * hidden],
+                    next: &next,
+                    depth: proposer.depth().min(left.saturating_sub(1)),
+                })
+                .to_vec();
+
+            ids = std::iter::once(pending)
+                .chain(guesses.iter().copied())
+                .collect();
         }
         Stop::Budget
     }
@@ -622,6 +813,231 @@ mod tests {
         assert!(streamed.is_empty());
         assert_eq!(stop, Stop::Budget);
         assert_eq!(logits(&stack, cache, &stack.ids), whole(&stack, &stack.ids));
+    }
+
+    /// A proposer that guesses from the continuation the model actually
+    /// produces, and lies from a stated depth onwards.
+    ///
+    /// One proposer rather than three, because what the cases below vary is one
+    /// number: `right` of 8 guesses everything correctly, 0 nothing, and 1 the
+    /// first of each round and no more — which is the case that exercises a
+    /// round accepting *some* of its block, where the two extremes exercise the
+    /// ends. A liar is not a hypothetical here either: at 44.9% acceptance on
+    /// prose, the second head of a real round is wrong more often than not.
+    struct Guesser {
+        /// The prompt and everything a generation of it produces, which is what
+        /// a guess is measured against — and, shifted by one, what a wrong
+        /// guess is drawn from.
+        truth: Vec<usize>,
+        /// How many of a round's guesses are the truth before the rest are not.
+        right: usize,
+        /// Tokens of `truth` the loop has fed, which is where this proposer's
+        /// guesses start: the token after the one it was handed last.
+        at: usize,
+        guesses: Vec<usize>,
+        /// How many rounds it has been asked for, which is what says
+        /// speculation banked anything at all.
+        rounds: usize,
+    }
+
+    impl Guesser {
+        fn new(truth: Vec<usize>, right: usize) -> Self {
+            Self {
+                truth,
+                right,
+                at: 0,
+                guesses: Vec::new(),
+                rounds: 0,
+            }
+        }
+    }
+
+    impl Proposer for Guesser {
+        fn depth(&self) -> usize {
+            DEPTH
+        }
+
+        fn propose(&mut self, round: Round<'_>) -> &[usize] {
+            self.rounds += 1;
+            self.at += round.next.len();
+            assert_eq!(
+                round.hidden.len() % 32,
+                0,
+                "a hidden state per row the round kept"
+            );
+            assert_eq!(
+                round.next.last().copied(),
+                self.truth.get(self.at).copied(),
+                "the last row's own next token"
+            );
+
+            let ahead = self.truth.get(self.at + 1..).unwrap_or_default();
+            self.guesses = ahead
+                .iter()
+                .take(round.depth)
+                .enumerate()
+                .map(|(at, id)| match at < self.right {
+                    true => *id,
+                    false => (id + 1) % VOCAB,
+                })
+                .collect();
+            &self.guesses
+        }
+    }
+
+    /// How far ahead the cases guess, which is more than the four tokens they
+    /// generate — so a round runs out of sequence to guess from, and the loop
+    /// meets a block it cannot fill.
+    const DEPTH: usize = 3;
+
+    /// The synthetic stack's vocabulary, which a wrong guess has to stay inside
+    /// of: an id past the head's rows is not a token the model could produce.
+    const VOCAB: usize = 48;
+
+    /// Everything a generation is: the tokens, why it ended, and the logits the
+    /// cache it left behind produces for the next token.
+    ///
+    /// The last is what says the *state* is the same and not only the answer. A
+    /// loop that emitted the right tokens over a cache holding the rejected ones
+    /// would be a generation that is right until it is continued.
+    fn ran(
+        stack: &Stack,
+        ending: Ending,
+        take: usize,
+        proposer: &mut impl Proposer,
+    ) -> (Vec<usize>, Stop, Vec<f32>) {
+        let head = stack.head();
+        let cache = &mut ModelCache::speculating(&stack.config, proposer.depth());
+        let mut streamed = Vec::new();
+        let stop =
+            generator(stack, &head).speculate(cache, &stack.ids, ending, stack, proposer, |id| {
+                streamed.push(id);
+                match streamed.len() < take {
+                    true => ControlFlow::Continue(()),
+                    false => ControlFlow::Break(()),
+                }
+            });
+        let last = streamed.last().copied().unwrap_or(stack.ids[0]);
+        (streamed, stop, logits(stack, cache, &[last]))
+    }
+
+    /// **The property speculation exists to keep**: the tokens are the tokens,
+    /// however far ahead a round guessed and however wrong it was.
+    ///
+    /// Exact equality on all three of what a generation is — the tokens, the
+    /// ending, and the logits the cache goes on to produce — against the same
+    /// generation with no proposer at all. What a wrong guess must not leave
+    /// behind is a token in the stream *or* a key in the cache, and only the
+    /// third of those says the second.
+    ///
+    /// Every ending the loop has, because each ends a round in a different
+    /// place: the budget between two of a round's tokens, the sink between two,
+    /// and an id the model produces mid-block.
+    #[test]
+    fn speculation_changes_no_token() {
+        let stack = Stack::load();
+        let truth = [stack.ids.clone(), baseline(&stack)].concat();
+        let eos = truth[stack.ids.len() + COUNT - 2];
+
+        for (what, ending, take) in [
+            (
+                "the budget",
+                Ending {
+                    budget: COUNT,
+                    eos: None,
+                },
+                usize::MAX,
+            ),
+            (
+                "a shorter budget",
+                Ending {
+                    budget: COUNT - 1,
+                    eos: None,
+                },
+                usize::MAX,
+            ),
+            (
+                "an end-of-sequence id",
+                Ending {
+                    budget: COUNT,
+                    eos: Some(eos),
+                },
+                usize::MAX,
+            ),
+            (
+                "a sink that stops",
+                Ending {
+                    budget: COUNT,
+                    eos: None,
+                },
+                2,
+            ),
+        ] {
+            let alone = ran(&stack, ending, take, &mut Alone);
+            for right in [0, 1, DEPTH] {
+                let mut guesser = Guesser::new(truth.clone(), right);
+                let speculated = ran(&stack, ending, take, &mut guesser);
+                assert_eq!(speculated.0, alone.0, "{what}, {right} right: the tokens");
+                assert_eq!(speculated.1, alone.1, "{what}, {right} right: the ending");
+                assert_eq!(speculated.2, alone.2, "{what}, {right} right: the cache");
+            }
+        }
+    }
+
+    /// And that it banks anything at all, which the case above cannot say: a
+    /// loop that ignored every guess would pass it.
+    ///
+    /// Stated in rounds rather than in time, because what a round is worth is
+    /// the forward pass it did not run. Counted as the rounds that went on to
+    /// ask for another guess: four tokens are four rounds when every guess is
+    /// wrong — a round a token, which is decoding — and two when none is, since
+    /// the prefill has nothing to guess from yet and the round after it banks
+    /// the other three.
+    #[test]
+    fn a_round_that_guessed_right_is_a_forward_pass_nobody_ran() {
+        let stack = Stack::load();
+        let truth = [stack.ids.clone(), baseline(&stack)].concat();
+        let ending = Ending {
+            budget: COUNT,
+            eos: None,
+        };
+
+        let rounds = |right: usize| {
+            let mut guesser = Guesser::new(truth.clone(), right);
+            ran(&stack, ending, usize::MAX, &mut guesser);
+            guesser.rounds
+        };
+        let (perfect, wrong) = (rounds(DEPTH), rounds(0));
+        assert!(
+            perfect < wrong,
+            "{perfect} rounds guessing right against {wrong} guessing wrong"
+        );
+        assert_eq!(wrong, COUNT - 1, "a round a token, which is decoding");
+        assert_eq!(perfect, 1, "one round bought the rest of the budget");
+    }
+
+    /// A cache that kept no slack cannot give a rejected token back, and says so
+    /// where the round would have taken it — rather than answering out of a
+    /// window that no longer holds what it claims to.
+    #[test]
+    #[should_panic(expected = "the window can give back")]
+    fn speculating_against_a_cache_that_kept_no_slack_is_refused() {
+        let stack = Stack::load();
+        let truth = [stack.ids.clone(), baseline(&stack)].concat();
+        let head = stack.head();
+        let ending = Ending {
+            budget: COUNT,
+            eos: None,
+        };
+
+        generator(&stack, &head).speculate(
+            &mut ModelCache::new(&stack.config),
+            &stack.ids,
+            ending,
+            &stack,
+            &mut Guesser::new(truth, 0),
+            |_| ControlFlow::Continue(()),
+        );
     }
 
     #[test]

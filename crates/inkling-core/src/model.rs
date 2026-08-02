@@ -217,6 +217,11 @@ impl<'a> Model<'a> {
         self.layers
     }
 
+    /// The width every hidden state this model passes around is a row of.
+    pub fn hidden(&self) -> usize {
+        self.norm.len()
+    }
+
     /// `[tokens]` ids in, the `[tokens, hidden]` hidden state the last layer
     /// produced out — *before* the final norm, which is
     /// [`Model::final_norm`]'s.
