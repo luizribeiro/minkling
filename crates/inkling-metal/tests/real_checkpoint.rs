@@ -535,9 +535,10 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// a decode step is **two submissions**, one for the forty-two layers and one
 /// for the head, where it was 43 and 87 and 249.
 ///
-/// A prefill is still one a layer, and deliberately — see
-/// `ModelLayers::carries`, where what a merged run holds is traded against what
-/// it saves. This counts a decode step.
+/// A prefill wide enough that one layer reaches the bytes a run may hold is
+/// still one a layer, and deliberately — see `ModelLayers::carries`, where what
+/// a merged run holds is traded against what it saves. This counts a decode
+/// step, whose forty-two layers are far under that budget.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let moe = layers - dense;
     (14 * layers + 4 * dense + 12 * moe + 1, 2)
@@ -562,9 +563,16 @@ struct OnTheDevice {
     prompt: usize,
     /// What each step took, the prompt's prefill first.
     steps: Vec<Duration>,
-    /// The running `(dispatches, submissions, allocations)` each step was
-    /// reached at.
-    submitted: Vec<(u64, u64, u64)>,
+    /// The running `(dispatches, submissions, allocations, allocated bytes)`
+    /// each step was reached at.
+    ///
+    /// The bytes are the last of the four and the newest, and they are what a
+    /// merged run is bounded by: a decode step's are what a run of forty-two
+    /// layers holds until its one command buffer completes, which is the number
+    /// `ModelLayers::carries` decides against a budget. The count of buffers
+    /// cannot say it — a layer allocates the same buffers for one row as for
+    /// seven hundred.
+    submitted: Vec<(u64, u64, u64, u64)>,
     peak: u64,
     got: Vec<usize>,
     /// What the **decode** steps spent, by operation. The prefill's accounts
@@ -669,6 +677,7 @@ impl OnTheDevice {
                     device.dispatches(),
                     device.submissions(),
                     device.allocations(),
+                    device.allocated_bytes(),
                 ));
                 run.peak = run.peak.max(fixture::resident_bytes());
                 run.got.push(id);
@@ -694,13 +703,19 @@ impl OnTheDevice {
         decode.iter().sum::<Duration>() / self.decode_steps()
     }
 
-    /// The `(dispatches, submissions, allocations)` of the last decode step,
-    /// which is the difference between the two running totals either side of it.
-    fn per_decode_step(&self) -> (u64, u64, u64) {
+    /// The `(dispatches, submissions, allocations, allocated bytes)` of the last
+    /// decode step, which is the difference between the two running totals
+    /// either side of it.
+    fn per_decode_step(&self) -> (u64, u64, u64, u64) {
         let [.., before, after] = self.submitted.as_slice() else {
             panic!("a step per token, and more than one of them")
         };
-        (after.0 - before.0, after.1 - before.1, after.2 - before.2)
+        (
+            after.0 - before.0,
+            after.1 - before.1,
+            after.2 - before.2,
+            after.3 - before.3,
+        )
     }
 }
 
@@ -767,17 +782,18 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
         "a layer has a feed-forward network or banks, never both and never neither"
     );
 
-    let (dispatches, submissions, allocations) = run.per_decode_step();
+    let (dispatches, submissions, allocations, bytes) = run.per_decode_step();
     eprintln!(
         "{} tokens prefilled in {:.2?}, {} decoded at {:.2?}/token, peak RSS {:.2} GiB\
          \n  {dispatches} dispatches a decode step in {submissions} submissions over \
-         {allocations} buffers, which is {:.0} dispatches a submission\
+         {allocations} buffers of {:.1} MiB, which is {:.0} dispatches a submission\
          \n  got  {:?}\n  want {want:?}",
         run.prompt,
         run.steps[0],
         run.decode_steps(),
         run.each_decode_step(),
         run.peak as f64 / (1u64 << 30) as f64,
+        bytes as f64 / (1u64 << 20) as f64,
         dispatches as f64 / submissions as f64,
         run.got,
     );
@@ -817,14 +833,18 @@ const MEMORY_BANDWIDTH: f64 = 819e9;
 /// executed for, which is a share of the wait, which is a share of the step.
 fn decode_step_table(run: &OnTheDevice) -> String {
     let step = run.each_decode_step();
-    let (dispatches, submissions, allocations) = run.per_decode_step();
+    let (dispatches, submissions, allocations, bytes) = run.per_decode_step();
     let accounted = run.profile.total();
 
     let share = |part: Duration| 100.0 * part.as_secs_f64() / step.as_secs_f64();
     let mut table = vec![format!(
         "a {step:.2?} decode step, {dispatches} dispatches in {submissions} submissions over \
-         {allocations} buffers\n  {:<18}{:>7}{:>12}{:>8}",
-        "operation", "calls", "self time", "share"
+         {allocations} buffers of {:.1} MiB\n  {:<18}{:>7}{:>12}{:>8}",
+        bytes as f64 / (1u64 << 20) as f64,
+        "operation",
+        "calls",
+        "self time",
+        "share"
     )];
     for (op, calls, elapsed) in run.profile.rows() {
         table.push(format!(
