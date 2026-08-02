@@ -137,9 +137,10 @@ doing bandwidth's work.** Its 5.9 GB is what the checkpoint's shapes say a token
 reads — six of each MoE layer's 256 experts and both shared ones, plus every
 layer's own projections — arrived at from a dispatch's own declaration rather
 than from that arithmetic, and the two agree. 46% of the machine is what a lane
-holding four packed bytes rather than one is worth: 34% before it, and above the
-284-to-424 GB/s M2's isolated matmul measured, which was the range this kernel
-had been seen to reach. Its own paragraph below says what is left.
+holding four packed bytes rather than one is worth, against 34% before it — and
+375 GB/s is two thirds of the way up the 284-to-424 GB/s M2's isolated matmul
+measured, where 282 sat at the bottom of it. Its own paragraph below says what
+is left.
 
 **The other 28% is not waiting on memory, and that was measurable rather than
 arguable.** The eight kernels under the matmul are 6.1 ms and 133 MB between
@@ -210,8 +211,9 @@ dispatch**, and the pass boundary lands *between* the spans rather than inside
 them: the rows above sum to 22.0 ms against the 18.2 ms those same pairs put an
 unsampled step's device time at, so each carries a couple of microseconds it
 would not have — 21% across the table, and more of it on the short rows than on
-the long one. **The bias grew with the kernel**, because a pass boundary costs
-what it costs whatever is inside it and a step's work is now smaller. The
+the long one. **The bias grew in both denominators and why is unmeasured**: 3.8
+ms of over-reporting where it was 2.7, over the same 1077 boundaries, so a
+boundary costing what it costs whatever is inside it does not explain it. The
 ranking is the finding; the absolute figures carry that.
 
 **A dispatch's shape is not an allocation.** Each of the 749 dispatches a step
@@ -283,7 +285,7 @@ architecture notes below price.
 against 0.42, 0.71 and 1.18 in a single pass of `just prefill-bench` — ×4.2, ×6.6
 and ×7.5, and widening with the prompt. Where the gap comes from is unmeasured;
 what can be said is that it is not the round trips, since a prefill's submissions
-are 42 at 250 µs against a gap of seven seconds. **The matmul is the one thing
+are 42 at 250 µs against a gap of eight seconds. **The matmul is the one thing
 that has moved this row**, taking it 1.90, 5.39 and 10.14 s to those three over
 three alternating passes; every other milestone here has moved the decode step,
 and prefill has never been the path any of them was about. The peak resident set
@@ -493,9 +495,8 @@ the GPU holds, which unified memory makes a move rather than a copy.
 
 **What a round costs, measured here rather than inherited.** Against a warm
 cache, a 34-token prompt, and this engine's own decode step over the 64 tokens
-that follow it — 29.0 ms, where the 24 ms the profile above divides up is the
-same step at the eight-token context every other measurement in this file is
-taken at:
+that follow it — 29.0 ms, where the 23.85 ms above is the same step at the
+eight-token context every other measurement in this file is taken at:
 
     tokens in the block    1      2      3      4      6      9
     forward pass       24.6ms 33.3ms 41.6ms 50.6ms 71.6ms  94.0ms
