@@ -325,6 +325,15 @@ a run holds the budget plus the layer that crossed it, and that layer holds what
 it would have held unmerged. A call whose own layer already reaches the budget
 merges nothing and is one submission a layer, which is what a long prefill is.
 
+**The budget was sized by the checkpoint's shapes and is now sized against a
+measurement.** A decode step allocates 17.6 MiB across the 953 buffers its one
+run retains, so the 160 MiB the budget allows is about nine rows of this stack —
+which is the deepest block the eight heads can ask for, and the width the table
+under "Speculating with the MTP heads" still submits in two, one for the layers
+and one for the head, the same as a single row. It is also why the budget does
+not reach a prefill: ten tokens already pass it, so every prompt worth the name
+is a submission a layer, exactly as it was.
+
 **So a decode step is two submissions**, one for the forty-two layers and one for
 the head, where it was 43 and 87 and 249. Over seven alternating pairs, every
 pair moving the same way: 47.43 ms to 34.69. The device's own clock did not move
@@ -334,8 +343,10 @@ uploads and 41 readbacks that stop happening. **250 µs is not the 152 to 172 th
 marginal figures had**, and the difference is the serialisation rather than the
 submission: a step used to encode a layer, submit it, wait for it, and only then
 encode the next. A prefill long enough that one of its layers reaches the budget
-still submits a layer at a time; a shorter one merges what fits, and what that
-costs and buys is unmeasured — see below.
+still submits a layer at a time, and every prefill worth the name does: 97, 385
+and 769 tokens cost 2.04, 5.45 and 10.1 s before the budget replaced the row
+count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
+and is the point of where the line was drawn.
 
 There is no operation of a layer left outside the GPU. Both backends generate the
 same tokens, and the CPU one stays the oracle every kernel here is validated

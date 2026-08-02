@@ -741,14 +741,15 @@ impl std::fmt::Debug for Carried<'_> {
 /// stack come to by the arithmetic of the checkpoint's own shapes — which is
 /// what makes every block this engine can speculate one command buffer.
 ///
-/// **That arithmetic is not yet a measurement, and it is the only thing sizing
-/// this.** Where a prefill's own single layer passes the budget — which is where
-/// a prefill goes back to being one submission a layer, and what says this
-/// raises nothing at the widest calls — is a comparison against the same
-/// per-layer figure and is unmeasured too. What a decode step allocates is
-/// printed by `the_generated_tokens_match_the_oracle_with_the_model_on_the_device`
-/// and that is the number this has to be re-derived against; it could not be run
-/// when this landed.
+/// **And the arithmetic agrees with what a step allocates.** A decode step
+/// retains 17.6 MiB, which
+/// `the_generated_tokens_match_the_oracle_with_the_model_on_the_device` prints,
+/// so this admits about nine rows of these shapes — the deepest block the eight
+/// heads can propose, which `what_a_speculative_round_costs_and_what_it_buys`
+/// reports at every width through nine as the two submissions a single row
+/// takes, one for the run of layers and one for the head. The same figure is
+/// what keeps a prefill out: ten rows already pass this, so any prompt reaches
+/// it at its first layer and stays a submission a layer.
 const RETAINED_BUDGET: u64 = 160 << 20;
 
 /// One whole decoder layer on the device: its attention, the convolution and
