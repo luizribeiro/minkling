@@ -27,11 +27,13 @@
 //! be handed the gate where the checkpoint mapped it.
 //!
 //! **A run of simdgroups per output element**, where [`crate::matmul`] gives
-//! each one a simdgroup: lane `l` walks its weight row from value `l` in strides
-//! of the run's width and the run sums what its lanes held, so 32 lanes of one
-//! reduction read 64 consecutive bytes and a run of eight reads 512. How long
-//! the run is comes from how many elements the dispatch has to spread over the
-//! machine — see [`SIMDGROUPS_IN_FLIGHT`].
+//! each one a simdgroup: lane `l` walks its weight row from value
+//! `l * VALUES_PER_LANE` in strides of that many times the run's width and the
+//! run sums what its lanes held, so 32 lanes of one reduction read 256
+//! consecutive bytes and a run of eight reads 2048. How long the run is comes
+//! from how many elements the dispatch has to spread over the machine — see
+//! [`SIMDGROUPS_IN_FLIGHT`] — and how much of a row one lane holds at a time
+//! from [`VALUES_PER_LANE`].
 
 use std::cell::RefCell;
 
@@ -83,6 +85,31 @@ const MOST_SIMDGROUPS: usize = 32;
 /// between — `what_a_gate_costs_the_device_at_each_reduction_width` is the
 /// sweep, and the row counts in between are not shapes this engine dispatches.
 const SIMDGROUPS_IN_FLIGHT: usize = 16512;
+
+/// Values of a weight row one lane reads before the next lane's, which is how
+/// much of that row one thread has in flight at a time.
+///
+/// **A value read one at a time is two byte loads and an input float for one
+/// multiply-add**, and this kernel was reaching 171 GB/s against the packed
+/// matmul's 414 on the same chain of heads — which for a multiply that streams a
+/// weight once is a kernel waiting on its own requests rather than on memory.
+/// Four values a lane issue those same loads as twelve independent ones, because
+/// the trip count is a compile-time constant and the four inputs are consecutive
+/// floats. That is [`SIMDGROUPS_IN_FLIGHT`]'s finding on the other axis: more
+/// memory in flight per thread, no extra dispatch, and nothing about the grid.
+///
+/// **What it does move is summation order.** A lane holds a run of consecutive
+/// values where it held every `width`th one, so the products enter its sum in a
+/// different order — exactly as [`crate::matmul`]'s own width did. Every product
+/// is the same float32 either way; what a caller has to check is the tokens, and
+/// that is checked rather than argued.
+///
+/// A lane's last chunk may run past a row that is not whole chunks, which the
+/// kernel finishes one value at a time rather than the caller refusing the
+/// width. Every weight this engine dispatches is a multiple of 4096 wide, so
+/// nothing here reaches that tail; what it buys is that the sweep below can ask
+/// the kernel for any width against any shape.
+const VALUES_PER_LANE: usize = 4;
 
 /// The compiled kernel, which every bfloat16 weight on a device shares.
 ///
@@ -397,7 +424,8 @@ pub(crate) fn source() -> String {
     format!(
         "constant uint BF16_BYTES = {BF16_BYTES};\n\
          constant uint BF16_SHIFT = {BF16_SHIFT};\n\
-         constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n{BODY}"
+         constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n\
+         constant uint VALUES_PER_LANE = {VALUES_PER_LANE};\n{BODY}"
     )
 }
 
@@ -415,14 +443,31 @@ struct Shape {
     uint simdgroups;
 };
 
-/// One output element: a thread walks its weight row from value `lane` in
-/// strides of `width`, and the caller reduces what the threads held. The pair is
-/// where a thread sits in the run over this element and how wide that run is,
-/// which is a simdgroup's own width only when the run is one simdgroup.
+/// One value of a weight, from the two bytes that hold it.
 ///
 /// A value is two bytes little-endian, which are the top sixteen bits of the
 /// float32 it stands for — so widening is a shift, exact, and the low mantissa
 /// bits it puts back are zeros.
+inline float widened(device const uchar *pair) {
+    const uint low = pair[0];
+    const uint high = pair[1];
+    return as_type<float>(((high << 8) | low) << BF16_SHIFT);
+}
+
+/// One output element: a thread walks its weight row from value
+/// `lane * VALUES_PER_LANE` in strides of that many times `width`, and the
+/// caller reduces what the threads held. The pair is where a thread sits in the
+/// run over this element and how wide that run is, which is a simdgroup's own
+/// width only when the run is one simdgroup.
+///
+/// The inner loop's trip count is a compile-time constant, so it is unrolled and
+/// its loads have no dependency on each other — which is the whole of what a
+/// chunk buys, and the same thing `crate::matmul`'s own width buys there.
+///
+/// **The second loop is the row that is not whole chunks**, which the first
+/// stops one chunk short of. Only the lane whose chunk straddles the end reaches
+/// it — the chunks are disjoint and a lane that has passed the row does nothing
+/// — so every value of the row is read exactly once whatever the width.
 inline float weight_dot(
     device const uchar *weight,
     device const float *values,
@@ -431,10 +476,16 @@ inline float weight_dot(
     uint width
 ) {
     float sum = 0.0f;
-    for (uint i = lane; i < in_dim; i += width) {
-        const uint low = weight[i * BF16_BYTES];
-        const uint high = weight[i * BF16_BYTES + 1];
-        sum += as_type<float>(((high << 8) | low) << BF16_SHIFT) * values[i];
+    uint i = lane * VALUES_PER_LANE;
+    for (; i + VALUES_PER_LANE <= in_dim; i += width * VALUES_PER_LANE) {
+        float dot = 0.0f;
+        for (uint j = 0; j < VALUES_PER_LANE; ++j) {
+            dot += widened(weight + (i + j) * BF16_BYTES) * values[i + j];
+        }
+        sum += dot;
+    }
+    for (; i < in_dim; ++i) {
+        sum += widened(weight + i * BF16_BYTES) * values[i];
     }
     return sum;
 }
@@ -1047,5 +1098,137 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// The same kernel with a different [`VALUES_PER_LANE`] written into its
+    /// prelude, which is how a sweep prices the widths and how the case below
+    /// puts each of them against the CPU.
+    fn a_lane_reading(values_per_lane: usize) -> String {
+        let wanted = format!("constant uint VALUES_PER_LANE = {values_per_lane};");
+        let source = source().replace(
+            &format!("constant uint VALUES_PER_LANE = {VALUES_PER_LANE};"),
+            &wanted,
+        );
+        assert!(source.contains(&wanted), "the prelude declares {wanted}");
+        source
+    }
+
+    /// The widths the sweep prices and this case holds to the CPU.
+    const WIDTHS: [usize; 5] = [1, 2, 4, 8, 16];
+
+    /// **Every width answers what the CPU answers, including one that does not
+    /// divide the row.**
+    ///
+    /// A lane holds a run of consecutive values, so a row that is not a whole
+    /// number of chunks leaves one lane's chunk straddling its end — and the
+    /// kernel finishes that lane one value at a time rather than the caller
+    /// refusing the width. A width that read past the row would be reading the
+    /// *next* output element's weight, which is a plausible number rather than a
+    /// fault, and a width that stopped short would drop the tail's products.
+    ///
+    /// So the shapes are chosen against the widths rather than against the
+    /// engine: 4096 is what every weight this dispatches is a multiple of, and
+    /// 250 is a width no chunk above one divides — 62 chunks of four and two
+    /// values over, at every reduction run the row counts here reach.
+    #[test]
+    fn every_width_a_lane_reads_answers_what_the_cpu_answers() {
+        let Some(device) = device() else { return };
+        assert!(WIDTHS.contains(&VALUES_PER_LANE), "{VALUES_PER_LANE}");
+
+        for in_dim in [IN_DIM, 250] {
+            // Two rows, so a lane's chunk offset is checked against the row it
+            // is inside rather than against the start of the weight.
+            let case = Case::noisy(in_dim, OUT_DIM, 2);
+            let want = case.on_the_cpu();
+            for width in WIDTHS {
+                let matmul = DenseMatmul::from_source(&device, &a_lane_reading(width))
+                    .unwrap_or_else(|err| panic!("{width} values a lane compiles: {err}"));
+                let got = case
+                    .upload(&device, &matmul)
+                    .multiply(&case.x)
+                    .expect("the dispatch completes");
+
+                let deviation = deviation(&got, &want);
+                assert!(
+                    deviation <= TOLERANCE,
+                    "{width} values a lane over a row of {in_dim}: deviation {deviation:e}"
+                );
+            }
+        }
+    }
+
+    /// **What a dense multiply costs the device at each width a lane reads**,
+    /// and the sweep [`VALUES_PER_LANE`] was chosen from.
+    ///
+    /// The shapes are the ones this kernel is dispatched at rather than round
+    /// numbers, and they are two workloads: a chain of MTP heads, where 75% of
+    /// the device time is this kernel and every weight is 4096 wide, and the
+    /// routers' `[258, 4096]` gate, which is the only thing a decode step or a
+    /// prefill sends here at all. A width that helped the heads and cost the
+    /// gate would be paying for speculation out of the step it accelerates.
+    ///
+    /// Nothing asserts a rate. The numbers go to stderr for the commit message
+    /// to quote, and what is asserted is that the shipped width was among the
+    /// ones tried.
+    ///
+    /// **The rates rank the widths and do not state a bandwidth**, for the
+    /// reason `matmul::tests::what_a_packed_multiply_costs_at_each_width_a_lane_reads`
+    /// gives: one weight is dispatched against `CALLS` times in a row, so what
+    /// the second call reads is what the first left in cache, where a head's own
+    /// 532 MiB is cold every round.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_dense_multiply_costs_at_each_width_a_lane_reads() {
+        let Some(device) = device() else { return };
+        const CALLS: usize = 8;
+        const ROUNDS: usize = 3;
+
+        // `(what, in_dim, out_dim, rows)`.
+        let shapes = [
+            ("a head's input_proj", 8192, 4096, 2),
+            ("a head's q_proj", 4096, 4096, 2),
+            ("a head's k_proj", 4096, 1024, 2),
+            ("a head's gate or up", 4096, 16384, 2),
+            ("a head's down_proj", 16384, 4096, 2),
+            ("a router's gate, decode", 4096, 258, 1),
+            ("a router's gate, 97 tokens", 4096, 258, 97),
+        ];
+
+        assert!(WIDTHS.contains(&VALUES_PER_LANE), "{VALUES_PER_LANE}");
+        eprintln!(
+            "  {:<28}{}",
+            "shape",
+            WIDTHS
+                .iter()
+                .map(|width| format!("{:>10}", format!("{width}/lane")))
+                .collect::<String>()
+        );
+        for (what, in_dim, out_dim, rows) in shapes {
+            let case = Case::noisy(in_dim, out_dim, rows);
+            let mut x = device.buffer(&case.x).expect("the rows upload");
+            let mut line = format!("  {what:<28}");
+            for width in WIDTHS {
+                let matmul = DenseMatmul::from_source(&device, &a_lane_reading(width))
+                    .unwrap_or_else(|err| panic!("{width} values a lane compiles: {err}"));
+                let weight = case.upload(&device, &matmul);
+
+                let mut best = Duration::MAX;
+                for _ in 0..ROUNDS {
+                    best = best.min(crate::testing::device_time(&device, CALLS, |batch| {
+                        weight
+                            .encode_over(batch, &mut x)
+                            .expect("the dispatch encodes");
+                    }));
+                }
+                line.push_str(&format!(
+                    "{:>10}",
+                    format!(
+                        "{:.0} GB/s",
+                        case.moves(rows) as f64 / best.as_secs_f64() / 1e9
+                    )
+                ));
+            }
+            eprintln!("{line}");
+        }
     }
 }
