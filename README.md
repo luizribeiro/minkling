@@ -388,8 +388,19 @@ which is where a custom engine wins outright.
 
 ## Weights
 
-The MXFP4 quant (`mlx-community/Inkling-Small-mxfp4`, 140 GB) has **no MTP
-tensors** — they were stripped during quantisation. It is fine for text, vision,
-audio, batching and perf work, but MTP requires the BF16 original
-(`thinkingmachines/Inkling-Small`, 532 GB). The official NVFP4 keeps its MTP
-weights but is in ModelOpt format, which mlx-vlm cannot read.
+The MXFP4 quant (`mlx-community/Inkling-Small-mxfp4`, 140 GB) is what the engine
+runs, and the 160 `model.mtp.*` tensors are not in it — they were dropped during
+quantisation. **They are not a quantisation of anything.** Every quant that kept
+them kept them in bfloat16, and the 8-bit quant's `mtp.safetensors` is the BF16
+original's own 160 tensors *byte for byte*, all 4.5 GB of them compared. So the
+heads pair with any stack quantised from the same original, and giving this one
+its heads is `just mtp-shard` — a file copy, where re-quantising the 532 GB
+original to keep them is hours and would write out these same bytes. What it
+costs is that the heads see an mxfp4 stack's hidden states rather than the
+8-bit stack the acceptance study measured, which is why acceptance is measured
+here again rather than inherited.
+
+No index names that shard, in either quant. The loader maps every
+`*.safetensors` in a checkpoint directory and reads the index only for whether a
+shard it names is missing. The official NVFP4 keeps its MTP weights but is in
+ModelOpt format, which mlx-vlm cannot read.

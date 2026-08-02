@@ -48,13 +48,26 @@ fn checkpoint_tensor<'a>(ckpt: &'a Checkpoint, name: &str) -> TensorView<'a> {
         .unwrap_or_else(|err| panic!("checkpoint holds {name}: {err}"))
 }
 
+/// The thirty shards the mxfp4 index names, and the one it does not.
+///
+/// `mtp.safetensors` is the 160 bfloat16 tensors of the eight multi-token
+/// prediction heads, which no quantiser touched and no index lists — see
+/// [`Checkpoint::open`]. Counted here because the count is what says the shard
+/// was mapped: every name in it is one the main stack has no use for, so a
+/// checkpoint that quietly dropped it would pass every other test in this file.
 #[test]
-fn mxfp4_checkpoint_spans_thirty_shards() {
+fn mxfp4_checkpoint_spans_thirty_shards_and_the_one_beside_them() {
     let Some(dir) = checkpoint_dir() else { return };
     let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
 
-    assert_eq!(ckpt.num_shards(), 30);
-    assert_eq!(ckpt.tensor_names().count(), 1508);
+    assert_eq!(ckpt.num_shards(), 31);
+    assert_eq!(ckpt.tensor_names().count(), 1508 + 160);
+    assert_eq!(
+        ckpt.tensor_names()
+            .filter(|name| name.starts_with("model.mtp."))
+            .count(),
+        160
+    );
 }
 
 /// The gate a backend multiplies against, and the tensor beside it that is

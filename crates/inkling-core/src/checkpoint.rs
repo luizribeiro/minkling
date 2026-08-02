@@ -134,7 +134,16 @@ impl Checkpoint {
     /// Tensor metadata comes from the shard headers rather than from the
     /// index's `weight_map`: the headers are what the bytes are addressed
     /// against, so a stale or truncated index cannot silently misplace a
-    /// tensor. The index is read only to learn which files to map.
+    /// tensor.
+    ///
+    /// **Every `*.safetensors` file in the directory is mapped, listed or
+    /// not.** The index says what a checkpoint's shards *are*; the directory
+    /// says what it *has*, and a published Inkling checkpoint has more than its
+    /// index lists — `mtp.safetensors` is 160 tensors the mxfp4 index never
+    /// names. What the index is still read for is the one question the
+    /// directory cannot answer: whether a shard it names is missing. A file
+    /// restating a tensor another one holds is
+    /// [`CheckpointError::DuplicateTensor`] either way.
     pub fn open(path: &Path) -> Result<Self, CheckpointError> {
         let mut shards: Vec<Shard> = Vec::new();
         let mut owners: BTreeMap<String, usize> = BTreeMap::new();
@@ -246,12 +255,11 @@ fn shard_paths(path: &Path) -> Result<Vec<PathBuf>, CheckpointError> {
         return Err(CheckpointError::NotFound(path.to_owned()));
     }
 
+    let shards = loose_shard_paths(path)?;
     let index = path.join(INDEX_FILE);
-    let shards = if index.is_file() {
-        indexed_shard_paths(&index, path)?
-    } else {
-        loose_shard_paths(path)?
-    };
+    if index.is_file() {
+        indexed_shard_paths(&index, path)?;
+    }
 
     if shards.is_empty() {
         return Err(CheckpointError::NoTensorFiles(path.to_owned()));
@@ -270,6 +278,7 @@ fn loose_shard_paths(dir: &Path) -> Result<Vec<PathBuf>, CheckpointError> {
     Ok(loose)
 }
 
+/// Every shard the index names, which is read for whether they are all there.
 fn indexed_shard_paths(index: &Path, dir: &Path) -> Result<Vec<PathBuf>, CheckpointError> {
     let text = std::fs::read_to_string(index).map_err(io_error(index))?;
     let parsed: ShardIndex =
@@ -457,6 +466,25 @@ mod tests {
         assert_eq!(ckpt.num_shards(), 2);
         assert_eq!(ckpt.tensor_names().collect::<Vec<_>>(), ["first", "second"]);
         assert_eq!(ckpt.tensor("second").expect("second").data(), [0xbb; 16]);
+    }
+
+    /// The shape both published Inkling quantisations ship: an index that names
+    /// the main stack's thirty-odd shards, and `mtp.safetensors` beside it
+    /// holding 160 tensors it does not name. A loader that mapped the index's
+    /// list would open such a checkpoint, run it, and find no MTP head in it.
+    #[test]
+    fn a_shard_the_index_does_not_list_is_still_the_checkpoints() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        sharded_checkpoint(dir.path());
+        write_shard(&dir.path().join("mtp.safetensors"), "head", 0xcc);
+
+        let ckpt = Checkpoint::open(dir.path()).expect("checkpoint opens");
+        assert_eq!(ckpt.num_shards(), 3);
+        assert_eq!(
+            ckpt.tensor_names().collect::<Vec<_>>(),
+            ["first", "head", "second"]
+        );
+        assert_eq!(ckpt.tensor("head").expect("head").data(), [0xcc; 16]);
     }
 
     #[test]

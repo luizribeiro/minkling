@@ -123,6 +123,18 @@ dump-chat-template-fixture model="models/Inkling-Small-mxfp4":
 fetch repo="thinkingmachines/Inkling-Small":
     hf download {{ repo }}
 
+# Put the multi-token prediction heads beside a checkpoint that was quantised
+# without them.
+#
+# Every quantiser left `model.mtp.*` in bfloat16 — the 8-bit quant's
+# mtp.safetensors is the BF16 original's 160 tensors byte for byte — so the
+# heads are not a quantisation of anything and pair with any stack quantised
+# from the same original. That makes this a 4.5 GB copy where re-quantising the
+# 532 GB original to keep them would be hours. No index names the shard in
+# either quant; the loader maps it because it is there.
+mtp-shard src="models/Inkling-Small-8bit" dst="models/Inkling-Small-mxfp4":
+    cp {{ src }}/mtp.safetensors {{ dst }}/mtp.safetensors
+
 # Quantise the BF16 original to 8-bit, keeping the MTP tensors the mxfp4 quant
 # dropped. Streams a shard at a time and resumes from what it has already
 # written, so it can be run in chunks and re-run until it prints an index:
