@@ -16,6 +16,7 @@
 //! other way — so the engine driven from end to end with its head on the GPU is
 //! a case that has to live here, beside the kernel it is measuring.
 
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -35,7 +36,7 @@ use inkling_core::{
 use inkling_metal::{
     DenseMatmul, DenseWeight, Device, ExpertKernels, LayerKernels, LayerProjections, LayerRouter,
     MetalError, ModelHeads, ModelLayers, MoeCombine, PackedBank, PackedMatmul, PackedProjection,
-    Router, RouterWeights, StackShape, SwiGlu,
+    RoundTrip, Router, RouterWeights, StackShape, SwiGlu,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -579,6 +580,11 @@ struct OnTheDevice {
     /// are cleared before the first of them: it dispatches the same kernels
     /// over more rows, and what a profile is read for is the steady state.
     profile: Profile,
+    /// Every command buffer the **decode** steps waited for, cleared after the
+    /// prefill for the reason the profile is — and one row where the profile
+    /// has a sum, because a step's two submissions are 1076 dispatches and one
+    /// and the wait means something different in each.
+    round_trips: Vec<RoundTrip>,
 }
 
 impl OnTheDevice {
@@ -653,7 +659,9 @@ impl OnTheDevice {
             peak: fixture::resident_bytes(),
             got: Vec::new(),
             profile: Profile::default(),
+            round_trips: Vec::new(),
         };
+        device.record_round_trips(true);
 
         // Once, before the loop rather than inside it — though "once" is now 6
         // ms for 137 GB, so what that used to be defending against is gone.
@@ -683,12 +691,15 @@ impl OnTheDevice {
                 run.got.push(id);
                 if run.steps.len() == 1 {
                     profile::take();
+                    device.round_trips();
                 }
                 step = Instant::now();
                 ControlFlow::Continue(())
             },
         );
         run.profile = profile::take().per_step(run.decode_steps());
+        run.round_trips = device.round_trips();
+        device.record_round_trips(false);
         run
     }
 
@@ -962,6 +973,94 @@ fn where_a_decode_step_spends_its_time() {
     assert!(
         accounted > step / 2,
         "only {accounted:.2?} of a {step:.2?} step is accounted for"
+    );
+}
+
+/// **What the CPU is waiting for while it waits**, which is the question the
+/// `submit and wait` row above cannot answer either.
+///
+/// That row is three quarters of a decode step, and a milestone that reads it
+/// as three quarters of a step spent asking rather than working would go and
+/// remove submissions. The device's own clock already says otherwise — the row
+/// prints what share of it the GPU was executing for — and what this adds is
+/// the rest of the division, per submission rather than summed: the driver
+/// turning a committed buffer into work the GPU can start, the queue, the
+/// execution, and what none of the three claim.
+///
+/// **One row per shape of submission and not one per submission**, because a
+/// decode step's two are 1076 dispatches and one, and a mean over the pair
+/// describes neither. Grouped by the dispatches in them, which is what tells
+/// them apart without this having to know which came first.
+///
+/// Nothing asserts a share. What is asserted is that the trips describe the same
+/// waits the profile does, so that a table read against the one above is read
+/// against the same step.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn what_a_decode_steps_round_trips_are_waiting_on() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    let run = OnTheDevice::generate(&dir, &device);
+    let steps = run.decode_steps();
+    let mut shapes: BTreeMap<usize, Vec<RoundTrip>> = BTreeMap::new();
+    for trip in &run.round_trips {
+        shapes.entry(trip.dispatches).or_default().push(*trip);
+    }
+
+    eprintln!(
+        "a {:.2?} decode step, of which {:.2?} is the {} submissions it waits for\n  \
+         {:<11}{:>8}{:>11}{:>11}{:>10}{:>11}{:>14}",
+        run.each_decode_step(),
+        run.profile.elapsed(Op::Submit),
+        run.round_trips.len() as u32 / steps,
+        "dispatches",
+        "a step",
+        "waited",
+        "scheduled",
+        "queued",
+        "executed",
+        "unattributed",
+    );
+    let mean = |trips: &[RoundTrip], of: fn(&RoundTrip) -> Duration| {
+        trips.iter().map(of).sum::<Duration>() / steps
+    };
+    for (dispatches, trips) in &shapes {
+        eprintln!(
+            "  {dispatches:<11}{:>8}{:>11}{:>11}{:>10}{:>11}{:>14}",
+            trips.len() as u32 / steps,
+            format!("{:.2?}", mean(trips, |trip| trip.waited)),
+            format!("{:.2?}", mean(trips, |trip| trip.scheduled)),
+            format!("{:.2?}", mean(trips, |trip| trip.queued)),
+            format!("{:.2?}", mean(trips, |trip| trip.executed)),
+            format!("{:.2?}", mean(trips, |trip| trip.unattributed())),
+        );
+    }
+
+    let waited: Duration = run.round_trips.iter().map(|trip| trip.waited).sum();
+    let executed: Duration = run.round_trips.iter().map(|trip| trip.executed).sum();
+    assert_eq!(
+        run.round_trips.len() as u64,
+        run.profile.calls(Op::Submit) * u64::from(steps),
+        "a trip was recorded for a wait the profile did not see, or the other way round"
+    );
+    // The two clocks around one wait: `Op::Submit` is a scope that closes after
+    // the trip is recorded, so it is the larger of the two by whatever the
+    // recording itself takes, and a trip claiming more than the scope around it
+    // would mean the wall time here is not this wait's.
+    assert!(
+        waited / steps <= run.profile.elapsed(Op::Submit),
+        "the trips waited {:.2?} inside a {:.2?} row",
+        waited / steps,
+        run.profile.elapsed(Op::Submit)
+    );
+    // Exactly, and not within a tolerance: a wait reads the device's clock once
+    // and charges the same duration to both accounts, so a disagreement here is
+    // a trip or a submission one of the two did not see rather than a rounding.
+    assert_eq!(
+        executed / steps,
+        run.profile.gpu(),
+        "the trips and the profile disagree about what the device executed for"
     );
 }
 

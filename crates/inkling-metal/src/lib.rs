@@ -49,7 +49,7 @@ pub use attention::{AttentionError, FusedAttention, LayerAttention, Step};
 pub use buffer::{Arg, Buffer, Bytes, Element, Inline, Landing, Mapped};
 pub use combine::MoeCombine;
 pub use dense::{DenseMatmul, DenseWeight};
-pub use device::{Device, MetalError};
+pub use device::{Device, MetalError, RoundTrip};
 pub use experts::{ExpertBanks, ExpertKernels, LayerExperts};
 pub use heads::{HeadDevice, ModelHeads};
 pub use kernel::{Grid, Kernel};

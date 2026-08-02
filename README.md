@@ -115,6 +115,33 @@ for a layer at a time. Nothing an operation of a layer would open a scope
 around is left in the table at all: what remains beside the round trip is
 encoding it, the sampling at the end, and the embedding at the start.
 
+**And "three quarters of a step is a round trip" is a sentence worth reading
+twice, because a milestone that reads it as three quarters of a step spent
+asking would go and remove submissions.** The driver timestamps four points on
+every command buffer and the wait can be divided by them, one row per shape of
+submission rather than summed over the pair:
+
+    dispatches   a step     waited  scheduled    queued   executed  unattributed
+    1                 1     1.98ms    54.49µs   65.54µs   656.22µs        1.21ms
+    1076              1    18.75ms   934.09µs  106.36µs    17.53ms      183.68µs
+
+`scheduled` is the driver turning a committed buffer into work the GPU can start
+and `unattributed` is what none of the three claim — the commit reaching the
+driver, and this thread being woken once the buffer completed. **So the big
+submission is 93% execution and there is nothing in it to remove.** The 1.2 ms
+that is not execution is mostly the driver walking 1076 dispatches at 0.87 µs
+each, which is a cost of *having* the dispatches rather than of submitting them.
+The head's submission is the other kind: 1.98 ms of wait around 0.66 ms of work,
+so 1.3 ms of it buys nothing, and that is the price of the seam that reads the
+stack's rows back to norm them on this side.
+
+**What is not in that table is the encode, and that is the finding.** A command
+buffer executes nothing until it is committed, and a decode step commits after
+encoding all 1076 of the stack's dispatches — so the 4.4 ms `dispatch encode`
+row is 4.4 ms with the GPU idle, ahead of the wait rather than inside it. Add
+the two round trips and the sampling and a step is 26.4 ms around 18.2 of
+execution. The wait is honest; the step is not.
+
 **And now which kernel owns which of those 18 milliseconds.** The device
 timestamps a command buffer, and a decode step is two of them around 1077
 dispatches, so until this landed that figure was one number with nine kernels

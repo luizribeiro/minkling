@@ -1,6 +1,7 @@
 //! The GPU this process runs against, and everything that can go wrong there.
 
 use std::cell::{Cell, RefCell};
+use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -69,6 +70,49 @@ pub enum MetalError {
     TooManySampledDispatches { most: usize },
 }
 
+/// What one command buffer's round trip was made of.
+///
+/// **`submit and wait` is one row and four things happen inside it.** The wall
+/// time is this process's, and every other figure here is the driver's own
+/// clock: a committed buffer is scheduled, sits in the queue, executes, and
+/// then somebody has to notice it finished. Only the third is work, and a
+/// backend deciding how many command buffers a step should be needs the other
+/// three separated from it rather than summed into a round trip nobody can
+/// divide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundTrip {
+    /// How many dispatches were in it.
+    pub dispatches: usize,
+    /// This process's clock from just before the commit to the wait returning,
+    /// which is what the buffer cost the caller and what the three below divide
+    /// up.
+    pub waited: Duration,
+    /// What the driver spent turning a committed buffer into work the GPU could
+    /// start — `kernelEndTime - kernelStartTime`, which grows with the
+    /// dispatches in it.
+    pub scheduled: Duration,
+    /// How long it then sat before the GPU picked it up.
+    pub queued: Duration,
+    /// What the GPU was executing it for, which is the only part of a round trip
+    /// that is the model's arithmetic.
+    pub executed: Duration,
+}
+
+impl RoundTrip {
+    /// The part of the wait that was none of the three: the commit reaching the
+    /// driver, and this thread being woken once the buffer completed.
+    ///
+    /// Saturating because the two clocks are not the same clock. Nothing here
+    /// converts between them — the wall time is `Instant`'s and the rest is
+    /// `CFTimeInterval`'s — so what this subtracts is three durations from a
+    /// fourth, and a round trip whose parts came to more than the whole would be
+    /// a resolution artefact rather than a negative interval.
+    pub fn unattributed(&self) -> Duration {
+        self.waited
+            .saturating_sub(self.scheduled + self.queued + self.executed)
+    }
+}
+
 /// The default Metal device and one command queue onto it.
 ///
 /// The queue is opened once and held, rather than per dispatch: a queue is the
@@ -86,6 +130,11 @@ pub struct Device {
     /// it. `None` — nobody is — is the default, because sampling is not free:
     /// see [`crate::sampling`].
     timestamps: RefCell<Option<Timestamps>>,
+    /// Each command buffer's round trip, while somebody is asking what the waits
+    /// were made of. `None` — nobody is — is the default, because a decode loop
+    /// that nobody is measuring would otherwise grow a record per submission for
+    /// as long as it runs.
+    round_trips: RefCell<Option<Vec<RoundTrip>>>,
 }
 
 impl Device {
@@ -102,6 +151,7 @@ impl Device {
             allocations: Cell::new(0),
             allocated_bytes: Cell::new(0),
             timestamps: RefCell::new(None),
+            round_trips: RefCell::new(None),
         })
     }
 
@@ -146,6 +196,42 @@ impl Device {
 
     pub(crate) fn timestamps(&self) -> std::cell::Ref<'_, Option<Timestamps>> {
         self.timestamps.borrow()
+    }
+
+    /// Keep a [`RoundTrip`] for each command buffer from here, or stop and
+    /// discard what was kept.
+    ///
+    /// **The figures are read off a buffer that has already completed, so what
+    /// this switches on changes nothing it measures.** What it is opt-in for is
+    /// the accumulation: a decode loop nobody is measuring would otherwise grow
+    /// a record per submission for as long as it runs, and a device that opens
+    /// once and serves a whole process runs for a long time.
+    pub fn record_round_trips(&self, recording: bool) {
+        *self.round_trips.borrow_mut() = recording.then(Vec::new);
+    }
+
+    /// Every round trip since [`Device::record_round_trips`] was switched on,
+    /// in the order they were waited for, and the record cleared.
+    ///
+    /// Cleared rather than read for [`inkling_core::profile::take`]'s reason: a
+    /// caller measuring one step of a loop wants that step rather than the run
+    /// so far.
+    pub fn round_trips(&self) -> Vec<RoundTrip> {
+        match self.round_trips.borrow_mut().as_mut() {
+            None => Vec::new(),
+            Some(taken) => std::mem::take(taken),
+        }
+    }
+
+    /// The record taken and kept, where somebody asked for one.
+    ///
+    /// A closure rather than a value so that a caller who would have to read the
+    /// driver's timestamps to build one does not read them when nobody is
+    /// recording, which is every run but a measurement.
+    pub(crate) fn round_tripped(&self, trip: impl FnOnce() -> RoundTrip) {
+        if let Some(taken) = self.round_trips.borrow_mut().as_mut() {
+            taken.push(trip());
+        }
     }
 
     /// How many buffers this device has been asked to allocate.
@@ -232,7 +318,58 @@ impl Device {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use super::RoundTrip;
     use crate::testing::device;
+
+    /// What a round trip's parts leave over is the wait minus all three, and a
+    /// record whose parts came to more than the wait leaves nothing rather than
+    /// panicking on a negative interval: the wall time is `Instant`'s clock and
+    /// the other three are the driver's, so the two disagree in the last
+    /// microsecond by construction.
+    #[test]
+    fn a_round_trips_unattributed_time_is_what_its_three_parts_leave_over() {
+        let trip = |waited: u64| RoundTrip {
+            dispatches: 1,
+            waited: Duration::from_micros(waited),
+            scheduled: Duration::from_micros(100),
+            queued: Duration::from_micros(60),
+            executed: Duration::from_micros(600),
+        };
+        assert_eq!(trip(1000).unattributed(), Duration::from_micros(240));
+        assert_eq!(trip(700).unattributed(), Duration::ZERO);
+    }
+
+    /// The record is off by default, kept only while somebody asks for it, and
+    /// cleared by the reading — so a caller measuring one step of a loop is
+    /// handed that step rather than every submission since the device opened.
+    #[test]
+    fn a_device_records_round_trips_only_while_it_is_asked_to() {
+        let Some(device) = device() else { return };
+        let mut empty = crate::testing::EmptyDispatch::new(&device);
+        let mut run = || empty.cost(&device, 1, crate::kernel::Grid::new(1, 1));
+
+        run();
+        assert!(device.round_trips().is_empty(), "nobody was recording");
+
+        device.record_round_trips(true);
+        run();
+        run();
+        let recorded = device.round_trips();
+        assert_eq!(recorded.len(), 2, "one a submission");
+        assert!(device.round_trips().is_empty(), "the reading clears");
+        assert!(
+            recorded
+                .iter()
+                .all(|trip| trip.dispatches == 1 && trip.waited > trip.executed),
+            "{recorded:?}"
+        );
+
+        device.record_round_trips(false);
+        run();
+        assert!(device.round_trips().is_empty(), "recording stopped");
+    }
 
     /// Every buffer is counted once, however it was asked for — and an
     /// allocation the device refuses is not one of them, which is what keeps the

@@ -14,7 +14,7 @@ use objc2_metal::{
 };
 
 use crate::buffer::Arg;
-use crate::device::{Device, MetalError};
+use crate::device::{Device, MetalError, RoundTrip};
 use crate::sampling::Sampled;
 
 /// Entries in one compute function's buffer argument table. Every Apple GPU
@@ -291,6 +291,7 @@ impl<'a> Batch<'a> {
     pub fn wait(mut self) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Submit);
         self.end();
+        let committed = std::time::Instant::now();
         self.commands.commit();
 
         // The GPU watchdog kills a command buffer that runs too long, and this
@@ -304,8 +305,15 @@ impl<'a> Batch<'a> {
         // layer in one is asking for the sum to finish in time. A decode step's
         // largest is four projections at 105 µs each, four decades below it.
         self.commands.waitUntilCompleted();
+        let waited = committed.elapsed();
         self.device.counted(self.dispatches);
-        profile::ran_on_the_gpu(self.executed());
+        // One reading of the device's clock, charged to the profile and handed
+        // to the record, so that the two figures are the same figure and a case
+        // that reads them against each other is reading one measurement.
+        let executed = self.executed();
+        self.device
+            .round_tripped(|| self.round_trip(waited, executed));
+        profile::ran_on_the_gpu(executed);
         if let Some(samples) = &self.samples {
             samples.charge();
         }
@@ -328,9 +336,26 @@ impl<'a> Batch<'a> {
     /// Both timestamps are only meaningful once the buffer has completed, which
     /// is where this is read.
     fn executed(&self) -> Duration {
-        Duration::from_secs_f64(
-            (self.commands.GPUEndTime() - self.commands.GPUStartTime()).max(0.0),
-        )
+        since(self.commands.GPUStartTime(), self.commands.GPUEndTime())
+    }
+
+    /// The same wait divided into what the driver, the queue and the GPU each
+    /// held it for, which is what says whether a round trip is work or asking.
+    ///
+    /// `executed` is passed in rather than read again for the reason its caller
+    /// states. The other two are read here, and only where a caller asked for
+    /// the record — see [`Device::record_round_trips`].
+    fn round_trip(&self, waited: Duration, executed: Duration) -> RoundTrip {
+        RoundTrip {
+            dispatches: self.dispatches,
+            waited,
+            scheduled: since(
+                self.commands.kernelStartTime(),
+                self.commands.kernelEndTime(),
+            ),
+            queued: since(self.commands.kernelEndTime(), self.commands.GPUStartTime()),
+            executed,
+        }
     }
 
     /// The open pass closed, which has to happen before the buffer is committed
@@ -423,6 +448,16 @@ impl Grid {
 /// dispatch a grid for the wrong shape over buffers of the right one.
 pub(crate) fn extent(value: usize, what: &str) -> u32 {
     u32::try_from(value).unwrap_or_else(|_| panic!("{value} is wider than a kernel's uint: {what}"))
+}
+
+/// The interval between two of a command buffer's timestamps, which the driver
+/// reports as seconds on the host's clock.
+///
+/// Clamped at nothing because the four are only meaningful on a buffer that has
+/// completed, and a device that reported them out of order — or reported none
+/// at all, which is a zero — is not a reason to build a negative interval.
+fn since(from: f64, to: f64) -> Duration {
+    Duration::from_secs_f64((to - from).max(0.0))
 }
 
 fn one_dimensional(width: usize) -> MTLSize {
