@@ -605,6 +605,19 @@ impl<'a> LayerAttention<'a> {
             "{} relative features are not {queries} rows of {heads} heads",
             step.rel.len()
         );
+        // **Every query's own key is one of the keys**, which the module
+        // documentation states and which nothing checked while the kernel scored
+        // the whole span: a query sitting past the last key used to attend over
+        // all of them, which is wrong quietly. The kernel bounds its loop by that
+        // position now, so the same call would attend over the tail of the span
+        // or over nothing at all — and a row of zeroes is wrong more quietly
+        // still. Refused here, where the shape is known.
+        assert!(
+            step.q_offset + queries <= step.keys,
+            "{queries} queries from {} sit past the {} keys of the call",
+            step.q_offset,
+            step.keys
+        );
 
         let fields = [
             extent(heads, "the heads of a layer"),
@@ -897,8 +910,35 @@ kernel void fused_attention(
     float peak = -INFINITY;
     float total = 0.0f;
 
-    for (uint first = 0; first < shape.keys; first += tile) {
-        const uint held = min(tile, shape.keys - first);
+    // BOUND: the keys this query can reach, which is where two of
+    // `banded_entry`'s four branches are answered by not walking rather than by
+    // walking and discarding. Nothing at or after the query's own position is
+    // causal, and on a windowed layer nothing further back than the window is in
+    // it — the same two comparisons the entry makes, made once for the row
+    // instead of once for every key of it.
+    //
+    // **The start is rounded down to a tile so that this is the same arithmetic
+    // and not merely the same answer.** A tile's softmax takes a maximum over
+    // what the tile holds and rescales what came before by it, so tiles cut in
+    // different places accumulate in a different order and land a few ulps
+    // apart. Aligned, every tile this walks holds the keys it held when the loop
+    // began at zero, and the tiles it skips contributed exactly zero to that
+    // accumulation: the ones before rescale by `exp(-1e30 - peak)` and the ones
+    // after add `exp(-1e30 - peak)`, which underflow to a zero that is exact.
+    // So the bounded kernel is the unbounded one bit for bit, which is what
+    // `the_bounded_loop_is_the_unbounded_one_bit_for_bit` asserts and what makes
+    // it worth asserting. It costs at most one tile of keys already inside the
+    // window.
+    //
+    // The branches stay, and the tests that pin them drive the loop unbounded —
+    // which this is measured against, so they pin what it is measured against.
+    const uint last = min(shape.keys, (uint)position + 1u);
+    const uint reach = shape.sliding > 0 && (uint)position >= shape.sliding
+        ? ((uint)position - (shape.sliding - 1u)) / tile * tile
+        : 0u;
+
+    for (uint first = reach; first < last; first += tile) {
+        const uint held = min(tile, last - first);
 
         // The tile's values, brought in by the whole threadgroup in the order
         // they lie rather than by each thread down its own channel.
@@ -995,6 +1035,44 @@ mod tests {
     /// pinned to, which is what puts the branches this kernel derives beside the
     /// tensor mlx-vlm wrote for them.
     const MASK_FIXTURE: &str = "mask.safetensors";
+
+    /// The kernel with its loop bound taken off, which scores every key of the
+    /// span and lets the softmax discard the ones the band masks.
+    ///
+    /// **This is the kernel this one is measured against, and the reason three
+    /// cases below drive it rather than the shipped source.** Bounding the loop
+    /// makes a masked key one the dispatch never visits, so a mutation to the
+    /// branch that would have masked it stops changing any answer — and a case
+    /// asserting that it does would go on passing while proving nothing. What
+    /// those cases pin is `banded_entry`, which is still the authority on which
+    /// keys are live; what pins the bound to it is
+    /// `the_bounded_loop_is_the_unbounded_one_bit_for_bit`.
+    fn unbounded() -> String {
+        let source = source();
+        let (head, tail) = source
+            .split_once("    // BOUND:")
+            .expect("the bound is marked");
+        let (_, tail) = tail
+            .split_once("\n    for (uint first = reach;")
+            .expect("the bound ends at its loop");
+        let whole = format!(
+            "{head}    const uint last = shape.keys;\n    const uint reach = 0u;\n\n    for (uint first = reach;{tail}"
+        );
+        // What is asserted is that the bound is *gone*, not merely that the
+        // string moved: cutting between two markers is only as good as the
+        // markers, and a comment that came to hold the loop's own header would
+        // shift the cut somewhere a length comparison would not notice.
+        assert!(
+            !whole.contains("shape.sliding - 1u") && !whole.contains("(uint)position + 1u"),
+            "the bound survived the cut"
+        );
+        assert!(
+            whole.contains("const uint reach = 0u;")
+                && whole.contains("const uint last = shape.keys;"),
+            "the loop was not put back over the whole span"
+        );
+        whole
+    }
 
     /// The synthetic cases, and the branches each was placed to reach — named
     /// here as `inkling_core::mask` names them, so a fixture retuned until a
@@ -1533,6 +1611,111 @@ mod tests {
         assert!(dropped > TOLERANCE, "deviation {dropped:e}");
     }
 
+    /// **The loop bound skips exactly the keys the band would have masked**, and
+    /// the two kernels are not merely close: they are the same floats.
+    ///
+    /// The claim the bound makes is that walking a key and discarding it is the
+    /// same as not walking it. Every case here has an answer already pinned to
+    /// mlx-vlm's own mask elsewhere in this module, so what this adds is the
+    /// stronger form — `assert_eq!` on the bits — which is available because the
+    /// bound starts on a tile boundary. Anything weaker would leave "the same to
+    /// six decimals" as the standard for a change whose whole argument is that it
+    /// changes nothing.
+    ///
+    /// The trained captures are here beside the synthetic cases because they are
+    /// the shapes the model runs: eight tokens on the committed capture, and 1280
+    /// queries over 1280 keys on the long one, which is the only case in this
+    /// crate where a sliding layer's window is actually narrower than its span
+    /// and so the only one where the window half of the bound skips anything at
+    /// all.
+    #[test]
+    fn the_bounded_loop_is_the_unbounded_one_bit_for_bit() {
+        let Some(device) = device() else { return };
+        let bounded = FusedAttention::new(&device).expect("the kernel compiles");
+        let whole = unbounded();
+        assert_ne!(whole, source(), "the bound was not taken off");
+        let walking = FusedAttention::from_source(&device, &whole).expect("the mutant compiles");
+
+        let mut cases = Case::synthetic();
+        cases.extend(
+            Case::all(ACTIVATIONS)
+                .expect("the committed capture")
+                .into_iter()
+                .map(|(case, _)| case),
+        );
+        cases.extend(
+            Case::all(LONG_ACTIVATIONS)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(case, _)| case),
+        );
+        let mut skipped = 0;
+
+        for case in &cases {
+            assert_eq!(
+                case.on_the_device(&device, &bounded),
+                case.on_the_device(&device, &walking),
+                "{}: the bound changed the answer",
+                case.name
+            );
+            skipped += (0..case.queries)
+                .flat_map(|i| {
+                    (0..case.keys).map(move |j| (i + case.q_offset) as isize - j as isize)
+                })
+                .filter(|dist| matches!(branch(case, *dist), 1 | 2))
+                .count();
+        }
+        eprintln!(
+            "{} cases agree bit for bit, over {skipped} query-key pairs the band masks",
+            cases.len()
+        );
+        assert!(skipped > 0, "no case here has a key the bound could skip");
+    }
+
+    /// **And it is tight at both ends**, which the case above cannot say: a bound
+    /// that skipped nothing would pass it, and so would a bound one tile too
+    /// generous.
+    ///
+    /// Both mutations are one key too few — the query's own key at the causal
+    /// end, which is the one every row is guaranteed to have, and one key past
+    /// the far edge of the window, which the `decode` case has 512 live keys
+    /// behind. A bound that is right by an accident of alignment is not right
+    /// here: `reach` is rounded down to a tile, so the window end is mutated by
+    /// the `- 1u` that decides *which* tile rather than by a key inside one.
+    #[test]
+    fn a_bound_one_key_tighter_at_either_end_changes_the_answer() {
+        let Some(device) = device() else { return };
+        let case = synthetic("decode");
+        assert!(case.config.sliding > 0, "a windowed case");
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let want = case.through(case.mask.as_ref().expect("a recorded mask"));
+        assert!(
+            deviation(&case.on_the_device(&device, &attention), &want) <= TOLERANCE,
+            "the unmutated bound does not agree"
+        );
+
+        for (end, from, to) in [
+            (
+                "the causal end",
+                "min(shape.keys, (uint)position + 1u)",
+                "min(shape.keys, (uint)position)",
+            ),
+            (
+                "the window end",
+                "((uint)position - (shape.sliding - 1u)) / tile * tile",
+                "((uint)position - (shape.sliding - 1u) + tile) / tile * tile",
+            ),
+        ] {
+            let tighter = source().replace(from, to);
+            assert_ne!(tighter, source(), "{end}: the mutation changed nothing");
+            let mutant =
+                FusedAttention::from_source(&device, &tighter).expect("the mutant compiles");
+            let deviation = deviation(&case.on_the_device(&device, &mutant), &want);
+            eprintln!("{end} of the bound one tile tighter: deviation {deviation:e}");
+            assert!(deviation > TOLERANCE, "{end}: deviation {deviation:e}");
+        }
+    }
+
     /// **Branch 2 before branch 3.** The two overlap only where the window is
     /// narrower than the band, which no Inkling layer configures and which the
     /// `narrow_window` case exists to arrange: every distance from the window
@@ -1543,6 +1726,14 @@ mod tests {
     /// the entries are not a tensor anyone can look at — the two orderings are
     /// two kernels through the same plumbing, and what separates them is the
     /// answer.
+    ///
+    /// **Through [`unbounded`], because the shipped loop does not walk the keys
+    /// this is about.** A key past the window is one the bound skips, so the
+    /// ordering of the two branches that would have masked it decides nothing a
+    /// dispatch computes. What it decides is the answer the bound is measured
+    /// against — and this case's own `narrow_window` is one of the ten
+    /// `the_bounded_loop_is_the_unbounded_one_bit_for_bit` holds the two to, so
+    /// what is pinned here reaches the shipped kernel through that.
     #[test]
     fn the_window_cap_outranks_the_band_in_the_kernel() {
         let Some(device) = device() else { return };
@@ -1552,18 +1743,19 @@ mod tests {
             "the case's window is not narrower than its band"
         );
 
+        let source = unbounded();
         let want = case.through(case.mask.as_ref().expect("a recorded mask"));
-        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let attention = FusedAttention::from_source(&device, &source).expect("the kernel compiles");
         let agreed = deviation(&case.on_the_device(&device, &attention), &want);
         assert!(agreed <= TOLERANCE, "deviation {agreed:e}");
 
-        let banded_first = source().replace(
+        let banded_first = source.replace(
             "    if (shape.sliding > 0 && back >= shape.sliding) {\n        return MASKED;\n    }\n\
              \x20   if (back >= shape.rel_extent) {\n        return 0.0f;\n    }\n",
             "    if (back >= shape.rel_extent) {\n        return 0.0f;\n    }\n\
              \x20   if (shape.sliding > 0 && back >= shape.sliding) {\n        return MASKED;\n    }\n",
         );
-        assert_ne!(banded_first, source(), "the mutation changed nothing");
+        assert_ne!(banded_first, source, "the mutation changed nothing");
         let mutant =
             FusedAttention::from_source(&device, &banded_first).expect("the mutant compiles");
         let deviation = deviation(&case.on_the_device(&device, &mutant), &want);
@@ -1581,6 +1773,14 @@ mod tests {
     /// and is masked anyway; on a *global* layer, whose window is zero, it lands
     /// outside the band and comes back as a plain zero — an unmasked key ahead
     /// of the query, which the `global_band` case is where that shows.
+    ///
+    /// **Through [`unbounded`]**, for the reason the case above is: a key ahead
+    /// of the query is one the shipped loop stops before reaching, so what the
+    /// causal branch decides is the answer the bound is measured against rather
+    /// than the answer a dispatch produces — and this case's own `global_band` is
+    /// one of the ten `the_bounded_loop_is_the_unbounded_one_bit_for_bit` holds
+    /// the two to, so what is pinned here reaches the shipped kernel through
+    /// that.
     #[test]
     fn a_key_ahead_of_the_query_is_masked_before_the_band_is_indexed() {
         let Some(device) = device() else { return };
@@ -1590,16 +1790,17 @@ mod tests {
             "a global case, whose window is zero"
         );
 
+        let source = unbounded();
         let want = case.through(case.mask.as_ref().expect("a recorded mask"));
-        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let attention = FusedAttention::from_source(&device, &source).expect("the kernel compiles");
         let agreed = deviation(&case.on_the_device(&device, &attention), &want);
         assert!(agreed <= TOLERANCE, "deviation {agreed:e}");
 
-        let uncaused = source().replace(
+        let uncaused = source.replace(
             "    if (dist < 0) {\n        return MASKED;\n    }\n",
             "    if (dist < -1000000000) {\n        return MASKED;\n    }\n",
         );
-        assert_ne!(uncaused, source(), "the mutation changed nothing");
+        assert_ne!(uncaused, source, "the mutation changed nothing");
         let mutant = FusedAttention::from_source(&device, &uncaused).expect("the mutant compiles");
         let deviation = deviation(&case.on_the_device(&device, &mutant), &want);
         eprintln!("the causal branch dropped: deviation {deviation:e}");
@@ -1658,6 +1859,18 @@ mod tests {
     ///
     /// The mutation is that substitution, and the assertion is that the row
     /// stops being a number at all.
+    ///
+    /// **The bound is what takes this off the shipped kernel, and it is the
+    /// second thing the bound is worth.** A tile the loop walks now always holds
+    /// a live key, because the loop starts at the tile the window opens in — so
+    /// no tile shifts by a masked peak and the choice of magnitude stops being
+    /// load-bearing on this path. It is still load-bearing on the path this one
+    /// is measured against, which is why the case stays and why it is driven
+    /// through [`unbounded`]: the two kernels agree bit for bit only while the
+    /// masked entries the longer one walks weigh their values by one and get
+    /// rescaled to nothing, and `-INFINITY` is what turns that into a NaN. This
+    /// case's own `decode` is one of the ten
+    /// `the_bounded_loop_is_the_unbounded_one_bit_for_bit` holds the two to.
     #[test]
     fn a_tile_of_masked_keys_leaves_the_row_a_number() {
         let Some(device) = device() else { return };
@@ -1670,23 +1883,35 @@ mod tests {
             "{masked} masked keys do not fill five of the widest tile a threadgroup can hold"
         );
 
-        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let infinitely = |source: String| {
+            let infinite = source.replace(
+                &format!("constant float MASKED = {MASKED:e}f;"),
+                "constant float MASKED = -INFINITY;",
+            );
+            assert_ne!(infinite, source, "the mutation changed nothing");
+            FusedAttention::from_source(&device, &infinite).expect("the mutant compiles")
+        };
+
+        let walking =
+            FusedAttention::from_source(&device, &unbounded()).expect("the kernel compiles");
         assert!(
-            case.on_the_device(&device, &attention)
+            case.on_the_device(&device, &walking)
                 .iter()
                 .all(|value| value.is_finite())
         );
-
-        let infinite = source().replace(
-            &format!("constant float MASKED = {MASKED:e}f;"),
-            "constant float MASKED = -INFINITY;",
-        );
-        assert_ne!(infinite, source(), "the mutation changed nothing");
-        let mutant = FusedAttention::from_source(&device, &infinite).expect("the mutant compiles");
-        let poisoned = case.on_the_device(&device, &mutant);
+        let poisoned = case.on_the_device(&device, &infinitely(unbounded()));
         assert!(
             poisoned.iter().any(|value| !value.is_finite()),
             "an infinite mask left the row finite, so this proves nothing"
+        );
+
+        // And the shipped kernel is indifferent to the same substitution, which
+        // is the finding rather than a reason to stop asserting the above.
+        let bounded = FusedAttention::new(&device).expect("the kernel compiles");
+        assert_eq!(
+            case.on_the_device(&device, &bounded),
+            case.on_the_device(&device, &infinitely(source())),
+            "the bounded loop walked a masked key"
         );
     }
 
@@ -1785,16 +2010,22 @@ mod tests {
     /// cached span, 32 query heads over 8 KV heads of 128 channels, a 16-feature
     /// band a thousand distances wide.
     fn decode_shaped(keys: usize) -> Case {
+        windowed(keys, 0)
+    }
+
+    /// The same, on a layer whose window is `sliding` — which is 35 of the
+    /// checkpoint's 42 at 512, against 7 global ones this passes 0 for.
+    fn windowed(keys: usize, sliding: usize) -> Case {
         let (heads, kv_heads, head_dim, d_rel, extent) = (32, 8, 128, 16, 1024);
         Case {
-            name: format!("a decode step over {keys} keys"),
+            name: format!("a decode step over {keys} keys through a window of {sliding}"),
             config: AttentionConfig {
                 hidden: heads * head_dim,
                 heads,
                 kv_heads,
                 head_dim,
                 d_rel,
-                sliding: 0,
+                sliding,
                 rms_norm_eps: 1e-6,
                 log_scaling: None,
             },
@@ -1885,6 +2116,13 @@ mod tests {
     /// in this crate is taken at, 512 is what a sliding layer caps at, and 4096 is
     /// past anything a decode step here reaches.
     ///
+    /// **The windowed rows are the shape 35 of the 42 layers run**, and they are
+    /// where the loop bound is worth anything at all: a span shorter than the
+    /// window has no key outside it, which is why the rows above and the decode
+    /// step this engine measures elsewhere are untouched by the bound. What they
+    /// are is flat — a windowed layer stops paying for context past its window,
+    /// where before it paid for all of it.
+    ///
     /// **A span's step and the floor under it are two measurements and are
     /// interleaved as two**, for the reason [`crate::sconv`]'s own diagnosis
     /// states: a floor always taken straight after the heavier dispatch it is
@@ -1906,19 +2144,36 @@ mod tests {
         // `encoding` dispatches over — taken from the case rather than written
         // down, so that a floor cannot go on being subtracted from a step whose
         // grid has moved out from under it.
-        let spans = [8, 97, 512, 4096];
-        let grid = |keys: usize| {
-            let case = decode_shaped(keys);
+        // The checkpoint's own two kinds of layer: seven global and thirty-five
+        // capped at 512.
+        let spans = [
+            (8, 0),
+            (97, 0),
+            (512, 0),
+            (4096, 0),
+            (512, 512),
+            (4096, 512),
+            (16384, 512),
+        ];
+        let grid = |keys: usize, sliding: usize| {
+            let case = windowed(keys, sliding);
             Grid::new(
                 case.config.heads * case.queries * THREADS_PER_GROUP,
                 THREADS_PER_GROUP,
             )
         };
-        let groups = grid(spans[0]).threads() / THREADS_PER_GROUP;
+        let groups = grid(spans[0].0, spans[0].1).threads() / THREADS_PER_GROUP;
 
-        let cost = |keys: usize| -> Duration {
-            let case = decode_shaped(keys);
-            let layer = case.wrapped(&device, &attention);
+        // The kernel this one replaced, which walks every key of the span — kept
+        // as a column rather than as a number in a commit message, because what
+        // the bound is worth is the difference between two rows of one table and
+        // a reader should not have to take that on trust.
+        let walking =
+            FusedAttention::from_source(&device, &unbounded()).expect("the mutant compiles");
+
+        let cost = |kernel: &FusedAttention, keys: usize, sliding: usize| -> Duration {
+            let case = windowed(keys, sliding);
+            let layer = case.wrapped(&device, kernel);
             // The dispatch's own output, held until the command buffer that
             // writes it has completed.
             let mut held = Vec::with_capacity(CALLS);
@@ -1929,27 +2184,36 @@ mod tests {
 
         // Warm: the first dispatch of a fresh pipeline pays for the driver's
         // first look at these buffers, which a decode loop pays once.
-        let mut taken = spans.map(|keys| {
-            cost(keys);
-            (Vec::with_capacity(ROUNDS), Vec::with_capacity(ROUNDS))
+        let mut taken = spans.map(|(keys, sliding)| {
+            cost(&attention, keys, sliding);
+            cost(&walking, keys, sliding);
+            [const { Vec::new() }; 3]
         });
-        empty.cost(&device, CALLS, grid(spans[0]));
+        empty.cost(&device, CALLS, grid(spans[0].0, spans[0].1));
         for _ in 0..ROUNDS {
-            for (each, keys) in taken.iter_mut().zip(spans) {
-                each.0.push(cost(keys));
+            for (each, (keys, sliding)) in taken.iter_mut().zip(spans) {
+                each[0].push(cost(&attention, keys, sliding));
             }
-            for (each, keys) in taken.iter_mut().zip(spans) {
-                each.1.push(empty.cost(&device, CALLS, grid(keys)));
+            for (each, (keys, sliding)) in taken.iter_mut().zip(spans) {
+                each[1].push(cost(&walking, keys, sliding));
+            }
+            for (each, (keys, sliding)) in taken.iter_mut().zip(spans) {
+                each[2].push(empty.cost(&device, CALLS, grid(keys, sliding)));
             }
         }
 
-        for (keys, (spent, launch)) in spans.iter().zip(&taken) {
-            let mean = |each: &Vec<Duration>| each.iter().sum::<Duration>() / each.len() as u32;
-            let (spent, launch) = (mean(spent), mean(launch));
+        for ((keys, sliding), each) in spans.iter().zip(&taken) {
+            let mean = |of: &Vec<Duration>| of.iter().sum::<Duration>() / of.len() as u32;
+            let (bounded, walked, launch) = (mean(&each[0]), mean(&each[1]), mean(&each[2]));
+            let window = match sliding {
+                0 => "global".to_string(),
+                _ => format!("window {sliding}"),
+            };
             eprintln!(
-                "one query over {keys:>5} keys, {groups} threadgroups: {spent:>8.2?} a dispatch, \
-                 {launch:>8.2?} of it the launch — {:>5.0}% the step",
-                100.0 * (spent.saturating_sub(launch)).as_secs_f64() / spent.as_secs_f64(),
+                "one query over {keys:>5} keys, {window:>11}, {groups} threadgroups: \
+                 {bounded:>8.2?} a dispatch against {walked:>8.2?} walking the span whole \
+                 — ×{:.2}, over a {launch:.2?} launch",
+                walked.as_secs_f64() / bounded.as_secs_f64(),
             );
         }
     }

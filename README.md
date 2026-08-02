@@ -200,11 +200,14 @@ that row reports is the *context the profile is taken at*, which is the recorded
 prompt and eight generated tokens. Read off the rows above, the same 42 dispatches
 are 4.9 ms at the 155-key context the paired measurement below decodes over, and
 15.5 ms at 512. The kernel is not waiting on occupancy and it is not waiting on a
-floor. It is walking the span, and it walks all of it: 35 of the 42 layers cap at
-a 512-token window, and every key outside that window is scored anyway so that
-the softmax can discard it. That is M9's deferred finding arriving as this one's
-diagnosis, and it is where the work goes rather than into either of the remedies
-this table has used before.
+floor. It is walking the span — and it was walking all of it, on 35 layers that
+cap at a 512-token window. That is M9's deferred finding arriving as this one's
+diagnosis, and where the work went: neither of the two remedies this table has
+used before, but the loop bound whose table is under the attention step above.
+**It buys nothing at the context this profile is taken at and nothing at the one
+the comparison below decodes over** — the window is 512 and neither reaches it —
+which is why this row is where it was and why the change is a prefill and
+long-context one that a decode step pays a compare for.
 
 The matmul is 72% of a step, which is what keeps this table mostly one row.
 
@@ -318,17 +321,47 @@ about the millisecond the CPU's own scores and mask cost — and it is not what 
 kernel is for. What it is for is the memory the mask would have taken, which the
 architecture notes below price.
 
+**And the mask it derives is now a loop bound rather than an entry it computes
+and throws away.** The kernel scored every key of the span and let the softmax
+discard the ones the band ruled out. Two of the band's four branches are decided
+by the distance alone — nothing at or after the query is causal, and on a
+windowed layer nothing further back than the window is in it — so both are the
+same comparison made once for the row instead of once for every key of it. 35 of
+the 42 layers have a 512-token window and those keys are most of a long span:
+
+    one query, 32 threadgroups          bounded   walking the span whole
+      512 keys, global                 368.30µs                 368.67µs
+     4096 keys, global                   2.57ms                   2.58ms
+      512 keys, window 512             369.05µs                 369.61µs
+     4096 keys, window 512             388.67µs                   2.51ms
+    16384 keys, window 512             398.50µs                   9.74ms
+
+**Exactly nothing where nothing is outside the window, and ×24 where the span is
+32 times it** — which is the shape of the finding rather than a rate, since what
+a windowed layer now pays is flat in the context and what it paid before was
+linear. The two kernels are kept side by side rather than one of them being a
+number in a commit message, and the same pairing is what says the answer did not
+move: **bit for bit** over ten cases and 1.95 million query-key pairs the band
+masks, including the 1280-query capture. That is exact rather than within a
+tolerance because the bound starts on a tile boundary — a tile's softmax rescales
+by a maximum over what the tile holds, so tiles cut in different places land a
+few ulps apart, and one extra tile of keys already inside the window is what buys
+the stronger claim.
+
 **What it is not for is prefill wall time, and that belongs to the reference.**
-Over the six alternating rounds of the paired sitting below, 97, 385 and 769
-tokens prefill here in 1.73, 4.79 and 8.77 s on average against the reference's
-0.256, 0.680 and 1.132 — ×6.8, ×7.0 and ×7.7, and widening with the prompt. Where
-the gap comes from is unmeasured; what can be said is that it is not the round
-trips, since a prefill's submissions are 42 at 250 µs against a gap of eight
-seconds. **The matmul is the one thing
-that has moved this row**, taking it 1.90, 5.39 and 10.14 s to those three over
-three alternating passes; every other milestone here has moved the decode step,
-and prefill has never been the path any of them was about. The peak resident set
-at the longest is 0.43 GiB.
+97, 385 and 769 tokens prefill here in 1.73, 4.69 and 8.33 s against the
+reference's 0.256, 0.680 and 1.132 — ×6.8, ×6.9 and ×7.4, and widening with the
+prompt. The reference's three are the paired sitting's below; ours are the loop
+bound's, which took them from 1.73, 4.85 and 8.88 over eight alternating pairs —
+all eight moving the same way at the two longer lengths, with the ranges not
+overlapping at the longest, and 97 tokens a wash because nothing that short has a
+key outside the window. Where the gap comes from is otherwise unmeasured; what
+can be said is that it is not the round trips, since a prefill's submissions are
+42 at 250 µs against a gap of seven seconds. **Two things have moved this row
+and both were about something else**: the matmul took it 1.90, 5.39 and 10.14 s
+to 1.75, 4.70 and 8.87 over three alternating passes, and the loop bound was
+written for a long context and paid at a short one. No milestone here has been
+aimed at prefill yet. The peak resident set at the longest is 0.43 GiB.
 
 **A whole decoder layer is now one command buffer**, and twenty-six dispatches
 on a layer that routes. Eleven are its attention: the input layernorm, the four
