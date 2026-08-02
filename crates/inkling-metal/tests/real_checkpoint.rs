@@ -34,9 +34,10 @@ use inkling_core::{
     Tokenizer, split_heads,
 };
 use inkling_metal::{
-    DISPATCHES_A_SUBMISSION, DenseMatmul, DenseWeight, Device, ExpertKernels, LayerKernels,
-    LayerProjections, LayerRouter, MetalError, ModelHeads, ModelLayers, MoeCombine, PackedBank,
-    PackedMatmul, PackedProjection, RoundTrip, Router, RouterWeights, StackShape, SwiGlu,
+    DISPATCHES_A_SUBMISSION, DenseMatmul, DenseWeight, Device, ExpertGrouping, ExpertKernels,
+    LayerKernels, LayerProjections, LayerRouter, MetalError, ModelHeads, ModelLayers, MoeCombine,
+    PackedBank, PackedMatmul, PackedProjection, RoundTrip, Router, RouterWeights, StackShape,
+    SwiGlu,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -703,6 +704,7 @@ impl OnTheDevice {
         let dense = DenseMatmul::new(device).expect("the dense matmul compiles");
         let swiglu = SwiGlu::new(device).expect("the swiglu compiles");
         let router = Router::new(device).expect("the router compiles");
+        let grouping = ExpertGrouping::new(device).expect("the grouping compiles");
         let weighing = RouterWeights::new(device).expect("the weighting compiles");
         let combine = MoeCombine::new(device).expect("the combine compiles");
         let config = fixture::config(dir).text_config;
@@ -733,6 +735,7 @@ impl OnTheDevice {
                 dense: &dense,
                 swiglu: &swiglu,
                 router: &router,
+                grouping: &grouping,
                 weights: &weighing,
                 combine: &combine,
             },
@@ -2262,6 +2265,7 @@ struct Kernels<'d> {
     dense: DenseMatmul,
     swiglu: SwiGlu,
     router: Router,
+    grouping: ExpertGrouping,
     weights: RouterWeights,
     combine: MoeCombine,
 }
@@ -2274,6 +2278,7 @@ impl<'d> Kernels<'d> {
             dense: DenseMatmul::new(device).expect("the dense matmul compiles"),
             swiglu: SwiGlu::new(device).expect("the swiglu compiles"),
             router: Router::new(device).expect("the router compiles"),
+            grouping: ExpertGrouping::new(device).expect("the grouping compiles"),
             weights: RouterWeights::new(device).expect("the weighting compiles"),
             combine: MoeCombine::new(device).expect("the combine compiles"),
         }
@@ -2308,6 +2313,7 @@ impl<'d> Kernels<'d> {
                 dense: &self.dense,
                 swiglu: &self.swiglu,
                 router: &self.router,
+                grouping: &self.grouping,
                 weights: &self.weights,
                 combine: &self.combine,
             },

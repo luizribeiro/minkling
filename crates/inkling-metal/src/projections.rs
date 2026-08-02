@@ -1294,6 +1294,7 @@ mod tests {
 
     use crate::combine::MoeCombine;
     use crate::dense::DenseMatmul;
+    use crate::grouping::ExpertGrouping;
     use crate::matmul::testing::{Case, pack};
     use crate::router::{Router, RouterWeights};
     use crate::testing::device;
@@ -1699,6 +1700,7 @@ mod tests {
         let dense = DenseMatmul::new(&device).expect("the dense matmul compiles");
         let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
         let router = Router::new(&device).expect("the router compiles");
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
         let weights = RouterWeights::new(&device).expect("the weighting compiles");
         let combine = MoeCombine::new(&device).expect("the combine compiles");
         let experts = ExpertKernels {
@@ -1706,6 +1708,7 @@ mod tests {
             dense: &dense,
             swiglu: &swiglu,
             router: &router,
+            grouping: &grouping,
             weights: &weights,
             combine: &combine,
         };

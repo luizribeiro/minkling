@@ -57,6 +57,7 @@ use inkling_core::weights::Packed;
 
 use crate::buffer::{Arg, Buffer, Bytes};
 use crate::device::{Device, MetalError};
+use crate::grouping::Grouped;
 use crate::kernel::{Batch, Grid, Kernel, extent};
 
 const ENTRY: &str = "packed_matmul";
@@ -65,6 +66,18 @@ const ENTRY: &str = "packed_matmul";
 /// rather than per output element, so a weight row read once serves every row
 /// of the tile that named the same expert.
 const TILED_ENTRY: &str = "packed_matmul_rows";
+
+/// The third: the same tile, over rows a dispatch laid out expert by expert.
+///
+/// **A routed bank's rows are the one layout the tile above cannot reach**, and
+/// they are 59% of a prefill's bytes. A token reads six experts, so its six rows
+/// name six different weights and no two consecutive rows of a call ever share
+/// one — which is true however long the prompt. What this entry adds is an
+/// indirection at each end: [`crate::grouping`] writes the order the rows would
+/// be in if they were sorted by expert, and this reads its input through that
+/// order or writes its output through it, so the tile in between sees a run of
+/// rows that do name one weight.
+const GROUPED_ENTRY: &str = "packed_matmul_grouped";
 
 /// Rows one simdgroup of [`TILED_ENTRY`] multiplies against one weight row.
 ///
@@ -91,6 +104,29 @@ const TILED_ENTRY: &str = "packed_matmul_rows";
 /// reduction width both are, met a third time — see
 /// `what_a_packed_multiply_costs_at_each_height_a_tile_reads`.
 const ROWS_A_TILE: usize = 4;
+
+/// Rows an expert needs, on average, before sorting a call's rows by expert
+/// pays for the sort.
+///
+/// **Two measurements disagree about where this goes and the engine's is the
+/// one it is set from.** Over runs of a uniform length,
+/// `what_grouping_a_banks_rows_by_expert_is_worth_at_each_run_length` turns at
+/// four and is a loss below it — which is the tile height and no coincidence:
+/// runs of two laid out end to end put a boundary inside *every* tile, so every
+/// tile falls back to walking each row's own weight and the sort bought a
+/// dispatch and nothing else. But a routing's runs are not uniform. At 97 tokens
+/// a routed bank averages 2.3 rows an expert and the grouping takes 711 ms of
+/// device time to 592, because the experts a prompt favours reach a tile even
+/// where the mean does not — and `what_a_grouped_call_reads_against_what_it
+/// _declares` says that saving is not in the weight reads, which barely move at
+/// that length. So the line is drawn from the prefill rather than from the
+/// sweep, one step under the shortest prompt measured.
+///
+/// **What it has to exclude is everything a decode step and a speculative round
+/// dispatch**, and it is nowhere near them: one token is six rows over 256
+/// experts and the widest block the eight heads can propose is nine tokens,
+/// which is 54 — 0.02 and 0.2 rows an expert against this two.
+const RUNS_A_GROUPING: usize = 2;
 
 /// Threads one threadgroup of a dispatch holds.
 ///
@@ -196,6 +232,7 @@ pub enum MatmulError {
 pub struct PackedMatmul {
     kernel: Kernel,
     tiled: Kernel,
+    grouped: Kernel,
     /// The rows a tile of `tiled` holds, which is [`ROWS_A_TILE`] for the
     /// shipped source and whatever the sweep wrote into a mutant's prelude.
     rows_a_tile: usize,
@@ -234,6 +271,7 @@ impl PackedMatmul {
         Ok(Self {
             kernel: device.compile(source, ENTRY)?,
             tiled: device.compile(source, TILED_ENTRY)?,
+            grouped: device.compile(source, GROUPED_ENTRY)?,
             rows_a_tile,
         })
     }
@@ -247,12 +285,62 @@ impl PackedMatmul {
     /// — so the shape with nothing to win stays on the code that won what is
     /// already there, rather than carrying a tile's worth of registers to use
     /// one row of it.
-    fn entry(&self, tiled: bool, rows: usize, out_dim: usize) -> (&Kernel, usize) {
-        match tiled {
-            false => (&self.kernel, rows * out_dim),
-            true => (&self.tiled, rows.div_ceil(self.rows_a_tile) * out_dim),
+    fn entry(&self, layout: &Layout<'_>, rows: usize, out_dim: usize) -> (&Kernel, usize) {
+        let tiles = rows.div_ceil(self.rows_a_tile) * out_dim;
+        match layout {
+            Layout::Each => (&self.kernel, rows * out_dim),
+            Layout::Tiled => (&self.tiled, tiles),
+            Layout::Grouped { .. } => (&self.grouped, tiles),
         }
     }
+
+    /// Whether laying a call's rows out by the expert each named is worth the
+    /// dispatch that lays them out.
+    ///
+    /// **The question is the length of the runs the sort would produce**, which
+    /// is the rows over the experts they can name — where [`tiles`] asks the
+    /// same question of a layout nobody moved. A call with fewer rows than the
+    /// bank has experts sorts into runs of about one and has nothing for a tile
+    /// to share; the rows a prefill gives a routed bank are 6 a token against
+    /// 256 experts, so 97 tokens are runs of 2.3, 385 of nine and 769 of
+    /// eighteen. [`RUNS_A_GROUPING`] is where the line is and what it was drawn
+    /// from.
+    pub(crate) fn groups(&self, rows: usize, experts: usize) -> bool {
+        self.rows_a_tile >= 2 && rows >= experts.saturating_mul(RUNS_A_GROUPING)
+    }
+}
+
+/// Where a grouped call's permutation applies: to the rows it reads, or to the
+/// rows it writes.
+///
+/// **Both ends of a bank need it and only one end of each dispatch does.** The
+/// gate and up projections are handed the hidden state in the order the tokens
+/// are in and produce rows the activation and `down_proj` then read, so they
+/// gather on the way in and leave everything after them grouped; `down_proj`
+/// reads those grouped rows where they lie and scatters on the way out, so what
+/// it answers with is back in the order the weighting and the combine expect. A
+/// dispatch that did both would be undoing the grouping it was dispatched for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Through {
+    /// Row `i` reads row `order[i]` of the input and writes row `i`.
+    Gathered,
+    /// Row `i` reads row `i` of the input and writes row `order[i]`.
+    Scattered,
+}
+
+/// How a dispatch's rows are cut up between simdgroups, and the permutation the
+/// third way of cutting them reads.
+///
+/// The [`Arg`] rather than the buffer, because a grouped call's order is a
+/// binding like the expert list beside it — [`PackedBank::dispatch`] is handed
+/// both the same way and never learns where either came from.
+enum Layout<'a> {
+    /// One simdgroup an output element.
+    Each,
+    /// One simdgroup a tile of consecutive rows.
+    Tiled,
+    /// One simdgroup a tile of consecutive rows of the grouping.
+    Grouped { order: Arg<'a>, through: Through },
 }
 
 /// Whether a call's rows are laid out so that tiling them is worth a dispatch.
@@ -548,10 +636,23 @@ impl<'a> PackedBank<'a> {
         self.out_dim
     }
 
+    /// Whether a call of `rows` rows against this bank is worth sorting by
+    /// expert first — see [`PackedMatmul::groups`], which decides it, and which
+    /// needs the bank's own expert count to.
+    pub(crate) fn groups(&self, rows: usize) -> bool {
+        self.matmul.groups(rows, self.experts)
+    }
+
     /// The scalars the kernel's `Shape` struct declares, in its order — the
     /// caller's to hold, because they are read where the dispatch is encoded and
     /// an array made here would be gone by then.
-    fn shape(&self, rows: usize, per_source: usize, sources: usize) -> [u32; SHAPE_FIELDS] {
+    fn shape(
+        &self,
+        rows: usize,
+        per_source: usize,
+        sources: usize,
+        layout: &Layout<'_>,
+    ) -> [u32; SHAPE_FIELDS] {
         let resident = self.resident.borrow();
         let stride = self.out_dim * self.in_dim;
         [
@@ -567,6 +668,13 @@ impl<'a> PackedBank<'a> {
             extent(resident.scales.offset(), "where a bank's scales start"),
             extent(stride / CODES_PER_BYTE, "the packed bytes of an expert"),
             extent(stride / GROUP_SIZE, "the scale bytes of an expert"),
+            u32::from(matches!(
+                layout,
+                Layout::Grouped {
+                    through: Through::Scattered,
+                    ..
+                }
+            )),
         ]
     }
 
@@ -676,11 +784,54 @@ impl<'a> PackedBank<'a> {
             rows.div_ceil(per_source),
             self.in_dim
         );
-        // Untiled, and this is the one call site where that is not a choice:
-        // the list is in device memory and this side has not seen it, and what
-        // it holds is a token's `per_source` experts one after another — which
-        // is the one layout no tile can share a weight across.
-        self.dispatch(batch, rows, per_source, chosen.arg(), x, false)
+        // Untiled, because what the list holds is a token's `per_source`
+        // experts one after another — the one layout no tile can share a weight
+        // across, and the one [`PackedBank::encode_grouped`] moves the rows of.
+        self.dispatch(batch, rows, per_source, chosen.arg(), x, Layout::Each)
+    }
+
+    /// The same multiply over rows a dispatch already laid out expert by
+    /// expert, `per_source` rows of the *ungrouped* call reading each row of
+    /// the input.
+    ///
+    /// **This is the gather the routed bank never had.** Its rows are the same
+    /// rows [`PackedBank::encode_picked`] runs and its answers are the same
+    /// answers, row for row; what moved is the order the tile sees them in, so
+    /// that the rows naming one expert are consecutive and one weight read
+    /// serves up to [`ROWS_A_TILE`] of them. Which expert a row goes through is
+    /// [`Grouped::experts`](crate::Grouped) and is `chosen[order[i]]` — the
+    /// grouping cannot change it, and `a_grouping_moves_rows_and_never_the_
+    /// expert_a_row_named` is what says so.
+    ///
+    /// `through` says which end of this dispatch the permutation applies at,
+    /// and the two are not interchangeable — see [`Through`].
+    pub(crate) fn encode_grouped(
+        &self,
+        batch: &mut Batch<'_>,
+        grouped: &mut Grouped,
+        x: &mut Buffer<f32>,
+        per_source: usize,
+        through: Through,
+    ) -> Result<Pending, MatmulError> {
+        let _timed = profile::scope(Op::Encode);
+        let rows = grouped.order.len();
+        assert!(
+            per_source > 0,
+            "a row of a call reads some row of the input"
+        );
+        assert_eq!(
+            self.sources(x.len()),
+            rows.div_ceil(per_source),
+            "{} values are not {} rows of {}",
+            x.len(),
+            rows.div_ceil(per_source),
+            self.in_dim
+        );
+        let layout = Layout::Grouped {
+            order: grouped.order.arg(),
+            through,
+        };
+        self.dispatch(batch, rows, per_source, grouped.experts.arg(), x, layout)
     }
 
     /// The same multiply over rows a dispatch already left on the device, every
@@ -761,8 +912,11 @@ impl<'a> PackedBank<'a> {
         }
 
         let mut chosen = self.device.inline(experts)?;
-        let tiled = tiles(experts, self.matmul.rows_a_tile);
-        self.dispatch(batch, experts.len(), 1, chosen.arg(), x, tiled)
+        let layout = match tiles(experts, self.matmul.rows_a_tile) {
+            false => Layout::Each,
+            true => Layout::Tiled,
+        };
+        self.dispatch(batch, experts.len(), 1, chosen.arg(), x, layout)
     }
 
     /// How many rows of this bank's input width `values` is, which is what the
@@ -779,11 +933,16 @@ impl<'a> PackedBank<'a> {
 
     /// The dispatch itself, over an expert list wherever it lies.
     ///
-    /// `tiled` decides which entry runs it and nothing else about it: the two
-    /// take the same bindings, the same shape and the same expert list, and
-    /// answer the same values — see [`tiles`] for who can say yes to it and
-    /// `packed_matmul_rows` for why the answer does not depend on the caller
-    /// being right.
+    /// `layout` decides which entry runs it and nothing else about it: the
+    /// three take the same shape and the same expert list and answer the same
+    /// values — see [`tiles`] and [`PackedMatmul::groups`] for who can say yes
+    /// to each, and `packed_matmul_rows` for why the answer does not depend on
+    /// the caller being right about an expert list.
+    ///
+    /// **The grouped entry is the one that takes a seventh binding**, and the
+    /// two arms below are that difference stated where it is: a kernel that
+    /// reads no permutation is handed none, so nothing a decode step dispatches
+    /// grew an argument.
     fn dispatch(
         &self,
         batch: &mut Batch<'_>,
@@ -791,7 +950,7 @@ impl<'a> PackedBank<'a> {
         per_source: usize,
         chosen: Arg<'_>,
         x: &mut Buffer<f32>,
-        tiled: bool,
+        layout: Layout<'_>,
     ) -> Result<Pending, MatmulError> {
         if rows == 0 {
             return Ok(Pending::empty());
@@ -799,28 +958,35 @@ impl<'a> PackedBank<'a> {
 
         // The shape is read out of `resident` and so is built before it is
         // borrowed mutably for the binding below.
-        let fields = self.shape(rows, per_source, self.sources(x.len()));
+        let fields = self.shape(rows, per_source, self.sources(x.len()), &layout);
         let mut shape = self.device.inline(&fields)?;
         let mut resident = self.resident.borrow_mut();
         let resident = &mut *resident;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
 
-        let (kernel, elements) = self.matmul.entry(tiled, rows, self.out_dim);
+        let (kernel, elements) = self.matmul.entry(&layout, rows, self.out_dim);
         let grid = Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP);
-        let moves = self.moves(rows, x.len(), tiled);
-        batch.add(
-            kernel,
-            &[
-                shape.arg(),
-                chosen,
-                x.arg(),
-                resident.codes.arg(),
-                resident.scales.arg(),
-                out.arg(),
-            ],
-            grid,
-            moves,
-        )?;
+        let moves = self.moves(rows, x.len(), &layout);
+        let bound = [
+            shape.arg(),
+            chosen,
+            x.arg(),
+            resident.codes.arg(),
+            resident.scales.arg(),
+            out.arg(),
+        ];
+        match layout {
+            Layout::Grouped { order, .. } => {
+                let [shape, chosen, x, codes, scales, written] = bound;
+                batch.add(
+                    kernel,
+                    &[shape, chosen, x, codes, scales, written, order],
+                    grid,
+                    moves,
+                )?;
+            }
+            Layout::Each | Layout::Tiled => batch.add(kernel, &bound, grid, moves)?,
+        }
 
         Ok(Pending { out: Some(out) })
     }
@@ -845,20 +1011,49 @@ impl<'a> PackedBank<'a> {
     /// rows are one run, and one tile in ninety-six for a shared bank at 385
     /// tokens.
     ///
+    /// **A grouped call is charged the other way round, and it has to be.** Its
+    /// runs are as long as the routing made them, so a tile boundary falls
+    /// inside a run far more often than at the end of one — at 97 tokens a
+    /// routed bank's runs are 2.3 rows and nearly every tile straddles. What
+    /// this side can say is a bound rather than a count: there is at most one
+    /// straddling tile per run, a run per expert, and a straddling tile reads
+    /// [`ROWS_A_TILE`] weights where a uniform one reads one. So a grouped call
+    /// is charged the *worst* layout its shape allows, which is never below what
+    /// it reads — where charging one weight a tile would be a figure that
+    /// flattered the change this kernel exists for.
+    ///
+    /// It is loose, and how loose is measured rather than argued:
+    /// `what_a_grouped_call_reads_against_what_it_declares` puts it 0.2% above
+    /// the truth at 97 tokens, 24% at 385 and 12% at 769. Nothing on this side
+    /// can narrow it — the expert each row named is in device memory and was
+    /// never read back.
+    ///
     /// The weight is charged as the bytes it is packed into rather than the
     /// values it holds — a code is half a byte and a group of 32 codes shares
     /// one scale byte — because the whole of this kernel is that nothing decodes
     /// it on the way. Beside it, the input, the output, and the one expert index
     /// a row is read through, which a bank's own dispatch leaves on the device
     /// and a projection's travels in the command buffer.
-    fn moves(&self, rows: usize, values: usize, tiled: bool) -> usize {
-        let read = match tiled {
-            false => rows,
-            true => rows.div_ceil(self.matmul.rows_a_tile),
+    fn moves(&self, rows: usize, values: usize, layout: &Layout<'_>) -> usize {
+        let tiles = rows.div_ceil(self.matmul.rows_a_tile);
+        let read = match layout {
+            Layout::Each => rows,
+            Layout::Tiled => tiles,
+            Layout::Grouped { .. } => rows.min(
+                tiles + (self.matmul.rows_a_tile - 1) * tiles.min(self.experts.saturating_sub(1)),
+            ),
         };
         let elements = read * self.out_dim * self.in_dim;
         let weight = elements * BITS / u8::BITS as usize + elements / GROUP_SIZE;
-        weight + size_of::<f32>() * (values + rows * self.out_dim) + size_of::<u32>() * rows
+        // A grouped call reads the order beside the expert list, one index a
+        // row of each.
+        let indices = match layout {
+            Layout::Grouped { .. } => 2,
+            Layout::Each | Layout::Tiled => 1,
+        };
+        weight
+            + size_of::<f32>() * (values + rows * self.out_dim)
+            + size_of::<u32>() * indices * rows
     }
 }
 
@@ -1021,14 +1216,16 @@ constant uint BYTES_PER_LANE = {BYTES_PER_LANE};
 constant uint EXPONENT_SHIFT = {EXPONENT_SHIFT};
 constant uint ROWS_A_TILE = {ROWS_A_TILE};
 constant float ELEMENTS[] = {{ {} }};
-{BODY}",
+{BODY}{}{}",
         (1u32 << BITS) - 1,
         elements.join(", "),
+        tiled_entry(TILED_ENTRY, false),
+        tiled_entry(GROUPED_ENTRY, true),
     )
 }
 
 /// How many `uint`s the kernel's `Shape` struct declares.
-const SHAPE_FIELDS: usize = 9;
+const SHAPE_FIELDS: usize = 10;
 
 /// Everything of the kernel that the format does not decide.
 ///
@@ -1090,6 +1287,10 @@ struct Shape {
     uint scale_base;
     uint code_stride;
     uint scale_stride;
+    /// Which end of a grouped call the permutation applies at: 0 names the row
+    /// each of the call's rows reads, 1 names the row each of them writes. Read
+    /// by `packed_matmul_grouped` and by nothing else.
+    uint scatters;
 };
 
 /// `out[i] = x[(i / per_source) % sources] @ w[experts[i]]^T` over an
@@ -1179,13 +1380,87 @@ inline uint tile_source(constant Shape &shape, uint row) {
 /// product enters any sum has moved; what moved is how many sums one load
 /// feeds. `a_tiled_dispatch_answers_what_the_untiled_one_answers` is where that
 /// is held.
-kernel void packed_matmul_rows(
+"#;
+
+/// The tiled kernel, which is emitted twice: once over the rows as the caller
+/// laid them out and once over a permutation a dispatch wrote.
+///
+/// **Written once and compiled twice.** The two differ in three places — the
+/// binding the order arrives in, the row of the input a tile's `r`th row reads,
+/// and the row of the output it writes — and in nothing else at all: the same
+/// tile check, the same fallback, the same walk, the same reduction. Sharing
+/// them at *run* time is what would cost something, because everything a tile
+/// carries has to stay in registers and a body reached through a function is a
+/// body whose arrays the compiler may put somewhere else. Sharing them here
+/// costs nothing and is the only reading of the walk.
+///
+/// **`packed_matmul_grouped` is the one that reaches a routed bank**, and what
+/// it reaches it with is an indirection at one end of the call. `gate` and `up`
+/// read the hidden state through `order` and leave their rows grouped, the
+/// activation between them is elementwise and does not care, and `down` reads
+/// those grouped rows where they lie and writes each of them back to the row the
+/// router named — so the tensor the weighting behind it reads is in the order it
+/// was always in, and nothing downstream of the bank knows the rows were ever
+/// moved. `shape.scatters` is which of the two a call is.
+///
+/// **The expert list is the grouping's**, not the router's: `experts[i]` is
+/// `chosen[order[i]]`, which `group_by_expert` writes in the same dispatch that
+/// writes `order`. So the question the tile asks — do these rows name one weight
+/// — is asked of the sorted list, which is where the runs are. And a tile that
+/// straddles two runs is correct and saves nothing, exactly as it is for the
+/// ungrouped entry, so neither of the two assumes anything the other does not.
+fn tiled_entry(entry: &str, grouped: bool) -> String {
+    let (order, reads, writes) = match grouped {
+        false => ("", "row", "row"),
+        true => (
+            "\n    device const uint *order [[buffer(6)]],",
+            "shape.scatters ? row : order[row]",
+            "shape.scatters ? order[row] : row",
+        ),
+    };
+    TILE.replace("__ENTRY__", entry)
+        .replace("__ORDER__", order)
+        .replace("__READS__", reads)
+        .replace("__WRITES__", writes)
+}
+
+/// The tiled kernel with the three expressions [`tiled_entry`] decides written
+/// as placeholders, which is what makes one walk serve both entries.
+const TILE: &str = r#"
+/// One simdgroup per `ROWS_A_TILE` consecutive rows of one column rather than
+/// per output element.
+///
+/// **The whole of what this buys is that the weight row is read once.**
+/// `packed_matmul` walks the weight each of a call's rows names from end to
+/// end, so a call of `n` rows against one expert reads that expert `n` times —
+/// which is a decode step's price paid once a token by a prefill that could
+/// have paid it once. Here the walk is shared: one lane loads a packed byte,
+/// decodes its two codes, and multiplies them against the `ROWS_A_TILE` rows of
+/// `x` that want them.
+///
+/// **Only rows naming the same expert can share it, and the check is here
+/// rather than in the caller's head.** A tile whose rows disagree falls back to
+/// walking each row's own weight, which is exactly what `packed_matmul` does
+/// and is the same arithmetic — so a caller that tiled a routed bank gets a
+/// correct answer and no saving, and correctness never rests on a claim about
+/// an expert list this side may not have seen.
+///
+/// **The answer is the untiled kernel's bit for bit and that is by
+/// construction**, not within a tolerance. An output element is still one
+/// simdgroup's `simd_sum` over lanes that still walk the row in `BYTES_PER_LANE`
+/// chunks from the same byte in the same stride, and a chunk is still summed
+/// into `dot` and then into `sum` under one scale. Nothing about the order any
+/// product enters any sum has moved; what moved is how many sums one load
+/// feeds. `a_tiled_dispatch_answers_row_for_row_what_the_untiled_one_answers`
+/// and `a_grouped_dispatch_answers_what_the_dispatch_it_reorders_answers` are
+/// where that is held, one for each entry.
+kernel void __ENTRY__(
     constant Shape &shape [[buffer(0)]],
     device const uint *experts [[buffer(1)]],
     device const float *x [[buffer(2)]],
     device const uchar *codes [[buffer(3)]],
     device const uchar *scales [[buffer(4)]],
-    device float *out [[buffer(5)]],
+    device float *out [[buffer(5)]],__ORDER__
     uint position [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint width [[threads_per_simdgroup]]
@@ -1216,14 +1491,14 @@ kernel void packed_matmul_rows(
                 codes + shape.code_base + (ulong)each * shape.code_stride + (ulong)col * bytes,
                 scales + shape.scale_base + (ulong)each * shape.scale_stride
                     + (ulong)col * scale_bytes,
-                x + tile_source(shape, row),
+                x + tile_source(shape, __READS__),
                 bytes,
                 lane,
                 width
             );
             sum = simd_sum(sum);
             if (lane == 0) {
-                out[row * shape.out_dim + col] = sum;
+                out[(__WRITES__) * shape.out_dim + col] = sum;
             }
         }
         return;
@@ -1240,7 +1515,8 @@ kernel void packed_matmul_rows(
     uint sources[ROWS_A_TILE];
     float sums[ROWS_A_TILE];
     for (uint r = 0; r < ROWS_A_TILE; ++r) {
-        sources[r] = tile_source(shape, first + min(r, rows - 1));
+        const uint row = first + min(r, rows - 1);
+        sources[r] = tile_source(shape, __READS__);
         sums[r] = 0.0f;
     }
 
@@ -1266,10 +1542,14 @@ kernel void packed_matmul_rows(
         }
     }
 
+    // The order is read again here rather than carried through the loop above:
+    // an index a tile holds is a register its rows compete for, and this one is
+    // wanted once a row of the tile where the sources are wanted once a byte.
     for (uint r = 0; r < rows; ++r) {
+        const uint row = first + r;
         const float sum = simd_sum(sums[r]);
         if (lane == 0) {
-            out[(first + r) * shape.out_dim + col] = sum;
+            out[(__WRITES__) * shape.out_dim + col] = sum;
         }
     }
 }
@@ -1390,6 +1670,7 @@ mod tests {
     use inkling_core::quant::dequantize_blocks;
     use inkling_core::weights::PackedRows;
 
+    use crate::grouping::ExpertGrouping;
     use crate::testing::{device, drift};
 
     /// The reduction the checkpoint's projections are: `lm_head`, every
@@ -2130,6 +2411,180 @@ mod tests {
         assert_ne!(row(0), row(SOURCES), "the expert is read off the row");
     }
 
+    /// The routing a grouped case is dispatched over: `TOP_K` experts a token,
+    /// no two of a token's the same, and enough tokens that every expert of the
+    /// bank is named several times over.
+    ///
+    /// The shape a routed bank runs at, cut down: 6 of 256 becomes 2 of 3, and
+    /// what carries over is the one property that matters — a token's rows name
+    /// different experts, so no two consecutive rows of the ungrouped call ever
+    /// share a weight.
+    const TOP_K: usize = 2;
+    const TOKENS: usize = 7;
+
+    fn routing(experts: usize) -> Vec<u32> {
+        (0..TOKENS)
+            .flat_map(|token| (0..TOP_K).map(move |slot| ((token + slot * 2) % experts) as u32))
+            .collect()
+    }
+
+    /// Which shapes are worth laying out by expert first, decided on the row
+    /// and expert counts alone.
+    ///
+    /// **The shapes that must say no are the ones this milestone is under a
+    /// constraint about**, and they are written out here as the numbers they
+    /// are rather than described. A decode step's routed bank is six rows over
+    /// 256 experts and the widest block the eight multi-token heads can propose
+    /// is nine tokens, which is 54 — both sort into runs of one, where a tile
+    /// shares nothing and the sort is a dispatch spent for it.
+    ///
+    /// The shapes that say yes are the prefill's, and the shortest of them is
+    /// what [`RUNS_A_GROUPING`] was set from: 97 tokens are 582 rows and 2.3 an
+    /// expert.
+    #[test]
+    fn only_a_prefills_routed_bank_is_worth_laying_out_by_expert() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        const ROUTED: usize = 256;
+        const ROUTED_TOP_K: usize = 6;
+        let tokens = |tokens: usize| matmul.groups(tokens * ROUTED_TOP_K, ROUTED);
+
+        assert!(!tokens(1), "a decode step's routed bank");
+        assert!(!tokens(9), "the widest block a speculative round proposes");
+        assert!(tokens(97), "the shortest prefill this file measures");
+        assert!(tokens(385));
+        assert!(tokens(769));
+
+        // The line itself, from either side, and that no bank is grouped at a
+        // height below its own expert count however many rows it has.
+        assert!(tokens(86) && !tokens(85), "the line is at 86 tokens");
+        assert!(
+            !matmul.groups(ROUTED, ROUTED),
+            "a call of one row an expert sorts into runs of one"
+        );
+    }
+
+    /// **A grouped dispatch answers what the ungrouped one answers, row for
+    /// row and bit for bit** — the rows having been moved through the tile and
+    /// back.
+    ///
+    /// This is the claim the whole change rests on, and it is the same claim
+    /// `a_tiled_dispatch_answers_row_for_row_what_the_untiled_one_answers`
+    /// makes one step earlier: nothing about the order any product enters any
+    /// sum moved, so a bound here would be hiding the one mistake this can
+    /// make. What moved is which rows a weight read is shared across, and — new
+    /// here — which row of the input a row of the call reads and which row of
+    /// the output it writes.
+    ///
+    /// **Both ends, because they are two different dispatches of the bank.**
+    /// `gate` and `up` gather: the rows arrive in the router's order and leave
+    /// in the grouping's, so what is checked is that grouped row `i` is the
+    /// ungrouped row `order[i]`. `down` scatters: the rows arrive grouped and
+    /// leave in the router's order, so what is checked is that the answer is
+    /// the ungrouped one exactly, in place.
+    ///
+    /// The routing is the one a router writes — a token's slots naming
+    /// different experts — so the ungrouped call is the untiled kernel by
+    /// [`tiles`]'s own rule, which is what makes it the before of this change
+    /// rather than a tiled kernel imitating it.
+    #[test]
+    fn a_grouped_dispatch_answers_what_the_dispatch_it_reorders_answers() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const EXPERTS: usize = 3;
+        const ROWS: usize = TOKENS * TOP_K;
+
+        let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, ROWS);
+        let bank = PackedBank::upload(
+            &device,
+            &matmul,
+            EXPERTS,
+            IN_DIM,
+            OUT_DIM,
+            &case.packed(),
+            &case.scales,
+        )
+        .expect("the bank's shapes pair");
+
+        let chosen = routing(EXPERTS);
+        assert!(
+            !tiles(&chosen, ROWS_A_TILE),
+            "a routing a tile could already reach would prove nothing"
+        );
+        let (order, grouped) = grouping
+            .group(&device, &chosen, EXPERTS)
+            .expect("the dispatch completes");
+        assert_ne!(
+            order,
+            (0..ROWS as u32).collect::<Vec<u32>>(),
+            "the identity"
+        );
+        assert!(
+            grouped
+                .chunk_by(|a, b| a == b)
+                .any(|run| run.len() > ROWS_A_TILE),
+            "no run outlasts a tile, so nothing here exercises a whole one: {grouped:?}"
+        );
+
+        // What `gate` and `up` are handed: one row of the hidden state per
+        // token, read `TOP_K` times over.
+        let tokens = &case.x[..TOKENS * IN_DIM];
+        let ungrouped = |x: &[f32], per_source: usize| {
+            let mut chosen = device.buffer(&chosen).expect("the selection uploads");
+            let mut x = device.buffer(x).expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let pending = bank
+                .encode_picked(&mut batch, &mut chosen, &mut x, per_source)
+                .expect("the dispatch encodes");
+            batch.wait().expect("the dispatch completes");
+            pending.take()
+        };
+        let regrouped = |x: &[f32], per_source: usize, through: Through| {
+            let mut selection = device.buffer(&chosen).expect("the selection uploads");
+            let mut x = device.buffer(x).expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let mut sorted = grouping
+                .encode(&mut batch, &mut selection, EXPERTS)
+                .expect("the grouping encodes");
+            let pending = bank
+                .encode_grouped(&mut batch, &mut sorted, &mut x, per_source, through)
+                .expect("the dispatch encodes");
+            batch.wait().expect("the dispatch completes");
+            pending.take()
+        };
+        let row = |rows: &[f32], i: usize| rows[i * OUT_DIM..][..OUT_DIM].to_vec();
+
+        let want = ungrouped(tokens, TOP_K);
+        let gathered = regrouped(tokens, TOP_K, Through::Gathered);
+        assert_eq!(gathered.len(), want.len());
+        for (at, from) in order.iter().enumerate() {
+            assert_eq!(
+                row(&gathered, at),
+                row(&want, *from as usize),
+                "grouped row {at} is the call's row {from}"
+            );
+        }
+
+        // What `down` is handed: the rows the pair before it produced, which are
+        // already in the grouping's order.
+        let want = ungrouped(&case.x, 1);
+        let sorted: Vec<f32> = order
+            .iter()
+            .flat_map(|from| case.x[*from as usize * IN_DIM..][..IN_DIM].to_vec())
+            .collect();
+        let scattered = regrouped(&sorted, 1, Through::Scattered);
+        assert_eq!(
+            scattered, want,
+            "the rows did not come back where they went"
+        );
+        assert_ne!(
+            row(&want, 0),
+            row(&want, 1),
+            "rows that agreed would prove nothing"
+        );
+    }
+
     /// The one argument a real call sends past the inline threshold.
     ///
     /// A shape is a few dozen bytes and always travels in the command buffer;
@@ -2493,6 +2948,188 @@ mod tests {
             }
             eprintln!("{line}");
         }
+    }
+
+    /// How many weight rows a call whose experts are `experts` actually reads,
+    /// counted the way `packed_matmul_rows` and `packed_matmul_grouped` read
+    /// them: one for a tile whose rows agree about the expert, and one per row
+    /// for a tile whose rows do not.
+    ///
+    /// The oracle for what [`PackedBank::moves`] declares, and the only thing
+    /// that can be: the declared figure charges one weight a tile, and what a
+    /// grouped call reads depends on where the runs the routing made happen to
+    /// fall against the tile boundaries — which is a property of the selection
+    /// and not of the shape.
+    fn weights_read(experts: &[u32], rows_a_tile: usize) -> usize {
+        experts
+            .chunks(rows_a_tile)
+            .map(|tile| match tile.iter().all(|expert| *expert == tile[0]) {
+                true => 1,
+                false => tile.len(),
+            })
+            .sum()
+    }
+
+    /// A selection of the shape a router writes at prefill: `TOP_K` experts a
+    /// token out of `experts`, no two of a token's the same.
+    fn prefill_routing(tokens: usize, experts: usize, top_k: usize) -> Vec<u32> {
+        (0..tokens)
+            .flat_map(|token| {
+                let first = token * 37 % experts;
+                (0..top_k).map(move |slot| ((first + slot * 41) % experts) as u32)
+            })
+            .collect()
+    }
+
+    /// **What a grouped call actually reads against what it declares**, which is
+    /// the one figure in the bandwidth table this side cannot state exactly.
+    ///
+    /// [`PackedBank::moves`] charges a grouped call the worst layout its shape
+    /// allows — one straddling tile per expert, each reading [`ROWS_A_TILE`]
+    /// weights — because the expert each row named is in device memory and this
+    /// side never sees it. This is how loose that is against the layout the
+    /// device actually produces, at the three shapes a prefill gives a routed
+    /// bank, beside the untiled call the grouping replaces.
+    ///
+    /// **The 97-token row is the finding and it is a negative one.** At 2.3 rows
+    /// an expert the runs are shorter than a tile, nearly every tile straddles,
+    /// and a grouped call reads 581 weights where the untiled one reads 582 —
+    /// so whatever a 97-token prefill gains from being grouped, it is not bytes.
+    /// The saving arrives at 385 and 769, where the runs are 9 and 18 rows.
+    ///
+    /// Nothing asserts a ratio. What is asserted is that the declared figure is
+    /// a bound in the direction it claims: never below what the kernel reads,
+    /// and never above what the untiled call reads — the first is what keeps the
+    /// bandwidth column from flattering this change, and the second is what
+    /// keeps it from reporting a loss the kernel cannot have.
+    #[test]
+    fn what_a_grouped_call_reads_against_what_it_declares() {
+        let Some(device) = device() else { return };
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const EXPERTS: usize = 256;
+        const ROUTED_TOP_K: usize = 6;
+
+        eprintln!(
+            "  {:<14}{:>8}{:>12}{:>10}{:>10}{:>12}",
+            "tokens", "rows", "a run", "declared", "read", "untiled"
+        );
+        for tokens in [97usize, 385, 769] {
+            let chosen = prefill_routing(tokens, EXPERTS, ROUTED_TOP_K);
+            let (_, grouped) = grouping
+                .group(&device, &chosen, EXPERTS)
+                .expect("the dispatch completes");
+
+            let rows = chosen.len();
+            let tiles = rows.div_ceil(ROWS_A_TILE);
+            let declared = rows.min(tiles + (ROWS_A_TILE - 1) * tiles.min(EXPERTS - 1));
+            let read = weights_read(&grouped, ROWS_A_TILE);
+            let runs = grouped.chunk_by(|a, b| a == b).count();
+            eprintln!(
+                "  {:<14}{rows:>8}{:>12}{declared:>10}{read:>10}{rows:>12}",
+                format!("{tokens}"),
+                format!("{:.1}", rows as f64 / runs as f64),
+            );
+
+            assert!(
+                read <= declared && declared <= rows,
+                "{tokens} tokens: read {read}, declared {declared}, untiled {rows}"
+            );
+        }
+    }
+
+    /// **What grouping a bank's rows by expert is worth at each length of run
+    /// it produces**, and the sweep [`RUNS_A_GROUPING`] was chosen from.
+    ///
+    /// The rows a routed bank runs are the tokens six times over and the runs
+    /// the sort makes of them are those over the bank's experts — 2.3 rows an
+    /// expert at 97 tokens, 9 at 385 and 18 at 769 — so the run length is what a
+    /// grouping is worth at, and the token count is only how a caller reaches
+    /// one. That is what this sweeps, over a bank narrow enough in experts to
+    /// hold in a test and a shape wide enough to be the one a layer dispatches.
+    ///
+    /// **A run of one is the case that must not pay**, because it is a decode
+    /// step's: six rows over 256 experts sort into runs of one and a tile of
+    /// them shares nothing at all, so what the column says is the price of the
+    /// sort and the tile's registers with nothing bought.
+    ///
+    /// The same caution as the two sweeps above, and harder: one weight is
+    /// dispatched against `CALLS` times in a row, so the table ranks the run
+    /// lengths and does not state a bandwidth.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_grouping_a_banks_rows_by_expert_is_worth_at_each_run_length() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const CALLS: usize = 8;
+        const ROUNDS: usize = 3;
+        const EXPERTS: usize = 16;
+        const IN: usize = 4096;
+        const OUT: usize = 2048;
+        const RUNS: [usize; 7] = [1, 2, 3, 4, 6, 9, 18];
+
+        eprintln!(
+            "  {:<16}{:>8}{:>14}{:>14}{:>10}",
+            "rows an expert", "rows", "ungrouped", "grouped", "reads"
+        );
+        for run in RUNS {
+            let rows = EXPERTS * run;
+            let case = Case::seeded(1, IN, EXPERTS * OUT, rows);
+            let bank = PackedBank::upload(
+                &device,
+                &matmul,
+                EXPERTS,
+                IN,
+                OUT,
+                &case.packed(),
+                &case.scales,
+            )
+            .expect("the bank's shapes pair");
+
+            // Round-robin, which is a routed bank's own layout: consecutive rows
+            // name different experts, so no tile can share a read until the sort
+            // moves them.
+            let chosen: Vec<u32> = (0..rows).map(|row| (row % EXPERTS) as u32).collect();
+            let mut x = device.buffer(&case.x).expect("the rows upload");
+            let mut best = [Duration::MAX; 2];
+            for _ in 0..ROUNDS {
+                for (at, grouped) in [false, true].into_iter().enumerate() {
+                    let taken = crate::testing::device_time(&device, CALLS, |batch| {
+                        let mut picked = device.buffer(&chosen).expect("the selection uploads");
+                        match grouped {
+                            false => bank
+                                .encode_picked(batch, &mut picked, &mut x, 1)
+                                .expect("the dispatch encodes"),
+                            true => {
+                                let mut sorted = grouping
+                                    .encode(batch, &mut picked, EXPERTS)
+                                    .expect("the grouping encodes");
+                                bank.encode_grouped(
+                                    batch,
+                                    &mut sorted,
+                                    &mut x,
+                                    1,
+                                    Through::Gathered,
+                                )
+                                .expect("the dispatch encodes")
+                            }
+                        };
+                    });
+                    best[at] = best[at].min(taken);
+                }
+            }
+
+            let mut sorted = chosen.clone();
+            sorted.sort_unstable();
+            eprintln!(
+                "  {:<16}{rows:>8}{:>14}{:>14}{:>10}",
+                run,
+                format!("{:.0}µs", 1e6 * best[0].as_secs_f64()),
+                format!("{:.0}µs", 1e6 * best[1].as_secs_f64()),
+                format!("{}/{rows}", weights_read(&sorted, ROWS_A_TILE)),
+            );
+        }
+        assert!(RUNS.contains(&RUNS_A_GROUPING), "{RUNS_A_GROUPING}");
     }
 
     /// The shipped kernel with a different [`ROWS_A_TILE`] written into its

@@ -38,8 +38,8 @@ use anyhow::{Context, Result};
 use inkling_core::mtp::CheckpointHeads;
 use inkling_core::{Checkpoint, CheckpointWeights, Config, TextConfig};
 use inkling_metal::{
-    DenseMatmul, Device, ExpertKernels, LayerKernels, ModelHeads, ModelLayers, MoeCombine,
-    PackedProjection, Router, RouterWeights, StackShape, SwiGlu,
+    DenseMatmul, Device, ExpertGrouping, ExpertKernels, LayerKernels, ModelHeads, ModelLayers,
+    MoeCombine, PackedProjection, Router, RouterWeights, StackShape, SwiGlu,
 };
 
 use crate::LABEL;
@@ -66,6 +66,7 @@ pub struct Gpu {
     dense: DenseMatmul,
     swiglu: SwiGlu,
     router: Router,
+    grouping: ExpertGrouping,
     weights: RouterWeights,
     combine: MoeCombine,
 }
@@ -77,6 +78,7 @@ impl Gpu {
         let dense = DenseMatmul::new(&device).context("compiling the dense matmul")?;
         let swiglu = SwiGlu::new(&device).context("compiling the swiglu")?;
         let router = Router::new(&device).context("compiling the router")?;
+        let grouping = ExpertGrouping::new(&device).context("compiling the expert grouping")?;
         let weights = RouterWeights::new(&device).context("compiling the router's weighting")?;
         let combine = MoeCombine::new(&device).context("compiling the combine")?;
         Ok(Self {
@@ -85,6 +87,7 @@ impl Gpu {
             dense,
             swiglu,
             router,
+            grouping,
             weights,
             combine,
         })
@@ -98,6 +101,7 @@ impl Gpu {
             dense: &self.dense,
             swiglu: &self.swiglu,
             router: &self.router,
+            grouping: &self.grouping,
             weights: &self.weights,
             combine: &self.combine,
         }

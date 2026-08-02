@@ -61,8 +61,9 @@ use crate::buffer::Buffer;
 use crate::combine::MoeCombine;
 use crate::dense::{DenseMatmul, DenseWeight};
 use crate::device::Device;
+use crate::grouping::{ExpertGrouping, Grouped};
 use crate::kernel::Batch;
-use crate::matmul::{MatmulError, PackedBank, PackedMatmul, Pending};
+use crate::matmul::{MatmulError, PackedBank, PackedMatmul, Pending, Through};
 use crate::router::{LayerRouter, Router, RouterWeights};
 use crate::swiglu::SwiGlu;
 
@@ -270,6 +271,45 @@ impl<'a> ExpertBanks<'a> {
             .encode_picked(batch, chosen, &mut activated, 1)
     }
 
+    /// The same bank over rows a dispatch already laid out expert by expert,
+    /// `per_source` rows of the *ungrouped* call reading each row of `x`.
+    ///
+    /// **One sort serves all three dispatches and the rows are still never laid
+    /// out.** `gate` and `up` read the hidden state at the stride the routing
+    /// implies, through the order; the activation between them is elementwise
+    /// and inherits it; and `down` reads those rows where they lie and writes
+    /// each of them back to the row the router named. So what this answers with
+    /// is what [`ExpertBanks::encode_picked`] answers with, in the order it
+    /// answers it in — see `packed_matmul_grouped`.
+    pub(crate) fn encode_grouped(
+        &self,
+        batch: &mut Batch<'_>,
+        grouped: &mut Grouped,
+        x: &mut Buffer<f32>,
+        per_source: usize,
+    ) -> Result<Pending, MatmulError> {
+        let glu = [
+            self.gate_proj
+                .encode_grouped(batch, grouped, x, per_source, Through::Gathered)?,
+            self.up_proj
+                .encode_grouped(batch, grouped, x, per_source, Through::Gathered)?,
+        ];
+        let Some(mut activated) = self.activated(batch, glu)? else {
+            return Ok(Pending::empty());
+        };
+        self.down_proj
+            .encode_grouped(batch, grouped, &mut activated, 1, Through::Scattered)
+    }
+
+    /// Whether a call of `rows` rows against this bank is worth sorting by
+    /// expert first — see [`PackedMatmul::groups`], which decides it.
+    ///
+    /// Asked of `gate_proj` because [`ExpertBanks::new`] is what says the three
+    /// banks hold the same experts, so any of them answers for the bank.
+    pub(crate) fn groups(&self, rows: usize) -> bool {
+        self.gate_proj.groups(rows)
+    }
+
     pub fn device(&self) -> &'a Device {
         self.gate_proj.device()
     }
@@ -337,6 +377,9 @@ pub struct ExpertKernels<'a> {
     pub swiglu: &'a SwiGlu,
     /// The top-k over what the gate produced.
     pub router: &'a Router,
+    /// The sort that lays a prefill's routed rows out expert by expert, so that
+    /// the tile behind it has a run of rows to share a weight read across.
+    pub grouping: &'a ExpertGrouping,
     /// The softmax over the eight logits that top-k picked out — the other half
     /// of the router, and a second entry point rather than a second half of the
     /// first.
@@ -367,6 +410,9 @@ pub struct LayerExperts<'a> {
     shared: ExpertBanks<'a>,
     gate: DenseWeight<'a>,
     router: LayerRouter<'a>,
+    /// The sort in front of the routed bank, dispatched only where the rows are
+    /// long enough for it to pay — see [`ExpertBanks::groups`].
+    grouping: &'a ExpertGrouping,
     /// The two banks' rows weighted and summed, which is the layer's answer.
     combine: &'a MoeCombine,
 }
@@ -490,15 +536,42 @@ impl<'a> LayerExperts<'a> {
         let shared = self
             .shared
             .encode_repeated(batch, &self.shared_chosen(tokens), x)?;
-        let routed =
-            self.routed
-                .encode_picked(batch, &mut picked, x, self.router.config().top_k)?;
+        let routed = self.routed_rows(batch, &mut picked, x, tokens)?;
         Ok(Dispatched {
             logits,
             picked,
             shared,
             routed,
         })
+    }
+
+    /// The routed bank's rows, laid out by expert first where that pays.
+    ///
+    /// **The sort is a dispatch between the top-k and the bank**, reading what
+    /// the one wrote and writing what the other reads, so a layer that takes it
+    /// is still one command buffer — which is the constraint M8 left behind
+    /// about moving work near the router, and is what says this costs no
+    /// submission.
+    ///
+    /// **A decode step never takes it.** Six rows over 256 experts sort into
+    /// runs of one and a tile of them shares nothing, so [`ExpertBanks::groups`]
+    /// is false for every shape a step or a speculative round dispatches and
+    /// the two dispatches below are the same two they have always been.
+    fn routed_rows(
+        &self,
+        batch: &mut Batch<'_>,
+        picked: &mut Buffer<u32>,
+        x: &mut Buffer<f32>,
+        tokens: usize,
+    ) -> Result<Pending, MatmulError> {
+        let top_k = self.router.config().top_k;
+        if !self.routed.groups(self.router.assignments(tokens)) {
+            return self.routed.encode_picked(batch, picked, x, top_k);
+        }
+        let mut grouped = self
+            .grouping
+            .encode(batch, picked, self.router.config().n_routed)?;
+        self.routed.encode_grouped(batch, &mut grouped, x, top_k)
     }
 
     /// The expert each of the shared bank's rows goes through, which is
@@ -570,6 +643,7 @@ impl<'a> LayerExperts<'a> {
                 &banks.correction_bias,
                 banks.global_scale,
             )?,
+            grouping: kernels.grouping,
             combine: kernels.combine,
         })
     }
@@ -730,6 +804,7 @@ mod tests {
         dense: DenseMatmul,
         swiglu: SwiGlu,
         router: Router,
+        grouping: ExpertGrouping,
         weights: RouterWeights,
         combine: MoeCombine,
     }
@@ -741,6 +816,7 @@ mod tests {
                 dense: DenseMatmul::new(device).expect("the dense matmul compiles"),
                 swiglu: SwiGlu::new(device).expect("the swiglu compiles"),
                 router: Router::new(device).expect("the router compiles"),
+                grouping: ExpertGrouping::new(device).expect("the grouping compiles"),
                 weights: RouterWeights::new(device).expect("the weighting compiles"),
                 combine: MoeCombine::new(device).expect("the combine compiles"),
             }
@@ -768,6 +844,7 @@ mod tests {
                     GLOBAL_SCALE,
                 )
                 .expect("the router stands up"),
+                grouping: &self.grouping,
                 combine: &self.combine,
             }
         }
@@ -1175,6 +1252,87 @@ mod tests {
         );
         assert_eq!(whole.0, 12, "the layer's dispatches");
         assert_eq!(whole.1, 1, "the command buffers they went in");
+    }
+
+    /// **The routed bank's rows through a grouping are the routed bank's rows,
+    /// bit for bit** — and one dispatch more, in the same command buffer.
+    ///
+    /// Both halves are the change. That the values agree says the sort moved
+    /// the rows and nothing else: every row still goes through the expert the
+    /// selection named it, still reads the token's own hidden state, and still
+    /// lands on its own row of the answer. That the submission count does not
+    /// move is M8's constraint met — the sort reads what the top-k wrote and
+    /// writes what the bank reads, so putting it between them costs a dispatch
+    /// and no round trip.
+    ///
+    /// Exact rather than within a tolerance, for the reason
+    /// `a_grouped_dispatch_answers_what_the_dispatch_it_reorders_answers` is:
+    /// nothing about the order any product enters any sum moved.
+    #[test]
+    fn a_grouped_bank_answers_what_the_ungrouped_bank_answers() {
+        let Some(device) = device() else { return };
+        let kernels = Kernels::compile(&device);
+        let banks = Banks::new();
+        let bank = banks
+            .upload(
+                &device,
+                &kernels.matmul,
+                &kernels.swiglu,
+                &banks.gate,
+                &banks.up,
+            )
+            .expect("the three banks pair");
+
+        // Tokens enough that the rows sort into runs a tile can share, which is
+        // what `ExpertBanks::groups` is asking about — and a routing whose
+        // slots name different experts, which is the layout no tile reaches.
+        const TOKENS: usize = 7;
+        let assignments = TOKENS * CONFIG.top_k;
+        assert!(
+            bank.groups(assignments),
+            "the case under test is not grouped"
+        );
+        let chosen: Vec<u32> = (0..assignments)
+            .map(|row| ((row / CONFIG.top_k + row % CONFIG.top_k) % EXPERTS) as u32)
+            .collect();
+        let x = rows(TOKENS);
+
+        let through = |grouped: bool| {
+            spent(&device, || {
+                let mut picked = device.buffer(&chosen).expect("the selection uploads");
+                let mut hidden = device.buffer(&x).expect("the hidden state uploads");
+                let mut batch = device.batch().expect("a command buffer opens");
+                let pending = match grouped {
+                    false => bank
+                        .encode_picked(&mut batch, &mut picked, &mut hidden, CONFIG.top_k)
+                        .expect("the bank encodes"),
+                    true => {
+                        let mut sorted = kernels
+                            .grouping
+                            .encode(&mut batch, &mut picked, EXPERTS)
+                            .expect("the grouping encodes");
+                        bank.encode_grouped(&mut batch, &mut sorted, &mut hidden, CONFIG.top_k)
+                            .expect("the bank encodes")
+                    }
+                };
+                batch.wait().expect("the batch completes");
+                pending.take()
+            })
+        };
+
+        let (want, apart) = through(false);
+        let (got, together) = through(true);
+        assert_eq!(got.len(), assignments * DIM);
+        assert_eq!(got, want, "the rows came back different");
+        assert!(
+            want.iter().any(|y| *y != 0.0),
+            "an output of zeros would prove nothing"
+        );
+        assert_eq!(
+            (together.0 - apart.0, together.1),
+            (1, apart.1),
+            "the sort cost a dispatch and no submission"
+        );
     }
 
     /// Which banks a layer answers with, which is the one thing a stack of these
