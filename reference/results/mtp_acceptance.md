@@ -122,6 +122,13 @@ MTP is dead, enumeration alone says it triples throughput.
 Timed against a warm 512-token cache on real decoded tokens, 12 repeats.
 Decode step: **31.8 ms** (31.5 tok/s, consistent with the 33.4 tok/s baseline).
 
+**That step is this file's 8-bit checkpoint and does not carry to the mxfp4 one**,
+which is the quant the Rust engine runs and the one the README compares against.
+The same `smoke.py` on the same host, back to back, reads 33.1 and 33.2 tok/s
+here and 44.0 on mxfp4 — a 282 GB stack against a 140 GB one, and 2.01× the bytes
+for 1.33× the step. Every figure below is 8-bit; a comparison against an engine
+reading mxfp4 wants the mxfp4 number.
+
 | speculated k | verify k+1 tok | ×decode | MTP chain | ×decode | round ×decode |
 | -----------: | -------------: | ------: | --------: | ------: | ------------: |
 | 0 | 31.8 ms | 1.00 | — | — | 1.00 |

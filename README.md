@@ -281,11 +281,12 @@ kernel is for. What it is for is the memory the mask would have taken, which the
 architecture notes below price.
 
 **What it is not for is prefill wall time, and that belongs to the reference.**
-97, 385 and 769 tokens prefill here in 1.75, 4.70 and 8.87 s, best of three,
-against 0.42, 0.71 and 1.18 in a single pass of `just prefill-bench` — ×4.2, ×6.6
-and ×7.5, and widening with the prompt. Where the gap comes from is unmeasured;
-what can be said is that it is not the round trips, since a prefill's submissions
-are 42 at 250 µs against a gap of eight seconds. **The matmul is the one thing
+Over the six alternating rounds of the paired sitting below, 97, 385 and 769
+tokens prefill here in 1.73, 4.79 and 8.77 s on average against the reference's
+0.256, 0.680 and 1.132 — ×6.8, ×7.0 and ×7.7, and widening with the prompt. Where
+the gap comes from is unmeasured; what can be said is that it is not the round
+trips, since a prefill's submissions are 42 at 250 µs against a gap of eight
+seconds. **The matmul is the one thing
 that has moved this row**, taking it 1.90, 5.39 and 10.14 s to those three over
 three alternating passes; every other milestone here has moved the decode step,
 and prefill has never been the path any of them was about. The peak resident set
@@ -538,7 +539,11 @@ A head's guess costs 4.7 ms, of which about 3.4 is the 950 MB it reads — its o
 532 MiB, and `lm_head` again to turn a hidden state into a token — and the rest
 is the five submissions a partial handover takes. The study called the
 reference's per-head overhead "yours to win in Rust"; most of it turns out to be
-bandwidth, and mlx-vlm was already near it at 3.9 ms. **Only the `lm_head` half
+bandwidth, and mlx-vlm was already near it at 3.9 ms — on the 8-bit checkpoint,
+whose heads are these heads byte for byte but whose `lm_head`, which a guess also
+reads, its quantiser left in the original precision. The two figures are close
+for reasons only half of which are shared.
+**Only the `lm_head` half
 of those bytes is the packed matmul's**, and reading four to a lane took that
 dispatch 1.57 ms to 1.46 and the guess 4.85 to 4.70 — the same tenth of a
 millisecond arriving twice, which is what says the head's own bfloat16 tensors
@@ -562,21 +567,49 @@ own extra rows, and those did not fall by as much as the step they are weighed
 against did, which is what a speedup ratio shrinking while every absolute figure
 improves means. `k = 1` and `k = 2` are now half a millisecond apart.
 
-**22.02 ms a token is level with mlx-vlm rather than under it, and it is the
-reference that moved.** `just smoke` measures the reference at 44.2 tok/s here
-today — 22.6 ms a token — where `reference/results/mtp_acceptance.md` records
-31.5 and this file quoted 32 ms. Nothing on this side touches the reference, and
-what its own `reference/results/prefill.md` records is that a decode step of it
-costs 2.6 s rather than 32 ms when MLX cannot keep the model GPU-resident, which
-is a thing about how much of the host is free rather than about either engine.
-The cause is not measured here; what is measured is that the two figures are 33%
-apart and only one of them was taken beside these.
+**Against mlx-vlm, measured in one sitting on 2 August 2026.** Both engines were
+given the same 27-token prompt — the string mlx-vlm's own chat template renders
+for `just smoke`'s question — and both decoded 128 tokens from it. The two
+continuations are the same 128 tokens, byte for byte, which is what makes this a
+comparison of two engines rather than of two workloads. Six rounds, the order of
+the two halves flipped each round so that neither always ran on the other's warm
+page cache:
 
-So the comparison worth quoting is the one taken in a single sitting, and both
-sides of it are: over 128 tokens from a short prompt this engine decodes at 29.08
-ms a token against the reference's 22.6 — **1.29× the slower of the two
-unspeculated** — and at `k = 2` it decodes at 22.02, which is level. The tokens
-it does not decode are what close that gap rather than what open a lead.
+    round                 1      2      3      4      5      6     mean
+    mlx-vlm ms/token  22.68  22.68  22.73  22.78  22.83  22.94    22.77
+    ours, k = 0       29.53  29.43  29.47  29.14  29.14  29.03    29.29
+    ours, k = 2       26.66  26.61  26.53  26.51  27.06  26.93    26.72
+
+**So this engine decodes at 1.29× the reference unspeculated and 1.17× at
+`k = 2`, and it is behind on both.** The tokens it does not decode narrow the gap
+by two fifths of it and do not close it. That `k = 2` reads 26.72 here and 22.02 in
+the sweep above is the workload rather than the engine: this prompt's first head
+is accepted 66% of the time against the sweep prompt's 85%, and acceptance was
+identical in all six rounds — 67 of 117 guesses, 66% and 48% by depth — so the
+spread in the row is timing alone.
+
+**Both engines drifted over the sitting, and not the same way.** The reference
+went from 44.1 to 43.6 tok/s across the six rounds, 1.1% slower; this engine went
+29.53 ms to 29.03, 1.7% faster. Two figures taken an hour apart would have
+carried the sum of those in whichever direction the order chose, which is the
+whole argument for alternating rather than measuring one engine and then the
+other. Free memory held at 280 GiB and swap at zero throughout, the GPU was idle
+before the first round, and the four vllm-mlx daemons
+`reference/results/prefill.md` already counts stayed resident at about 60 GiB. Two
+of the twelve reference runs prefilled their own 27-token prompt at 27.8 tok/s
+against 196–202 for the other ten, a 7× swing inside the process that never
+reached its decode rate. The reference's model load was 6.5–7.1 s while its pages
+were in the buffer cache and 20.7 s once the 8-bit checkpoint had evicted them.
+
+**The reference never moved, and what looked like it moving was the checkpoint.**
+`reference/results/mtp_acceptance.md` records a 31.8 ms reference decode step, and
+that study ran on `Inkling-Small-8bit`. Measured back to back in this sitting, the
+same script on the same host reads 44.0 tok/s — 22.7 ms — against the mxfp4
+stack's 140 GB and 33.1 and 33.2 over two runs — 30.2 ms — against the 8-bit
+stack's 282 GB, reproducing the study's figure to 5%. So the 33% this file
+previously reported as an unexplained change in the reference is **2.01× the
+weight bytes buying 1.33× the step**. Both engines here are read against mxfp4 and
+always were; nothing on this side touches the reference either way.
 
 Acceptance is joint rather than marginal and cannot be otherwise in an engine: a
 round whose first guess was rejected never learns what its second was worth,
