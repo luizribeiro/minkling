@@ -882,13 +882,10 @@ mod tests {
                 .zeroed::<f32>(rows * OUT_DIM)
                 .expect("the answer allocates");
             let elements = rows * OUT_DIM;
-            let fields = [
-                rows as u32,
-                IN_DIM as u32,
-                OUT_DIM as u32,
-                weight.resident.borrow().offset() as u32,
-                run as u32,
-            ];
+            // The dispatch's own fields, from the weight rather than restated:
+            // the kernel's `Shape` is an ABI, and a second spelling of it here
+            // is one that goes stale the next time a field is added to it.
+            let fields = weight.shape(rows, run);
             let mut shape = device.inline(&fields).expect("the shape inlines");
             let mut resident = weight.resident.borrow_mut();
             let grid = Grid::new(elements * run * simd, THREADS_PER_GROUP);
