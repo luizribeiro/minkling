@@ -28,6 +28,7 @@ use inkling_core::mtp::{CheckpointHeads, MtpProposer};
 use inkling_core::ops::linear;
 use inkling_core::profile::{self, Op, Profile};
 use inkling_core::quant::{BITS, dequantize_blocks_into};
+use inkling_core::workload::{DECODED, STRUCTURED_PROMPT, SWEPT, tiled};
 use inkling_core::{
     AttentionCache, AttentionStep, BandedMask, Bf16, Checkpoint, CheckpointWeights, Dtype, Ending,
     LayerStep, ModelCache, Packed as CorePacked, Projections, Sdpa, ShortConv, Tail, TensorView,
@@ -621,16 +622,6 @@ impl Asked {
     fn charges_the_prefill(&self) -> bool {
         self.generated == 1
     }
-}
-
-/// The recorded prompt repeated up to `tokens` and cut there.
-///
-/// Real ids rather than a synthetic run of one, because which experts a token
-/// routes to is decided by the token: a prompt of one id repeated would send
-/// every row of every bank through the same six of 256 and measure a stack
-/// nobody runs.
-fn tiled(ids: &[usize], tokens: usize) -> Vec<usize> {
-    ids.iter().copied().cycle().take(tokens).collect()
 }
 
 /// One run of the engine with every weight it has a kernel for on the device,
@@ -2233,31 +2224,9 @@ fn the_dense_matmul_reproduces_the_cpu_over_a_real_router_gate() {
     );
 }
 
-/// The prompt the speculative measurement runs against.
-///
-/// Templated, because the model answers a turn and continues raw text — and
-/// what a head is guessing about is what the model is doing. The acceptance
-/// study measured six regimes and found the spread between them larger than the
-/// spread between depths; this is one of them, the structured one, so what it
-/// says about acceptance is "on text like this" and nothing wider.
-const SPECULATIVE_PROMPT: &str = "<|message_user|><|content_text|>Count from 1 to 30. Put each on \
-     its own line in exactly the form 'Line N: N squared is M'. No \
-     commentary.<|end_message|><|message_model|>";
-
-/// How many tokens each depth decodes, which is what the acceptance and the
-/// throughput are both measured over.
-const SPECULATED_TOKENS: usize = 64;
-
 /// How many depths the block's cost is priced over, which is every one the
 /// checkpoint ships heads for.
 const DEPTHS: usize = 8;
-
-/// How deep the sweep of real generations goes.
-///
-/// Four, where the block is priced to eight: the study's pooled optimum was 2
-/// and its deepest paying depth 6, and every depth here is a whole generation
-/// rather than a repeat of one block.
-const SWEPT: usize = 4;
 
 /// How many times the sweep runs every depth, round-robin.
 const PASSES: usize = 3;
@@ -2293,7 +2262,7 @@ fn what_a_speculative_round_costs_and_what_it_buys() {
     let mtp = config.mtp_config.as_ref().expect("an mtp_config");
     let tokenizer = Tokenizer::open(&dir, &config).expect("the tokenizer opens");
     let ids: Vec<usize> = tokenizer
-        .encode(SPECULATIVE_PROMPT)
+        .encode(STRUCTURED_PROMPT)
         .expect("the prompt encodes")
         .into_iter()
         .map(|id| id as usize)
@@ -2316,7 +2285,7 @@ fn what_a_speculative_round_costs_and_what_it_buys() {
     // What the machinery costs when nothing speculates: the same generation,
     // over layers whose windows keep enough to take four tokens back and over
     // layers that keep nothing.
-    eprintln!("\nwith nothing speculating, over {SPECULATED_TOKENS} tokens");
+    eprintln!("\nwith nothing speculating, over {DECODED} tokens");
     eprintln!("{:>7}  {:>10}", "slack", "ms/token");
     let mut idle = Vec::new();
     for slack in [0, 4] {
@@ -2388,7 +2357,7 @@ fn what_a_speculative_round_costs_and_what_it_buys() {
         .collect();
     let decode = runs[0].step;
 
-    eprintln!("\nwhat the loop banked, over {SPECULATED_TOKENS} tokens");
+    eprintln!("\nwhat the loop banked, over {DECODED} tokens");
     eprintln!(
         "{:>3}  {:>10}  {:>9}  {:>8}  {:>18}  accepted",
         "k", "ms/token", "tok/round", "speedup", "passes"
@@ -2456,7 +2425,7 @@ fn which_kernels_own_a_chain_of_heads() {
     let mtp = config.mtp_config.as_ref().expect("an mtp_config");
     let tokenizer = Tokenizer::open(&dir, &config).expect("the tokenizer opens");
     let ids: Vec<usize> = tokenizer
-        .encode(SPECULATIVE_PROMPT)
+        .encode(STRUCTURED_PROMPT)
         .expect("the prompt encodes")
         .into_iter()
         .map(|id| id as usize)
@@ -2717,7 +2686,7 @@ impl Decoded {
         let generator = weights.generator();
         let cache = &mut ModelCache::speculating(config, depth);
         let ending = Ending {
-            budget: SPECULATED_TOKENS,
+            budget: DECODED,
             eos: None,
         };
         let mut proposer = MtpProposer::new(heads, generator, weights, depth);

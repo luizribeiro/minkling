@@ -16,6 +16,7 @@ pub mod quant;
 pub mod sconv;
 pub mod tokenizer;
 pub mod weights;
+pub mod workload;
 
 #[cfg(feature = "test-support")]
 pub mod fixture;
