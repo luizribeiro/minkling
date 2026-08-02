@@ -26,10 +26,12 @@
 //! together read the same value wherever it starts, which is what lets the GPU
 //! be handed the gate where the checkpoint mapped it.
 //!
-//! **One simdgroup per output element**, as in [`crate::matmul`]: lane `l`
-//! walks its weight row from value `l` in strides of the simdgroup width and
-//! the group sums what the lanes held, so the 32 lanes of one reduction read 64
-//! consecutive bytes.
+//! **A run of simdgroups per output element**, where [`crate::matmul`] gives
+//! each one a simdgroup: lane `l` walks its weight row from value `l` in strides
+//! of the run's width and the run sums what its lanes held, so 32 lanes of one
+//! reduction read 64 consecutive bytes and a run of eight reads 512. How long
+//! the run is comes from how many elements the dispatch has to spread over the
+//! machine — see [`SIMDGROUPS_IN_FLIGHT`].
 
 use std::cell::RefCell;
 
@@ -46,9 +48,40 @@ const ENTRY: &str = "dense_matmul";
 
 /// Threads one threadgroup of a dispatch holds, and a multiple of every
 /// simdgroup width Metal reports — which is what lets the kernel take its
-/// output element from `thread_position_in_grid` divided by
-/// `threads_per_simdgroup`.
+/// output element from where its simdgroup sits inside the threadgroup.
 const THREADS_PER_GROUP: usize = 256;
+
+/// Entries the kernel's threadgroup array holds, for [`crate::RmsNorm`]'s
+/// reason: 1024 threads is the widest threadgroup any Apple GPU allows and 32
+/// the narrowest simdgroup any reports, so 32 partials is the most a threadgroup
+/// can produce.
+const MOST_SIMDGROUPS: usize = 32;
+
+/// Simdgroups a dispatch wants in flight before it stops widening the reduction
+/// over one output element.
+///
+/// A count of simdgroups and not of rows, so it is the same number whatever the
+/// weight's shape — though the only weight this kernel has is the `[258, 4096]`
+/// gate, which is what the sweep it was chosen from measures.
+///
+/// **A decode-shaped gate is 258 output elements, and one simdgroup each is a
+/// lane walking 128 strides of two bytes.** That is `rms_norm`'s finding at a
+/// different width: nothing here is waiting on bandwidth, it is waiting on the
+/// requests one thread has outstanding, and the fix is to give the reduction
+/// more threads rather than the machine more bytes. Eight simdgroups to an
+/// element takes a decode-shaped gate from 39 microseconds to 10.
+///
+/// **And it has to be the dispatch that decides.** The same widening at prefill
+/// makes the kernel twice as slow — 385 rows are 99330 elements, which fill the
+/// machine at one simdgroup apiece, and eight of them is eight times the
+/// reduction overhead for work that was never idle. So the count comes from how
+/// many elements there are: this many simdgroups between them, and each element
+/// takes what is left over. Measured across rows 1 to 385 and one to eight
+/// simdgroups, it picks the best run at a decode step's one row and at a
+/// prefill's hundreds, and lands within a sixth of the best at every row count
+/// between — `what_a_gate_costs_the_device_at_each_reduction_width` is the
+/// sweep, and the row counts in between are not shapes this engine dispatches.
+const SIMDGROUPS_IN_FLIGHT: usize = 16512;
 
 /// The compiled kernel, which every bfloat16 weight on a device shares.
 ///
@@ -207,14 +240,18 @@ impl<'a> DenseWeight<'a> {
         );
 
         let rows = x.len() / self.in_dim;
-        let fields = self.shape(rows);
+        let kernel = &self.matmul.kernel;
+        let elements = rows * self.out_dim;
+        let simdgroups = simdgroups_an_element(elements, THREADS_PER_GROUP / kernel.simd_width());
+        let fields = self.shape(rows, simdgroups);
         let mut shape = self.device.inline(&fields)?;
         let mut resident = self.resident.borrow_mut();
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
 
-        let elements = rows * self.out_dim;
-        let kernel = &self.matmul.kernel;
-        let grid = Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP);
+        let grid = Grid::new(
+            elements * simdgroups * kernel.simd_width(),
+            THREADS_PER_GROUP,
+        );
         let moves = self.in_dim * self.out_dim * BF16_BYTES
             + size_of::<f32>() * (x.len() + rows * self.out_dim);
         batch.add(
@@ -229,13 +266,36 @@ impl<'a> DenseWeight<'a> {
     /// The scalars the kernel's `Shape` struct declares, in its order — of this
     /// call's own, which is what two multiplies of different heights sharing a
     /// command buffer needs them to be.
-    fn shape(&self, rows: usize) -> [u32; SHAPE_FIELDS] {
+    fn shape(&self, rows: usize, simdgroups: usize) -> [u32; SHAPE_FIELDS] {
         [
             extent(rows, "the rows of a call"),
             extent(self.in_dim, "the width a weight maps from"),
             extent(self.out_dim, "the width a weight maps to"),
             extent(self.resident.borrow().offset(), "where a weight starts"),
+            extent(simdgroups, "the simdgroups over one output element"),
         ]
+    }
+}
+
+/// How many of a threadgroup's simdgroups reduce one output element, given how
+/// many elements the whole dispatch has to spread over the machine.
+///
+/// **A run has to divide the threadgroup's simdgroups**, because the kernel
+/// takes an element from where its run sits inside the threadgroup and a
+/// threadgroup that did not cut into whole runs would put two elements' lanes in
+/// one run. So the ceiling is not `most` but the largest power of two dividing
+/// it — the same number for the 8 every Apple GPU's simdgroup width and this
+/// threadgroup produce, and a number rather than an assumption for a device that
+/// reported a width making them anything else.
+///
+/// See [`SIMDGROUPS_IN_FLIGHT`] for where the count it is weighed against comes
+/// from.
+fn simdgroups_an_element(elements: usize, most: usize) -> usize {
+    let whole = 1 << most.trailing_zeros();
+    let wanted = (SIMDGROUPS_IN_FLIGHT / elements.max(1)).clamp(1, whole);
+    match wanted.is_power_of_two() {
+        true => wanted,
+        false => wanted.next_power_of_two() / 2,
     }
 }
 
@@ -256,7 +316,7 @@ fn pairs(in_dim: usize, out_dim: usize, bytes: usize) -> Result<(), MatmulError>
 }
 
 /// How many `uint`s the kernel's `Shape` struct declares.
-const SHAPE_FIELDS: usize = 4;
+const SHAPE_FIELDS: usize = 5;
 
 /// The kernel, with the format's two facts written into its prelude.
 ///
@@ -266,7 +326,9 @@ const SHAPE_FIELDS: usize = 4;
 /// string is a copy that can drift from the widening the CPU path is pinned by.
 pub(crate) fn source() -> String {
     format!(
-        "constant uint BF16_BYTES = {BF16_BYTES};\nconstant uint BF16_SHIFT = {BF16_SHIFT};\n{BODY}"
+        "constant uint BF16_BYTES = {BF16_BYTES};\n\
+         constant uint BF16_SHIFT = {BF16_SHIFT};\n\
+         constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n{BODY}"
     )
 }
 
@@ -280,10 +342,13 @@ struct Shape {
     uint in_dim;
     uint out_dim;
     uint base;
+    uint simdgroups;
 };
 
-/// One output element: lane `l` walks its weight row from value `l` in strides
-/// of the simdgroup width, and the caller reduces what the lanes held.
+/// One output element: a thread walks its weight row from value `lane` in
+/// strides of `width`, and the caller reduces what the threads held. The pair is
+/// where a thread sits in the run over this element and how wide that run is,
+/// which is a simdgroup's own width only when the run is one simdgroup.
 ///
 /// A value is two bytes little-endian, which are the top sixteen bits of the
 /// float32 it stands for — so widening is a shift, exact, and the low mantissa
@@ -305,34 +370,77 @@ inline float weight_dot(
 }
 
 /// `out[i] = x[i] @ w^T` over an `[out_dim, in_dim]` bfloat16 weight.
+///
+/// **`shape.simdgroups` of a threadgroup's simdgroups reduce one output
+/// element**, and the caller chooses that from how many elements the dispatch
+/// has — see `simdgroups_an_element`. At one it is a simdgroup an element and a
+/// threadgroup holds several, which is what a prefill wants; at the threadgroup's
+/// whole width it is one element reduced by every thread, which is what a decode
+/// step wants of the same weight.
+///
+/// The two are one body because the run of simdgroups over an element is where
+/// they differ and nothing else is: `slot` is which element of this threadgroup
+/// a simdgroup works on, and a run of one is the case where that is its own
+/// index.
 kernel void dense_matmul(
     constant Shape &shape [[buffer(0)]],
     device const float *x [[buffer(1)]],
     device const uchar *weight [[buffer(2)]],
     device float *out [[buffer(3)]],
-    uint position [[thread_position_in_grid]],
+    uint group [[threadgroup_position_in_grid]],
+    uint local [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint simds [[simdgroups_per_threadgroup]],
     uint width [[threads_per_simdgroup]]
 ) {
-    const uint element = position / width;
-    if (element >= shape.rows * shape.out_dim) {
-        return;
-    }
+    threadgroup float partials[MOST_SIMDGROUPS];
+
+    const uint slot = simd / shape.simdgroups;
+    const uint element = group * (simds / shape.simdgroups) + slot;
+    // Not a return, because the barrier below is reached by the whole
+    // threadgroup and the tail element of a dispatch is one simdgroup's own
+    // rather than the threadgroup's. An out-of-range simdgroup reads nothing,
+    // contributes a zero and waits where the others wait.
+    const bool live = element < shape.rows * shape.out_dim;
 
     const uint row = element / shape.out_dim;
     const uint col = element % shape.out_dim;
+    // The threads over one element are the `shape.simdgroups` of them starting
+    // at the run's own, so a lane walks the row from where it sits in the run.
+    const uint reach = shape.simdgroups * width;
+    const uint start = (simd % shape.simdgroups) * width + lane;
 
-    float sum = weight_dot(
+    float sum = live ? weight_dot(
         weight + shape.base + (ulong)col * shape.in_dim * BF16_BYTES,
         x + (ulong)row * shape.in_dim,
         shape.in_dim,
-        lane,
-        width
-    );
-
+        start,
+        reach
+    ) : 0.0f;
     sum = simd_sum(sum);
+
+    // A run of one is the whole reduction and has nothing to wait for. `shape`
+    // is the dispatch's rather than a thread's, so every threadgroup takes this
+    // branch or none does, which is what makes the barrier below reachable by a
+    // whole threadgroup or by none of it.
+    if (shape.simdgroups == 1) {
+        if (live && lane == 0) {
+            out[element] = sum;
+        }
+        return;
+    }
+
     if (lane == 0) {
-        out[element] = sum;
+        partials[simd] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (live && local == slot * reach) {
+        float total = 0.0f;
+        for (uint s = 0; s < shape.simdgroups; ++s) {
+            total += partials[slot * shape.simdgroups + s];
+        }
+        out[element] = total;
     }
 }
 "#;
@@ -367,6 +475,8 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::testing::{narrowed, widened};
     use super::*;
     use inkling_core::fixture::deviation;
@@ -549,12 +659,6 @@ mod tests {
         assert_eq!(weight.in_dim(), IN_DIM);
         assert_eq!(weight.out_dim(), OUT_DIM);
 
-        let elements = 3 * OUT_DIM;
-        assert!(
-            elements * matmul.kernel.simd_width() % THREADS_PER_GROUP != 0,
-            "a dispatch that filled its last threadgroup would not exercise the bounds check"
-        );
-
         let got = weight.multiply(&case.x).expect("the dispatch completes");
         let on_the_cpu = case.on_the_cpu();
         let deviation = deviation(&got, &on_the_cpu);
@@ -575,6 +679,200 @@ mod tests {
         );
         assert!(deviation <= TOLERANCE, "deviation {deviation:e}");
         assert!(mine < theirs, "{mine:e} against the CPU's {theirs:e}");
+    }
+
+    /// **A dispatch chooses how many simdgroups reduce one output element**, and
+    /// the ends of that choice index differently enough to be two kernels: a run
+    /// of one is a simdgroup an element with several elements to a threadgroup
+    /// and no barrier at all, and a run of the threadgroup's whole width is one
+    /// element reduced by every thread of it. Every run between is a threadgroup
+    /// holding several elements *and* reducing each of them across simdgroups,
+    /// which is the case neither end reaches. All of them have to answer what
+    /// the CPU answers.
+    ///
+    /// The row counts are chosen for the run they select rather than for their
+    /// shape — asserted, so that a different [`SIMDGROUPS_IN_FLIGHT`] makes this
+    /// fail rather than quietly measure one run twice. The shapes the engine
+    /// dispatches are elsewhere: a decode step's single row is
+    /// `the_kernel_reproduces_the_cpu_at_the_gates_shape`'s, and a prefill of any
+    /// length reaches the shortest run this covers.
+    #[test]
+    fn every_reduction_width_answers_what_the_cpu_answers() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let most = THREADS_PER_GROUP / matmul.kernel.simd_width();
+        // Narrow enough that the oracle over sixty-five rows is not the test.
+        const NARROW: usize = 64;
+        let rows_for = |run: usize| match run {
+            // Past the boundary rather than on it, so the shortest run is also
+            // the ragged case: a threadgroup holds several elements there, and
+            // the element count has to not be a whole number of them.
+            1 => SIMDGROUPS_IN_FLIGHT / OUT_DIM + 1,
+            _ => SIMDGROUPS_IN_FLIGHT / (run * OUT_DIM),
+        };
+
+        let mut runs = Vec::new();
+        for run in (0..).map(|i| 1usize << i).take_while(|run| *run <= most) {
+            let rows = rows_for(run);
+            let elements = rows * OUT_DIM;
+            assert_eq!(
+                simdgroups_an_element(elements, most),
+                run,
+                "{rows} rows did not reach a run of {run}"
+            );
+            let case = Case::noisy(NARROW, OUT_DIM, rows);
+            let got = case
+                .upload(&device, &matmul)
+                .multiply(&case.x)
+                .expect("the dispatch completes");
+
+            let deviation = deviation(&got, &case.on_the_cpu());
+            eprintln!("a run of {run} over {rows} rows: deviation {deviation:e}");
+            assert!(
+                deviation <= TOLERANCE,
+                "a run of {run}: deviation {deviation:e}"
+            );
+            runs.push((run, elements));
+        }
+        assert!(runs.len() > 2, "the runs between the two ends went untried");
+
+        // A threadgroup can only hold a partial element where it holds more than
+        // one, so the shortest run is the only one whose bounds check does
+        // anything — and the row count above has to be one that leaves a tail.
+        let (shortest, elements) = runs[0];
+        assert_eq!(shortest, 1);
+        assert_ne!(elements % most, 0, "the tail threadgroup was full");
+    }
+
+    /// The rule the choice above is made by, at the shapes it is made for and at
+    /// the two ends it has to be defensive about.
+    ///
+    /// A run has to divide the threadgroup's simdgroups, so it is a power of two
+    /// and never wider than they are; and a dispatch of more elements than the
+    /// machine wants in flight still has to reduce each of them with something.
+    /// The counts include ones no power of two divides, which is what a device
+    /// reporting an unusual simdgroup width would produce.
+    #[test]
+    fn a_run_of_simdgroups_divides_the_threadgroup_it_is_cut_from() {
+        for most in [1usize, 4, 6, 8, 12, 32] {
+            for elements in [0usize, 1, 258, 774, 3000, 16512, 99330, usize::MAX] {
+                let run = simdgroups_an_element(elements, most);
+                assert!(run >= 1 && run <= most, "{elements} of {most}: {run}");
+                assert_eq!(
+                    most % run,
+                    0,
+                    "{elements} of {most}: {run} is a partial run"
+                );
+            }
+        }
+        // A decode step's gate takes the whole threadgroup and a prefill's takes
+        // a simdgroup, which is the finding the rule exists to act on.
+        assert_eq!(simdgroups_an_element(OUT_DIM, 8), 8);
+        assert_eq!(simdgroups_an_element(97 * OUT_DIM, 8), 1);
+    }
+
+    /// **What a gate costs the device at each width it is dispatched over**, and
+    /// the sweep [`SIMDGROUPS_IN_FLIGHT`] was chosen from.
+    ///
+    /// The row counts run from a decode step's one to a prefill's, and each is
+    /// dispatched at every run of simdgroups a threadgroup can be cut into — so
+    /// what the table shows is both the best run at each shape and how far the
+    /// rule's choice lands from it. Nothing asserts a duration; the numbers go
+    /// to stderr for the commit message to quote.
+    ///
+    /// Read off the device's own clock over a command buffer of `CALLS`
+    /// dispatches, for `norm`'s reason: a submission is 225 microseconds and
+    /// most of these are under a hundred.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_gate_costs_the_device_at_each_reduction_width() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let simd = matmul.kernel.simd_width();
+        let most = THREADS_PER_GROUP / simd;
+        const CALLS: usize = 64;
+        const ROUNDS: usize = 3;
+
+        let case = Case::noisy(IN_DIM, OUT_DIM, 1);
+        let weight = case.upload(&device, &matmul);
+        let runs: Vec<usize> = (0..)
+            .map(|i| 1 << i)
+            .take_while(|run| *run <= most)
+            .collect();
+        let cost = |rows: usize, run: usize| -> Duration {
+            let x: Vec<f32> = (0..rows * IN_DIM)
+                .map(|i| ((i % 37) as f32 - 18.0) / 16.0)
+                .collect();
+            let mut input = device.buffer(&x).expect("the rows upload");
+            let mut out = device
+                .zeroed::<f32>(rows * OUT_DIM)
+                .expect("the answer allocates");
+            let elements = rows * OUT_DIM;
+            let fields = [
+                rows as u32,
+                IN_DIM as u32,
+                OUT_DIM as u32,
+                weight.resident.borrow().offset() as u32,
+                run as u32,
+            ];
+            let mut shape = device.inline(&fields).expect("the shape inlines");
+            let mut resident = weight.resident.borrow_mut();
+            let grid = Grid::new(elements * run * simd, THREADS_PER_GROUP);
+
+            let mut batch = device.batch().expect("a command buffer opens");
+            for _ in 0..CALLS {
+                batch
+                    .add(
+                        &matmul.kernel,
+                        &[shape.arg(), input.arg(), resident.arg(), out.arg()],
+                        grid,
+                        0,
+                    )
+                    .expect("the dispatch encodes");
+            }
+            profile::take();
+            batch.wait().expect("the batch completes");
+            profile::take().gpu() / CALLS as u32
+        };
+
+        let shapes = [1usize, 2, 4, 8, 16, 32, 97, 385];
+        let mut taken = vec![vec![Vec::new(); runs.len()]; shapes.len()];
+        for round in 0..=ROUNDS {
+            for (s, rows) in shapes.iter().enumerate() {
+                for (r, run) in runs.iter().enumerate() {
+                    let each = cost(*rows, *run);
+                    if round > 0 {
+                        taken[s][r].push(each);
+                    }
+                }
+            }
+        }
+        for (s, rows) in shapes.iter().enumerate() {
+            let means: Vec<Duration> = taken[s]
+                .iter()
+                .map(|each| each.iter().sum::<Duration>() / each.len() as u32)
+                .collect();
+            let best = means
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, each)| **each)
+                .expect("a run")
+                .0;
+            let chose = simdgroups_an_element(rows * OUT_DIM, most);
+            eprintln!(
+                "[{rows}, {IN_DIM}] @ [{OUT_DIM}, {IN_DIM}]^T over {:?}: {}, best {} at {:.2?}, \
+                 the rule chose {chose} at {:.2?}",
+                runs,
+                means
+                    .iter()
+                    .map(|each| format!("{each:.2?}"))
+                    .collect::<Vec<String>>()
+                    .join(" "),
+                runs[best],
+                means[best],
+                means[runs.iter().position(|run| *run == chose).expect("a run")],
+            );
+        }
     }
 
     /// Which of a value's two bytes is the high one, which is the one fact
