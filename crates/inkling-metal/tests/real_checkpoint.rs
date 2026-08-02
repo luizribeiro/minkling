@@ -560,6 +560,69 @@ fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     (dispatches + 1, submissions + 1)
 }
 
+/// What a run of the engine is asked for, since standing the model up is the
+/// same whichever of the two regimes the case below is about.
+///
+/// **The profile follows from `generated` rather than being a knob beside it.**
+/// A run that decodes nothing is a prefill and its one step is what there is to
+/// charge; a run that decodes is charged its decode steps and the prefill in
+/// front of them is cleared. A profile summed over both would describe neither:
+/// the first step is hundreds of rows through the same kernels every later one
+/// puts a single row through.
+#[derive(Clone, Copy)]
+struct Asked {
+    /// How many tokens to prefill, or the recorded prompt's own length.
+    prompt: Option<usize>,
+    /// How many tokens the run produces, the prefill's own being the first.
+    generated: usize,
+    /// Whether the device times each dispatch.
+    sampling: bool,
+}
+
+impl Asked {
+    /// The recorded prompt and the oracle's continuation, nothing sampling —
+    /// what every case about a decode step starts from.
+    fn decoding() -> Self {
+        Self {
+            prompt: None,
+            generated: GENERATED,
+            sampling: false,
+        }
+    }
+
+    /// One prefill of `prompt` tokens and no decode step at all.
+    fn prefilling(prompt: usize) -> Self {
+        Self {
+            prompt: Some(prompt),
+            generated: 1,
+            sampling: false,
+        }
+    }
+
+    fn sampled(self) -> Self {
+        Self {
+            sampling: true,
+            ..self
+        }
+    }
+
+    /// Whether the profile that comes back is the prefill's rather than the
+    /// decode steps'.
+    fn charges_the_prefill(&self) -> bool {
+        self.generated == 1
+    }
+}
+
+/// The recorded prompt repeated up to `tokens` and cut there.
+///
+/// Real ids rather than a synthetic run of one, because which experts a token
+/// routes to is decided by the token: a prompt of one id repeated would send
+/// every row of every bank through the same six of 256 and measure a stack
+/// nobody runs.
+fn tiled(ids: &[usize], tokens: usize) -> Vec<usize> {
+    ids.iter().copied().cycle().take(tokens).collect()
+}
+
 /// One run of the engine with every weight it has a kernel for on the device,
 /// over the prompt the activation capture recorded.
 ///
@@ -577,10 +640,14 @@ struct OnTheDevice {
     dense_layers: usize,
     wrapped: Duration,
     prompt: usize,
+    /// What this run was asked for, which is what says whether the profile
+    /// below is the prefill's or the decode steps'.
+    asked: Asked,
     /// What each step took, the prompt's prefill first.
     steps: Vec<Duration>,
     /// The running `(dispatches, submissions, allocations, allocated bytes)`
-    /// each step was reached at.
+    /// the run opened at and each step was reached at, so there is one more of
+    /// these than there are steps and a step is the difference across it.
     ///
     /// The bytes are the last of the four and the newest, and they are what a
     /// merged run is bounded by: a decode step's are what a run of forty-two
@@ -591,14 +658,15 @@ struct OnTheDevice {
     submitted: Vec<(u64, u64, u64, u64)>,
     peak: u64,
     got: Vec<usize>,
-    /// What the **decode** steps spent, by operation. The prefill's accounts
-    /// are cleared before the first of them: it dispatches the same kernels
-    /// over more rows, and what a profile is read for is the steady state.
+    /// What the steps [`Asked::charges_the_prefill`] names spent, by operation,
+    /// divided by however many of them there were. The other regime's accounts
+    /// are cleared rather than folded in: a prefill dispatches the same kernels
+    /// over hundreds of rows where a decode step puts one row through them.
     profile: Profile,
-    /// Every command buffer the **decode** steps waited for, cleared after the
-    /// prefill for the reason the profile is — and one row where the profile
-    /// has a sum, because a step's two submissions are 1076 dispatches and one
-    /// and the wait means something different in each.
+    /// Every command buffer those same steps waited for, cleared the same way —
+    /// and one row per shape of submission where the profile has a sum, because
+    /// a decode step's two are 1076 dispatches and one and the wait means
+    /// something different in each.
     round_trips: Vec<RoundTrip>,
 }
 
@@ -606,7 +674,7 @@ impl OnTheDevice {
     /// The run every case here starts from, with the device's own clock left
     /// where it is.
     fn generate(dir: &Path, device: &Device) -> Self {
-        Self::generating(dir, device, false)
+        Self::running(dir, device, Asked::decoding())
     }
 
     /// The same run, with each dispatch timed on the device if `sampling`.
@@ -615,8 +683,20 @@ impl OnTheDevice {
     /// to say what it costs is to run the same thing both ways — see
     /// `what_timing_each_dispatch_costs`.
     fn generating(dir: &Path, device: &Device, sampling: bool) -> Self {
+        let asked = Asked::decoding();
+        Self::running(dir, device, if sampling { asked.sampled() } else { asked })
+    }
+
+    /// One prefill of `prompt` tokens and nothing after it, which is the step
+    /// the cases below are about.
+    fn prefilling(dir: &Path, device: &Device, prompt: usize, sampling: bool) -> Self {
+        let asked = Asked::prefilling(prompt);
+        Self::running(dir, device, if sampling { asked.sampled() } else { asked })
+    }
+
+    fn running(dir: &Path, device: &Device, asked: Asked) -> Self {
         device
-            .time_each_dispatch(sampling)
+            .time_each_dispatch(asked.sampling)
             .expect("the device times a dispatch");
         let kernels = LayerKernels::compile(device).expect("the layer kernels compile");
         let matmul = kernels.matmul();
@@ -627,7 +707,11 @@ impl OnTheDevice {
         let combine = MoeCombine::new(device).expect("the combine compiles");
         let config = fixture::config(dir).text_config;
         let ckpt = Checkpoint::open(dir).expect("checkpoint opens");
-        let ids = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+        let recorded = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+        let ids = match asked.prompt {
+            None => recorded,
+            Some(tokens) => tiled(&recorded, tokens),
+        };
 
         let weights =
             CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
@@ -669,6 +753,7 @@ impl OnTheDevice {
             dense_layers: layers.dense_layers(),
             wrapped: started.elapsed(),
             prompt: ids.len(),
+            asked,
             steps: Vec::new(),
             submitted: Vec::new(),
             peak: fixture::resident_bytes(),
@@ -685,26 +770,30 @@ impl OnTheDevice {
             .with_backend(Box::new(layers));
         let generator = weights.generator();
 
+        let counters = |run: &mut Self| {
+            run.submitted.push((
+                device.dispatches(),
+                device.submissions(),
+                device.allocations(),
+                device.allocated_bytes(),
+            ));
+        };
+        counters(&mut run);
         let mut step = Instant::now();
         generator.stream(
             &mut ModelCache::new(&config),
             &ids,
             Ending {
-                budget: GENERATED,
+                budget: asked.generated,
                 eos: None,
             },
             &weights,
             |id| {
                 run.steps.push(step.elapsed());
-                run.submitted.push((
-                    device.dispatches(),
-                    device.submissions(),
-                    device.allocations(),
-                    device.allocated_bytes(),
-                ));
+                counters(&mut run);
                 run.peak = run.peak.max(fixture::resident_bytes());
                 run.got.push(id);
-                if run.steps.len() == 1 {
+                if run.steps.len() == 1 && !asked.charges_the_prefill() {
                     profile::take();
                     device.round_trips();
                 }
@@ -712,7 +801,7 @@ impl OnTheDevice {
                 ControlFlow::Continue(())
             },
         );
-        run.profile = profile::take().per_step(run.decode_steps());
+        run.profile = profile::take().per_step(run.charged_steps());
         run.round_trips = device.round_trips();
         device.record_round_trips(false);
         run
@@ -722,19 +811,36 @@ impl OnTheDevice {
         (self.steps.len() - 1) as u32
     }
 
+    /// How many steps the profile was summed over, which is one for a prefill.
+    fn charged_steps(&self) -> u32 {
+        if self.asked.charges_the_prefill() {
+            1
+        } else {
+            self.decode_steps()
+        }
+    }
+
+    /// The index into [`Self::steps`] of the first step the profile describes.
+    fn charged_from(&self) -> usize {
+        usize::from(!self.asked.charges_the_prefill())
+    }
+
+    /// What one step of the regime the profile describes took: the prefill, or
+    /// the mean of the decode steps after it.
+    ///
     /// The prompt's prefill is the first step and every later one is a single
-    /// decode; a mean over the two describes neither.
-    fn each_decode_step(&self) -> Duration {
-        let (_, decode) = self.steps.split_first().expect("a step per token");
-        decode.iter().sum::<Duration>() / self.decode_steps()
+    /// decode; a mean over the two describes neither, which is what the slice
+    /// here is for.
+    fn each_charged_step(&self) -> Duration {
+        self.steps[self.charged_from()..].iter().sum::<Duration>() / self.charged_steps()
     }
 
     /// The `(dispatches, submissions, allocations, allocated bytes)` of the last
-    /// decode step, which is the difference between the two running totals
-    /// either side of it.
-    fn per_decode_step(&self) -> (u64, u64, u64, u64) {
-        let [.., before, after] = self.submitted.as_slice() else {
-            panic!("a step per token, and more than one of them")
+    /// step the profile describes, which is the difference between the two
+    /// running totals either side of it.
+    fn per_charged_step(&self) -> (u64, u64, u64, u64) {
+        let [.., before, after] = &self.submitted[..=self.steps.len()] else {
+            panic!("the counters are read once before the loop and once a step, so there are two")
         };
         (
             after.0 - before.0,
@@ -742,6 +848,24 @@ impl OnTheDevice {
             after.2 - before.2,
             after.3 - before.3,
         )
+    }
+
+    /// The same two for a decode step, which is what the cases about one call
+    /// them — and which a run that decoded nothing does not have.
+    fn each_decode_step(&self) -> Duration {
+        self.decoded().each_charged_step()
+    }
+
+    fn per_decode_step(&self) -> (u64, u64, u64, u64) {
+        self.decoded().per_charged_step()
+    }
+
+    fn decoded(&self) -> &Self {
+        assert!(
+            !self.asked.charges_the_prefill(),
+            "a run that decoded nothing has no decode step to price"
+        );
+        self
     }
 }
 
@@ -851,20 +975,29 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
 /// a decade off it.
 const MEMORY_BANDWIDTH: f64 = 819e9;
 
-/// A decode step's rows, and the kernels underneath them where the device was
-/// asked which of its dispatches owns which of the milliseconds.
+/// A step's rows, and the kernels underneath them where the device was asked
+/// which of its dispatches owns which of the milliseconds.
 ///
 /// One table rather than two, because the second half only means anything
 /// against the first: a kernel's device time is a share of what the device
 /// executed for, which is a share of the wait, which is a share of the step.
-fn decode_step_table(run: &OnTheDevice) -> String {
-    let step = run.each_decode_step();
-    let (dispatches, submissions, allocations, bytes) = run.per_decode_step();
+///
+/// **One function rather than one per regime**, because the question a prefill
+/// is read for is which rows differ from a decode step's — and two tables that
+/// could rank, divide or round differently could not answer it.
+fn step_table(run: &OnTheDevice) -> String {
+    let step = run.each_charged_step();
+    let (dispatches, submissions, allocations, bytes) = run.per_charged_step();
     let accounted = run.profile.total();
+    let regime = if run.asked.charges_the_prefill() {
+        format!("prefill of {} tokens", run.prompt)
+    } else {
+        "decode step".to_string()
+    };
 
     let share = |part: Duration| 100.0 * part.as_secs_f64() / step.as_secs_f64();
     let mut table = vec![format!(
-        "a {step:.2?} decode step, {dispatches} dispatches in {submissions} submissions over \
+        "a {step:.2?} {regime}, {dispatches} dispatches in {submissions} submissions over \
          {allocations} buffers of {:.1} MiB\n  {:<18}{:>7}{:>12}{:>8}",
         bytes as f64 / (1u64 << 20) as f64,
         "operation",
@@ -912,13 +1045,13 @@ fn decode_step_table(run: &OnTheDevice) -> String {
     let sampled = run.profile.dispatched();
     let executing = |part: Duration| 100.0 * part.as_secs_f64() / sampled.as_secs_f64();
     table.push(format!(
-        "  {:<18}{:>7}{:>12}{:>8}{:>11}{:>11}{:>8}",
+        "  {:<18}{:>7}{:>12}{:>8}{:>14}{:>11}{:>8}",
         "kernel", "calls", "device", "share", "moved", "achieved", "of peak"
     ));
     for (kernel, dispatches) in &kernels {
         let achieved = dispatches.bytes_per_second();
         table.push(format!(
-            "  {kernel:<18}{:>7}{:>12}{:>7.1}%{:>11}{:>11}{:>7.0}%",
+            "  {kernel:<18}{:>7}{:>12}{:>7.1}%{:>14}{:>11}{:>7.0}%",
             dispatches.calls,
             format!("{:.2?}", dispatches.elapsed),
             executing(dispatches.elapsed),
@@ -927,12 +1060,72 @@ fn decode_step_table(run: &OnTheDevice) -> String {
             100.0 * achieved / MEMORY_BANDWIDTH,
         ));
     }
-    table.push(format!(
-        "  the passes account for {sampled:.2?} of the {:.2?} the command buffers reported, and \
-         the {:.2?} between them is what a pass boundary a dispatch costs",
-        run.profile.gpu(),
-        run.profile.gpu().saturating_sub(sampled),
-    ));
+    // **The two clocks need not fall the same way round and which one is larger
+    // is itself a reading.** A command buffer's own clock runs from before its
+    // first dispatch to after its last, so what the passes inside it leave over
+    // is the device's gaps between them — until a pass span's own
+    // over-reporting is the larger of the two, which is where a table of few
+    // long dispatches lands and a table of many short ones does not.
+    let (gpu, gap) = (run.profile.gpu(), run.profile.gpu().saturating_sub(sampled));
+    table.push(if gap > Duration::ZERO {
+        format!(
+            "  the passes account for {sampled:.2?} of the {gpu:.2?} the command buffers \
+             reported, and the {gap:.2?} between them is what a pass boundary a dispatch costs"
+        )
+    } else {
+        format!(
+            "  the passes claim {sampled:.2?} of the {gpu:.2?} the command buffers reported, \
+             which is {:.2?} more than the buffers themselves clocked and is the span's own \
+             over-reporting arriving above the gaps it is measured beside",
+            sampled.saturating_sub(gpu),
+        )
+    });
+    table.join("\n")
+}
+
+/// What the waits inside a step were waiting on, one row per shape of
+/// submission.
+///
+/// **Grouped by the dispatches in a submission and not by which came first**,
+/// because that is what tells a decode step's two apart — 1076 dispatches and
+/// one — and what tells a prefill's forty-two apart from the head's, without
+/// this having to know the order. A mean over shapes that differ that much
+/// describes none of them.
+fn round_trip_table(run: &OnTheDevice) -> String {
+    let steps = run.charged_steps();
+    let mut shapes: BTreeMap<usize, Vec<RoundTrip>> = BTreeMap::new();
+    for trip in &run.round_trips {
+        shapes.entry(trip.dispatches).or_default().push(*trip);
+    }
+
+    let mut table = vec![format!(
+        "a {:.2?} step, of which {:.2?} is the {} submissions it waits for\n  \
+         {:<11}{:>8}{:>11}{:>11}{:>10}{:>11}{:>14}",
+        run.each_charged_step(),
+        run.profile.elapsed(Op::Submit),
+        run.round_trips.len() as u32 / steps,
+        "dispatches",
+        "a step",
+        "waited",
+        "scheduled",
+        "queued",
+        "executed",
+        "unattributed",
+    )];
+    let mean = |trips: &[RoundTrip], of: fn(&RoundTrip) -> Duration| {
+        trips.iter().map(of).sum::<Duration>() / steps
+    };
+    for (dispatches, trips) in &shapes {
+        table.push(format!(
+            "  {dispatches:<11}{:>8}{:>11}{:>11}{:>10}{:>11}{:>14}",
+            trips.len() as u32 / steps,
+            format!("{:.2?}", mean(trips, |trip| trip.waited)),
+            format!("{:.2?}", mean(trips, |trip| trip.scheduled)),
+            format!("{:.2?}", mean(trips, |trip| trip.queued)),
+            format!("{:.2?}", mean(trips, |trip| trip.executed)),
+            format!("{:.2?}", mean(trips, |trip| trip.unattributed())),
+        ));
+    }
     table.join("\n")
 }
 
@@ -969,7 +1162,7 @@ fn where_a_decode_step_spends_its_time() {
     let run = OnTheDevice::generate(&dir, &device);
     let step = run.each_decode_step();
     let accounted = run.profile.total();
-    eprintln!("{}", decode_step_table(&run));
+    eprintln!("{}", step_table(&run));
 
     assert!(
         accounted <= step,
@@ -1026,39 +1219,7 @@ fn what_a_decode_steps_round_trips_are_waiting_on() {
 
     let run = OnTheDevice::generate(&dir, &device);
     let steps = run.decode_steps();
-    let mut shapes: BTreeMap<usize, Vec<RoundTrip>> = BTreeMap::new();
-    for trip in &run.round_trips {
-        shapes.entry(trip.dispatches).or_default().push(*trip);
-    }
-
-    eprintln!(
-        "a {:.2?} decode step, of which {:.2?} is the {} submissions it waits for\n  \
-         {:<11}{:>8}{:>11}{:>11}{:>10}{:>11}{:>14}",
-        run.each_decode_step(),
-        run.profile.elapsed(Op::Submit),
-        run.round_trips.len() as u32 / steps,
-        "dispatches",
-        "a step",
-        "waited",
-        "scheduled",
-        "queued",
-        "executed",
-        "unattributed",
-    );
-    let mean = |trips: &[RoundTrip], of: fn(&RoundTrip) -> Duration| {
-        trips.iter().map(of).sum::<Duration>() / steps
-    };
-    for (dispatches, trips) in &shapes {
-        eprintln!(
-            "  {dispatches:<11}{:>8}{:>11}{:>11}{:>10}{:>11}{:>14}",
-            trips.len() as u32 / steps,
-            format!("{:.2?}", mean(trips, |trip| trip.waited)),
-            format!("{:.2?}", mean(trips, |trip| trip.scheduled)),
-            format!("{:.2?}", mean(trips, |trip| trip.queued)),
-            format!("{:.2?}", mean(trips, |trip| trip.executed)),
-            format!("{:.2?}", mean(trips, |trip| trip.unattributed())),
-        );
-    }
+    eprintln!("{}", round_trip_table(&run));
 
     let waited: Duration = run.round_trips.iter().map(|trip| trip.waited).sum();
     let executed: Duration = run.round_trips.iter().map(|trip| trip.executed).sum();
@@ -1124,7 +1285,7 @@ fn which_kernels_own_a_decode_step() {
     // close they sum to the device time of a step nobody was asking about.
     let unsampled = OnTheDevice::generate(&dir, &device).profile.gpu();
     let run = OnTheDevice::generating(&dir, &device, true);
-    eprintln!("{}", decode_step_table(&run));
+    eprintln!("{}", step_table(&run));
     eprintln!(
         "  against {unsampled:.2?} of device time with nothing sampling, so the rows carry \
          {:+.1}% of asking",
@@ -1161,6 +1322,115 @@ fn which_kernels_own_a_decode_step() {
         run.profile.dispatched(),
         run.profile.gpu()
     );
+}
+
+/// The two prompt lengths a prefill is diagnosed at, the same two the README
+/// quotes wall times for. The 97-token one is left out on purpose: it is the
+/// only length short enough that a run of layers still merges, so its rows
+/// carry a scheduling difference the other two do not, and the question here is
+/// what a prefill's kernels cost rather than how they are submitted.
+const PREFILL_LENGTHS: [usize; 2] = [385, 769];
+
+/// **Where a prefill's time goes, kernel by kernel**, which is the same
+/// question `which_kernels_own_a_decode_step` asks of the other regime and has
+/// never been asked of this one.
+///
+/// **The shapes are entirely different and the ranking was not assumed to
+/// survive them.** A decode step is one row through every kernel in the model;
+/// a prefill is hundreds through the same ones, and the model's own arithmetic
+/// says the two cannot scale alike — a token reads six of each MoE layer's 256
+/// experts, so 769 tokens name up to every expert a layer has where one token
+/// names six. Whether that arrives as bandwidth, as occupancy or as neither is
+/// what the table answers.
+///
+/// **Against a standing hypothesis, and it is on record as a hypothesis.** M9
+/// left behind the claim that every `(head, query)` threadgroup re-reading all
+/// keys is the next order of magnitude here. Nothing in this repo has measured
+/// it, and this project's estimates have a poor record — `lm_head` was
+/// predicted at 54% of a step and measured 7.6%, and the dequantisation
+/// bandwidth model died the moment a different kernel dominated. So the table
+/// is taken first and the hypothesis is read off it rather than the other way
+/// round.
+///
+/// Two lengths rather than one, because a row that is flat in the tokens and a
+/// row that is quadratic in them are the same row at a single length. Nothing
+/// asserts a share; what is asserted is that the accounting adds up and that
+/// every dispatch was timed.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn where_a_prefill_spends_its_time() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    if !device.times_a_pass() {
+        eprintln!("skipping: this device does not sample at a stage boundary");
+        return;
+    }
+
+    for tokens in PREFILL_LENGTHS {
+        // **Two unsampled prefills and not one, and they go either side of
+        // nothing.** A decode step's table takes one, to say how close the rows
+        // sum to the device time of a step nobody was asking about. A prefill
+        // needs the pair, because here that comparison comes out the wrong way
+        // round — the sampled wall time is the *shorter* — and a single
+        // unsampled run could not tell an effect of sampling from this
+        // machine's own state or from the first read of a length faulting its
+        // pages in. Two that agree with each other can.
+        let first = OnTheDevice::prefilling(&dir, &device, tokens, false);
+        let unsampled = OnTheDevice::prefilling(&dir, &device, tokens, false);
+        let run = OnTheDevice::prefilling(&dir, &device, tokens, true);
+        eprintln!(
+            "{}\n  against {:.2?} then {:.2?} of prefill and {:.2?} then {:.2?} of device time \
+             with nothing sampling, so the rows carry {:+.1}% of asking\n{}",
+            step_table(&run),
+            first.each_charged_step(),
+            unsampled.each_charged_step(),
+            first.profile.gpu(),
+            unsampled.profile.gpu(),
+            100.0
+                * (run.profile.dispatched().as_secs_f64() / unsampled.profile.gpu().as_secs_f64()
+                    - 1.0),
+            round_trip_table(&run),
+        );
+
+        let kernels = run.profile.kernels();
+        assert!(!kernels.is_empty(), "nothing was sampled");
+        // The same two bounds a decode step's table is held to: the rows are
+        // self time inside the wall time they were measured in, and the device
+        // cannot have executed for longer than the step that waited for it.
+        let (step, accounted) = (run.each_charged_step(), run.profile.total());
+        assert!(
+            accounted <= step,
+            "the rows sum to {accounted:.2?} inside a {step:.2?} prefill"
+        );
+        assert!(
+            run.profile.gpu() < step,
+            "the device reported executing for {:.2?} of a {step:.2?} prefill",
+            run.profile.gpu()
+        );
+        // Every dispatch the prefill encoded came back with a pair of
+        // timestamps. A device that dropped one writes `MTLCounterErrorValue`
+        // and this side charges it nothing, which would be a row quietly short
+        // rather than a failure.
+        let (dispatches, submissions, ..) = run.per_charged_step();
+        assert_eq!(
+            kernels.iter().map(|(_, each)| each.calls).sum::<u64>(),
+            dispatches,
+            "a prefill's dispatches were not all timed"
+        );
+        // **A prefill of hundreds of tokens merges nothing**, because one of
+        // its layers alone passes the bytes a run may hold — so it is a
+        // submission a layer where a decode step is two for the whole stack,
+        // and a run that started merging them would be a different engine from
+        // the one these rows describe. The two dense layers are 18 dispatches
+        // each and share one, which is why this is not a layer plus a head
+        // exactly.
+        let layers = fixture::config(&dir).text_config.num_hidden_layers as u64;
+        assert!(
+            submissions >= layers,
+            "a prefill of {tokens} tokens went in {submissions} submissions, which is fewer than \
+             its {layers} layers and so is a merged run rather than a layer at a time"
+        );
+    }
 }
 
 /// **What asking costs**, over seven alternating pairs.

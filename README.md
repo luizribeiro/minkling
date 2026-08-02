@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **507 of the 523 tests, no
+`just test` is the one to run while iterating: **507 of the 524 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,8 +32,8 @@ a crate's tests in one process: opening a Metal device costs a second, so the 15
 kernel tests are 7.8 s sharing a process and 223 s with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass before a commit lands: **all 523 against a
-real checkpoint, eight minutes.** The 42 gated tests — the 34 above and eight of
+`just test-full` is what has to pass before a commit lands: **all 524 against a
+real checkpoint, eight minutes.** The 43 gated tests — the 34 above and nine of
 the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the sixteen tests whose result *is* a number — a duration
+`just test-timing` is the seventeen tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -406,21 +406,96 @@ the stronger claim.
 **What it is not for is prefill wall time, and that belongs to the reference.**
 97, 385 and 769 tokens prefill here in 1.55, 4.68 and 8.37 s against the
 reference's 0.256, 0.680 and 1.132 — ×6.1, ×6.9 and ×7.4, and widening with the
-prompt. Where the gap comes from is unmeasured; what can be said is that it is
-not the round trips, since a prefill's submissions are 42 at 250 µs against a gap
-of seven seconds. **Three things have moved this row and all three were about
-something else**: the matmul took it 1.90, 5.39 and 10.14 s to 1.75, 4.70 and
-8.87; the loop bound was written for a long context and paid at a short one,
-taking it to 1.73, 4.69 and 8.33; and pipelining a decode step's run took the
-shortest length to 1.55 over three alternating pairs, all three moving the same
-way, while the other two lengths did not move — 4.83 s to 4.68 and 8.39 to 8.37.
-That last pair re-measured both sides rather than reading the middle stage's
-figures off this file, which is why its `before` is 4.83 and 8.39 where the row
-above records 4.69 and 8.33: a sitting a milestone apart is a different sitting.
-That is where the budget is drawn: a 97-token prefill still merges four layers to
-a run and a longer one merges none, so only the shortest has a run to pipeline.
-No milestone here has been aimed at prefill yet. The peak resident set at the
-longest is 0.434 GiB, unchanged.
+prompt. **Three things have moved this row and all three were about something
+else**: the matmul took it 1.90, 5.39 and 10.14 s to 1.75, 4.70 and 8.87; the
+loop bound was written for a long context and paid at a short one, taking it to
+1.73, 4.69 and 8.33; and pipelining a decode step's run took the shortest length
+to 1.55 over three alternating pairs, all three moving the same way, while the
+other two lengths did not move — 4.83 s to 4.68 and 8.39 to 8.37. That last pair
+re-measured both sides rather than reading the middle stage's figures off this
+file, which is why its `before` is 4.83 and 8.39 where the row above records 4.69
+and 8.33: a sitting a milestone apart is a different sitting. That is where the
+budget is drawn: a 97-token prefill still merges four layers to a run and a
+longer one merges none, so only the shortest has a run to pipeline. The peak
+resident set at the longest is 0.434 GiB.
+
+**And now where those seconds go, which is a question this file has answered for
+a decode step and had never once asked of the other regime.** The same
+sampling, the same table, at the two longer lengths above — one sitting, in
+which those two prefilled unsampled in 4.62 and 8.37 s:
+
+    kernel                    385 tokens                769 tokens
+                        device   share    moved     device   share     moved
+    packed_matmul        3.32s   94.3%  2116 GB      6.72s   91.3%   4227 GB
+    fused_attention    153.6ms    4.4%  0.70 GB    549.5ms    7.5%   1.39 GB
+    dense_matmul        20.1ms    0.6%  0.35 GB     38.7ms    0.5%   0.62 GB
+    swiglu               9.4ms    0.3%  3.18 GB     18.5ms    0.3%   6.35 GB
+    short_conv          10.2ms    0.3%  1.87 GB     17.8ms    0.2%   3.72 GB
+    rms_norm             4.6ms    0.1%  1.72 GB      7.7ms    0.1%   3.44 GB
+    moe_combine          3.1ms    0.1%  2.27 GB      6.4ms    0.1%   4.54 GB
+    router_top_k        0.85ms    0.0%  0.02 GB      1.4ms    0.0%   0.03 GB
+    router_weights      0.55ms    0.0%  0.00 GB     0.48ms    0.0%   0.00 GB
+
+**The matmul is 94% of a prefill's device time where it is 70% of a decode
+step's, and it is not slow — it is reading the model once per token.** 2116 GB at
+385 tokens and 4227 at 769 is 5496 MB a token at both lengths, and the figure a
+*decode* step moves with its head taken off is 5495 MB. So the two regimes read
+exactly the same bytes per token: a 769-token prefill reads all 42 layers' active
+weights 769 times over, which is what 769 decode steps would have read, and the
+one thing a prefill is for — reading a weight once and multiplying it against
+every row that wants it — does not happen here at all. The linearity is exact
+rather than approximate: the totals are in the ratio 1.9972 where the token
+counts are 1.9974.
+
+**The bandwidth column says the same thing from the other side.** This kernel
+reaches 638 and 629 GB/s at the two prefill lengths — 78% and 77% of this
+machine's 819 — against the 386 GB/s and 47% it reaches at decode. **It is
+nearer the machine at prefill shape than anywhere else this file measures**, so
+there is nothing in the kernel's own execution to win back. The whole of the gap
+is byte count, and the byte count is the model's own arithmetic: a row of this
+dispatch is a whole weight — see `PackedBank::moves` — and a prefill hands it one
+row per token rather than one row per weight.
+
+**Which is what says where the bytes are, and it is not spread evenly.** By the
+checkpoint's shapes, a token's 5.5 GB is 59.1% the routed banks it reads six of,
+19.7% the two shared banks every token reads, 17.2% every layer's own five
+projections and 3.9% the two dense layers' feed-forward network. Rows that could
+share a weight read are the ones naming the same expert, and only the last three
+of those four have any: a projection's rows all name expert zero and a shared
+bank's name one of two, where the routed bank's six rows a token are six
+different experts by construction. **So 40.8% of a prefill's bytes are reachable
+without moving a row and 59.1% are not**, and that is the line the commit after
+this one is drawn on.
+
+**M9's hypothesis did not hold, and the table is what says so.** It was that
+every `(head, query)` threadgroup re-reading all keys is the next order of
+magnitude here. `fused_attention` is 4.4% of a 385-token prefill's device time
+and 7.5% of a 769-token one — growing with the prompt, as the hypothesis
+implies, and two orders below where the time is. A perfect attention kernel that
+cost nothing at all would take 8.37 s to 7.82. It stays worth doing eventually
+and it is not what a prefill is waiting on.
+
+**Nor is it the round trips, and this time that is measured rather than argued
+from a submission count.** A prefill is one submission a layer — 42 of them at
+385 tokens and 43 at 769, since one of its layers alone passes the bytes a merged
+run may hold — and the wait on each is 97% and 98% execution, with `queued` at
+nothing on every layer's row. So M16's pipelining reaches none of this: there is
+no second command buffer behind the one being waited for, because a prefill never
+merges two layers into one. The 42 submissions are 250 µs against a gap of seven
+seconds, which is where that argument stood before, and the round-trip table now
+says it rather than the arithmetic.
+
+**One thing in the diagnosis is unexplained and is written down as such.** A
+sampled prefill is *faster* in wall time than an unsampled one — 3.57 s against
+4.62 and 4.65 at 385 tokens, 7.26 against 8.37 and 8.29 at 769 — while the
+device's own clock does not move: 3.36 s against 3.32 and 3.36, and 6.96 s
+against 6.96 and 6.87. It is not the first read of a length faulting its pages
+in, because the two unsampled runs sit either side of the sampled one and agree
+with each other and with the figure the command line reports cold. So about a
+second of a prefill is this process's own, it is not execution, and putting each
+dispatch in a compute pass of its own removes it. Nothing here has attributed
+that, and no
+number above rests on it — every row in the tables is device time.
 
 **A whole decoder layer is now one command buffer**, and twenty-six dispatches
 on a layer that routes. Eleven are its attention: the input layernorm, the four
