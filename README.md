@@ -23,17 +23,17 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **523 of the 547 tests, no
+`just test` is the one to run while iterating: **527 of the 552 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
-34 that need weights report a skip and pass. It runs through libtest, which puts
-a crate's tests in one process: opening a Metal device costs a second, so the 163
-kernel tests are 7.9 s sharing a process and minutes with one each. Nothing in this
+36 that need weights report a skip and pass. It runs through libtest, which puts
+a crate's tests in one process: opening a Metal device costs a second, so the 168
+kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass before a commit lands: **all 547 against a
-real checkpoint, ten minutes.** The 45 gated tests — the 34 above and eleven
+`just test-full` is what has to pass before a commit lands: **all 552 against a
+real checkpoint, ten minutes.** The 48 gated tests — the 36 above and twelve
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the twenty-four tests whose result *is* a number — a duration
+`just test-timing` is the twenty-five tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -92,9 +92,9 @@ inferred.** Every operation a forward pass runs opens a scope charged the time
 inside it that no scope inside *it* claimed, so the rows of a decode step sum to
 the step and what they leave over is a number rather than a shrug:
 
-    submit and wait      30    66%      of which the device executed for 18 ms
-    dispatch encode    1077    27%
-    readback              2     0%
+    submit and wait      28    66%      of which the device executed for 18 ms
+    dispatch encode    1078    27%
+    readback              1     0%
     everything else                     7%
 
 **Every row that named an operation of a layer has left it, and the shape of
@@ -116,7 +116,10 @@ commits part way through and keeps encoding, so a command buffer executes while
 this process is charging its time to `dispatch encode`. Nothing an operation of a
 layer would open a scope around is left in the table at all: what remains beside
 the round trip is encoding it, the sampling at the end, and the embedding at the
-start.
+start. **And the back of the model has left it too** — the final norm and the
+muP divide were the last two rows here that were arithmetic rather than asking,
+and they are dispatches now: `readback` is one call where it was two and
+`sample` is the argmax alone. See "The tail of a step" below.
 
 **"Three quarters of a step is a round trip" was a sentence worth reading twice,
 because a milestone that read it as three quarters of a step spent asking would
@@ -134,9 +137,13 @@ driver, and this thread being woken once the buffer completed. **The big
 submission was 93% execution and there was nothing in it to remove.** The 1.2 ms
 that was not execution is mostly the driver walking 1076 dispatches at 0.87 µs
 each, which is a cost of *having* the dispatches rather than of submitting them.
-The head's submission is the other kind, and still is: 1.98 ms of wait around
-0.66 ms of work, so 1.3 ms of it buys nothing, and that is the price of the seam
-that reads the stack's rows back to norm them on this side.
+The head's submission was the other kind: 1.98 ms of wait around 0.66 ms of
+work, so 1.3 ms of it bought nothing, and that was the price of the seam that
+read the stack's rows back to norm them on this side. **That seam is gone and
+the row with it** — see "The tail of a step", where the same row is re-measured
+at 0.98 ms of wait around 0.66 ms of work before it is removed, because a figure
+taken three milestones ago against a step that has changed twice is not a figure
+about this step.
 
 **What was not in that table is the encode, and that was the finding.** A command
 buffer executes nothing until it is committed, and a step committed after
@@ -148,17 +155,19 @@ the rows. A MoE layer is 26 dispatches, so that boundary is three of them, and
 the same table reads:
 
     dispatches   a step     waited  scheduled    queued   executed  unattributed
-    1                 1   983.97µs    52.68µs  146.65µs   659.26µs      125.38µs
-    52                1   842.85µs    68.56µs   11.14ms   839.12µs        0.00ns
-    78               12    11.27ms     1.13ms   70.83ms    15.05ms        0.00ns
-    88                1     1.07µs   106.93µs  424.15µs     1.55ms        0.00ns
+    54                1     1.51ms   141.12µs   10.98ms     1.51ms        0.00ns
+    78               12    11.17ms     1.08ms   70.83ms    14.97ms        0.00ns
+    88                1     1.17µs   120.12µs  467.13µs     1.55ms        0.00ns
 
 **A `queued` column of 71 ms inside a 20 ms step is the whole of what changed.**
 Twelve command buffers sit in the queue while the ones ahead of them run, and the
-one this process blocked for 1.07 microseconds is the first of them — committed
+one this process blocked for 1.17 microseconds is the last of them — committed
 and finished before there was anything else to wait for. `unattributed` is
-nothing on every row a run committed, because the three parts of those now
-account for more than the wait rather than less.
+nothing on any row, because the three parts of a submission a run committed now
+account for more than the wait rather than less. **There is no one-dispatch row
+here any more**: the 54 is the last two layers' 52 dispatches with the final
+norm and `lm_head` behind them, where the head used to open a buffer of its
+own.
 
 Over seven alternating pairs, every pair moving the same way and the two ranges
 not overlapping, a decode step is **26.34 ms to 20.11**. **The device's own clock
@@ -169,21 +178,21 @@ was read beside the step put the same figures at 26.39 and 20.18. The recorded
 continuation did not change, and neither did the peak resident set.
 
 **And now which kernel owns which of those 18 milliseconds.** The device
-timestamps a command buffer, and a decode step is fifteen of them around 1077
+timestamps a command buffer, and a decode step is fourteen of them around 1078
 dispatches, so until this landed that figure was one number with nine kernels
 behind it. It is now nine numbers, each beside the bytes that dispatch said it
 moves and what that comes to against this machine's 819 GB/s:
 
     kernel            calls    device   share       moved   achieved  of peak
-    packed_matmul       457   15.20ms   70.3%   5932.36 MB   390 GB/s     48%
-    rms_norm            168    1.88ms    8.7%      5.89 MB     3 GB/s      0%
-    short_conv          168    1.37ms    6.3%     22.02 MB    16 GB/s      2%
-    fused_attention      42    880µs     4.1%      5.62 MB     6 GB/s      1%
-    router_top_k         40    547µs     2.5%      0.08 MB     0 GB/s      0%
-    dense_matmul         40    480µs     2.2%     85.24 MB   178 GB/s     22%
-    swiglu               82    437µs     2.0%      8.26 MB    19 GB/s      2%
-    router_weights       40    378µs     1.7%      0.00 MB     0 GB/s      0%
-    moe_combine          40    351µs     1.6%      5.90 MB    17 GB/s      2%
+    packed_matmul       457   15.07ms   70.4%   5932.36 MB   394 GB/s     48%
+    rms_norm            169    1.90ms    8.9%      5.94 MB     3 GB/s      0%
+    short_conv          168    1.38ms    6.4%     22.02 MB    16 GB/s      2%
+    fused_attention      42    891µs     4.2%      5.62 MB     6 GB/s      1%
+    router_top_k         40    549µs     2.6%      0.08 MB     0 GB/s      0%
+    dense_matmul         40    466µs     2.2%     85.24 MB   183 GB/s     22%
+    swiglu               82    429µs     2.0%      8.26 MB    19 GB/s      2%
+    router_weights       40    380µs     1.8%      0.00 MB     0 GB/s      0%
+    moe_combine          40    335µs     1.6%      5.90 MB    18 GB/s      2%
 
 **The packed matmul is 70% of the device's time and it is the only kernel here
 doing bandwidth's work.** Its 5.9 GB is what the checkpoint's shapes say a token
@@ -191,7 +200,7 @@ reads — six of each MoE layer's 256 experts and both shared ones, plus every
 layer's own projections — arrived at from a dispatch's own declaration rather
 than from that arithmetic, and the two agree. 48% of the machine is what a lane
 holding four packed bytes rather than one is worth, against 34% before it — and
-390 GB/s is three quarters of the way up the 284-to-424 GB/s M2's isolated matmul
+394 GB/s is four fifths of the way up the 284-to-424 GB/s M2's isolated matmul
 measured, where 282 sat at the bottom of it. Its own paragraph below says what
 is left.
 
@@ -313,12 +322,12 @@ put back the round trip two milestones went to remove and measure an engine
 nobody runs; the passes still go in the same command buffers. Over seven
 alternating pairs it costs **12.1 ms a step and 10.0 ms of device time, 9 µs a
 dispatch**, and the pass boundary lands *between* the spans rather than inside
-them: the rows above sum to 22.0 ms against the 18.2 ms those same pairs put an
+them: the rows above sum to 21.4 ms against the 18.2 ms the same reading puts an
 unsampled step's device time at, so each carries a couple of microseconds it
-would not have — 21% across the table, and more of it on the short rows than on
-the long one. **The bias grew in both denominators and why is unmeasured**: 3.8
-ms of over-reporting where it was 2.7, over the same 1077 boundaries, so a
-boundary costing what it costs whatever is inside it does not explain it. The
+would not have — 18% across the table, and more of it on the short rows than on
+the long one. **The bias grew in both denominators and why is unmeasured**: 3.2
+ms of over-reporting where it was 2.7, over about the same number of boundaries,
+so a boundary costing what it costs whatever is inside it does not explain it. The
 ranking is the finding; the absolute figures carry that.
 
 **A dispatch's shape is not an allocation.** Each of the 749 dispatches a step
@@ -338,8 +347,8 @@ share nothing: the four projections a layer's normed hidden state feeds, the nor
 that makes it, the two convolutions and two head norms behind two of them, the
 attention step beside the projection it feeds, the convolution and add on the
 residual path behind that, the norm over what they left, and every dispatch the
-MLP then runs — 1077 dispatches, and the only thing that ends a command buffer
-is a run reaching the dispatches it commits at or the head reading the rows. **What those have in common is that a seam had to be able to express
+MLP then runs — 1078 dispatches, and the only thing that ends a command buffer
+is a run reaching the dispatches it commits at or somebody reading the logits. **What those have in common is that a seam had to be able to express
 them.** Handing a backend one bank at a time, none of it is visible: it takes a
 call that is given the whole layer to see that the gate reads the hidden state
 the shared bank reads, that the top-k reads what the gate wrote, and that the
@@ -462,8 +471,10 @@ grouping before it read the same way. What says *why* is not the timing: `tiles`
 and `groups` are both false for every shape a decode step dispatches, so the
 table of a decode step's kernels has the same 457 `packed_matmul` calls moving
 the same 5932.36 MB and **neither a `packed_matmul_rows` row nor a
-`packed_matmul_grouped` one**, in the same 1077 dispatches, 15 submissions and
-953 buffers of 17.6 MiB. The recorded continuation
+`packed_matmul_grouped` one**, in the same dispatches, submissions and 953
+buffers of 17.6 MiB the commit before it ran. (Those two counts were 1077 and 15
+when that pair was taken and are 1078 and 14 now, for a reason that has nothing
+to do with the tile — see "The tail of a step".) The recorded continuation
 `[656, 13, 623, 180069, 86333, 60500, 220, 23]` did not change; nor did 48
 tokens of a longer prompt, byte for byte across the two builds at every depth
 speculation runs at — `k` of 0, 1, 2 and 4 — nor what `--backend cpu` answers,
@@ -597,7 +608,9 @@ the tile's own is.
 about moving work near the router: the sort reads what the top-k wrote and writes
 what the bank reads, so it goes between them in the command buffer a layer
 already was. 1077 dispatches a prefill to 1117 at every length, and the
-submissions where they were: 22 at 97 tokens, 42 at 385 and 43 at 769.
+submissions where they were: 22 at 97 tokens, 42 at 385 and 43 at 769. (The tail
+has since taken 97 tokens to 1118 dispatches in 21 submissions and left the other
+two where they are — see "The tail of a step".)
 
 **What it bought, at 769 tokens and as the rows stood then:**
 
@@ -834,13 +847,13 @@ merges nothing and is one submission a layer, which is what a long prefill is.
 measurement.** A decode step allocates 17.6 MiB across the 953 buffers its one
 run retains, so the 160 MiB the budget allows is about nine rows of this stack —
 which is the deepest block the eight heads can ask for, and the width the table
-under "Speculating with the MTP heads" still submits in fifteen, fourteen for the
-layers and one for the head, the same as a single row. It is also why the budget does
+under "Speculating with the MTP heads" still submits in fourteen, the same as a
+single row. It is also why the budget does
 not reach a prefill: ten tokens already pass it, so every prompt worth the name
 is a submission a layer, exactly as it was.
 
 **So a decode step became two submissions**, one for the forty-two layers and one
-for the head, where it was 43 and 87 and 249 — and is fifteen now for a reason
+for the head, where it was 43 and 87 and 249 — and is fourteen now for a reason
 that has nothing to do with round trips, since it still waits once. Over seven alternating pairs, every
 pair moving the same way: 47.43 ms to 34.69. The device's own clock did not move
 — 26.7 ms either side — so the 12.7 ms is round trip and nothing else: 10.2 ms of
@@ -855,8 +868,133 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
-There is no operation of a layer left outside the GPU. Both backends generate the
-same tokens, and the CPU one stays the oracle every kernel here is validated
+## The tail of a step
+
+**What a decode step did last was a round trip, and the only reason was that the
+final norm ran on this side.** The stack's rows came back so this process could
+normalise them, divide by `logits_mup_width_multiplier`, and hand the result
+straight over again for `lm_head` — two crossings and a submission, around a
+projection whose input the device had just written. A chain of eight MTP heads
+paid the same thing eight times: half of its sixteen submissions were `lm_head`,
+one behind each head.
+
+**All three run there now**, in whichever command buffer wrote the rows they
+read — the run of layers for a decode step, the head's own for a guess. Nothing
+else moved: the last layer of the stack is simply a layer with something after
+it, which is the condition every other merged submission in this file rests on.
+
+**This is the one piece of tail work the project deferred every time it came up,
+and the reason was numerical.** Apple GPUs have no f64, a norm is a reduction,
+and a reduction that reassociates differently from the host moves a logit — and a
+moved logit at the top of the distribution is a different token. So the
+comparison came before any timing: the same prompt through two stacks differing
+in nothing but who runs the last three operations, so that what they hand the
+tail is the same hidden state bit for bit.
+
+    step   token   logits apart   the winner's margin   normed apart
+     0       656        0.000e0               1.449e-1        6.729e-8
+     1        13        0.000e0               5.683e-2         0.000e0
+     2       623       1.715e-7               1.404e-1        7.120e-8
+     3    180069       1.780e-7               1.283e-1        6.904e-8
+     4     86333        0.000e0               1.407e-1         0.000e0
+     5     60500        0.000e0               1.484e-1         0.000e0
+     6       220       1.468e-7               1.228e-1        1.424e-7
+     7        23       1.794e-7               1.556e-2        6.303e-8
+     8     33610        0.000e0               1.708e-1         0.000e0
+
+**The same token at every one of the nine positions, and the margin column is
+what says that is not luck.** The worst the two tails disagree by is 1.79e-7 of
+the row's peak and the narrowest gap between a position's best logit and its
+second best is 1.56e-2 — a factor of 87000, and the assertion the case makes is
+that the first stays under the second. Five of the nine positions agree bit for
+bit and four differ in the last couple of ulps, which is a reduction landing on
+the same float most of the time and not quite always; the row at step 0 is the
+one where a normed state that differs does not produce logits that do.
+
+**The muP divide is exact rather than close, and it is exact because of where it
+went.** A dispatch of its own for one multiply is a dispatch, and the norm's own
+per-row scale is a *multiply* where the reference divides — so the multiplier is
+divided into a copy of the norm's weight instead, once, at wrap time. Scaling by
+a power of two moves an exponent and no mantissa bit, so `a * (w/m)` and
+`(a * w)/m` are the same float; both halves of that are checked rather than
+assumed, and a checkpoint whose multiplier is not a power of two, or whose
+divided weight would fall subnormal, keeps the tail it always had. What the
+round trip of the division would say is nothing — `0.3 / 12.0 * 12.0` is `0.3`
+and `0.3 / 12.0` is not exact — which is a case the tests here name.
+
+**What it is worth is a submission each time, and that is what it measures.** A
+decode step is **1078 dispatches in 14 submissions** where it was 1077 in 15, and
+the round-trip table says which one went. Its first two rows, as they read
+immediately before this change:
+
+    dispatches   a step     waited  scheduled    queued   executed  unattributed
+    1                 1   969.00µs    60.34µs  134.66µs   660.17µs      113.83µs
+    52                1   838.60µs    97.29µs   10.82ms   835.92µs        0.00ns
+
+The first is `lm_head`'s own submission and there is no such row now; the second
+is the last two layers of the run, and it is 54 dispatches with the tail behind
+them. Over three readings that row is **0.89 to 1.01 ms of wait around 0.66 ms of
+execution, so 0.23 to 0.35 ms of it bought nothing** — which is this milestone
+re-measuring a figure the file had at 1.3 ms in the M16 era, against a step that
+has changed twice since, rather than inheriting it.
+
+**About 0.3 ms is also what the step moved.** Over three alternating pairs with the
+order of the two halves flipped each pair, and every pair moving the same way, an
+unspeculated decode step over 64 tokens went **21.18 ms to 20.86** — ranges
+21.14-21.23 against 20.83-20.89 — and a run that keeps four timesteps of slack in
+every window went 21.23 to 20.90 beside it. The two agree with the round-trip
+row to a hundredth of a millisecond, which is what says the submission is the
+whole of what was removed.
+
+**A chain of eight heads is 168 dispatches in 8 submissions** where it was 160 in
+16 — 21.0 a submission against 10.0, and against a decode step's 77. Over five
+alternating pairs, every pair moving the same way and the two ranges not
+overlapping, the chain went **27.36 ms to 25.31**, and the device's own clock did
+not move with it: 18.21 ms against 18.26, the 0.05 being what eight more norm
+dispatches cost at 6 µs each. So the 2.05 ms is round trip and nothing else, at
+0.26 ms a submission removed — the same price the decode step paid for its
+one.
+
+**A prefill is where the fold does not reach, and the budget is why.** A run ends
+when it has retained the bytes it may hold, and that is asked before the tail is:
+385 and 769 tokens are 1117 dispatches in 42 and 43 submissions either way, with
+the norm and the divide on this side and `lm_head` in a submission of its own,
+exactly as before. 97 tokens is under the budget at its last layer and does fold
+— 1118 dispatches in 21 submissions where it was 1117 in 22 — and it costs
+nothing measurable: 1.21, 1.20 and 1.21 s of wall against 1.21, 1.23 and 1.21,
+and 497, 499 and 494 ms of device time against 493, 499 and 498. Every other
+column of that table is identical to the tenth at all three lengths.
+
+**No token changed anywhere.** The recorded continuation is the recorded
+continuation; 48 tokens of a longer prompt are byte for byte what they were at
+`k` of 0, 1, 2 and 4; and acceptance is unmoved to the digit — 85% at depth 1,
+then 91/74%, 84/74/63% and 82/65/53/47% — which is what says the guesses the
+heads make are the same guesses. **The peak resident set did not move either**,
+and the measurement it is worth reading is the command's own rather than a test
+harness's: `inklingrs generate` over the same eight tokens peaks at 402.2, 402.3
+and 402.4 MB before and 402.7, 402.8 and 403.0 after, over three pairs. The
+gated case that bounds a *pass* reads 0.08 GiB against 0.22 across the same two
+commits, and none of that is the engine: all of it is `Device::open`, 7 MiB in
+one test binary and 144 MiB in the other, before a line of model code runs and
+with the tail withheld. `device.rs` is byte-identical across the two, and running
+each binary from the other's directory moves nothing — the cost follows the
+binary. Why the driver charges one process twenty times what it charges another
+for opening the same device is not attributed here.
+
+**Sampling did not follow, and what stopped it is a number rather than a
+scruple.** The argmax over 200058 logits is the last thing a step asks this
+process for, and it is `sample` at 279 to 288 µs over three readings — 1.4% of a
+decode step, beside a `readback` of 61 to 74 µs. On a chain of eight it is worth far more and is measured far
+worse: five sampled readings put it between 2.2 and 7.2 ms, and the spread is
+most of what those say. What a device argmax would have to buy first is the tie
+rule the whole engine's token identity rests on — `greedy` is `top_k(logits, 1)`
+and takes the lower id — over a reduction across eighty cores, which is its own
+equivalence argument and not a corollary of this one. It is the next thing at the
+back of the model; it is not this.
+
+There is no operation of a layer left outside the GPU, and nothing of the model
+past its last layer either but the argmax. Both backends generate the same
+tokens, and the CPU one stays the oracle every kernel here is validated
 against.
 
 Or the same model behind an OpenAI-compatible endpoint, loaded once:
@@ -966,19 +1104,27 @@ the GPU holds, which unified memory makes a move rather than a copy.
 
 **What a round costs, measured here rather than inherited.** Against a warm
 cache, a 34-token prompt, and this engine's own decode step over the 64 tokens
-that follow it — 21.1 ms, where the 20.1 ms above is the same step at the
+that follow it — 20.9 ms, where the 20.1 ms above is the same step at the
 eight-token context every other measurement in this file is taken at:
 
     tokens in the block    1      2      3      4      6      9
-    forward pass       23.3ms 31.1ms 38.6ms 43.1ms 62.5ms  79.5ms
-    × a decode step      1.10   1.48   1.83   2.04   2.96    3.77
-    submissions            15     15     15     15     15      15
+    forward pass       24.2ms 30.6ms 37.3ms 42.6ms 61.6ms  78.9ms
+    × a decode step      1.16   1.47   1.79   2.04   2.95    3.78
+    submissions            14     14     14     14     14      14
 
     heads chained          1      2      3      4      6      8
-    the chain           3.5ms  6.9ms 10.3ms 13.7ms 20.6ms  27.4ms
-    × a decode step      0.16   0.32   0.49   0.65   0.97    1.29
+    the chain           3.6ms  6.6ms  9.5ms 12.7ms 19.1ms  25.3ms
+    × a decode step      0.17   0.31   0.46   0.61   0.91    1.21
 
-**An extra token in the block costs 7.0 ms**, which is 0.33 of a decode step and
+**The first two rows of the block table are noise and are worth saying so
+about**: over three readings a block of one swings 19.9 to 26.1 ms and a block of
+two 28.9 to 32.0, either side of the change these figures were taken across, so a
+row that reads above a decode step at one token is the measurement rather than
+the engine. From three tokens up the same three readings hold to a few tenths,
+and hold to a few tenths across the change: 37.8 to 37.3, 42.2 to 42.6, 61.3 to
+61.6 and 79.1 to 78.9 ms.
+
+**An extra token in the block costs 6.8 ms**, which is 0.33 of a decode step and
 is exactly what the acceptance study measured — 10.5 ms against a 31.8 ms step.
 Both the block and the step it is weighed against have fallen since, and by
 enough of the same factor that the fraction is back where it started. Most of it
@@ -993,7 +1139,7 @@ handed one row can leave what it produced where the next layer reads it; the
 engine drew that line at one row, so a call of two paid a submission a layer.
 The line is bytes now — nine rows of this stack stay under what a run may retain,
 see the layers' own paragraph above — and that is 41 round trips off every block
-a round can ask for. The fifteen in the row are command buffers a run commits as
+a round can ask for. The fourteen in the row are command buffers a run commits as
 it fills them and waits for once at the end, which is a different number from the
 one that used to be the same number.
 
@@ -1008,14 +1154,14 @@ measurement**, at two widths out of three; what separates them is unmeasured, an
 the sweep is the one that describes a run. Those six figures are that commit's
 own pair; the tables above are what the two cost now.
 
-A head's guess costs 3.4 ms and reads 995 MB — its own 532 MiB, and `lm_head`
+A head's guess costs 3.2 ms and reads 995 MB — its own 532 MiB, and `lm_head`
 again to turn a hidden state into a token. **How that divides was inferred here
 for two milestones, measured against the inference and found to disagree with
 it, and has now been moved**: at six submissions a guess the device executed for
 2.2 ms of 4.5 and the other 2.3 were the round trips and this process's own work
 between them, where this file had 3.4 ms of bandwidth and 1.3 of round trip. At
-one submission a head plus its `lm_head` it is 2.27 ms of execution inside 2.78
-ms of wait. The study called the reference's per-head overhead "yours to win in
+one submission a head plus its `lm_head` it was 2.27 ms of execution inside 2.78
+ms of wait, and at one submission for both it is 2.28 inside 2.58. The study called the reference's per-head overhead "yours to win in
 Rust"; mlx-vlm was near the old figure at 3.9 ms — on the 8-bit checkpoint, whose
 heads are these heads byte for byte but whose `lm_head`, which a guess also
 reads, its quantiser left in the original precision. **Only the `lm_head` half
@@ -1029,12 +1175,12 @@ answered for a decode step and a prefill and never once asked of the heads.**
 The same tables, over the eight heads at one row, sampled:
 
     kernel            calls    device   share       moved   achieved  of peak
-    dense_matmul         72   12.60ms   67.6%   4469.46 MB   355 GB/s     43%
-    packed_matmul         8    5.26ms   28.2%   3489.14 MB   664 GB/s     81%
-    rms_norm             32  342.10µs    1.8%      1.97 MB     6 GB/s      1%
-    short_conv           32  277.45µs    1.5%      5.77 MB    21 GB/s      3%
-    fused_attention       8  117.25µs    0.6%      1.05 MB     9 GB/s      1%
-    swiglu                8   57.20µs    0.3%      3.15 MB    55 GB/s      7%
+    dense_matmul         72   12.55ms   67.0%   4469.46 MB   356 GB/s     43%
+    packed_matmul         8    5.26ms   28.1%   3489.14 MB   663 GB/s     81%
+    rms_norm             40  454.14µs    2.4%      2.37 MB     5 GB/s      1%
+    short_conv           32  305.85µs    1.6%      5.77 MB    19 GB/s      2%
+    fused_attention       8  125.51µs    0.7%      1.05 MB     8 GB/s      1%
+    swiglu                8   46.28µs    0.2%      3.15 MB    68 GB/s      8%
 
 **A chain of eight heads reads 7.96 GB where a decode step reads 5.9**, and 4.5
 of those are bfloat16 the quantisers never touched — so two thirds of the
@@ -1049,7 +1195,9 @@ row was 161 GB/s against 205 and the chain's device clock 19.59 ms against
 are new: a head's norms, its convolutions and its activation are dispatches now
 rather than loops on this side, where the same table charged this process 2.24
 ms of `sconv`, `swiglu` and `rms_norm` rows for them and 26 µs of residual adds
-the convolutions now carry as a second addend.
+the convolutions now carry as a second addend. The `rms_norm` row is forty calls
+where it was thirty-two, and the eight are the model's own final norm arriving
+here — see "The tail of a step".
 
 **The rates in that table are not the rates the one before it printed, and the
 sampling is why.** These rows carry **+2.6% of asking** where the chain's first
@@ -1068,19 +1216,21 @@ dispatches in 48 submissions — 1.8 a submission, against a decode step's 71.8*
 turns what it produced into a token, each committed and then waited for. It is
 **160 dispatches in 16 submissions, 10.0 a submission**: one for the head, whose
 input projection and whose eighteen dispatches of dense decoder layer are
-nineteen in one command buffer, and one for the `lm_head` behind it. Of a 27 ms chain the device
-executes for 18.2 and the wait is 22.4, where of the 43 ms chain before it the
-device executed for 17.9 and the wait was 36.5:
+nineteen in one command buffer, and one for the `lm_head` behind it. **And it is
+168 dispatches in 8 now**, because the `lm_head` behind each head is in the
+head's own buffer along with the final norm in front of it — 21.0 a submission,
+against a decode step's 77. Of a 25.3 ms chain the device executes for 18.2 and
+the wait is 20.7, where of the 43 ms chain two milestones ago the device executed
+for 17.9 and the wait was 36.5:
 
     dispatches   a chain     waited  scheduled    queued   executed  unattributed
-    1                  8     7.32ms   375.63µs  540.64µs     5.25ms        1.15ms
-    19                 8    14.95ms   430.73µs  539.18µs    12.93ms        1.05ms
+    21                 8    20.72ms   631.15µs  712.15µs    18.24ms        1.13ms
 
-**`queued` is 1.1 ms across the whole chain where a decode step's run of layers
-has 71 ms of it, and that is not what a merged head fixed.** M16's pipelining
+**`queued` is 0.71 ms across the whole chain where a decode step's run of layers
+has 71 ms of it, and that is not what merging a head fixed.** M16's pipelining
 still reaches none of this, and cannot: a head's guess has to *be* a token before
 the head after it can embed it, so there is nothing behind the buffer being
-waited for and there is no arrangement of these sixteen submissions in which
+waited for and there is no arrangement of these eight submissions in which
 there would be. What the merge removed is the other 32 — the norms, the two
 convolutions, the head norms, the activation and the residual adds each had a
 kernel on the device already and what did not exist was the seam. It is the same
@@ -1088,10 +1238,13 @@ move the layers made four milestones ago, and what it needed was not a kernel:
 `LayerProjections` and `DenseFfn` hold a weight either format answers for, so a
 head's block is wrapped as the decoder layer it always was.
 
-What is left after those two is this process's own: `sample` is 7.8% of the
-chain and `readback` 2.1%, which are the argmax over 201024 logits and the
-logits arriving to be argmaxed — eight times over, for the same reason `queued`
-is nothing.
+What is left after those three is this process's own: `sample` is 14.4% of a
+sampled chain and `readback` 2.1%, which are the argmax over 201024 logits and
+the logits arriving to be argmaxed — eight times over, for the same reason
+`queued` is nothing. **`sample` is also the noisiest row in this file**: five
+sampled readings put it between 2.2 and 7.2 ms, tracking the drift of the runs
+around it rather than the work, which is why a device argmax is described at the
+end of "The tail of a step" rather than costed here.
 
 **And what is left of the chain is stated rather than attempted.** Of 27.4 ms
 the device executes 18.2, and 12.6 of those are `dense_matmul` reading the 4.5
@@ -1103,9 +1256,9 @@ merging its submissions cannot: no token can move, because the model verifies
 every guess and a wrong guess costs a round its speedup and nothing else — but
 *acceptance* can move, and acceptance is what the speedup is made of, so it
 needs the heads' guesses held against the bfloat16 chain's before any timing
-claim. Of the 4.2 ms of wait that is not execution, half is the eight `lm_head`
-submissions, which a head could share a command buffer with if the model's own
-final norm were on the device beside it.
+claim. Of the 2.4 ms of wait that is not execution, the eight `lm_head`
+submissions used to be half — and they are not there any more, because the
+model's own final norm is on the device beside them.
 
 **Speculation pays again at three depths where it paid at one.** Over 64 tokens
 of a structured prompt, three passes round-robin over the depths so that a drift
@@ -1113,45 +1266,49 @@ moves them all, best pass each — and the whole sweep three times, so that ever
 figure here is the mean of three of those:
 
     k                      0      1      2      3      4
-    ms/token           21.14  19.10  19.75  20.23  24.97
+    ms/token           20.85  18.82  19.39  19.92  24.74
     tokens a round      1.000  1.829  2.560  3.048  3.368
-    speedup             1.000  1.107  1.070  1.045  0.847
+    speedup             1.000  1.108  1.075  1.047  0.843
     accepted, by depth         85%  91/74% 84/74/63% 82/65/53/47%
 
-**Those three sweeps are three alternating pairs against the six submissions a
-head used to take, the order of the two halves flipped each pair**: 19.89,
-21.05, 21.73 and 25.57 ms a token become the row above at `k` of 1, 2, 3 and 4.
-Every pair moves the same way at every depth, and the two ranges are apart at
-1, 2 and 3 —
-19.88-19.89 against 19.06-19.13, 20.96-21.14 against 19.62-19.88, 21.35-22.03
-against 20.13-20.41. **At `k = 4` they are not**, 25.30-25.93 against
-24.03-25.47, so the depth speculation still loses at is the one depth this
-milestone claims nothing about. The chain is 36.24 ms to 27.44 at eight heads
-and 4.59 to 3.46 at one, neither range overlapping. Acceptance is untouched, to
-three decimals, because the prompt and the model are the same.
+**Those three sweeps are three alternating pairs against the tail on this side,
+the order of the two halves flipped each pair**: 21.18, 19.01, 19.74, 20.12 and
+25.28 ms a token become the row above at `k` of 0 through 4. Every pair moves the
+same way at every depth, and the two ranges are apart at 0, 1 and 2 —
+21.16-21.22 against 20.77-20.90, 18.97-19.05 against 18.78-18.88, 19.55-19.88
+against 19.34-19.49. **At `k = 3` they overlap** over three hundredths of a millisecond,
+20.07-20.18 against 19.77-20.10, and **at `k = 4` one pair falls the other way**,
+24.88-25.62 against 24.42-24.96 — so the depth speculation still loses at is
+again the one depth a milestone claims nothing about. The chain is 27.44 ms to
+25.32 at eight heads, ranges apart. Acceptance is untouched, to three decimals,
+because the prompt and the model are the same.
 
-**And the unspeculated step is where it was**, which is the constraint all of
-this was done under: 21.13 ms against 21.16 over the same six readings, ranges
-21.08-21.16 against 21.10-21.20. The two halves of that disagree about the last
-0.05 ms — the run that speculates nothing reads 21.13 against 21.18 with its
-ranges apart, and the `k = 0` row of the table above reads 21.13 against 21.14
-with them across each other — which is what a change that touched no decode
-dispatch and put a virtual call in front of 457 of them looks like when it is
-measured at 0.2%.
+**Every row of that table moved and the speedups did not**, which is the shape of
+what a round trip off the end of a forward pass is worth: `k = 0` is one pass and
+one tail a token, and `k = 3` is one pass and four tails over three tokens, so
+the saving is about the same per token at every depth and cancels in the ratio.
+1.114 / 1.074 / 1.053 / 0.838 became 1.108 / 1.075 / 1.047 / 0.843, which is no
+change at all.
+
+**And the unspeculated step came down with them**, which is the other half of
+what the tail is for: 21.18 ms to 20.86 over the same three pairs, ranges
+21.14-21.23 against 20.83-20.89, and 21.23 to 20.90 for a run that keeps four
+timesteps of slack in every window. Both agree with the `k = 0` row above and
+with the round-trip row "The tail of a step" removes.
 
 **`k = 1` is what pays best and it pays 1.11×**, and `k = 2` and `k = 3` are
-worth running again at 1.07× and 1.045× where they were 1.00× and 0.97×. What
-changed is not acceptance and not the block: a `k = 1` round spends 3.5 of its
-35 ms guessing where it spent 4.6 of 36, and a `k = 3` round 10.3 of its 61 ms
-where it spent 13.9 of 66.
+worth running at 1.075× and 1.047×. What changed is not acceptance and not the
+block: a `k = 1` round spends 3.6 of its 34 ms guessing where it spent 4.1 of 35,
+and a `k = 3` round 9.5 of its 61 ms where it spent 10.3 of 61.
 
-**A chain that cost nothing would put those three at 1.23×, 1.24× and 1.26×**,
-against the 1.22×, 1.21× and 1.23× the same arithmetic puts them at over the
-three pairs' own `before` half. So the ceiling is the workload's — acceptance
-and what a block costs to verify decide it, and neither moved — and what still
-separates `k = 1` from it is 0.12 where it was 0.15. This file said 1.28× when
-it last stated that ceiling, off a one-head chain of 6.1 ms that three
-alternating pairs now put at 4.59.
+**A chain that cost nothing would put those three at 1.24×, 1.24× and 1.24×**,
+against the 1.26×, 1.25× and 1.27× the same arithmetic puts them at over the
+three pairs' own `before` half. **The ceiling fell and that is not a
+regression**: what it is a ratio *of* fell. A free chain leaves the same 16.8
+ms/token either side — 16.86, 16.83 and 16.80 against 16.80, 16.89 and 16.74 —
+so what a block costs to verify per token did not move, and the ceiling divides
+it into a `k = 0` step that did. What still separates `k = 1` from it is 0.13
+where the same sitting puts the figure before at 0.15.
 
 **Against mlx-vlm, measured in one sitting on 2 August 2026.** Both engines were
 given the same 27-token prompt — the string mlx-vlm's own chat template renders
