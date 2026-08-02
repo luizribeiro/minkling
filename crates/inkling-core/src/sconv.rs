@@ -168,6 +168,19 @@ impl ConvState {
         self.held.rewindable()
     }
 
+    /// The rows a call left behind, for a convolution that ran somewhere else.
+    ///
+    /// **A window this side does not hold still has to be counted.** Where a
+    /// backend runs the convolution, the rows are in its buffer and this holds
+    /// none of them — the same shape as
+    /// [`AttentionCache::keys`](crate::AttentionCache), whose vector is empty
+    /// there and whose count is not. What a rewind can give back is a count
+    /// either way, so it is kept either way and the values follow whoever has
+    /// them.
+    pub fn advanced(&mut self, rows: usize) {
+        self.held.advanced(rows);
+    }
+
     /// Take back the last `rows` inputs — see [`Held::rewind`].
     pub fn rewind(&mut self, rows: usize) {
         self.held.rewind(rows, &mut self.history);

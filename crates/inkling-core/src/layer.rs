@@ -356,6 +356,15 @@ impl DecoderCache {
         }
     }
 
+    /// Record that `rows` timesteps went through the two convolutions on this
+    /// layer's residual paths somewhere else — see
+    /// [`ConvState::advanced`](crate::sconv::ConvState::advanced). The two
+    /// inside attention are [`AttentionCache::convolved`]'s.
+    pub fn convolved(&mut self, rows: usize) {
+        self.attn_sconv.advanced(rows);
+        self.mlp_sconv.advanced(rows);
+    }
+
     /// Take back the last `rows` timesteps, in all four of the places this
     /// layer put them: the keys, the values, and the four convolution windows.
     ///

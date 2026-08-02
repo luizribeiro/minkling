@@ -795,6 +795,19 @@ impl AttentionCache {
         self.cached += rows;
     }
 
+    /// Record that `rows` timesteps went through the two convolutions inside
+    /// this layer's attention somewhere else — see [`ConvState::advanced`].
+    ///
+    /// Beside [`AttentionCache::appended`] rather than inside it, because the
+    /// two are not the same handover: a backend can run the convolutions and
+    /// leave the keys here, which is what
+    /// [`Projections::qkvr`] and
+    /// [`Projections::layer`] are the two ends of.
+    pub fn convolved(&mut self, rows: usize) {
+        self.k_sconv.advanced(rows);
+        self.v_sconv.advanced(rows);
+    }
+
     /// Take back the last `rows` timesteps: the keys and values they left, and
     /// the two convolution windows they advanced.
     ///

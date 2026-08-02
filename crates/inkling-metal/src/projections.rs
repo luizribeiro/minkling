@@ -528,6 +528,7 @@ impl Projections for LayerProjections<'_> {
         })
         .unwrap_or_else(|err| panic!("the layer's attention did not run: {err}"));
         cache.appended(queries);
+        cache.convolved(queries);
         Some(out)
     }
 
@@ -1076,6 +1077,8 @@ impl LayerDevice<'_> {
         // counted its keys at the wait would count them all after the last
         // layer of the run had already attended.
         cache.attention().appended(queries);
+        cache.attention().convolved(queries);
+        cache.convolved(queries);
         Ok(out)
     }
 
