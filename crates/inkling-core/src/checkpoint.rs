@@ -309,8 +309,6 @@ fn indexed_shard_paths(index: &Path, dir: &Path) -> Result<Vec<PathBuf>, Checkpo
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-
     use super::*;
     use crate::fixture;
 
@@ -321,29 +319,8 @@ mod tests {
         fixture::open(FIXTURE)
     }
 
-    struct Blob {
-        dtype: Dtype,
-        shape: Vec<usize>,
-        data: Vec<u8>,
-    }
-
-    impl safetensors::View for &Blob {
-        fn dtype(&self) -> Dtype {
-            self.dtype
-        }
-        fn shape(&self) -> &[usize] {
-            &self.shape
-        }
-        fn data(&self) -> Cow<'_, [u8]> {
-            Cow::Borrowed(&self.data)
-        }
-        fn data_len(&self) -> usize {
-            self.data.len()
-        }
-    }
-
     fn write_shard(path: &Path, name: &str, byte: u8) {
-        let blob = Blob {
+        let blob = fixture::Blob {
             dtype: Dtype::U32,
             shape: vec![2, 2],
             data: vec![byte; 16],

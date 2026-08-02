@@ -603,6 +603,131 @@ impl TokenizerFixture {
 /// agreement. Every assertion in this suite is a comparison against a bound, so
 /// a kernel that produced no numbers at all would read as the best possible
 /// kernel.
+/// A tensor as a checkpoint holds one, for a test that writes one rather than
+/// reading one.
+///
+/// Here rather than in either test module that wants it because both write the
+/// same shard: `checkpoint`'s cases write shards to be found and mapped, and
+/// `mtp`'s write a set of heads to be read back in each of the two formats a
+/// head comes in. A second copy of a `safetensors::View` impl is a second copy
+/// that can disagree about what a dtype means.
+pub struct Blob {
+    pub dtype: Dtype,
+    pub shape: Vec<usize>,
+    pub data: Vec<u8>,
+}
+
+impl Blob {
+    /// Bfloat16, which is a float32 with its low sixteen mantissa bits dropped.
+    pub fn bf16(values: &[f32], shape: Vec<usize>) -> Self {
+        assert_eq!(
+            values.len(),
+            shape.iter().product::<usize>(),
+            "{shape:?} against {} values",
+            values.len()
+        );
+        Self {
+            dtype: Dtype::BF16,
+            shape,
+            data: values
+                .iter()
+                .flat_map(|value| {
+                    ((value.to_bits() >> crate::checkpoint::BF16_SHIFT) as u16).to_le_bytes()
+                })
+                .collect(),
+        }
+    }
+
+    /// The codes and the block scales of the same values, MXFP4.
+    ///
+    /// **Every group takes the scale `2^0`**, which is what makes this an
+    /// encoder worth having in a test: the values are handed to it already
+    /// snapped to the sixteen the element table holds, so the codes stand for
+    /// exactly the floats that went in and a bfloat16 blob of the same values
+    /// holds exactly the same numbers. A general encoder would have to choose an
+    /// exponent per group and would put a rounding between the two, which is the
+    /// thing this exists to keep out.
+    pub fn mxfp4(values: &[f32], shape: Vec<usize>) -> (Self, Self) {
+        let [rows, width] = shape[..] else {
+            panic!("{shape:?} is not a matrix")
+        };
+        assert_eq!(width % crate::quant::GROUP_SIZE, 0, "{width} in groups");
+        let code = |value: &f32| {
+            crate::quant::ELEMENTS
+                .iter()
+                .position(|element| element.to_bits() == value.to_bits())
+                .unwrap_or_else(|| panic!("{value} is not one of the sixteen codes"))
+                as u32
+        };
+        let codes = values
+            .chunks_exact(CODES_A_WORD)
+            .flat_map(|word| {
+                // Least-significant nibble first, which is what the dequantiser
+                // this pairs with reads.
+                word.iter()
+                    .enumerate()
+                    .fold(0u32, |word, (at, value)| word | (code(value) << (4 * at)))
+                    .to_le_bytes()
+            })
+            .collect();
+        (
+            Self {
+                dtype: Dtype::U32,
+                shape: vec![rows, width / CODES_A_WORD],
+                data: codes,
+            },
+            Self {
+                dtype: Dtype::U8,
+                shape: vec![rows, width / crate::quant::GROUP_SIZE],
+                // 127 is `2^0`: the exponent bias of an E8M0 scale byte.
+                data: vec![127u8; values.len() / crate::quant::GROUP_SIZE],
+            },
+        )
+    }
+
+    /// Every value snapped to the nearest of the sixteen MXFP4 stands for at a
+    /// block scale of one.
+    ///
+    /// Not a quantiser: what it is for is a pair of blobs that hold the *same*
+    /// numbers in two formats, so that what a case compares is the reading and
+    /// not the rounding. Every one of the sixteen is a bfloat16 exactly — three
+    /// mantissa bits at most — so the bfloat16 blob is exact too.
+    pub fn snapped(values: &[f32]) -> Vec<f32> {
+        values
+            .iter()
+            .map(|value| {
+                *crate::quant::ELEMENTS
+                    .iter()
+                    .min_by(|a, b| {
+                        (*a - value)
+                            .abs()
+                            .total_cmp(&(*b - value).abs())
+                            .then(a.total_cmp(b))
+                    })
+                    .expect("the table is not empty")
+            })
+            .collect()
+    }
+}
+
+/// How many MXFP4 codes a packed `u32` holds.
+const CODES_A_WORD: usize = 8;
+
+impl safetensors::View for &Blob {
+    fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+    fn data(&self) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Borrowed(&self.data)
+    }
+    fn data_len(&self) -> usize {
+        self.data.len()
+    }
+}
+
 pub fn deviation(got: &[f32], want: &[f32]) -> f32 {
     assert_eq!(got.len(), want.len(), "length");
     assert_finite(got, "measured");
