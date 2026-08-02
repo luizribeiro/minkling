@@ -29,9 +29,16 @@
 //! strides of that many times the simdgroup width, and the group sums what the
 //! lanes held — so the 32 lanes of one reduction read 128 consecutive bytes,
 //! which is what makes a matmul this memory-bound run at the bandwidth rather
-//! than at a thirty-second of it. The cost is that a call with several rows of
-//! `x` reads the weight once per row; decode is one row, and a prefill shape
-//! that wants the weight read once is a tiling commit of its own.
+//! than at a thirty-second of it.
+//!
+//! **Or one simdgroup per [`ROWS_A_TILE`] rows of it, where the rows share an
+//! expert.** The arrangement above reads the weight once per row of `x`, which
+//! is free at a decode step's single row and is the whole of a prefill's cost
+//! at hundreds: 385 tokens through this kernel moved the same bytes a token
+//! that 385 decode steps would have. `packed_matmul_rows` is the same walk with
+//! the sums of several rows carried through it, and the two are separate
+//! entries out of one source so that the shape with nothing to win keeps the
+//! register budget it had.
 //!
 //! **`0x00` scale bytes decode to zero here.** The scale is
 //! `as_type<float>(byte << 23)`, which is exact for `0x01..=0xfe` and gives 0
@@ -53,6 +60,37 @@ use crate::device::{Device, MetalError};
 use crate::kernel::{Batch, Grid, Kernel, extent};
 
 const ENTRY: &str = "packed_matmul";
+
+/// The second entry point of the same source: one simdgroup per *tile* of rows
+/// rather than per output element, so a weight row read once serves every row
+/// of the tile that named the same expert.
+const TILED_ENTRY: &str = "packed_matmul_rows";
+
+/// Rows one simdgroup of [`TILED_ENTRY`] multiplies against one weight row.
+///
+/// **What this is worth is the whole of the prefill gap and none of the decode
+/// step.** A row of this kernel is a whole weight — see [`PackedBank::moves`] —
+/// so a call of `n` rows reads its weight `n` times, and a prefill measured
+/// 5496 MB a token at 385 tokens and at 769, against the 5495 MB a *decode*
+/// step moves. It amortised nothing at all. A tile of this many rows reads the
+/// weight once for all of them and multiplies it against each, which is the
+/// same weight traffic a decode step pays for that many tokens' worth of work.
+///
+/// **It is the rows and not the whole call**, because only some of a prefill's
+/// rows can share a read: the ones naming the same expert. A projection's rows
+/// all name expert zero and a shared bank's name one of two, which is 40.8% of
+/// what a prefill reads; the routed bank's six rows a token are six different
+/// experts by construction, and getting at that 59.1% means moving rows rather
+/// than tiling them.
+///
+/// **Four, and the sweep turns hard on either side of it.** Every shape a
+/// prefill gives this kernel is fastest here and six is already slower than
+/// two: a tile carries a running sum and an input offset a row, and past four
+/// of each the occupancy that buys them costs more than the reads it saves.
+/// That is the same shape of finding [`BYTES_PER_LANE`] and `dense_matmul`'s
+/// reduction width both are, met a third time — see
+/// `what_a_packed_multiply_costs_at_each_height_a_tile_reads`.
+const ROWS_A_TILE: usize = 4;
 
 /// Threads one threadgroup of a dispatch holds.
 ///
@@ -157,6 +195,10 @@ pub enum MatmulError {
 #[derive(Debug)]
 pub struct PackedMatmul {
     kernel: Kernel,
+    tiled: Kernel,
+    /// The rows a tile of `tiled` holds, which is [`ROWS_A_TILE`] for the
+    /// shipped source and whatever the sweep wrote into a mutant's prelude.
+    rows_a_tile: usize,
 }
 
 impl PackedMatmul {
@@ -168,10 +210,79 @@ impl PackedMatmul {
     /// is how a test puts a deliberately wrong kernel through the same plumbing
     /// as the right one and measures the difference.
     pub(crate) fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
+        Self::tiling(device, source, ROWS_A_TILE)
+    }
+
+    /// The same, where the source declares a tile of another height.
+    ///
+    /// **The two are given together because neither is any use alone**, and
+    /// the assertion is what makes that safe rather than conventional. The grid
+    /// this side dispatches covers the tiles `rows_a_tile` cuts a call into and
+    /// the kernel takes its own height from its prelude, so a pair that
+    /// disagreed would leave rows no simdgroup computed or run tiles off the
+    /// end of the call — and both are wrong answers rather than failures.
+    pub(crate) fn tiling(
+        device: &Device,
+        source: &str,
+        rows_a_tile: usize,
+    ) -> Result<Self, MetalError> {
+        let declares = format!("constant uint ROWS_A_TILE = {rows_a_tile};");
+        assert!(
+            source.contains(&declares),
+            "a source dispatched at {rows_a_tile} rows a tile does not declare it"
+        );
         Ok(Self {
             kernel: device.compile(source, ENTRY)?,
+            tiled: device.compile(source, TILED_ENTRY)?,
+            rows_a_tile,
         })
     }
+
+    /// The entry a call goes through and the simdgroups it takes to cover
+    /// `rows` rows of `out_dim` columns.
+    ///
+    /// **An untiled call stays on the untiled kernel rather than on a tile of
+    /// one.** The two compute the same thing at that height, and the ordinary
+    /// one is what every decode step this project has measured was dispatching
+    /// — so the shape with nothing to win stays on the code that won what is
+    /// already there, rather than carrying a tile's worth of registers to use
+    /// one row of it.
+    fn entry(&self, tiled: bool, rows: usize, out_dim: usize) -> (&Kernel, usize) {
+        match tiled {
+            false => (&self.kernel, rows * out_dim),
+            true => (&self.tiled, rows.div_ceil(self.rows_a_tile) * out_dim),
+        }
+    }
+}
+
+/// Whether a call's rows are laid out so that tiling them is worth a dispatch.
+///
+/// **The question is not how many rows there are but how long a run of them
+/// names one expert**, since that is what a tile can share a weight read
+/// across. A run of at least a tile leaves at most one straddling tile per
+/// boundary, and a straddling tile is correct and simply saves nothing.
+///
+/// The three layouts this bank is dispatched in answer it differently, and by
+/// construction rather than by luck. A projection's rows all name expert zero,
+/// so the run is the whole call. A shared bank is its input laid end to end
+/// once per expert, so the run is the tokens. A routed bank's rows are a
+/// token's six experts one after another, so every run is one row and this is
+/// false however long the prompt — which is where the other 59% of a prefill's
+/// bytes are, and it wants the rows moved rather than tiled.
+///
+/// False for every shape a decode step dispatches, which is what says this
+/// cannot cost one: a decode step's projections are a single row, its shared
+/// bank is two rows naming two experts, and its routed bank is six naming six.
+fn tiles(experts: &[u32], rows_a_tile: usize) -> bool {
+    if rows_a_tile < 2 || experts.len() < rows_a_tile {
+        return false;
+    }
+    let shortest = experts
+        .chunk_by(|a, b| a == b)
+        .map(<[u32]>::len)
+        .min()
+        .unwrap_or(0);
+    shortest >= rows_a_tile
 }
 
 /// An `[experts, out_dim, in_dim]` MXFP4 weight on the device, and the gathered
@@ -565,7 +676,11 @@ impl<'a> PackedBank<'a> {
             rows.div_ceil(per_source),
             self.in_dim
         );
-        self.dispatch(batch, rows, per_source, chosen.arg(), x)
+        // Untiled, and this is the one call site where that is not a choice:
+        // the list is in device memory and this side has not seen it, and what
+        // it holds is a token's `per_source` experts one after another — which
+        // is the one layout no tile can share a weight across.
+        self.dispatch(batch, rows, per_source, chosen.arg(), x, false)
     }
 
     /// The same multiply over rows a dispatch already left on the device, every
@@ -646,7 +761,8 @@ impl<'a> PackedBank<'a> {
         }
 
         let mut chosen = self.device.inline(experts)?;
-        self.dispatch(batch, experts.len(), 1, chosen.arg(), x)
+        let tiled = tiles(experts, self.matmul.rows_a_tile);
+        self.dispatch(batch, experts.len(), 1, chosen.arg(), x, tiled)
     }
 
     /// How many rows of this bank's input width `values` is, which is what the
@@ -662,6 +778,12 @@ impl<'a> PackedBank<'a> {
     }
 
     /// The dispatch itself, over an expert list wherever it lies.
+    ///
+    /// `tiled` decides which entry runs it and nothing else about it: the two
+    /// take the same bindings, the same shape and the same expert list, and
+    /// answer the same values — see [`tiles`] for who can say yes to it and
+    /// `packed_matmul_rows` for why the answer does not depend on the caller
+    /// being right.
     fn dispatch(
         &self,
         batch: &mut Batch<'_>,
@@ -669,6 +791,7 @@ impl<'a> PackedBank<'a> {
         per_source: usize,
         chosen: Arg<'_>,
         x: &mut Buffer<f32>,
+        tiled: bool,
     ) -> Result<Pending, MatmulError> {
         if rows == 0 {
             return Ok(Pending::empty());
@@ -682,10 +805,9 @@ impl<'a> PackedBank<'a> {
         let resident = &mut *resident;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
 
-        let elements = rows * self.out_dim;
-        let kernel = &self.matmul.kernel;
+        let (kernel, elements) = self.matmul.entry(tiled, rows, self.out_dim);
         let grid = Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP);
-        let moves = self.moves(rows, x.len());
+        let moves = self.moves(rows, x.len(), tiled);
         batch.add(
             kernel,
             &[
@@ -705,12 +827,23 @@ impl<'a> PackedBank<'a> {
 
     /// What one dispatch of `rows` rows over `values` of input moves.
     ///
-    /// **A row is a whole weight.** Each output row goes through one expert and
-    /// every element of that row reads a different `in_dim`-long slice of it, so
-    /// `rows` rows read `rows` weights whichever experts they name. That is what
-    /// makes this the kernel a decode step's bandwidth is mostly about: six
-    /// routed rows of a `[2048, 4096]` bank are 27 MB of packed bytes for six
-    /// rows of output.
+    /// **A weight is read once per tile of rows that shares it**, which
+    /// untiled is once per row. Each output row goes through one expert and
+    /// every element of that row reads a different `in_dim`-long slice of it,
+    /// so an untiled call of `rows` rows reads `rows` weights whichever experts
+    /// they name — six routed rows of a `[2048, 4096]` bank are 27 MB of packed
+    /// bytes for six rows of output, which is what makes this the kernel a
+    /// decode step's bandwidth is mostly about. Tiled, the same six rows under
+    /// one expert are two tiles and so 9.0 MB.
+    ///
+    /// **The tiled figure is what a call of uniform tiles reads, and a
+    /// straddling tile reads one weight more than is charged here.** A tile
+    /// whose rows name two experts walks both — see `packed_matmul_rows` — and
+    /// there is at most one such tile per run of equal experts, which [`tiles`]
+    /// keeps at least a tile long. So this under-counts by under a run in
+    /// however many tiles the call has: nothing at all for a projection, whose
+    /// rows are one run, and one tile in ninety-six for a shared bank at 385
+    /// tokens.
     ///
     /// The weight is charged as the bytes it is packed into rather than the
     /// values it holds — a code is half a byte and a group of 32 codes shares
@@ -718,8 +851,12 @@ impl<'a> PackedBank<'a> {
     /// it on the way. Beside it, the input, the output, and the one expert index
     /// a row is read through, which a bank's own dispatch leaves on the device
     /// and a projection's travels in the command buffer.
-    fn moves(&self, rows: usize, values: usize) -> usize {
-        let elements = rows * self.out_dim * self.in_dim;
+    fn moves(&self, rows: usize, values: usize, tiled: bool) -> usize {
+        let read = match tiled {
+            false => rows,
+            true => rows.div_ceil(self.matmul.rows_a_tile),
+        };
+        let elements = read * self.out_dim * self.in_dim;
         let weight = elements * BITS / u8::BITS as usize + elements / GROUP_SIZE;
         weight + size_of::<f32>() * (values + rows * self.out_dim) + size_of::<u32>() * rows
     }
@@ -882,6 +1019,7 @@ constant uint CODES_PER_BYTE = {CODES_PER_BYTE};
 constant uint BYTES_PER_GROUP = {BYTES_PER_GROUP};
 constant uint BYTES_PER_LANE = {BYTES_PER_LANE};
 constant uint EXPONENT_SHIFT = {EXPONENT_SHIFT};
+constant uint ROWS_A_TILE = {ROWS_A_TILE};
 constant float ELEMENTS[] = {{ {} }};
 {BODY}",
         (1u32 << BITS) - 1,
@@ -1007,6 +1145,132 @@ kernel void packed_matmul(
     sum = simd_sum(sum);
     if (lane == 0) {
         out[element] = sum;
+    }
+}
+
+/// Where a row of the input the tile's `r`th row multiplies begins.
+inline uint tile_source(constant Shape &shape, uint row) {
+    return ((row / shape.per_source) % shape.sources) * shape.in_dim;
+}
+
+/// The same multiply, one simdgroup per `ROWS_A_TILE` consecutive rows of one
+/// column rather than per output element.
+///
+/// **The whole of what this buys is that the weight row is read once.** Above,
+/// each of a call's rows walks the weight it names from end to end, so a call
+/// of `n` rows against one expert reads that expert `n` times — which is a
+/// decode step's price paid once a token by a prefill that could have paid it
+/// once. Here the walk is shared: one lane loads a packed byte, decodes its two
+/// codes, and multiplies them against the `ROWS_A_TILE` rows of `x` that want
+/// them.
+///
+/// **Only rows naming the same expert can share it, and the check is here
+/// rather than in the caller's head.** A tile whose rows disagree falls back to
+/// walking each row's own weight, which is exactly what the kernel above does
+/// and is the same arithmetic — so a caller that tiled a routed bank gets a
+/// correct answer and no saving, and correctness never rests on a claim about
+/// an expert list this side may not have seen.
+///
+/// **The answer is the untiled kernel's bit for bit and that is by
+/// construction**, not within a tolerance. An output element is still one
+/// simdgroup's `simd_sum` over lanes that still walk the row in `BYTES_PER_LANE`
+/// chunks from the same byte in the same stride, and a chunk is still summed
+/// into `dot` and then into `sum` under one scale. Nothing about the order any
+/// product enters any sum has moved; what moved is how many sums one load
+/// feeds. `a_tiled_dispatch_answers_what_the_untiled_one_answers` is where that
+/// is held.
+kernel void packed_matmul_rows(
+    constant Shape &shape [[buffer(0)]],
+    device const uint *experts [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device const uchar *codes [[buffer(3)]],
+    device const uchar *scales [[buffer(4)]],
+    device float *out [[buffer(5)]],
+    uint position [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint width [[threads_per_simdgroup]]
+) {
+    const uint tile = position / width;
+    const uint tiles = (shape.rows + ROWS_A_TILE - 1) / ROWS_A_TILE;
+    if (tile >= tiles * shape.out_dim) {
+        return;
+    }
+
+    const uint first = (tile / shape.out_dim) * ROWS_A_TILE;
+    const uint col = tile % shape.out_dim;
+    const uint bytes = shape.in_dim / CODES_PER_BYTE;
+    const uint rows = min((uint)ROWS_A_TILE, shape.rows - first);
+    const uint scale_bytes = bytes / BYTES_PER_GROUP;
+
+    const uint expert = experts[first];
+    bool one_weight = true;
+    for (uint r = 1; r < rows; ++r) {
+        one_weight = one_weight && (experts[first + r] == expert);
+    }
+
+    if (!one_weight) {
+        for (uint r = 0; r < rows; ++r) {
+            const uint row = first + r;
+            const uint each = experts[row];
+            float sum = weight_dot(
+                codes + shape.code_base + (ulong)each * shape.code_stride + (ulong)col * bytes,
+                scales + shape.scale_base + (ulong)each * shape.scale_stride
+                    + (ulong)col * scale_bytes,
+                x + tile_source(shape, row),
+                bytes,
+                lane,
+                width
+            );
+            sum = simd_sum(sum);
+            if (lane == 0) {
+                out[row * shape.out_dim + col] = sum;
+            }
+        }
+        return;
+    }
+
+    device const uchar *packed =
+        codes + shape.code_base + (ulong)expert * shape.code_stride + (ulong)col * bytes;
+    device const uchar *scale =
+        scales + shape.scale_base + (ulong)expert * shape.scale_stride + (ulong)col * scale_bytes;
+
+    // The rows past this tile's own read the last of them, so that every load
+    // below is inside `x` whatever the call's row count leaves over. What they
+    // produce is never written.
+    uint sources[ROWS_A_TILE];
+    float sums[ROWS_A_TILE];
+    for (uint r = 0; r < ROWS_A_TILE; ++r) {
+        sources[r] = tile_source(shape, first + min(r, rows - 1));
+        sums[r] = 0.0f;
+    }
+
+    for (uint b = lane * BYTES_PER_LANE; b < bytes; b += width * BYTES_PER_LANE) {
+        float dots[ROWS_A_TILE];
+        for (uint r = 0; r < ROWS_A_TILE; ++r) {
+            dots[r] = 0.0f;
+        }
+        for (uint i = 0; i < BYTES_PER_LANE; ++i) {
+            const uint code = packed[b + i];
+            const float low = ELEMENTS[code & CODE_MASK];
+            const float high = ELEMENTS[(code >> BITS) & CODE_MASK];
+            const uint at = (b + i) * CODES_PER_BYTE;
+
+            for (uint r = 0; r < ROWS_A_TILE; ++r) {
+                device const float *v = x + sources[r] + at;
+                dots[r] += low * v[0] + high * v[1];
+            }
+        }
+        const float by = as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
+        for (uint r = 0; r < ROWS_A_TILE; ++r) {
+            sums[r] += dots[r] * by;
+        }
+    }
+
+    for (uint r = 0; r < rows; ++r) {
+        const float sum = simd_sum(sums[r]);
+        if (lane == 0) {
+            out[(first + r) * shape.out_dim + col] = sum;
+        }
     }
 }
 "#;
@@ -1250,41 +1514,64 @@ mod tests {
 
     /// What the bandwidth column divides by, against what the kernel reads.
     ///
-    /// **A row is a whole weight and the weight is never decoded**, which are
-    /// the two things this figure has to get right: every element of an output
-    /// row reads a different slice of the expert that row goes through, and what
-    /// it reads is packed — half a byte a code, plus one scale byte for every
-    /// 32 of them. A figure that charged the decoded float32 would be eight
-    /// times high and would put this kernel past the machine's bandwidth
-    /// rather than at a third of it.
+    /// **A weight is read once per tile and the weight is never decoded**,
+    /// which are the two things this figure has to get right: every element of
+    /// an output row reads a different slice of the expert that row goes
+    /// through, and what it reads is packed — half a byte a code, plus one
+    /// scale byte for every 32 of them. A figure that charged the decoded
+    /// float32 would be eight times high and would put this kernel past the
+    /// machine's bandwidth rather than at a third of it.
+    ///
+    /// **Both heights, because the whole of the prefill change is this number.**
+    /// A kernel that tiled without the declaration following it would report a
+    /// bandwidth it never reached and a saving nothing measured; one that
+    /// declared the tiling without the kernel doing it would report the reverse.
     #[test]
     fn a_dispatch_declares_the_packed_bytes_it_reads_rather_than_the_values() {
         let Some(device) = device() else { return };
         let matmul = matmul(&device);
         const IN_DIM: usize = 128;
         const OUT_DIM: usize = 8;
-        const ROWS: usize = 3;
-        let case = Case::seeded(1, IN_DIM, OUT_DIM, ROWS);
-        let projection = case.upload(&device, &matmul);
 
-        let moved = crate::testing::moved(&device, |batch| {
-            projection
-                .encode(batch, &case.x)
-                .expect("the dispatch encodes");
-        });
+        let declared = |rows: usize| {
+            let case = Case::seeded(1, IN_DIM, OUT_DIM, rows);
+            let projection = case.upload(&device, &matmul);
+            crate::testing::moved(&device, |batch| {
+                projection
+                    .encode(batch, &case.x)
+                    .expect("the dispatch encodes");
+            }) as usize
+        };
+        let besides = |rows: usize| {
+            size_of::<f32>() * (rows * IN_DIM + rows * OUT_DIM) + size_of::<u32>() * rows
+        };
+        let weight = |read: usize| {
+            let elements = read * OUT_DIM * IN_DIM;
+            elements / 2 + elements / GROUP_SIZE
+        };
 
-        let elements = ROWS * OUT_DIM * IN_DIM;
+        // Under a tile, so every row reads its own weight — which is what a
+        // decode step's shapes all are.
+        const UNTILED: usize = 3;
+        assert!(!tiles(&[0; UNTILED], ROWS_A_TILE));
         assert_eq!(
-            moved as usize,
-            elements / 2
-                + elements / GROUP_SIZE
-                + size_of::<f32>() * (ROWS * IN_DIM + ROWS * OUT_DIM)
-                + size_of::<u32>() * ROWS,
+            declared(UNTILED),
+            weight(UNTILED) + besides(UNTILED),
             "codes, scales, the rows in, the rows out, and an expert a row"
         );
         assert!(
-            (moved as usize) < elements * size_of::<f32>(),
+            declared(UNTILED) < UNTILED * OUT_DIM * IN_DIM * size_of::<f32>(),
             "a decoded weight was charged for one nothing decodes"
+        );
+
+        // Two whole tiles and a row over, all of them one expert, so three
+        // weights are read for every row of the call.
+        const TILED: usize = 2 * ROWS_A_TILE + 1;
+        assert!(tiles(&[0; TILED], ROWS_A_TILE));
+        assert_eq!(
+            declared(TILED),
+            weight(TILED.div_ceil(ROWS_A_TILE)) + besides(TILED),
+            "a weight a tile, and the rows in and out of every row"
         );
     }
 
@@ -1699,6 +1986,150 @@ mod tests {
         assert_ne!(row(0), row(3), "the expert is read off the row");
     }
 
+    /// Which layouts share a weight read across a tile, decided on the expert
+    /// list alone.
+    ///
+    /// **The three the engine dispatches answer differently and none of them by
+    /// luck**, so they are written out here as the lists they are rather than
+    /// described. What matters most is the last pair: a decode step's every
+    /// shape says no, which is what makes this incapable of moving the step
+    /// this project spent four milestones on.
+    #[test]
+    fn a_calls_rows_share_a_weight_read_only_where_they_name_one_expert() {
+        let projection = |rows: usize| vec![0u32; rows];
+        let shared = |tokens: usize| -> Vec<u32> {
+            (0..2 * tokens).map(|row| (row / tokens) as u32).collect()
+        };
+        let routed =
+            |tokens: usize| -> Vec<u32> { (0..6 * tokens).map(|row| (row % 6) as u32).collect() };
+
+        assert!(
+            tiles(&projection(385), ROWS_A_TILE),
+            "a prefill's projection"
+        );
+        assert!(tiles(&shared(385), ROWS_A_TILE), "a prefill's shared bank");
+        assert!(!tiles(&routed(385), ROWS_A_TILE), "a prefill's routed bank");
+
+        assert!(
+            !tiles(&projection(1), ROWS_A_TILE),
+            "a decode step's projection"
+        );
+        assert!(
+            !tiles(&shared(1), ROWS_A_TILE),
+            "a decode step's shared bank"
+        );
+        assert!(
+            !tiles(&routed(1), ROWS_A_TILE),
+            "a decode step's routed bank"
+        );
+
+        // A run exactly a tile long is the shortest that pays, and one row
+        // under it is the longest that cannot.
+        assert!(tiles(&projection(ROWS_A_TILE), ROWS_A_TILE));
+        assert!(!tiles(&projection(ROWS_A_TILE - 1), ROWS_A_TILE));
+        assert!(
+            !tiles(&shared(ROWS_A_TILE - 1), ROWS_A_TILE),
+            "runs under a tile"
+        );
+    }
+
+    /// **The tiled kernel's answer against the untiled one's, bit for bit.**
+    ///
+    /// This is the claim the whole change rests on. A tile reads one weight row
+    /// once and multiplies it against every row of the tile that named that
+    /// expert, where the untiled kernel reads the row again for each — and
+    /// since nothing about the order any product enters any sum moved, the two
+    /// have to agree exactly rather than within a tolerance. A bound here would
+    /// be hiding the one mistake this kernel can make.
+    ///
+    /// The oracle is each row run *alone*, which is a call of one row and so
+    /// goes through the untiled kernel by [`tiles`]'s own rule — the same
+    /// arrangement `a_gathered_dispatch_multiplies_each_row_against_the_expert
+    /// _it_named` uses, and it needs no second implementation of anything.
+    ///
+    /// **The shape is chosen so that all three kinds of tile occur**, and the
+    /// three assertions below are what say it still does if [`ROWS_A_TILE`]
+    /// moves: a run of eleven rows is not a whole number of tiles, so one tile
+    /// straddles the two experts and walks each of its rows' own weight, and
+    /// twenty-two rows are not either, so the call ends inside a tile. It is
+    /// the repeating shape rather than
+    /// the gathered one because the input row a tile's rows read is then a
+    /// modulo rather than the row index, so a tiled kernel that hoisted the
+    /// source out of the loop instead of computing it per row lands the wrong
+    /// input on the second expert's rows.
+    #[test]
+    fn a_tiled_dispatch_answers_row_for_row_what_the_untiled_one_answers() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        const EXPERTS: usize = 2;
+        const SOURCES: usize = 11;
+
+        let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, SOURCES);
+        let bank = PackedBank::upload(
+            &device,
+            &matmul,
+            EXPERTS,
+            IN_DIM,
+            OUT_DIM,
+            &case.packed(),
+            &case.scales,
+        )
+        .expect("the bank's shapes pair");
+
+        let chosen: Vec<u32> = (0..EXPERTS * SOURCES)
+            .map(|row| (row / SOURCES) as u32)
+            .collect();
+        assert!(
+            tiles(&chosen, ROWS_A_TILE),
+            "the call under test was not tiled"
+        );
+        assert_ne!(
+            chosen.len() % ROWS_A_TILE,
+            0,
+            "a call that filled its last tile would not exercise the partial one"
+        );
+        assert_ne!(
+            SOURCES % ROWS_A_TILE,
+            0,
+            "a run that filled whole tiles would not exercise the straddling one"
+        );
+
+        let mut batch = device.batch().expect("a command buffer opens");
+        let mut input = device.buffer(&case.x).expect("the input uploads");
+        let got = bank
+            .encode_repeating(&mut batch, &chosen, &mut input)
+            .expect("the dispatch encodes");
+        batch.wait().expect("the dispatch completes");
+        let got = got.take();
+        assert_eq!(got.len(), chosen.len() * OUT_DIM);
+
+        let codes_per_expert = OUT_DIM * IN_DIM / CODES_PER_BYTE;
+        let scales_per_expert = OUT_DIM * IN_DIM / GROUP_SIZE;
+        let packed = case.packed();
+        for (row, expert) in chosen.iter().enumerate() {
+            let at = *expert as usize;
+            let alone = PackedProjection::upload(
+                &device,
+                &matmul,
+                IN_DIM,
+                OUT_DIM,
+                &packed[at * codes_per_expert..][..codes_per_expert],
+                &case.scales[at * scales_per_expert..][..scales_per_expert],
+            )
+            .expect("one expert's shapes pair")
+            .multiply(&case.x[(row % SOURCES) * IN_DIM..][..IN_DIM])
+            .expect("the dispatch completes");
+            assert_eq!(got[row * OUT_DIM..][..OUT_DIM], alone[..], "row {row}");
+        }
+
+        // The rows have to disagree for the check above to have said anything:
+        // against a bank whose two experts answered alike, a tile that read the
+        // wrong weight for the rows past a boundary would still match.
+        let row = |i: usize| &got[i * OUT_DIM..][..OUT_DIM];
+        assert_ne!(row(0), row(1), "the input row is read off the row");
+        assert_ne!(row(0), row(SOURCES), "the expert is read off the row");
+    }
+
     /// The one argument a real call sends past the inline threshold.
     ///
     /// A shape is a few dozen bytes and always travels in the command buffer;
@@ -1981,6 +2412,103 @@ mod tests {
             }
             eprintln!("{line}");
         }
+    }
+
+    /// **What a packed multiply costs the device at each height a tile reads**,
+    /// and the sweep [`ROWS_A_TILE`] was chosen from.
+    ///
+    /// The shapes are the ones a *prefill* dispatches, because that is where a
+    /// tile has anything to share: the two lengths the profile is taken at, by
+    /// the two layouts whose rows name one expert. A tile of one is the untiled
+    /// kernel and is the column the rest are read against.
+    ///
+    /// **The rate is over the bytes a tiled call actually reads**, which is a
+    /// weight a tile rather than a weight a row — so the column does not climb
+    /// merely because the denominator fell, and a height that read the same
+    /// bytes in the same time reports the same number. What it ranks is
+    /// throughput at a fixed amount of *work*, and the wall time behind it is
+    /// what falls.
+    ///
+    /// Nothing asserts a rate. What is asserted is that the shipped height was
+    /// among the ones tried, the way the width sweep above does.
+    ///
+    /// The same caution applies as to that sweep, and harder: one weight is
+    /// dispatched against `CALLS` times in a row, so the table ranks the
+    /// heights and does not state a bandwidth.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_packed_multiply_costs_at_each_height_a_tile_reads() {
+        let Some(device) = device() else { return };
+        const CALLS: usize = 8;
+        const ROUNDS: usize = 3;
+        const HEIGHTS: [usize; 6] = [1, 2, 3, 4, 6, 8];
+
+        // `(what, in_dim, out_dim, rows)`.
+        let shapes = [
+            ("q_proj, 385 tokens", 4096, 4096, 385),
+            ("k_proj, 385 tokens", 4096, 1024, 385),
+            ("shared gate/up, 385 tokens", 4096, 2048, 2 * 385),
+            ("shared down, 385 tokens", 2048, 4096, 2 * 385),
+            ("q_proj, 769 tokens", 4096, 4096, 769),
+            ("shared gate/up, 769 tokens", 4096, 2048, 2 * 769),
+        ];
+
+        assert!(HEIGHTS.contains(&ROWS_A_TILE), "{ROWS_A_TILE}");
+        eprintln!(
+            "  {:<28}{}",
+            "shape",
+            HEIGHTS
+                .iter()
+                .map(|rows| format!("{:>16}", format!("{rows} rows a tile")))
+                .collect::<String>()
+        );
+        for (what, in_dim, out_dim, rows) in shapes {
+            let case = Case::seeded(1, in_dim, out_dim, rows);
+            let mut x = device.buffer(&case.x).expect("the rows upload");
+            let mut line = format!("  {what:<28}");
+            for height in HEIGHTS {
+                let matmul = PackedMatmul::tiling(&device, &a_tile_of(height), height)
+                    .unwrap_or_else(|err| panic!("{height} rows a tile compiles: {err}"));
+                let projection = case.upload(&device, &matmul);
+
+                let mut best = Duration::MAX;
+                for _ in 0..ROUNDS {
+                    best = best.min(crate::testing::device_time(&device, CALLS, |batch| {
+                        projection
+                            .encode_over(batch, &mut x)
+                            .expect("the dispatch encodes");
+                    }));
+                }
+
+                let codes = rows.div_ceil(height) * out_dim * in_dim;
+                let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+                line.push_str(&format!(
+                    "{:>16}",
+                    format!(
+                        "{:.0}µs {:.0} GB/s",
+                        1e6 * best.as_secs_f64() / CALLS as f64,
+                        moved / best.as_secs_f64() / 1e9
+                    )
+                ));
+            }
+            eprintln!("{line}");
+        }
+    }
+
+    /// The shipped kernel with a different [`ROWS_A_TILE`] written into its
+    /// prelude, which is the one thing the sweep above varies.
+    ///
+    /// A height of one is not a tile at all — [`tiles`] refuses it, so the call
+    /// goes through the untiled entry — which is what makes that column the
+    /// before of this change rather than a tiled kernel imitating it.
+    fn a_tile_of(rows_a_tile: usize) -> String {
+        let wanted = format!("constant uint ROWS_A_TILE = {rows_a_tile};");
+        let source = source().replace(
+            &format!("constant uint ROWS_A_TILE = {ROWS_A_TILE};"),
+            &wanted,
+        );
+        assert!(source.contains(&wanted), "the prelude declares {wanted}");
+        source
     }
 
     /// The shipped kernel with a different [`BYTES_PER_LANE`] written into its
