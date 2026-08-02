@@ -138,6 +138,17 @@ bench-weights a b *measurement:
     "$root/target/debug/bench" alternate --pairs {{ pairs }} \
         "$bin {{ absolute_path(a) }}" "$bin {{ absolute_path(b) }}" -- {{ measurement }}
 
+# What two sets of MTP heads guess, held against each other over one generation.
+#
+# The gate a change to the heads has to pass before any timing claim, and it is
+# not the tokens: no token can move, because the model verifies every guess, so
+# what a worse head costs is acceptance and acceptance is the whole of the
+# speedup. One stack, one set of embeddings, both chains asked the same round at
+# every round of one generation.
+guesses a b *args:
+    cargo run -q --bin bench -- guesses \
+        {{ absolute_path(a) }} {{ absolute_path(b) }} {{ args }}
+
 fmt:
     cargo fmt --all
     cargo clippy --all-targets -- -D warnings
