@@ -2482,11 +2482,16 @@ fn which_kernels_own_a_chain_of_heads() {
     // charges it nothing, which would be a row quietly short rather than a
     // failure — so the count is what says the table describes the whole chain.
     assert_eq!(timed, dispatches, "a chain's dispatches were not all timed");
-    // A chain reads each head's own 532 MiB of bfloat16 once and `lm_head` once
-    // a head, which the checkpoint's shapes put at about a gigabyte a head.
+    // A chain reads `lm_head` once a head — 3.5 GB over the eight — and each
+    // head's own weights once, which the checkpoint's shapes put at 4.5 GB where
+    // they are the BF16 original's and a quarter of that where they have since
+    // been packed. The bound holds for either, because which of the two a shard
+    // is is not this case's question: what it guards is that the byte column
+    // describes a chain rather than a fraction of one.
     assert!(
-        (6e9..12e9).contains(&(moved as f64)),
-        "a chain of {DEPTHS} heads moved {:.2} GB, where the shapes put a head at about one",
+        (4e9..12e9).contains(&(moved as f64)),
+        "a chain of {DEPTHS} heads moved {:.2} GB, where the shapes put its \
+         weights between 4.6 and 8.0",
         moved as f64 / 1e9,
     );
     let accounted = sampled.profile.total();
