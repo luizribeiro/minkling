@@ -424,7 +424,9 @@ slack they were built with. On the device that is the same shift over a buffer
 the GPU holds, which unified memory makes a move rather than a copy.
 
 **What a round costs, measured here rather than inherited.** Against a warm
-cache, a 34-token prompt, and this engine's own 37.0 ms decode step:
+cache, a 34-token prompt, and this engine's own decode step over the 64 tokens
+that follow it — 37.0 ms, where the 33 ms above is the same step at the
+eight-token context every other measurement in this file is taken at:
 
     tokens in the block    1      2      3      4      6      9
     forward pass       35.1ms 54.2ms 68.4ms 75.2ms 95.1ms 127.8ms
