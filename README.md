@@ -300,8 +300,22 @@ does not any more: what a layer answers with is either rows or a count of rows
 somebody else is holding, and the backend rather than the layer decides which,
 because whether what a layer produced crosses back is a question about the layer
 *after* it. A run ends where somebody has to read it — a layer the backend does
-not hold whole, the end of the stack, or a call of more than one row, which is
-where the memory a merged run holds is traded against the round trips it saves.
+not hold whole, the end of the stack, or a run that has reached the bytes it may
+hold, which is where the memory a merged run holds is traded against the round
+trips it saves.
+
+**What a run may hold is bytes rather than rows**, because what it holds is every
+intermediate of every layer in it until the command buffer completes and a layer
+allocates the same buffers whatever the call: a normed state, four projections,
+two convolutions, two head norms, what the step and `o_proj` produced, and the
+eight expert rows a token routes through. Only their lengths grow with the
+tokens. So the backend counts what it has allocated since the run opened —
+nothing bound into a command buffer can be freed before it completes, which is
+what makes that reading what the run is still carrying — and ends the run when it
+reaches a budget. What that budget bounds is exactly what merging adds to a peak:
+a run holds the budget plus the layer that crossed it, and that layer holds what
+it would have held unmerged. A call whose own layer already reaches the budget
+merges nothing and is one submission a layer, which is what a long prefill is.
 
 **So a decode step is two submissions**, one for the forty-two layers and one for
 the head, where it was 43 and 87 and 249. Over seven alternating pairs, every
@@ -311,8 +325,9 @@ it off the wait row at 250 microseconds a submission removed, and the rest the 4
 uploads and 41 readbacks that stop happening. **250 µs is not the 152 to 172 the
 marginal figures had**, and the difference is the serialisation rather than the
 submission: a step used to encode a layer, submit it, wait for it, and only then
-encode the next. A prefill still submits a layer at a time, and its own numbers
-are unchanged.
+encode the next. A prefill long enough that one of its layers reaches the budget
+still submits a layer at a time; a shorter one merges what fits, and what that
+costs and buys is unmeasured — see below.
 
 There is no operation of a layer left outside the GPU. Both backends generate the
 same tokens, and the CPU one stays the oracle every kernel here is validated
@@ -447,13 +462,20 @@ does, because you re-read the same weights.
 **But the first extra token costs twice what the ones after it do, and the
 submissions column says why.** A decode step is two command buffers because a
 layer handed one row can leave what it produced where the next layer reads it; a
-call of more than one row cannot, because what a merged run holds is every
-intermediate of every layer in it until the buffer completes — so the engine
-draws that line at one row and a two-token block is 43 submissions where a
-one-token step is 2. At this machine's 250 µs a submission that is about 10 ms,
-against 11.6 ms of expert reads. It is a trade made deliberately for prefills of
+call of more than one row could not, because what a merged run holds is every
+intermediate of every layer in it until the buffer completes — so the engine drew
+that line at one row and a two-token block is 43 submissions where a one-token
+step is 2. At this machine's 250 µs a submission that is about 10 ms, against
+11.6 ms of expert reads. It was a trade made deliberately for prefills of
 hundreds of tokens and never revisited for blocks of two or three, and it is the
 one number in this section that is nobody's law.
+
+**The line is drawn in bytes now**, and a block of a few rows holds far less than
+the budget a run is allowed — see the layers' own paragraph above. Every figure
+in the two tables above is from before that change and none of them has been
+re-measured: the host's GPU was wedged by an unrelated process while it landed,
+so the submissions column, the block's cost and the sweep below are all
+outstanding.
 
 A head's guess costs 4.8 ms, of which about 3.4 is the 950 MB it reads — its own
 532 MiB, and `lm_head` again to turn a hidden state into a token — and the rest
