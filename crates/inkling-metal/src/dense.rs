@@ -890,8 +890,7 @@ mod tests {
             let mut resident = weight.resident.borrow_mut();
             let grid = Grid::new(elements * run * simd, THREADS_PER_GROUP);
 
-            let mut batch = device.batch().expect("a command buffer opens");
-            for _ in 0..CALLS {
+            crate::testing::device_time(&device, CALLS, |batch| {
                 batch
                     .add(
                         &matmul.kernel,
@@ -900,10 +899,7 @@ mod tests {
                         0,
                     )
                     .expect("the dispatch encodes");
-            }
-            profile::take();
-            batch.wait().expect("the batch completes");
-            profile::take().gpu() / CALLS as u32
+            })
         };
 
         let shapes = [1usize, 2, 4, 8, 16, 32, 97, 385];

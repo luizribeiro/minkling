@@ -133,6 +133,33 @@ pub fn moved(device: &Device, encode: impl FnOnce(&mut Batch<'_>)) -> u64 {
         .sum()
 }
 
+/// What the device's own clock makes of one dispatch of `encode`, over a
+/// command buffer holding `calls` of them.
+///
+/// **A submission costs 225 microseconds and the dispatches a sweep asks about
+/// are tens**, so a figure taken one submission at a time is a figure about the
+/// round trip. Repeating the dispatch inside one command buffer is what leaves
+/// the device's clock measuring the dispatch, and it is what both sweeps here
+/// — the packed matmul's width and the dense matmul's reduction run — do to get
+/// a number their tables can be read across.
+///
+/// The profile is emptied after the encoding rather than before it, so that
+/// what the clock is divided by is these dispatches and nothing a caller did to
+/// set them up.
+pub fn device_time(
+    device: &Device,
+    calls: usize,
+    mut encode: impl FnMut(&mut Batch<'_>),
+) -> std::time::Duration {
+    let mut batch = device.batch().expect("a command buffer opens");
+    for _ in 0..calls {
+        encode(&mut batch);
+    }
+    profile::take();
+    batch.wait().expect("the batch completes");
+    profile::take().gpu() / calls as u32
+}
+
 /// What one saxpy over `len` elements moves: `x` and `y` read, `out` written.
 ///
 /// Here rather than at each case because every dispatch has to declare what it

@@ -1948,15 +1948,11 @@ mod tests {
 
                 let mut best = Duration::MAX;
                 for _ in 0..ROUNDS {
-                    let mut batch = device.batch().expect("a command buffer opens");
-                    for _ in 0..CALLS {
+                    best = best.min(crate::testing::device_time(&device, CALLS, |batch| {
                         projection
-                            .encode_over(&mut batch, &mut x)
+                            .encode_over(batch, &mut x)
                             .expect("the dispatch encodes");
-                    }
-                    profile::take();
-                    batch.wait().expect("the batch completes");
-                    best = best.min(profile::take().gpu() / CALLS as u32);
+                    }));
                 }
 
                 let codes = rows * out_dim * in_dim;
