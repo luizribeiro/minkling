@@ -24,13 +24,14 @@
 //! where the checkpoint mapped it rather than 0.41 GiB of copy. It costs 2% of
 //! the dispatch, measured on that same head.
 //!
-//! **One simdgroup per output element.** Lane `l` walks its weight row from byte
-//! `l` in strides of the simdgroup width and the group sums what the lanes held,
-//! so the 32 lanes of one reduction read 32 consecutive bytes — which is what
-//! makes a matmul this memory-bound run at the bandwidth rather than at a
-//! thirty-second of it. The cost is that a call with several rows of `x` reads
-//! the weight once per row; decode is one row, and a prefill shape that wants
-//! the weight read once is a tiling commit of its own.
+//! **One simdgroup per output element, and [`BYTES_PER_LANE`] bytes to a lane a
+//! step.** Lane `l` walks its weight row from byte `l * BYTES_PER_LANE` in
+//! strides of that many times the simdgroup width, and the group sums what the
+//! lanes held — so the 32 lanes of one reduction read 128 consecutive bytes,
+//! which is what makes a matmul this memory-bound run at the bandwidth rather
+//! than at a thirty-second of it. The cost is that a call with several rows of
+//! `x` reads the weight once per row; decode is one row, and a prefill shape
+//! that wants the weight read once is a tiling commit of its own.
 //!
 //! **`0x00` scale bytes decode to zero here.** The scale is
 //! `as_type<float>(byte << 23)`, which is exact for `0x01..=0xfe` and gives 0
@@ -67,6 +68,34 @@ pub(crate) const CODES_PER_BYTE: usize = u8::BITS as usize / BITS;
 
 /// Packed bytes one scale byte covers.
 const BYTES_PER_GROUP: usize = GROUP_SIZE / CODES_PER_BYTE;
+
+/// Packed bytes one lane reads before the next lane's, which is how much of a
+/// weight row one thread has in flight at a time.
+///
+/// **What a chunk buys is the three loads beside the codes amortised over it**,
+/// which is `rms_norm`'s and `dense_matmul`'s finding met a third time: this
+/// kernel waits on the requests one thread has outstanding rather than on the
+/// memory behind them. A code byte is read alongside its group's scale byte and
+/// the two inputs its two codes multiply, and of those only the codes are the
+/// dispatch's own bytes — so a lane holding four of them issues four memory
+/// instructions where four lane-steps of one byte issue sixteen, because the
+/// scale is one byte for the whole chunk and the eight inputs are consecutive
+/// floats the compiler loads together.
+///
+/// **Four rather than eight or sixteen, and the sweep says why.** Wider chunks
+/// are faster at the shapes with few output elements — a decode step's
+/// `[1, 4096] @ [1024, 4096]ᵀ` key projection reaches 168 GB/s here, 191 at
+/// eight and 193 at sixteen — and slower at every shape with elements enough to
+/// fill the machine, which is where a step's bytes are: the routed banks are
+/// 55% of what a step reads and give up 4% at eight, and a 97-token prefill 7%.
+/// See `what_a_packed_multiply_costs_at_each_width_a_lane_reads`.
+///
+/// A chunk has to divide [`BYTES_PER_GROUP`], so that the bytes one lane holds
+/// share one scale byte, and it has to divide a weight row, so that no lane
+/// reads past one. Both hold for 4, 8 and 16 against any `in_dim` this module
+/// accepts: [`pairs`] refuses a width that is not whole groups of
+/// [`GROUP_SIZE`] codes, which is 16 packed bytes.
+const BYTES_PER_LANE: usize = 4;
 
 /// Where an f32's exponent field starts, above its 23 stored mantissa bits.
 const EXPONENT_SHIFT: u32 = f32::MANTISSA_DIGITS - 1;
@@ -844,6 +873,7 @@ constant uint BITS = {BITS};
 constant uint CODE_MASK = {};
 constant uint CODES_PER_BYTE = {CODES_PER_BYTE};
 constant uint BYTES_PER_GROUP = {BYTES_PER_GROUP};
+constant uint BYTES_PER_LANE = {BYTES_PER_LANE};
 constant uint EXPONENT_SHIFT = {EXPONENT_SHIFT};
 constant float ELEMENTS[] = {{ {} }};
 {BODY}",
@@ -861,12 +891,26 @@ const SHAPE_FIELDS: usize = 9;
 /// reading of the format on this side of the engine and a second copy of it
 /// would be a second reading that could drift.
 pub(crate) const BODY: &str = r#"
-/// One output element: lane `l` walks the weight row from byte `l` in strides
-/// of the simdgroup width, and the caller reduces what the lanes held.
+/// One output element: lane `l` walks the weight row from byte
+/// `l * BYTES_PER_LANE` in strides of that many times the simdgroup width, and
+/// the caller reduces what the lanes held.
 ///
 /// A byte is two codes, low nibble first, and its group's scale is a power of
 /// two — so every product here is exact and only the order they are summed in
 /// separates this from any other way of adding them up.
+///
+/// The inner loop's trip count is a compile-time constant, so it is unrolled
+/// and its loads have no dependency on each other — which is the whole of what
+/// a chunk buys.
+///
+/// **The chunk is bounded by `bytes` and not by anything inside it**, so what
+/// keeps a lane inside its own weight row is that a row is a whole number of
+/// chunks. `pairs` on the Rust side refuses a width that is not whole groups of
+/// 32 codes, which makes every row a whole number of 16 packed bytes, and 4
+/// divides 16 — and the same fact is what puts a whole chunk under the one
+/// scale byte read for it. A GPU read past a row is an address inside the next
+/// one rather than a fault, so this is the invariant to check first if either
+/// constant moves.
 inline float weight_dot(
     device const uchar *packed,
     device const uchar *scale,
@@ -876,13 +920,16 @@ inline float weight_dot(
     uint width
 ) {
     float sum = 0.0f;
-    for (uint b = lane; b < bytes; b += width) {
-        const uint code = packed[b];
-        const uint low = code & CODE_MASK;
-        const uint high = (code >> BITS) & CODE_MASK;
-        device const float *v = values + b * CODES_PER_BYTE;
+    for (uint b = lane * BYTES_PER_LANE; b < bytes; b += width * BYTES_PER_LANE) {
+        float dot = 0.0f;
+        for (uint i = 0; i < BYTES_PER_LANE; ++i) {
+            const uint code = packed[b + i];
+            const uint low = code & CODE_MASK;
+            const uint high = (code >> BITS) & CODE_MASK;
+            device const float *v = values + (b + i) * CODES_PER_BYTE;
 
-        float dot = ELEMENTS[low] * v[0] + ELEMENTS[high] * v[1];
+            dot += ELEMENTS[low] * v[0] + ELEMENTS[high] * v[1];
+        }
         sum += dot * as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
     }
     return sum;
@@ -1063,6 +1110,8 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::testing::{Case, Noise, pack};
     use super::*;
     use inkling_core::fixture::{self, deviation};
@@ -1839,6 +1888,104 @@ mod tests {
                 .expect("an empty multiply completes"),
             Vec::<f32>::new()
         );
+    }
+
+    /// **What a packed multiply costs the device at each width a lane reads**,
+    /// and the sweep [`BYTES_PER_LANE`] was chosen from.
+    ///
+    /// The shapes are the ones a step dispatches rather than round numbers: a
+    /// decode step's six routed rows of a `[2048, 4096]` bank, the `[4096, 4096]`
+    /// and `[1024, 4096]` projections beside them, and the same two at the row
+    /// counts a 97-token prefill gives them. What the table shows is that the
+    /// width that wins depends on how many output elements the dispatch has —
+    /// which is the same shape of finding `dense_matmul`'s reduction width is,
+    /// and the reason the constant is weighed against the shapes that carry a
+    /// step's bytes rather than against the fastest row.
+    ///
+    /// Nothing asserts a rate. The numbers go to stderr for the commit message
+    /// to quote, and what is asserted is that the shipped width was among the
+    /// ones tried.
+    ///
+    /// Read off the device's own clock over a command buffer of `CALLS`
+    /// dispatches, because a submission is 225 microseconds and most of these
+    /// are under a hundred.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_packed_multiply_costs_at_each_width_a_lane_reads() {
+        let Some(device) = device() else { return };
+        const CALLS: usize = 16;
+        const ROUNDS: usize = 3;
+        const WIDTHS: [usize; 5] = [1, 2, 4, 8, 16];
+
+        // `(what, in_dim, out_dim, rows)`.
+        let shapes = [
+            ("routed gate/up, decode", 4096, 2048, 6),
+            ("routed down, decode", 2048, 4096, 6),
+            ("q_proj, decode", 4096, 4096, 1),
+            ("k_proj, decode", 4096, 1024, 1),
+            ("shared gate/up, decode", 4096, 2048, 2),
+            ("routed gate/up, 97 tokens", 4096, 2048, 6 * 97),
+            ("q_proj, 97 tokens", 4096, 4096, 97),
+        ];
+
+        assert!(WIDTHS.contains(&BYTES_PER_LANE), "{BYTES_PER_LANE}");
+        eprintln!(
+            "  {:<28}{}",
+            "shape",
+            WIDTHS
+                .iter()
+                .map(|width| format!("{:>10}", format!("{width} B/lane")))
+                .collect::<String>()
+        );
+        for (what, in_dim, out_dim, rows) in shapes {
+            let case = Case::seeded(1, in_dim, out_dim, rows);
+            let mut x = device.buffer(&case.x).expect("the rows upload");
+            let mut line = format!("  {what:<28}");
+            for width in WIDTHS {
+                let matmul = PackedMatmul::from_source(&device, &a_lane_reading(width))
+                    .unwrap_or_else(|err| panic!("{width} bytes a lane compiles: {err}"));
+                let projection = case.upload(&device, &matmul);
+
+                let mut best = Duration::MAX;
+                for _ in 0..ROUNDS {
+                    let mut batch = device.batch().expect("a command buffer opens");
+                    for _ in 0..CALLS {
+                        projection
+                            .encode_over(&mut batch, &mut x)
+                            .expect("the dispatch encodes");
+                    }
+                    profile::take();
+                    batch.wait().expect("the batch completes");
+                    best = best.min(profile::take().gpu() / CALLS as u32);
+                }
+
+                let codes = rows * out_dim * in_dim;
+                let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+                line.push_str(&format!(
+                    "{:>10}",
+                    format!("{:.0} GB/s", moved / best.as_secs_f64() / 1e9)
+                ));
+            }
+            eprintln!("{line}");
+        }
+    }
+
+    /// The shipped kernel with a different [`BYTES_PER_LANE`] written into its
+    /// prelude, which is the one thing the sweep above varies.
+    ///
+    /// The declaration is named in full on both sides of the rewrite, and the
+    /// assertion asks for the whole of it: the prelude holds four other `uint`
+    /// constants and three of them are 2, 4 and 16, so a check for the value
+    /// alone would pass against `CODES_PER_BYTE` while the sweep measured one
+    /// width five times.
+    fn a_lane_reading(bytes_per_lane: usize) -> String {
+        let wanted = format!("constant uint BYTES_PER_LANE = {bytes_per_lane};");
+        let source = source().replace(
+            &format!("constant uint BYTES_PER_LANE = {BYTES_PER_LANE};"),
+            &wanted,
+        );
+        assert!(source.contains(&wanted), "the prelude declares {wanted}");
+        source
     }
 
     /// A weight paired with another tensor's scales is the mistake the shapes
