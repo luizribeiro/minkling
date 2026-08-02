@@ -1354,32 +1354,6 @@ inline uint tile_source(constant Shape &shape, uint row) {
     return ((row / shape.per_source) % shape.sources) * shape.in_dim;
 }
 
-/// The same multiply, one simdgroup per `ROWS_A_TILE` consecutive rows of one
-/// column rather than per output element.
-///
-/// **The whole of what this buys is that the weight row is read once.** Above,
-/// each of a call's rows walks the weight it names from end to end, so a call
-/// of `n` rows against one expert reads that expert `n` times — which is a
-/// decode step's price paid once a token by a prefill that could have paid it
-/// once. Here the walk is shared: one lane loads a packed byte, decodes its two
-/// codes, and multiplies them against the `ROWS_A_TILE` rows of `x` that want
-/// them.
-///
-/// **Only rows naming the same expert can share it, and the check is here
-/// rather than in the caller's head.** A tile whose rows disagree falls back to
-/// walking each row's own weight, which is exactly what the kernel above does
-/// and is the same arithmetic — so a caller that tiled a routed bank gets a
-/// correct answer and no saving, and correctness never rests on a claim about
-/// an expert list this side may not have seen.
-///
-/// **The answer is the untiled kernel's bit for bit and that is by
-/// construction**, not within a tolerance. An output element is still one
-/// simdgroup's `simd_sum` over lanes that still walk the row in `BYTES_PER_LANE`
-/// chunks from the same byte in the same stride, and a chunk is still summed
-/// into `dot` and then into `sum` under one scale. Nothing about the order any
-/// product enters any sum has moved; what moved is how many sums one load
-/// feeds. `a_tiled_dispatch_answers_what_the_untiled_one_answers` is where that
-/// is held.
 "#;
 
 /// The tiled kernel, which is emitted twice: once over the rows as the caller
@@ -1418,6 +1392,15 @@ fn tiled_entry(entry: &str, grouped: bool) -> String {
             "shape.scatters ? order[row] : row",
         ),
     };
+    // Each substitution replaces every occurrence, so what keeps the four from
+    // reaching into each other is that none of them writes a placeholder — which
+    // is a property of these four values rather than of the mechanism, and so is
+    // asserted rather than read off them.
+    let written = [entry, order, reads, writes];
+    assert!(
+        !written.iter().any(|value| value.contains("__")),
+        "a substitution that writes a placeholder would be substituted again"
+    );
     TILE.replace("__ENTRY__", entry)
         .replace("__ORDER__", order)
         .replace("__READS__", reads)

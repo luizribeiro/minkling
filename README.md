@@ -573,7 +573,8 @@ the tile's own is.
 **It costs a dispatch and no submission**, which is the constraint M8 left behind
 about moving work near the router: the sort reads what the top-k wrote and writes
 what the bank reads, so it goes between them in the command buffer a layer
-already was. 1077 dispatches a prefill to 1117 and 42 submissions to 42.
+already was. 1077 dispatches a prefill to 1117 at every length, and the
+submissions where they were: 22 at 97 tokens, 42 at 385 and 43 at 769.
 
 **What it bought, at 769 tokens:**
 
@@ -605,17 +606,18 @@ anyway, because a grid of tiles is a quarter of the simdgroups doing four times
 the work each, and that is worth something at a shape where the reads are not.
 
 **And what compiling a third entry costs is worth stating, because it is not
-nothing and it is not attributed.** A build whose grouped entry is compiled and
-never dispatched prefills at 0.711, 2.91 and 6.17 s of device time against the
-0.691, 2.91 and 6.01 of a build without it — so 2 to 3% of a prefill is the price
-of the pipeline existing, before any of it is used. `packed_matmul_rows`'s own
+nothing and it is not attributed.** Put `RUNS_A_GROUPING` past any prompt, so
+that the entry compiles and no call reaches it, and a prefill takes 0.711, 2.91
+and 6.17 s of device time against the 0.691, 2.91 and 6.01 of the commit before
+this one — so 2 to 3% of a prefill is the price of the pipeline existing, before
+any of it is used. `packed_matmul_rows`'s own
 row carries most of that: 2.03 s to 2.23 at 769 tokens over the same 336 calls
 and the same 445 GB. Why a pipeline that never runs slows one that does is
 unexplained here; what is measured is that the grouping buys 1.06 s at that
 length against it.
 
 **One lever is left, and it is the input re-read.** Both tiled rows are far under
-the untiled kernel's 660 GB/s — 201 and 393 — and they are 4.85 s of a 5.11 s
+the untiled kernel's 666 GB/s — 201 and 393 — and they are 4.85 s of a 5.11 s
 prefill's device time. Per output element a tile of four rows reads the same
 `in_dim` input floats an untiled call does and a quarter of the weight bytes, so
 the input is 32 bytes read for every byte of weight and the achieved column is
