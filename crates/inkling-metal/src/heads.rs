@@ -6,21 +6,24 @@
 //! them goes through [`crate::dense`], the kernel the routers' gates already
 //! use, rather than through the packed matmul the rest of the model does.
 //!
-//! **The seam is one step out from a layer's, and deliberately.** A decoder
-//! layer hands the device everything between one hidden state and the next; a
-//! head hands it the eight multiplies and keeps the rest here — the two norms
-//! in front of it, the concatenation between them, its own attention step, its
-//! convolutions and its activation. That is the shape this engine's layers had
-//! before they were merged, and what it costs is measured rather than assumed:
-//! a head is five submissions where a layer is one, at about 250 microseconds
-//! of round trip each.
+//! **The seam is one step out from a layer's.** A decoder layer hands the
+//! device everything between one hidden state and the next; a head hands it the
+//! eight multiplies and keeps the rest here — the two norms in front of it, the
+//! concatenation between them, its own attention step, its convolutions and its
+//! activation. That is the shape this engine's layers had before they were
+//! merged.
 //!
-//! What decides it is what the heads are for. A round runs `k` of them and then
-//! a verify pass over `k + 1` tokens, and the verify pass is where the time is
-//! — the study measured a block's extra token at a third of a decode step
-//! against a head's whole chain at a tenth. Merging a head into one command
-//! buffer means generalising every kernel a layer uses over a second weight
-//! format, and it would move the smaller of the two numbers.
+//! **What it costs is measured now and it is the larger of the two numbers.**
+//! `which_kernels_own_a_chain_of_heads` prices a chain of eight at 88
+//! dispatches in 48 submissions — six a head, against a whole decode step's
+//! fifteen — and about 390 microseconds of round trip on each, which is about
+//! half of a 4.5 ms guess against the 2.2 ms the device executes for. What made
+//! this seam defensible was the study's reading that a
+//! block's extra token is a third of a decode step where a head's whole chain is
+//! a tenth; a chain of eight is 1.71 decode steps. Merging a head into one
+//! command buffer means generalising every kernel a layer uses over a second
+//! weight format, and the README's speculation section is where that trade now
+//! stands.
 //!
 //! **The fused gate and up are two weights over one tensor.** `w13_dn` holds
 //! them interleaved row by row, and

@@ -179,8 +179,8 @@ moves and what that comes to against this machine's 819 GB/s:
     rms_norm            168    1.88ms    8.7%      5.89 MB     3 GB/s      0%
     short_conv          168    1.37ms    6.3%     22.02 MB    16 GB/s      2%
     fused_attention      42    880µs     4.1%      5.62 MB     6 GB/s      1%
-    dense_matmul         40    594µs     2.7%     85.24 MB   143 GB/s     18%
     router_top_k         40    547µs     2.5%      0.08 MB     0 GB/s      0%
+    dense_matmul         40    480µs     2.2%     85.24 MB   178 GB/s     22%
     swiglu               82    437µs     2.0%      8.26 MB    19 GB/s      2%
     router_weights       40    378µs     1.7%      0.00 MB     0 GB/s      0%
     moe_combine          40    351µs     1.6%      5.90 MB    17 GB/s      2%
@@ -216,6 +216,15 @@ reduces each output element across a run of simdgroups rather than one, as long
 a run as the dispatch can spare: 2.08 ms to 590 µs, 41 GB/s to 145, and a
 decode-shaped gate from 39 microseconds to 10. Neither added a dispatch and
 neither moved a token.
+
+**And that same kernel then took the lever a second time, for a reason that had
+nothing to do with a decode step.** A lane read one bfloat16 value, which is two
+byte loads and the input float it multiplies — three memory instructions
+carrying one multiply-add. Four values to a lane makes that twelve carrying
+four, and its row here is 480 µs at 178 GB/s where it was 594 at 143. That is
+114 microseconds of an 18 ms device step and is not why it was done: this kernel
+is 0.06% of the checkpoint here and 75% of a chain of MTP heads, whose weights
+the quantiser left alone. See "Speculating with the MTP heads" below.
 
 **What is left was diagnosed rather than attacked, and the two rows turned out
 not to be the same kind of row at all.** Both are already 64 and 32 threadgroups
@@ -957,23 +966,23 @@ the GPU holds, which unified memory makes a move rather than a copy.
 
 **What a round costs, measured here rather than inherited.** Against a warm
 cache, a 34-token prompt, and this engine's own decode step over the 64 tokens
-that follow it — 21.3 ms, where the 20.1 ms above is the same step at the
+that follow it — 21.1 ms, where the 20.1 ms above is the same step at the
 eight-token context every other measurement in this file is taken at:
 
     tokens in the block    1      2      3      4      6      9
-    forward pass       26.3ms 30.5ms 38.4ms 45.8ms 62.2ms  87.7ms
-    × a decode step      1.23   1.43   1.80   2.15   2.92    4.12
+    forward pass       23.3ms 31.1ms 38.6ms 43.1ms 62.5ms  79.5ms
+    × a decode step      1.10   1.48   1.83   2.04   2.96    3.77
     submissions            15     15     15     15     15      15
 
     heads chained          1      2      3      4      6      8
-    the chain           4.9ms  9.6ms 14.4ms 19.2ms 28.7ms  37.6ms
-    × a decode step      0.23   0.45   0.68   0.90   1.35    1.77
+    the chain           6.1ms  9.2ms 13.7ms 18.4ms 27.4ms  36.1ms
+    × a decode step      0.29   0.43   0.65   0.87   1.30    1.71
 
-**An extra token in the block costs 7.7 ms**, which is 0.36 of a decode step
-against the 0.33 the acceptance study measured — 10.5 ms against a 31.8 ms step.
-Both the block and the step it is weighed against fell; the fraction rose,
-because the step fell further. Most of that is
-the MoE and is fundamental — one token reads 6 routed experts a layer and nine
+**An extra token in the block costs 7.0 ms**, which is 0.33 of a decode step and
+is exactly what the acceptance study measured — 10.5 ms against a 31.8 ms step.
+Both the block and the step it is weighed against have fallen since, and by
+enough of the same factor that the fraction is back where it started. Most of it
+is the MoE and is fundamental — one token reads 6 routed experts a layer and nine
 tokens read up to 54, where the whole bargain of
 speculation elsewhere is that verifying `k` tokens costs about what decoding one
 does, because you re-read the same weights.
@@ -999,49 +1008,90 @@ measurement**, at two widths out of three; what separates them is unmeasured, an
 the sweep is the one that describes a run. Those six figures are that commit's
 own pair; the tables above are what the two cost now.
 
-A head's guess costs 4.7 ms, of which about 3.4 is the 950 MB it reads — its own
-532 MiB, and `lm_head` again to turn a hidden state into a token — and the rest
-is the five submissions a partial handover takes. The study called the
-reference's per-head overhead "yours to win in Rust"; most of it turns out to be
-bandwidth, and mlx-vlm was already near it at 3.9 ms — on the 8-bit checkpoint,
-whose heads are these heads byte for byte but whose `lm_head`, which a guess also
-reads, its quantiser left in the original precision. The two figures are close
-for reasons only half of which are shared.
+A head's guess costs 4.5 ms and reads 995 MB — its own 532 MiB, and `lm_head`
+again to turn a hidden state into a token. **How that 4.5 divides was inferred
+here for two milestones and is measured now, and the inference was wrong**: the
+device executes for 2.2 ms of it and the other 2.3 are the six submissions a
+guess takes and this process's own work between them, where this file had 3.4 ms
+of bandwidth and 1.3 of round trip. The study called the reference's per-head
+overhead "yours to win in Rust"; mlx-vlm was near it at 3.9 ms — on the 8-bit
+checkpoint, whose heads are these heads byte for byte but whose `lm_head`, which
+a guess also reads, its quantiser left in the original precision. The two
+figures are close for reasons only half of which are shared.
 **Only the `lm_head` half
 of those bytes is the packed matmul's**, and reading four to a lane took that
 dispatch 1.57 ms to 1.46 and the guess 4.85 to 4.70 — the same tenth of a
 millisecond arriving twice, which is what says the head's own bfloat16 tensors
-are the other half and no kernel here has been at them.
+are the other half.
 
-**Speculation has stopped paying.** Over 64 tokens of a structured prompt, three
-passes round-robin over the depths so that a drift moves them all, best pass
-each:
+**And now where a chain's milliseconds go, which is a question this file had
+answered for a decode step and a prefill and never once asked of the heads.**
+The same tables, over the eight heads at one row, sampled:
+
+    kernel            calls    device   share       moved   achieved  of peak
+    dense_matmul         72   26.21ms   75.3%   4469.46 MB   171 GB/s     21%
+    packed_matmul         8    8.43ms   24.2%   3489.14 MB   414 GB/s     51%
+    fused_attention       8   165.33µs   0.5%      1.05 MB     6 GB/s      1%
+
+**A chain of eight heads reads 7.96 GB where a decode step reads 5.9**, and 4.5
+of those are bfloat16 the quantisers never touched — so three quarters of the
+chain's device time is the one kernel in the model reading a format nobody
+packed. The two rows are the same chain and the same bytes, and the packed
+kernel beside it was at two and a half times the rate. That is the first half of
+the answer and it is taken: four values to a lane, which is the lever the decode
+step's own table above records this kernel taking twice. Over four alternating
+pairs, every pair moving the same way and the two ranges not overlapping, **this
+row is 161 GB/s against 205 and the chain's device clock 19.59 ms against
+17.90** — 26.79, 29.50, 27.67 and 27.82 ms of sampled device time against 23.27,
+21.52, 21.29 and 21.36.
+
+**The other half is round trips, and it is the whole of what is left.** A chain
+is **88 dispatches in 48 submissions — 1.8 a submission, against a decode
+step's 71.8** — six a head, which are the five a partial handover takes and the
+`lm_head` that turns what it produced into a token, each committed and then
+waited for. Of a 45 ms chain the device
+executes for about 18 and the wait is about 38, so `queued` is 3.3 ms across the
+whole chain where a decode step's run of layers has 71 ms of it: **M16's
+pipelining reaches none of this**, because there is nothing behind the buffer
+being waited for. The norms, the two convolutions, the head norms, the
+activation and the residual adds all sit between those waits on this side, and
+each of them has a kernel on the device already — what does not exist is the
+seam. Merging a head into one submission is what the layers did four milestones
+ago and it is the next thing here, not another kernel.
+
+What is left after those two is this process's own: `sample` is 6.4% of the
+chain and `readback` 5.5%, which are the argmax over 201024 logits and the
+logits arriving to be argmaxed — eight times over, because every guess has to be
+a token before the next head can embed it.
+
+**Speculation has stopped paying and the heads' own kernel has not put it
+back.** Over 64 tokens of a structured prompt, three passes round-robin over the
+depths so that a drift moves them all, best pass each:
 
     k                      0      1      2      3      4
-    ms/token           21.33  20.06  21.27  24.04  28.06
+    ms/token           21.11  19.78  20.84  21.79  27.33
     tokens a round      1.000  1.829  2.560  3.048  3.368
-    speedup             1.000  1.063  1.003  0.887  0.760
+    speedup             1.000  1.067  1.013  0.969  0.773
     accepted, by depth         85%  91/74% 84/74/63% 82/65/53/47%
 
-**Every absolute figure here improved but one, and the whole speedup column
-collapsed anyway**, which is what a fixed cost looks like when the thing it was
-hiding gets cheaper. The same sweep re-run against the commit before this one —
-both sides in one sitting, rather than against the figures this file already had
-— read 30.43, 23.77, 23.16, 24.83 and 27.99 — so the unspeculated step fell by 30% and `k = 2`
-by 8%, while `k = 4` went the other way by 0.07 ms and is the one row here that
-did not gain,
-because a round's fixed costs are the eight heads' chain and the block's own
-extra rows and the chain did not move at all: 37.92 ms to 37.63 over eight heads.
-A head is five submissions of a partial handover — see the heads' own paragraph
-above — and none of the five is a run of layers, so nothing this milestone did
-reached them. Acceptance is untouched, to three decimals, because the prompt and
-the model are the same.
+**Every absolute figure here improved and the speedup column barely moved**,
+which is what a fixed cost looks like when it is two thirds round trip. The
+sitting that took the step down 30% left the chain at 37.92 ms against 37.63
+over eight heads and took `k = 2` from 1.31× to 1.00×; the sitting since, over
+three alternating pairs, reads 21.10, 19.81, 20.84, 21.83 and 26.79 against
+20.99, 19.64, 20.74, 21.48 and 26.04 — every depth but `k = 2` falling the same
+way in all three pairs and every range overlapping, which by this file's own
+standard is not a claim. The chain itself is: 37.89 ms to 36.55 at eight heads
+and 19.12 to 18.35 at four, neither range overlapping. Acceptance is untouched,
+to three decimals, because the prompt and the model are the same.
 
-**`k = 1` is what pays now and it pays 1.06×**, where `k = 2` paid 1.31× in the
-sweep this one is measured against.
-The engine is faster at every depth a run can be given and there is now barely a
-depth worth giving it, which is the honest reading: the next thing speculation
-needs is the heads' chain, not the verify block.
+**`k = 1` is what pays and it pays 1.07×**, where `k = 2` paid 1.31× two
+milestones ago. The engine is faster at every depth a run can be given and there
+is barely a depth worth giving it, which is the honest reading, and the chain is
+now measured rather than suspected: at 1.71 decode steps for eight heads and
+0.29 for one, a `k = 1` round spends 6.1 of its 36 ms guessing. **A chain that
+cost nothing would put `k = 1` at 1.28×**, which is the whole of what is on the
+table here and the number every further millisecond is a fraction of.
 
 **Against mlx-vlm, measured in one sitting on 2 August 2026.** Both engines were
 given the same 27-token prompt — the string mlx-vlm's own chat template renders
