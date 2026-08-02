@@ -222,6 +222,29 @@ fetch repo="thinkingmachines/Inkling-Small":
 mtp-shard src="models/Inkling-Small-8bit" dst="models/Inkling-Small-mxfp4":
     cp {{ src }}/mtp.safetensors {{ dst }}/mtp.safetensors
 
+# The same checkpoint with its heads packed into the format its stack is already
+# in: a directory of symlinks to `src`, and one shard of its own.
+#
+# **The bfloat16 heads are not touched and must not be.** They are the oracle the
+# packed ones' guesses are held against — `just bench-weights <src> <dst> guesses`
+# — and the two checkpoints are the same 140 GB stack read twice, so what this
+# costs on disk is the 1.1 GiB shard and forty symlinks.
+#
+# A loader maps every `*.safetensors` in a directory, which is why this is a
+# directory rather than a second shard beside the first: two shards naming the
+# same tensors is a checkpoint that holds each of them twice.
+quantize-mtp src="models/Inkling-Small-mxfp4" dst="models/Inkling-Small-mxfp4-mtp4":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p {{ dst }}
+    for path in {{ src }}/*; do
+        name="$(basename "$path")"
+        [ "$name" = "mtp.safetensors" ] && continue
+        [ -e "{{ dst }}/$name" ] || ln -s "{{ absolute_path(src) }}/$name" "{{ dst }}/$name"
+    done
+    reference/.venv/bin/python reference/scripts/quantize_mtp.py \
+        {{ src }}/mtp.safetensors {{ dst }}/mtp.safetensors --check
+
 # Quantise the BF16 original to 8-bit, keeping the MTP tensors the mxfp4 quant
 # dropped. Streams a shard at a time and resumes from what it has already
 # written, so it can be run in chunks and re-run until it prints an index:
