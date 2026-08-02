@@ -84,7 +84,7 @@ The one thing here that is allocated rather than mapped is the keys and values,
 and it is the only part of the footprint that grows with the sequence: each
 layer keeps its own `[kv_heads, capacity, head_dim]` span of each and doubles it
 when a sequence outruns it, which at 64 slots is 21 MB across the stack and puts
-an eight-token generation at 0.14 GiB.
+an eight-token generation at 0.14 GiB and a 769-token prefill at 0.44.
 
 **What a step costs is now mostly the asking, and that is measured rather than
 inferred.** Every operation a forward pass runs opens a scope charged the time
@@ -245,8 +245,16 @@ from the backward distance where it scores the key it belongs to, so the mask an
 the scores it forces alongside it are never allocated. Over the eight-token
 context that profile is taken across, that is a wash — 42 more dispatches cost
 about the millisecond the CPU's own scores and mask cost — and it is not what the
-kernel is for. A 769-token prompt prefills in 13.6 s against 55.4 s, and the gap
-widens with the prompt: ×1.3 at 97 tokens, ×2.4 at 385, ×4.1 at 769.
+kernel is for. What it is for is the memory the mask would have taken, which the
+architecture notes below price.
+
+**What it is not for is prefill wall time, and that belongs to the reference.**
+97, 385 and 769 tokens prefill here in 1.87, 5.32 and 10.2 s, best of three,
+against 0.42, 0.71 and 1.18 in a single pass of `just prefill-bench` — ×4.5, ×7.5
+and ×8.6, and widening with the prompt. Where the gap comes from is unmeasured;
+what can be said is that it is not the round trips, since a prefill's submissions
+are 42 at 250 µs against a gap of nine seconds. Every milestone here has moved
+the decode step, and prefill has never been the path any of them was about.
 
 **A whole decoder layer is now one command buffer**, and twenty-six dispatches
 on a layer that routes. Eleven are its attention: the input layernorm, the four
