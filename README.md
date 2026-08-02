@@ -550,6 +550,18 @@ costs is that the heads see an mxfp4 stack's hidden states rather than the
 8-bit stack the acceptance study measured, which is why acceptance is measured
 here again rather than inherited.
 
+**So every MTP number in this file was taken on the mxfp4 checkpoint with that
+copied shard sitting beside its index, and none of them can be reproduced
+without it.** `models/Inkling-Small-mxfp4/mtp.safetensors` is a prerequisite of
+the speculation section above rather than a detail of it: absent, the checkpoint
+carries no `mtp_config`, `--speculate` has nothing to map, and the timing case
+that prices a round refuses to run. The 8-bit quant is not the alternative it
+looks like — this engine cannot load it at all, because `quantize.py` leaves
+`embed_tokens` and `lm_head` in their original precision and the loader opens
+both as packed pairs, so it stops on a missing `embed_tokens.scales`. It is a
+checkpoint for the Python acceptance study and for carrying these 4.5 GB, and
+that is the whole of what it is for.
+
 No index names that shard, in either quant. The loader maps every
 `*.safetensors` in a checkpoint directory and reads the index only for whether a
 shard it names is missing. The official NVFP4 keeps its MTP weights but is in
