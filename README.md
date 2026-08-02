@@ -440,42 +440,42 @@ the GPU holds, which unified memory makes a move rather than a copy.
 
 **What a round costs, measured here rather than inherited.** Against a warm
 cache, a 34-token prompt, and this engine's own decode step over the 64 tokens
-that follow it — 37.0 ms, where the 33 ms above is the same step at the
+that follow it — 35.6 ms, where the 33 ms above is the same step at the
 eight-token context every other measurement in this file is taken at:
 
     tokens in the block    1      2      3      4      6      9
-    forward pass       35.1ms 54.2ms 68.4ms 75.2ms 95.1ms 127.8ms
-    × a decode step      0.95   1.46   1.85   2.03   2.57    3.45
-    submissions             2     43     43     43     43      43
+    forward pass       33.5ms 51.6ms 51.3ms 74.5ms 85.4ms 117.4ms
+    × a decode step      0.94   1.45   1.44   2.10   2.40    3.30
+    submissions             2      2      2      2      2       2
 
     heads chained          1      2      3      4      6      8
-    the chain           4.8ms  9.4ms 14.0ms 20.2ms 29.0ms  38.3ms
-    × a decode step      0.13   0.25   0.38   0.54   0.78    1.03
+    the chain           4.8ms  9.7ms 15.8ms 20.3ms 28.4ms  38.3ms
+    × a decode step      0.14   0.27   0.44   0.57   0.80    1.08
 
-**An extra token in the block costs 11.6 ms**, which is the acceptance study's
+**An extra token in the block costs 10.5 ms**, which is the acceptance study's
 finding reproduced on this engine's own numbers: it measured 10.5 ms against a
 31.8 ms step. Most of that is the MoE and is fundamental — one token reads 6
 routed experts a layer and nine tokens read up to 54, where the whole bargain of
 speculation elsewhere is that verifying `k` tokens costs about what decoding one
 does, because you re-read the same weights.
 
-**But the first extra token costs twice what the ones after it do, and the
-submissions column says why.** A decode step is two command buffers because a
-layer handed one row can leave what it produced where the next layer reads it; a
-call of more than one row could not, because what a merged run holds is every
-intermediate of every layer in it until the buffer completes — so the engine drew
-that line at one row and a two-token block is 43 submissions where a one-token
-step is 2. At this machine's 250 µs a submission that is about 10 ms, against
-11.6 ms of expert reads. It was a trade made deliberately for prefills of
-hundreds of tokens and never revisited for blocks of two or three, and it is the
-one number in this section that is nobody's law.
+**Every block this engine can propose is two submissions**, where a block of two
+or more was 43. A decode step was always two command buffers, because a layer
+handed one row can leave what it produced where the next layer reads it; the
+engine drew that line at one row, so a call of two paid a submission a layer.
+The line is bytes now — nine rows of this stack stay under what a run may retain,
+see the layers' own paragraph above — and that is 41 round trips off every block
+a round can ask for.
 
-**The line is drawn in bytes now**, and a block of a few rows holds far less than
-the budget a run is allowed — see the layers' own paragraph above. Every figure
-in the two tables above is from before that change and none of them has been
-re-measured: the host's GPU was wedged by an unrelated process while it landed,
-so the submissions column, the block's cost and the sweep below are all
-outstanding.
+**What those 41 were worth is the finding, and the block table only half
+explains it.** At `k = 2` the two agree exactly: the round fell from 83.7 ms to
+66.5, and the block of three it verifies fell 1.85 decode steps to 1.44, which is
+17.1 ms of the 17.2. At `k = 1` and `k = 3` they do not. Those rounds fell from
+63.0 ms to 49.8 and from 115.8 to 86.2, while the blocks they verify barely moved
+— 1.46 decode steps to 1.45 at two rows, 2.03 to 2.10 at four. **So a block timed
+against a warm cache and the round a generation pays are not the same
+measurement**, at two widths out of three; what separates them is unmeasured, and
+the sweep is the one that describes a run.
 
 A head's guess costs 4.8 ms, of which about 3.4 is the 950 MB it reads — its own
 532 MiB, and `lm_head` again to turn a hidden state into a token — and the rest
@@ -483,22 +483,25 @@ is the five submissions a partial handover takes. The study called the
 reference's per-head overhead "yours to win in Rust"; most of it turns out to be
 bandwidth, and mlx-vlm was already near it at 3.9 ms.
 
-**So the speedup is thin.** Over 64 tokens of a structured prompt, three passes
+**So every depth pays now.** Over 64 tokens of a structured prompt, three passes
 round-robin over the depths so that a drift moves them all, best pass each:
 
     k                      0      1      2      3      4
-    ms/token           36.03  34.47  32.68  37.98  41.89
+    ms/token           35.35  27.22  25.96  28.28  31.50
     tokens a round      1.000  1.829  2.560  3.048  3.368
-    speedup             1.000  1.045  1.102  0.949  0.860
+    speedup             1.000  1.299  1.362  1.250  1.123
     accepted, by depth         85%  91/74% 84/74/63% 82/65/53/47%
 
-**k = 2 is the depth that pays, at 1.10×**, against the study's projected 1.32×
-at the same depth. Acceptance is not what separates them — 2.56 tokens a round
-here against its pooled 2.36 — and neither is the chain, at 0.25 decode steps
-against its 0.24. It is the block: 1.85 decode steps here against its 1.55, of
-which the submissions are more than half. **Speculation divides a fixed win
-rather than adding one**, and the harder the decode step it is measured against
-has been made to work, the more of that ratio a block gives back.
+**k = 2 is still the depth that pays, at 1.36×**, where it was 1.10× and where
+`k = 3` and `k = 4` were losses at 0.95× and 0.86×. Acceptance did not move —
+the tokens-a-round row is what it was, to three decimals, because the prompt and
+the model are the same — so the whole of it is the round getting cheaper. It
+beats the study's projected 1.32× at this depth, which it did not before.
+
+**25.96 ms a token is under mlx-vlm's 32.** The win is speculation's rather than
+the kernels': an unspeculated step costs 32.5 ms here against the reference's 32,
+so a token this engine decodes on its own is still a shade the slower of the two,
+and it is the tokens it does not decode that put the run ahead.
 
 Acceptance is joint rather than marginal and cannot be otherwise in an engine: a
 round whose first guess was rejected never learns what its second was worth,
@@ -509,8 +512,8 @@ structured text against the 44.9% it measured on prose — so the depth worth
 running is the workload's rather than the engine's, and `--speculate` takes it
 as a number for that reason.
 
-**The machinery costs a run that does not use it nothing**: 37.04 ms/token
-against 36.52 with four timesteps of slack in every window, which is inside the
+**The machinery costs a run that does not use it nothing**: 35.57 ms/token
+against 35.73 with four timesteps of slack in every window, which is inside the
 spread of three passes. A run that speculates nothing maps no head, allocates no
 scratch, and asks its windows for no slack at all.
 
