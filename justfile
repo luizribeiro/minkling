@@ -1,5 +1,10 @@
 checkpoint := "models/Inkling-Small-mxfp4"
 
+# How many pairs `just bench` alternates over. Seven is what most of the paired
+# figures in the README were taken over; `BENCH_PAIRS=3 just bench …` is the
+# shorter sitting a large effect does not need seven of.
+pairs := env("BENCH_PAIRS", "7")
+
 default:
     @just --list
 
@@ -35,6 +40,71 @@ test-timing checkpoint=checkpoint:
 # token.
 test-full checkpoint=checkpoint: && (test-timing checkpoint)
     INKLINGRS_CHECKPOINT={{ absolute_path(checkpoint) }} cargo nextest run
+
+# Weigh two refs against each other in one sitting: one of
+#
+#   just bench HEAD~1 HEAD decode
+#   just bench HEAD~1 .    prefill --tokens 769
+#   just bench v1 v2       sweep --depth 4
+#
+# `.` is the working tree, which is the arm a change is measured from before it
+# is a commit at all.
+#
+# **Each ref is built once and kept.** The binaries land in `target/bench/bin`
+# under the commit they were built from, so a second sitting against the same
+# pair builds nothing — and no pair of the seven rebuilds anything, which is what
+# a flip used to cost. The alternation is what the pairs are for: same sitting,
+# order flipped each pair, and the report says whether the ranges overlap.
+#
+# One arm at a time and one Metal device apiece, for the reason
+# `.config/nextest.toml` gives: a number taken beside another measurement is a
+# number about the other measurement.
+#
+# `rm -rf target/bench` is how the kept binaries are given back; nothing here
+# evicts them, because what they cost is a build each and what they buy is every
+# later sitting against the same commit.
+bench a b *measurement:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    bin="$root/target/bench/bin"
+    mkdir -p "$bin"
+    git worktree prune
+
+    # A ref's binary, built if this is the first sitting that has asked for it.
+    arm() {
+        if [ "$1" = "." ]; then
+            cargo build --quiet --bin bench
+            # Copied out rather than run in place: the next `cargo build` would
+            # otherwise swap the binary under a sitting that is still running.
+            cp "$root/target/debug/bench" "$bin/working-tree"
+            echo "$bin/working-tree"
+            return
+        fi
+        local sha
+        sha="$(git rev-parse --verify "$1^{commit}")"
+        if [ ! -x "$bin/$sha" ]; then
+            local tree="$root/target/bench/tree-$$"
+            rm -rf "$tree"
+            git worktree add --detach --quiet "$tree" "$sha"
+            # A target directory of its own, so that building the other ref does
+            # not invalidate this one and turn the pairs back into rebuilds.
+            CARGO_TARGET_DIR="$root/target/bench/target" \
+                cargo build --quiet --manifest-path "$tree/Cargo.toml" --bin bench
+            cp "$root/target/bench/target/debug/bench" "$bin/$sha"
+            git worktree remove --force "$tree"
+        fi
+        echo "$bin/$sha"
+    }
+
+    a="$(arm '{{ a }}')"
+    b="$(arm '{{ b }}')"
+    # The harness is the working tree's own, whichever refs the arms are.
+    cargo build --quiet --bin bench
+    # The measurement is deliberately unquoted: `sweep --depth 4` is three
+    # arguments to each arm and quoting it would hand them one.
+    "$root/target/debug/bench" alternate --pairs {{ pairs }} "$a" "$b" \
+        -- {{ measurement }} "{{ absolute_path(checkpoint) }}"
 
 fmt:
     cargo fmt --all

@@ -52,6 +52,30 @@ the fifteen:** a round trip this repo has at
 what believing a number like that once cost. `#[ignore]` is what keeps them out
 of the two runs above, and what selects them here.
 
+### Measuring two refs against each other
+
+    just bench HEAD~1 HEAD decode
+    just bench HEAD~1 .    prefill --tokens 769
+    just bench v1 v2       sweep --depth 4
+
+Every timed claim in this file is paired and alternating — build A, build B, run
+them in one sitting with the order flipped each pair, and report whether the
+ranges overlap — and what that discipline used to cost was a checkout and a
+Metal-crate rebuild per flip, up to fourteen of them for one figure. **The
+rebuild bought nothing**: the two binaries do not change between pairs. So each
+ref is built once into `target/bench/bin/<sha>` and kept, and the pairs are
+process launches against binaries that already exist. `.` is the working tree,
+which is the arm a change is measured from before it is a commit at all.
+
+The three things it measures are the three this file quotes: a decode step, a
+prefill at a given length, and the end-to-end `k` sweep with its acceptance and
+its speedups — the last of which are divided against *that run's* own `k = 0`,
+because a sweep whose speedup row comes from another sitting carries the drift
+between the two. What comes back is the per-arm mean, both ranges, whether they
+overlap, and how many pairs moved the way the means did, which is this file's own
+standard for an effect. It runs one arm at a time and opens one Metal device
+apiece, for the reason `.config/nextest.toml` gives.
+
 Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
