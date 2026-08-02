@@ -674,6 +674,10 @@ pub struct ModelLayers<'a> {
     /// layer the CPU keeps, and is how a partial handover stays expressible.
     layers: Vec<Option<LayerDevice<'a>>>,
     device: &'a Device,
+    /// What a run may retain before it has to end — see
+    /// [`ModelLayers::carries`] and [`RETAINED_BUDGET`], which is what
+    /// [`ModelLayers::wrap`] puts here.
+    budget: u64,
     /// The command buffer a run of layers is being encoded into, and what the
     /// last of them left in it — `None` between runs.
     ///
@@ -684,7 +688,8 @@ pub struct ModelLayers<'a> {
 }
 
 /// A run of layers part way through: the command buffer they are being encoded
-/// into, the last layer encoded, and the `[tokens, hidden]` it wrote.
+/// into, the last layer encoded, the `[tokens, hidden]` it wrote, and what the
+/// device had allocated when the run opened.
 ///
 /// **Nothing here has run yet.** The dispatches are in the buffer and the buffer
 /// is not committed, so what `rows` names is memory the next layer's first
@@ -694,6 +699,9 @@ struct Carried<'a> {
     batch: Batch<'a>,
     at: usize,
     rows: Buffer<f32>,
+    /// [`Device::allocated_bytes`] as this run opened, which is what the same
+    /// reading is measured against to say what the run is holding.
+    opened: u64,
 }
 
 /// By hand because a [`Batch`] is not printable, and because what a reader wants
@@ -706,6 +714,42 @@ impl std::fmt::Debug for Carried<'_> {
             .finish_non_exhaustive()
     }
 }
+
+/// What a merged run may hold before it ends and another begins.
+///
+/// **A run retains every intermediate of every layer in it until the command
+/// buffer completes**, and that is what merging is paid for in: the round trips
+/// of every layer boundary it crosses, against the memory those layers' values
+/// are held in a moment longer. What the cost is *not* is a row count. A layer
+/// allocates the same buffers for three rows as for one — a normed state, four
+/// projections, two convolutions, two head norms, what the step and `o_proj`
+/// produced, and the eight expert rows a token routes through — and what changes
+/// with the call is how long each of them is. So the thing to bound is the
+/// bytes, and a row count bounds them only for one width of model.
+///
+/// **What this bounds is what merging adds to a peak, and that is exact.** A run
+/// ends once it has reached this budget, so what it holds is this plus the layer
+/// that crossed it — and a layer holds what it would have held on its own,
+/// unmerged. So a call whose own layer already reaches this budget merges
+/// nothing and costs exactly what it costs today, which is what keeps a long
+/// prefill one submission a layer; and no call anywhere can peak more than this
+/// budget above the call it replaced.
+///
+/// **The figure is the deepest block this engine can ask for.** The checkpoint
+/// ships eight multi-token prediction heads, so the widest verify block a round
+/// can propose is nine rows, and this is set above what nine rows of the whole
+/// stack come to by the arithmetic of the checkpoint's own shapes — which is
+/// what makes every block this engine can speculate one command buffer.
+///
+/// **That arithmetic is not yet a measurement, and it is the only thing sizing
+/// this.** Where a prefill's own single layer passes the budget — which is where
+/// a prefill goes back to being one submission a layer, and what says this
+/// raises nothing at the widest calls — is a comparison against the same
+/// per-layer figure and is unmeasured too. What a decode step allocates is
+/// printed by `the_generated_tokens_match_the_oracle_with_the_model_on_the_device`
+/// and that is the number this has to be re-derived against; it could not be run
+/// when this landed.
+const RETAINED_BUDGET: u64 = 160 << 20;
 
 /// One whole decoder layer on the device: its attention, the convolution and
 /// residual add behind that, the second norm, its MLP, and the convolution and
@@ -815,6 +859,7 @@ impl<'a> ModelLayers<'a> {
         Ok(Self {
             layers: wrapped,
             device,
+            budget: RETAINED_BUDGET,
             carried: RefCell::new(None),
         })
     }
@@ -934,15 +979,24 @@ impl<'a> ModelLayers<'a> {
     ///
     /// **Two conditions, and the second is the memory one.** The layer after
     /// this one has to be here whole, or there is nobody to read the buffer. And
-    /// the call has to be a single row: what a merged run holds is every
-    /// intermediate of every layer in it until the buffer completes, which at a
-    /// decode step is a few megabytes and at a 769-token prefill would be
-    /// gigabytes — while what merging buys shrinks as the work inside a
-    /// submission grows, a round trip being the same 290 microseconds whatever
-    /// is in it. So a decode step is one command buffer and a prefill is one a
+    /// the run has to have room: what a merged run holds is every intermediate
+    /// of every layer in it until the buffer completes, which at a decode step
+    /// is a few megabytes and over a long enough prefill would be gigabytes —
+    /// while what merging buys shrinks as the work inside a submission grows, a
+    /// round trip being the same 290 microseconds whatever is in it. So a run
+    /// ends where the bytes it is holding reach [`RETAINED_BUDGET`], and a call
+    /// wide enough that one layer reaches it on its own is one command buffer a
     /// layer.
-    fn carries(&self, layer: usize, queries: usize) -> bool {
-        queries == 1 && self.whole(layer + 1).is_some()
+    ///
+    /// **`retained` is measured rather than derived**, as the bytes this device
+    /// has allocated since the run opened. Nothing allocated inside a run can be
+    /// freed before it completes, because the command buffer holds a reference
+    /// to everything bound into it — so the reading is what the run is still
+    /// carrying, and it needs no model of what a layer's dispatches ask for. A
+    /// span that doubled while the run was open is counted too, which overstates
+    /// a run by a buffer that outlives it and is the conservative direction.
+    fn carries(&self, layer: usize, retained: u64) -> bool {
+        retained < self.budget && self.whole(layer + 1).is_some()
     }
 
     /// The layer encoded into the run's command buffer, opening one where there
@@ -955,7 +1009,7 @@ impl<'a> ModelLayers<'a> {
         held: &LayerDevice<'a>,
     ) -> Result<Passed, ProjectionError> {
         let mut carried = self.carried.borrow_mut();
-        let (mut batch, mut x) = match carried.take() {
+        let (mut batch, mut x, opened) = match carried.take() {
             Some(run) => {
                 assert_eq!(
                     run.at + 1,
@@ -963,17 +1017,27 @@ impl<'a> ModelLayers<'a> {
                     "layer {layer} was handed what layer {} left",
                     run.at
                 );
-                (run.batch, run.rows)
+                (run.batch, run.rows, run.opened)
             }
-            None => (self.device.batch()?, self.device.buffer(step.attention.x)?),
+            None => {
+                // Read before the row this call is handed is allocated, so that
+                // the first thing a run holds is charged to it.
+                let opened = self.device.allocated_bytes();
+                (
+                    self.device.batch()?,
+                    self.device.buffer(step.attention.x)?,
+                    opened,
+                )
+            }
         };
 
         let rows = held.encode_into(&mut batch, cache, step, &mut x)?;
-        if self.carries(layer, step.queries) {
+        if self.carries(layer, self.device.allocated_bytes() - opened) {
             *carried = Some(Carried {
                 batch,
                 at: layer,
                 rows,
+                opened,
             });
             return Ok(Passed::Carried(step.queries));
         }
@@ -993,9 +1057,9 @@ impl<'a> ModelLayers<'a> {
 /// readbacks stop happening at all.
 ///
 /// **What forces a run to end early is stated rather than discovered**: a layer
-/// this does not hold whole, the last layer of the stack, or a call of more than
-/// one row — see [`ModelLayers::carries`], which is where the memory a run holds
-/// is traded against the round trips it saves.
+/// this does not hold whole, the last layer of the stack, or a run that has
+/// reached the bytes it may hold — see [`ModelLayers::carries`], which is where
+/// the memory a run holds is traded against the round trips it saves.
 impl DecoderDevice for ModelLayers<'_> {
     fn run(&self, layer: usize, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<Passed> {
         let held = self.whole(layer)?;
@@ -1678,6 +1742,24 @@ mod tests {
             .expect("the kernel uploads")
         }
 
+        /// Three of those layers as a stack a run can be driven across, holding
+        /// `budget` bytes before it has to end.
+        ///
+        /// Three because two cannot tell a run that carried once from a run that
+        /// carries everything — the middle layer is the only one that both
+        /// consumes a carried buffer and leaves one.
+        fn stack(&self, weights: &NarrowWeights, budget: u64) -> ModelLayers<'a> {
+            stack(
+                self.device,
+                vec![
+                    self.layer(weights, 0),
+                    self.layer(weights, 0x99),
+                    self.layer(weights, 0xdd),
+                ],
+                budget,
+            )
+        }
+
         /// The whole layer on the device, with a dense feed-forward network in
         /// the MLP slot.
         ///
@@ -1819,7 +1901,7 @@ mod tests {
             slack: 0,
         };
         let weights = NarrowWeights::new();
-        let stack = stack(&device, vec![narrow.layer(&weights, 0)]);
+        let stack = stack(&device, vec![narrow.layer(&weights, 0)], RETAINED_BUDGET);
         let held = stack.layer(0).expect("the layer is here");
 
         let mlp = DenseMlp::backend(
@@ -1881,11 +1963,12 @@ mod tests {
     /// run and the last closes it, and a backend that got the middle case wrong
     /// would still pass a pair.
     ///
-    /// **And one row, because that is what carries.** A merged run holds every
-    /// intermediate of every layer in it until the buffer completes, so
-    /// [`ModelLayers::carries`] takes only a decode step; the same three layers
-    /// over two rows are three submissions, and this drives both. The second
-    /// decode against the same caches is what says the state a carried run
+    /// **And more than one row, because a block of guesses is one.** What a
+    /// merged run holds is every intermediate of every layer in it until the
+    /// buffer completes, and that is bytes rather than rows — so a call of three
+    /// merges the way a call of one does, and what says otherwise is
+    /// [`ModelLayers::carries`] over a budget, which the case below drives. The
+    /// second call against the same caches is what says the state a carried run
     /// leaves behind is the state the next call reads.
     ///
     /// The three layers are not each other's: they differ in every packed
@@ -1903,68 +1986,162 @@ mod tests {
             slack: 0,
         };
         let weights = NarrowWeights::new();
-        let stack = stack(
-            &device,
-            vec![
-                narrow.layer(&weights, 0),
-                narrow.layer(&weights, 0x99),
-                narrow.layer(&weights, 0xdd),
-            ],
-        );
+        let stack = narrow.stack(&weights, RETAINED_BUDGET);
+        let run = Merged::over(&stack, &weights);
 
-        let layers: Vec<DecoderLayer<'_>> = (0..3)
-            .map(|at| {
-                let held = stack.layer(at).expect("the layer is here");
-                DecoderLayer::new(
-                    NARROW,
-                    weights.decoder(&held.attention),
-                    LayerMlp::Dense(DenseMlp::backend(
-                        NARROW.hidden,
-                        NARROW_FFN,
-                        held.mlp.as_ref().and_then(dense).expect("a dense layer"),
-                        GLOBAL_SCALE,
-                    )),
-                )
-            })
-            .collect();
+        // A decode step and a block of guesses, which merge alike.
+        for rows in [1, 3] {
+            let before = device.submissions();
+            let merged = run.sequence(Some(&stack as &dyn DecoderDevice), rows);
+            let submissions = device.submissions() - before;
 
-        let sequence = |device: Option<&dyn DecoderDevice>, rows: usize| {
-            let caches = &mut [layers[0].cache(), layers[1].cache(), layers[2].cache()];
+            let apart = run.sequence(None, rows);
+            for (what, got, want) in [
+                ("the first call", &merged.0, &apart.0),
+                ("the second", &merged.1, &apart.1),
+            ] {
+                let agreed = deviation(got, want);
+                assert!(agreed <= TOLERANCE, "{rows} rows, {what}: {agreed:e}");
+            }
+            assert_ne!(merged.0, merged.1, "a second call that read no state");
+            assert_eq!(
+                submissions, 2,
+                "{rows} rows: one submission a call over three layers"
+            );
+        }
+    }
+
+    /// **What ends a run is the bytes it is holding**, and the same three layers
+    /// over the same rows are one command buffer, two or three depending only on
+    /// what they are allowed to hold.
+    ///
+    /// The budgets are derived from a measurement rather than written down,
+    /// because what a layer of these retains is a shape this case does not own —
+    /// every buffer between two dispatches of a narrow layer, which the layer
+    /// decides and would have to be restated here to be asserted. So one run
+    /// with a budget of nothing says what a layer costs, and the two budgets
+    /// after it are a fraction of it.
+    ///
+    /// Three layers because two cannot tell a run of two from a run of
+    /// everything, and the answers are compared at every budget: a schedule that
+    /// changed an answer would be the finding, whichever way the bytes went.
+    #[test]
+    fn a_run_ends_where_the_bytes_it_holds_reach_its_budget() {
+        let Some(device) = device() else { return };
+        let kernels = LayerKernels::compile(&device).expect("the kernels compile");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
+        let narrow = Narrow {
+            device: &device,
+            kernels: &kernels,
+            swiglu: &swiglu,
+            slack: 0,
+        };
+        let weights = NarrowWeights::new();
+        const ROWS: usize = 2;
+
+        // A budget of nothing is a submission a layer, which is what a run of
+        // one layer allocates — and three of them is what the whole call does.
+        let alone = narrow.stack(&weights, 0);
+        let run = Merged::over(&alone, &weights);
+        let (bytes, submissions) = run.retaining(&device, Some(&alone as &dyn DecoderDevice), ROWS);
+        assert_eq!(submissions, 3, "a submission a layer");
+        let layer = bytes / 3;
+        assert!(layer > 0, "a layer that allocated nothing");
+
+        let want = run.sequence(None, ROWS);
+        for (budget, submissions, what) in [
+            (layer - 1, 3, "a budget one layer cannot fit in"),
+            (layer + 1, 2, "a budget of two layers"),
+            (3 * layer, 1, "a budget of the whole stack"),
+        ] {
+            let held = narrow.stack(&weights, budget);
+            let run = Merged::over(&held, &weights);
+            let (_, got) = run.retaining(&device, Some(&held as &dyn DecoderDevice), ROWS);
+            assert_eq!(got, submissions, "{what}");
+
+            let answered = run.sequence(Some(&held as &dyn DecoderDevice), ROWS);
+            for (which, got, want) in [
+                ("the first call", &answered.0, &want.0),
+                ("the second", &answered.1, &want.1),
+            ] {
+                let agreed = deviation(got, want);
+                assert!(agreed <= TOLERANCE, "{what}, {which}: {agreed:e}");
+            }
+        }
+    }
+
+    /// Three layers of the same stack driven as one, which is what a run is
+    /// about: the first opens it, the last closes it, and the middle one both
+    /// consumes a carried buffer and leaves one.
+    struct Merged<'a> {
+        layers: Vec<DecoderLayer<'a>>,
+    }
+
+    impl<'a> Merged<'a> {
+        fn over(stack: &'a ModelLayers<'_>, weights: &'a NarrowWeights) -> Self {
+            let layers = (0..3)
+                .map(|at| {
+                    let held = stack.layer(at).expect("the layer is here");
+                    DecoderLayer::new(
+                        NARROW,
+                        weights.decoder(&held.attention),
+                        LayerMlp::Dense(DenseMlp::backend(
+                            NARROW.hidden,
+                            NARROW_FFN,
+                            held.mlp.as_ref().and_then(dense).expect("a dense layer"),
+                            GLOBAL_SCALE,
+                        )),
+                    )
+                })
+                .collect();
+            Self { layers }
+        }
+
+        /// Two calls of `rows` against one set of caches, so that what the
+        /// second answers is what the first left behind.
+        fn sequence(
+            &self,
+            device: Option<&dyn DecoderDevice>,
+            rows: usize,
+        ) -> (Vec<f32>, Vec<f32>) {
+            let caches = &mut [
+                self.layers[0].cache(),
+                self.layers[1].cache(),
+                self.layers[2].cache(),
+            ];
             let mut through = |x: &[f32]| {
                 let mut h = Passed::Rows(x.to_vec());
-                for (at, layer) in layers.iter().enumerate() {
+                for (at, layer) in self.layers.iter().enumerate() {
                     h = layer.forward(at, &mut caches[at], h.handed(), &NoExperts, device);
                 }
                 h.rows()
             };
             let first = through(&hidden_rows(rows));
             (first, through(&hidden_rows(rows)))
-        };
-        // A decode step, which is what a run carries across.
-        let before = device.submissions();
-        let merged = sequence(Some(&stack as &dyn DecoderDevice), 1);
-        let decode = device.submissions() - before;
-
-        let apart = sequence(None, 1);
-        for (what, got, want) in [
-            ("the first call", &merged.0, &apart.0),
-            ("the second", &merged.1, &apart.1),
-        ] {
-            let agreed = deviation(got, want);
-            assert!(agreed <= TOLERANCE, "{what}: deviation {agreed:e}");
         }
-        assert_ne!(merged.0, merged.1, "a second call that read no state");
-        assert_eq!(decode, 2, "one submission a call over three layers");
 
-        // And a call of two rows, which is a prefill and does not: what a merged
-        // run holds grows with the tokens, and what it saves does not.
-        let before = device.submissions();
-        let prefilled = sequence(Some(&stack as &dyn DecoderDevice), 2);
-        let prefill = device.submissions() - before;
-        let apart = sequence(None, 2);
-        let agreed = deviation(&prefilled.0, &apart.0);
-        assert!(agreed <= TOLERANCE, "the prefill: deviation {agreed:e}");
-        assert_eq!(prefill, 6, "a submission a layer a call over three layers");
+        /// The bytes one call of `rows` allocated and the command buffers it
+        /// went in.
+        ///
+        /// A stack that has already run rather than a fresh one, so that what is
+        /// counted is what a call of these rows costs every time it is made: a
+        /// span grows by doubling and a window is started over, and either would
+        /// charge whichever call happened to be first for memory the calls after
+        /// it do not allocate at all.
+        fn retaining(
+            &self,
+            device: &Device,
+            held: Option<&dyn DecoderDevice>,
+            rows: usize,
+        ) -> (u64, u64) {
+            self.sequence(held, rows);
+            let (bytes, submissions) = (device.allocated_bytes(), device.submissions());
+            self.sequence(held, rows);
+            (
+                (device.allocated_bytes() - bytes) / 2,
+                (device.submissions() - submissions) / 2,
+            )
+        }
     }
 
     /// A stack of layers this backend holds whole, which is what a merged run is
@@ -2006,6 +2183,7 @@ mod tests {
             let stack = stack(
                 &device,
                 vec![narrow.layer(&weights, 0), narrow.layer(&weights, 0x99)],
+                RETAINED_BUDGET,
             );
             let layers: Vec<DecoderLayer<'_>> = (0..2)
                 .map(|at| {
@@ -2054,10 +2232,17 @@ mod tests {
 
     /// A stack of layers this backend holds whole, which is what a merged run is
     /// asked of — see [`ModelLayers::run`].
-    fn stack<'a>(device: &'a Device, held: Vec<LayerDevice<'a>>) -> ModelLayers<'a> {
+    ///
+    /// `budget` rather than [`RETAINED_BUDGET`] because these layers are 32
+    /// wide: what a real layer holds at the widest call this engine is measured
+    /// at is what the constant is derived from, and reaching it here would take
+    /// a call of a hundred thousand rows. A budget in the same relation to
+    /// *these* layers is what makes the same two cases drivable.
+    fn stack<'a>(device: &'a Device, held: Vec<LayerDevice<'a>>, budget: u64) -> ModelLayers<'a> {
         ModelLayers {
             layers: held.into_iter().map(Some).collect(),
             device,
+            budget,
             carried: RefCell::new(None),
         }
     }
