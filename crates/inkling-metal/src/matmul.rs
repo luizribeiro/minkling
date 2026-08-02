@@ -105,6 +105,37 @@ const GROUPED_ENTRY: &str = "packed_matmul_grouped";
 /// `what_a_packed_multiply_costs_at_each_height_a_tile_reads`.
 const ROWS_A_TILE: usize = 4;
 
+/// Output columns one simdgroup of [`TILED_ENTRY`] computes beside each other,
+/// against one read of the input.
+///
+/// **What this is worth is the ratio the row tile left behind.** A tile of
+/// [`ROWS_A_TILE`] rows over one column reads a packed byte and multiplies its
+/// two codes against that many rows of input — so per byte of weight it reads
+/// `8 * ROWS_A_TILE` input floats, which at four rows is 32 bytes of input for
+/// every byte the dispatch is charged. The row tile stopped waiting on the
+/// weight and started waiting on that. A tile that is also this many columns
+/// wide reads that many weight bytes against the same input floats, so the
+/// ratio falls by this factor and the loads the input costs are divided between
+/// the columns that wanted them.
+///
+/// **It shares no weight byte and is not meant to.** Every output column is its
+/// own weight row, so what a column tile moves is exactly what the same columns
+/// moved apart — [`PackedBank::moves`] does not mention it, and the figure a
+/// prefill declares does not change. What changes is the time, which is the
+/// whole of the difference between this and the row tile above.
+///
+/// **Four, and the sweep turns as hard here as it does on the other axis** —
+/// see `what_a_packed_multiply_costs_at_each_width_a_tile_spans`. Every shape a
+/// prefill gives this kernel gets faster at every width up to four and gives it
+/// all back at eight, which is slower than one column. A tile carries a running
+/// sum per row *per column*, so what it asks of the register file is the
+/// product of the two: four beside [`ROWS_A_TILE`] is 32 accumulators a lane
+/// where the row tile alone wanted eight, and eight columns is 64. **That the
+/// turn is register pressure is a reading and not a measurement** — the widest
+/// threadgroup the pipeline reports is the device's own 1024 at every width
+/// tried, eight included, which is the one place this side could have seen it.
+const COLS_A_TILE: usize = 4;
+
 /// Rows an expert needs, on average, before sorting a call's rows by expert
 /// pays for the sort.
 ///
@@ -236,6 +267,8 @@ pub struct PackedMatmul {
     /// The rows a tile of `tiled` holds, which is [`ROWS_A_TILE`] for the
     /// shipped source and whatever the sweep wrote into a mutant's prelude.
     rows_a_tile: usize,
+    /// The columns it spans, the same way — see [`COLS_A_TILE`].
+    cols_a_tile: usize,
 }
 
 impl PackedMatmul {
@@ -247,32 +280,39 @@ impl PackedMatmul {
     /// is how a test puts a deliberately wrong kernel through the same plumbing
     /// as the right one and measures the difference.
     pub(crate) fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
-        Self::tiling(device, source, ROWS_A_TILE)
+        Self::tiling(device, source, ROWS_A_TILE, COLS_A_TILE)
     }
 
-    /// The same, where the source declares a tile of another height.
+    /// The same, where the source declares a tile of another shape.
     ///
-    /// **The two are given together because neither is any use alone**, and
-    /// the assertion is what makes that safe rather than conventional. The grid
-    /// this side dispatches covers the tiles `rows_a_tile` cuts a call into and
-    /// the kernel takes its own height from its prelude, so a pair that
-    /// disagreed would leave rows no simdgroup computed or run tiles off the
+    /// **The three are given together because none is any use alone**, and
+    /// the assertions are what make that safe rather than conventional. The grid
+    /// this side dispatches covers the tiles the two heights cut a call into and
+    /// the kernel takes its own shape from its prelude, so a pair that
+    /// disagreed would leave elements no simdgroup computed or run tiles off the
     /// end of the call — and both are wrong answers rather than failures.
     pub(crate) fn tiling(
         device: &Device,
         source: &str,
         rows_a_tile: usize,
+        cols_a_tile: usize,
     ) -> Result<Self, MetalError> {
-        let declares = format!("constant uint ROWS_A_TILE = {rows_a_tile};");
-        assert!(
-            source.contains(&declares),
-            "a source dispatched at {rows_a_tile} rows a tile does not declare it"
-        );
+        for declares in [
+            format!("constant uint ROWS_A_TILE = {rows_a_tile};"),
+            format!("constant uint COLS_A_TILE = {cols_a_tile};"),
+        ] {
+            assert!(
+                source.contains(&declares),
+                "a source dispatched at {rows_a_tile}x{cols_a_tile} a tile does not declare \
+                 `{declares}`"
+            );
+        }
         Ok(Self {
             kernel: device.compile(source, ENTRY)?,
             tiled: device.compile(source, TILED_ENTRY)?,
             grouped: device.compile(source, GROUPED_ENTRY)?,
             rows_a_tile,
+            cols_a_tile,
         })
     }
 
@@ -286,7 +326,7 @@ impl PackedMatmul {
     /// already there, rather than carrying a tile's worth of registers to use
     /// one row of it.
     fn entry(&self, layout: &Layout<'_>, rows: usize, out_dim: usize) -> (&Kernel, usize) {
-        let tiles = rows.div_ceil(self.rows_a_tile) * out_dim;
+        let tiles = rows.div_ceil(self.rows_a_tile) * out_dim.div_ceil(self.cols_a_tile);
         match layout {
             Layout::Each => (&self.kernel, rows * out_dim),
             Layout::Tiled => (&self.tiled, tiles),
@@ -1215,6 +1255,7 @@ constant uint BYTES_PER_GROUP = {BYTES_PER_GROUP};
 constant uint BYTES_PER_LANE = {BYTES_PER_LANE};
 constant uint EXPONENT_SHIFT = {EXPONENT_SHIFT};
 constant uint ROWS_A_TILE = {ROWS_A_TILE};
+constant uint COLS_A_TILE = {COLS_A_TILE};
 constant float ELEMENTS[] = {{ {} }};
 {BODY}{}{}",
         (1u32 << BITS) - 1,
@@ -1410,16 +1451,25 @@ fn tiled_entry(entry: &str, grouped: bool) -> String {
 /// The tiled kernel with the three expressions [`tiled_entry`] decides written
 /// as placeholders, which is what makes one walk serve both entries.
 const TILE: &str = r#"
-/// One simdgroup per `ROWS_A_TILE` consecutive rows of one column rather than
-/// per output element.
+/// One simdgroup per `ROWS_A_TILE` consecutive rows of `COLS_A_TILE`
+/// consecutive columns rather than per output element.
 ///
-/// **The whole of what this buys is that the weight row is read once.**
+/// **The whole of what the rows buy is that the weight row is read once.**
 /// `packed_matmul` walks the weight each of a call's rows names from end to
 /// end, so a call of `n` rows against one expert reads that expert `n` times —
 /// which is a decode step's price paid once a token by a prefill that could
 /// have paid it once. Here the walk is shared: one lane loads a packed byte,
 /// decodes its two codes, and multiplies them against the `ROWS_A_TILE` rows of
 /// `x` that want them.
+///
+/// **And what the columns buy is the other side of the same loop.** A row tile
+/// reads one packed byte and `8 * ROWS_A_TILE` input floats around it, which is
+/// 32 bytes of input for every byte of weight the dispatch is charged — so a
+/// tile of rows alone stops waiting on the weight and starts waiting on the
+/// input. `COLS_A_TILE` columns of the same rows read that many weight bytes
+/// against one read of those same floats, and the ratio falls with it. The
+/// columns share no weight byte: every column is its own weight row, and what a
+/// column tile moves is exactly what the same columns moved apart.
 ///
 /// **Only rows naming the same expert can share it, and the check is here
 /// rather than in the caller's head.** A tile whose rows disagree falls back to
@@ -1449,15 +1499,17 @@ kernel void __ENTRY__(
     uint width [[threads_per_simdgroup]]
 ) {
     const uint tile = position / width;
-    const uint tiles = (shape.rows + ROWS_A_TILE - 1) / ROWS_A_TILE;
-    if (tile >= tiles * shape.out_dim) {
+    const uint down = (shape.rows + ROWS_A_TILE - 1) / ROWS_A_TILE;
+    const uint across = (shape.out_dim + COLS_A_TILE - 1) / COLS_A_TILE;
+    if (tile >= down * across) {
         return;
     }
 
-    const uint first = (tile / shape.out_dim) * ROWS_A_TILE;
-    const uint col = tile % shape.out_dim;
+    const uint first = (tile / across) * ROWS_A_TILE;
+    const uint leftmost = (tile % across) * COLS_A_TILE;
     const uint bytes = shape.in_dim / CODES_PER_BYTE;
     const uint rows = min((uint)ROWS_A_TILE, shape.rows - first);
+    const uint cols = min((uint)COLS_A_TILE, shape.out_dim - leftmost);
     const uint scale_bytes = bytes / BYTES_PER_GROUP;
 
     const uint expert = experts[first];
@@ -1470,58 +1522,81 @@ kernel void __ENTRY__(
         for (uint r = 0; r < rows; ++r) {
             const uint row = first + r;
             const uint each = experts[row];
-            float sum = weight_dot(
-                codes + shape.code_base + (ulong)each * shape.code_stride + (ulong)col * bytes,
-                scales + shape.scale_base + (ulong)each * shape.scale_stride
-                    + (ulong)col * scale_bytes,
-                x + tile_source(shape, __READS__),
-                bytes,
-                lane,
-                width
-            );
-            sum = simd_sum(sum);
-            if (lane == 0) {
-                out[(__WRITES__) * shape.out_dim + col] = sum;
+            for (uint c = 0; c < cols; ++c) {
+                const uint col = leftmost + c;
+                float sum = weight_dot(
+                    codes + shape.code_base + (ulong)each * shape.code_stride + (ulong)col * bytes,
+                    scales + shape.scale_base + (ulong)each * shape.scale_stride
+                        + (ulong)col * scale_bytes,
+                    x + tile_source(shape, __READS__),
+                    bytes,
+                    lane,
+                    width
+                );
+                sum = simd_sum(sum);
+                if (lane == 0) {
+                    out[(__WRITES__) * shape.out_dim + col] = sum;
+                }
             }
         }
         return;
     }
 
-    device const uchar *packed =
-        codes + shape.code_base + (ulong)expert * shape.code_stride + (ulong)col * bytes;
-    device const uchar *scale =
-        scales + shape.scale_base + (ulong)expert * shape.scale_stride + (ulong)col * scale_bytes;
+    // The rows and the columns past this tile's own read the last of each, so
+    // that every load below is inside the buffer it indexes whatever the call's
+    // shape leaves over. What they produce is never written.
+    device const uchar *packed[COLS_A_TILE];
+    device const uchar *scale[COLS_A_TILE];
+    for (uint c = 0; c < COLS_A_TILE; ++c) {
+        const uint col = leftmost + min(c, cols - 1);
+        packed[c] = codes + shape.code_base + (ulong)expert * shape.code_stride
+            + (ulong)col * bytes;
+        scale[c] = scales + shape.scale_base + (ulong)expert * shape.scale_stride
+            + (ulong)col * scale_bytes;
+    }
 
-    // The rows past this tile's own read the last of them, so that every load
-    // below is inside `x` whatever the call's row count leaves over. What they
-    // produce is never written.
     uint sources[ROWS_A_TILE];
-    float sums[ROWS_A_TILE];
+    float sums[ROWS_A_TILE][COLS_A_TILE];
     for (uint r = 0; r < ROWS_A_TILE; ++r) {
         const uint row = first + min(r, rows - 1);
         sources[r] = tile_source(shape, __READS__);
-        sums[r] = 0.0f;
+        for (uint c = 0; c < COLS_A_TILE; ++c) {
+            sums[r][c] = 0.0f;
+        }
     }
 
     for (uint b = lane * BYTES_PER_LANE; b < bytes; b += width * BYTES_PER_LANE) {
-        float dots[ROWS_A_TILE];
+        float dots[ROWS_A_TILE][COLS_A_TILE];
         for (uint r = 0; r < ROWS_A_TILE; ++r) {
-            dots[r] = 0.0f;
+            for (uint c = 0; c < COLS_A_TILE; ++c) {
+                dots[r][c] = 0.0f;
+            }
         }
         for (uint i = 0; i < BYTES_PER_LANE; ++i) {
-            const uint code = packed[b + i];
-            const float low = ELEMENTS[code & CODE_MASK];
-            const float high = ELEMENTS[(code >> BITS) & CODE_MASK];
+            float low[COLS_A_TILE];
+            float high[COLS_A_TILE];
+            for (uint c = 0; c < COLS_A_TILE; ++c) {
+                const uint code = packed[c][b + i];
+                low[c] = ELEMENTS[code & CODE_MASK];
+                high[c] = ELEMENTS[(code >> BITS) & CODE_MASK];
+            }
             const uint at = (b + i) * CODES_PER_BYTE;
 
             for (uint r = 0; r < ROWS_A_TILE; ++r) {
                 device const float *v = x + sources[r] + at;
-                dots[r] += low * v[0] + high * v[1];
+                const float even = v[0];
+                const float odd = v[1];
+                for (uint c = 0; c < COLS_A_TILE; ++c) {
+                    dots[r][c] += low[c] * even + high[c] * odd;
+                }
             }
         }
-        const float by = as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
-        for (uint r = 0; r < ROWS_A_TILE; ++r) {
-            sums[r] += dots[r] * by;
+        for (uint c = 0; c < COLS_A_TILE; ++c) {
+            const float by =
+                as_type<float>(uint(scale[c][b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
+            for (uint r = 0; r < ROWS_A_TILE; ++r) {
+                sums[r][c] += dots[r][c] * by;
+            }
         }
     }
 
@@ -1530,9 +1605,11 @@ kernel void __ENTRY__(
     // wanted once a row of the tile where the sources are wanted once a byte.
     for (uint r = 0; r < rows; ++r) {
         const uint row = first + r;
-        const float sum = simd_sum(sums[r]);
-        if (lane == 0) {
-            out[(__WRITES__) * shape.out_dim + col] = sum;
+        for (uint c = 0; c < cols; ++c) {
+            const float sum = simd_sum(sums[r][c]);
+            if (lane == 0) {
+                out[(__WRITES__) * shape.out_dim + leftmost + c] = sum;
+            }
         }
     }
 }
@@ -2357,6 +2434,11 @@ mod tests {
             0,
             "a run that filled whole tiles would not exercise the straddling one"
         );
+        assert_ne!(
+            OUT_DIM % COLS_A_TILE,
+            0,
+            "columns that filled their last tile would not exercise the partial one"
+        );
 
         let mut batch = device.batch().expect("a command buffer opens");
         let mut input = device.buffer(&case.x).expect("the input uploads");
@@ -2508,6 +2590,11 @@ mod tests {
                 .chunk_by(|a, b| a == b)
                 .any(|run| run.len() > ROWS_A_TILE),
             "no run outlasts a tile, so nothing here exercises a whole one: {grouped:?}"
+        );
+        assert_ne!(
+            OUT_DIM % COLS_A_TILE,
+            0,
+            "columns that filled their last tile would not exercise the partial one"
         );
 
         // What `gate` and `up` are handed: one row of the hidden state per
@@ -2905,8 +2992,13 @@ mod tests {
             let mut x = device.buffer(&case.x).expect("the rows upload");
             let mut line = format!("  {what:<28}");
             for height in HEIGHTS {
-                let matmul = PackedMatmul::tiling(&device, &a_tile_of(height), height)
-                    .unwrap_or_else(|err| panic!("{height} rows a tile compiles: {err}"));
+                let matmul = PackedMatmul::tiling(
+                    &device,
+                    &a_tile_of(height, COLS_A_TILE),
+                    height,
+                    COLS_A_TILE,
+                )
+                .unwrap_or_else(|err| panic!("{height} rows a tile compiles: {err}"));
                 let projection = case.upload(&device, &matmul);
 
                 let mut best = Duration::MAX;
@@ -2919,6 +3011,84 @@ mod tests {
                 }
 
                 let codes = rows.div_ceil(height) * out_dim * in_dim;
+                let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+                line.push_str(&format!(
+                    "{:>16}",
+                    format!(
+                        "{:.0}µs {:.0} GB/s",
+                        1e6 * best.as_secs_f64() / CALLS as f64,
+                        moved / best.as_secs_f64() / 1e9
+                    )
+                ));
+            }
+            eprintln!("{line}");
+        }
+    }
+
+    /// **What a packed multiply costs the device at each width a tile spans**,
+    /// and the sweep [`COLS_A_TILE`] was chosen from.
+    ///
+    /// The same shapes and the same reading as the height sweep above, over the
+    /// other axis of the same tile and at the shipped height. A tile one column
+    /// wide is the row tile exactly, so that column is the before of this change
+    /// rather than a column-tiled kernel imitating it.
+    ///
+    /// **The rate here is over bytes that do not move with the width**, which is
+    /// the difference between this sweep and the one above and is the whole
+    /// point of the change. A column is its own weight row, so the columns of a
+    /// tile share no weight byte and the denominator is the same at every width
+    /// — what the column reports is throughput at a fixed amount of work *and*
+    /// a fixed number of bytes, so a width that is faster is faster.
+    ///
+    /// Nothing asserts a rate. What is asserted is that the shipped width was
+    /// among the ones tried, the way the two sweeps above do.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_packed_multiply_costs_at_each_width_a_tile_spans() {
+        let Some(device) = device() else { return };
+        const CALLS: usize = 8;
+        const ROUNDS: usize = 3;
+        const WIDTHS: [usize; 6] = [1, 2, 3, 4, 6, 8];
+
+        // `(what, in_dim, out_dim, rows)`.
+        let shapes = [
+            ("q_proj, 385 tokens", 4096, 4096, 385),
+            ("k_proj, 385 tokens", 4096, 1024, 385),
+            ("shared gate/up, 385 tokens", 4096, 2048, 2 * 385),
+            ("shared down, 385 tokens", 2048, 4096, 2 * 385),
+            ("q_proj, 769 tokens", 4096, 4096, 769),
+            ("shared gate/up, 769 tokens", 4096, 2048, 2 * 769),
+        ];
+
+        assert!(WIDTHS.contains(&COLS_A_TILE), "{COLS_A_TILE}");
+        eprintln!(
+            "  {:<28}{}",
+            "shape",
+            WIDTHS
+                .iter()
+                .map(|cols| format!("{:>16}", format!("{cols} cols a tile")))
+                .collect::<String>()
+        );
+        for (what, in_dim, out_dim, rows) in shapes {
+            let case = Case::seeded(1, in_dim, out_dim, rows);
+            let mut x = device.buffer(&case.x).expect("the rows upload");
+            let mut line = format!("  {what:<28}");
+            for cols in WIDTHS {
+                let matmul =
+                    PackedMatmul::tiling(&device, &a_tile_of(ROWS_A_TILE, cols), ROWS_A_TILE, cols)
+                        .unwrap_or_else(|err| panic!("{cols} columns a tile compiles: {err}"));
+                let projection = case.upload(&device, &matmul);
+
+                let mut best = Duration::MAX;
+                for _ in 0..ROUNDS {
+                    best = best.min(crate::testing::device_time(&device, CALLS, |batch| {
+                        projection
+                            .encode_over(batch, &mut x)
+                            .expect("the dispatch encodes");
+                    }));
+                }
+
+                let codes = rows.div_ceil(ROWS_A_TILE) * out_dim * in_dim;
                 let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
                 line.push_str(&format!(
                     "{:>16}",
@@ -3115,20 +3285,31 @@ mod tests {
         assert!(RUNS.contains(&RUNS_A_GROUPING), "{RUNS_A_GROUPING}");
     }
 
-    /// The shipped kernel with a different [`ROWS_A_TILE`] written into its
-    /// prelude, which is the one thing the sweep above varies.
+    /// The shipped kernel with a different tile shape written into its prelude,
+    /// which is the one thing the two sweeps above vary.
     ///
-    /// A height of one is not a tile at all — [`tiles`] refuses it, so the call
-    /// goes through the untiled entry — which is what makes that column the
-    /// before of this change rather than a tiled kernel imitating it.
-    fn a_tile_of(rows_a_tile: usize) -> String {
-        let wanted = format!("constant uint ROWS_A_TILE = {rows_a_tile};");
-        let source = source().replace(
-            &format!("constant uint ROWS_A_TILE = {ROWS_A_TILE};"),
-            &wanted,
-        );
-        assert!(source.contains(&wanted), "the prelude declares {wanted}");
-        source
+    /// A tile one row high is not a tile at all — [`tiles`] refuses it, so the
+    /// call goes through the untiled entry — which is what makes that column of
+    /// the height sweep the before of the row tile rather than a tiled kernel
+    /// imitating it. One column wide *is* a tile, and is the before of the
+    /// column one: it is the kernel as the row tile left it.
+    fn a_tile_of(rows_a_tile: usize, cols_a_tile: usize) -> String {
+        let source = source();
+        let mut written = source;
+        for (declared, wanted) in [
+            (
+                format!("constant uint ROWS_A_TILE = {ROWS_A_TILE};"),
+                format!("constant uint ROWS_A_TILE = {rows_a_tile};"),
+            ),
+            (
+                format!("constant uint COLS_A_TILE = {COLS_A_TILE};"),
+                format!("constant uint COLS_A_TILE = {cols_a_tile};"),
+            ),
+        ] {
+            written = written.replace(&declared, &wanted);
+            assert!(written.contains(&wanted), "the prelude declares {wanted}");
+        }
+        written
     }
 
     /// The shipped kernel with a different [`BYTES_PER_LANE`] written into its
