@@ -67,7 +67,7 @@ use crate::layer::{
 use crate::model::{ModelCache, ModelWeights};
 use crate::ops::{DenseMlp, DenseProjection, MlpProjections, Projection, rms_norm};
 use crate::quant::Scratch;
-use crate::weights::{Bf16, WeightsError, widened};
+use crate::weights::{Bf16, Packed, WeightsError, widened};
 
 /// Where the heads' tensors live, which is a namespace of their own: the
 /// quantisers rewrote the main stack's names to mlx-vlm's and left these under
@@ -336,22 +336,108 @@ struct HeadTensors<'a> {
     v_sconv: Vec<f32>,
     rel_proj: Vec<f32>,
     global_scale: f32,
-    input_proj: Bf16<'a>,
+    input_proj: HeadWeight<'a>,
     attention: HeadAttention<'a>,
-    /// The fused gate and up of the head's SwiGLU, `[2 * dense, hidden]` with
-    /// the two **interleaved** row by row — see [`Mlp::split`].
-    w13: Bf16<'a>,
-    w2: Bf16<'a>,
+    /// The two halves of the head's SwiGLU: the gate and the up projection,
+    /// which the bfloat16 shard fuses into one `[2 * dense, hidden]` tensor with
+    /// the two **interleaved** row by row and the packed one holds apart.
+    gate: HeadWeight<'a>,
+    up: HeadWeight<'a>,
+    w2: HeadWeight<'a>,
 }
 
-/// A head's five attention projections, still bfloat16.
+/// One of a head's eight matmul weights, in whichever format the shard holds it.
+///
+/// **The heads are the one part of a checkpoint that may be either.** Every
+/// quantiser dropped or skipped `model.mtp.*`, so a stack quantised from an
+/// original pairs with heads that were never quantised at all — and pairs just
+/// as well with heads quantised afterwards, which is what
+/// `just quantize-mtp` writes. Both shards are checkpoints of the same model and
+/// the difference is 4.2 GiB of bfloat16 against 1.1 of codes; which one is
+/// mapped is decided by what is on disk, per weight, and nothing downstream of
+/// this asks.
+///
+/// The bfloat16 arm carries a row stride because one of the eight is two: a
+/// head's SwiGLU keeps its gate and its up projection interleaved row by row in
+/// `w13_dn`, so each is every other row of it. The packed arm needs none,
+/// because a packed pair cannot be strided through — its codes, its group
+/// boundaries and its scale bytes would all have to be — so `quantize_mtp.py`
+/// writes the two halves as two tensors, which changes nothing about either: a
+/// group spans 32 values of a row, and which rows are in a tensor is not
+/// something quantisation can see.
+#[derive(Debug, Clone, Copy)]
+pub enum HeadWeight<'a> {
+    /// Every `stride`th row of a bfloat16 matrix from `first`, which for all but
+    /// the fused one is every row of it.
+    Bf16 {
+        weight: Bf16<'a>,
+        first: usize,
+        stride: usize,
+    },
+    /// An MXFP4 tensor and its block scales, decoded by nobody until a caller
+    /// with no kernel for them asks.
+    Packed(Packed<'a>),
+}
+
+impl<'a> HeadWeight<'a> {
+    /// The whole of a bfloat16 tensor.
+    fn bf16(weight: Bf16<'a>) -> Self {
+        Self::Bf16 {
+            weight,
+            first: 0,
+            stride: 1,
+        }
+    }
+
+    pub fn in_dim(&self) -> usize {
+        match self {
+            Self::Bf16 { weight, .. } => weight.in_dim(),
+            Self::Packed(packed) => packed.slice_len(),
+        }
+    }
+
+    pub fn out_dim(&self) -> usize {
+        match self {
+            Self::Bf16 { weight, stride, .. } => weight.out_dim() / stride,
+            Self::Packed(packed) => packed.slices(),
+        }
+    }
+
+    /// How many float32 values widening it takes, which is what the CPU path
+    /// decodes into.
+    pub fn values(&self) -> usize {
+        self.in_dim() * self.out_dim()
+    }
+
+    /// The weight as float32, in a buffer the caller sized from [`Self::values`].
+    ///
+    /// This is what the CPU path costs and the reason it is the oracle rather
+    /// than a fallback: either format is decoded here, and a kernel that
+    /// multiplies against the checkpoint's own bytes is checked against what
+    /// this produces.
+    pub fn widen_into(&self, out: &mut [f32]) {
+        match self {
+            Self::Bf16 {
+                weight,
+                first,
+                stride,
+            } => weight.widen_rows_into(*first, *stride, out),
+            Self::Packed(packed) => packed
+                .decode_into(out)
+                .unwrap_or_else(|err| panic!("a head's packed weight decodes: {err}")),
+        }
+    }
+}
+
+/// A head's five attention projections, in whichever format the shard holds
+/// them.
 #[derive(Debug, Clone, Copy)]
 pub struct HeadAttention<'a> {
-    pub q_proj: Bf16<'a>,
-    pub k_proj: Bf16<'a>,
-    pub v_proj: Bf16<'a>,
-    pub r_proj: Bf16<'a>,
-    pub o_proj: Bf16<'a>,
+    pub q_proj: HeadWeight<'a>,
+    pub k_proj: HeadWeight<'a>,
+    pub v_proj: HeadWeight<'a>,
+    pub r_proj: HeadWeight<'a>,
+    pub o_proj: HeadWeight<'a>,
 }
 
 /// One head's tensors, still bfloat16, for a backend that takes the weight
@@ -360,11 +446,12 @@ pub struct HeadAttention<'a> {
 pub struct HeadPacked<'a> {
     pub head: usize,
     pub config: AttentionConfig,
-    pub input_proj: Bf16<'a>,
+    pub input_proj: HeadWeight<'a>,
     pub attention: HeadAttention<'a>,
-    /// The fused `[2 * dense, hidden]` gate and up, interleaved row by row.
-    pub w13: Bf16<'a>,
-    pub w2: Bf16<'a>,
+    /// The two halves of the SwiGLU, however the shard stores them.
+    pub gate: HeadWeight<'a>,
+    pub up: HeadWeight<'a>,
+    pub w2: HeadWeight<'a>,
     pub input_layernorm: Vec<f32>,
     pub post_attention_layernorm: Vec<f32>,
     pub attn_sconv: Vec<f32>,
@@ -377,13 +464,63 @@ pub struct HeadPacked<'a> {
     pub global_scale: f32,
 }
 
+/// One matmul weight of a head, in whichever format this checkpoint holds it.
+///
+/// **What decides is the scales beside it**, which is the same thing that
+/// decides for the stack: a packed tensor is `{stem}.weight` and `{stem}.scales`
+/// and a bfloat16 one is `{stem}.weight` alone, so a shard with no scales in it
+/// is read exactly as it always was. Per weight rather than per shard, because
+/// nothing here needs the two to be all of one or all of the other and asking
+/// per weight is what makes that true rather than assumed.
+fn matmul_weight<'a>(ckpt: &'a Checkpoint, name: &str) -> Result<HeadWeight<'a>, WeightsError> {
+    let stem = name.strip_suffix(".weight").unwrap_or(name);
+    match packed(ckpt, stem) {
+        Some(packed) => Ok(HeadWeight::Packed(packed)),
+        None => Ok(HeadWeight::bf16(Bf16::open(ckpt, name)?)),
+    }
+}
+
+/// The head's SwiGLU, whose gate and up projection are one tensor's interleaved
+/// rows where the shard is bfloat16 and two tensors where it is packed.
+fn swiglu<'a>(
+    ckpt: &'a Checkpoint,
+    stem: &str,
+) -> Result<(HeadWeight<'a>, HeadWeight<'a>), WeightsError> {
+    if let (Some(gate), Some(up)) = (
+        packed(ckpt, &format!("{stem}.gate")),
+        packed(ckpt, &format!("{stem}.up")),
+    ) {
+        return Ok((HeadWeight::Packed(gate), HeadWeight::Packed(up)));
+    }
+    let weight = Bf16::open(ckpt, &format!("{stem}.weight"))?;
+    Ok((
+        HeadWeight::Bf16 {
+            weight,
+            first: 0,
+            stride: 2,
+        },
+        HeadWeight::Bf16 {
+            weight,
+            first: 1,
+            stride: 2,
+        },
+    ))
+}
+
+/// The packed pair under `stem`, or nothing where the checkpoint has no scales
+/// to pair with.
+fn packed<'a>(ckpt: &'a Checkpoint, stem: &str) -> Option<Packed<'a>> {
+    Packed::open(ckpt, stem).ok()
+}
+
 impl<'a> HeadTensors<'a> {
     fn open(ckpt: &'a Checkpoint, head: usize) -> Result<Self, WeightsError> {
         let module = format!("{MTP}.{head}");
         let widened = |name: &str| widened(ckpt, &format!("{module}.{name}"));
         let block = |name: &str| format!("transformer_block.{name}");
-        let matrix = |name: &str| Bf16::open(ckpt, &format!("{module}.{name}"));
+        let matrix = |name: &str| matmul_weight(ckpt, &format!("{module}.{name}"));
         let attn = |name: &str| matrix(&block(&format!("attn.{name}.weight")));
+        let (gate, up) = swiglu(ckpt, &format!("{module}.{}", block("mlp.w13_dn")))?;
         Ok(Self {
             hidden_norm: widened("hidden_norm.weight")?,
             embed_norm: widened("embed_norm.weight")?,
@@ -405,7 +542,8 @@ impl<'a> HeadTensors<'a> {
                 r_proj: attn("wr_du")?,
                 o_proj: attn("wo_ud")?,
             },
-            w13: matrix(&block("mlp.w13_dn.weight"))?,
+            gate,
+            up,
             w2: matrix(&block("mlp.w2_md.weight"))?,
         })
     }
@@ -416,7 +554,8 @@ impl<'a> HeadTensors<'a> {
             config,
             input_proj: self.input_proj,
             attention: self.attention,
-            w13: self.w13,
+            gate: self.gate,
+            up: self.up,
             w2: self.w2,
             input_layernorm: self.input_layernorm.clone(),
             post_attention_layernorm: self.post_attention_layernorm.clone(),
@@ -519,7 +658,8 @@ impl<'a> CheckpointHeads<'a> {
                     + attention.v_proj.values()
                     + attention.r_proj.values()
                     + attention.o_proj.values()
-                    + head.w13.values()
+                    + head.gate.values()
+                    + head.up.values()
                     + head.w2.values()
             })
             .max()
@@ -925,33 +1065,14 @@ impl<'a> Mlp<'a> {
                 handed,
                 global_scale,
             },
-            None => {
-                let (gate, up) = Self::split(&tensors.w13, dim, scratch);
-                Mlp::Widened {
-                    dim,
-                    gate,
-                    up,
-                    down: widen(&tensors.w2, scratch),
-                    global_scale,
-                }
-            }
+            None => Mlp::Widened {
+                dim,
+                gate: widen(&tensors.gate, scratch),
+                up: widen(&tensors.up, scratch),
+                down: widen(&tensors.w2, scratch),
+                global_scale,
+            },
         }
-    }
-
-    /// The fused `w13_dn` widened into the two projections a SwiGLU multiplies
-    /// through.
-    ///
-    /// **The two are interleaved, not stacked.** `_split_gate_up` reads the
-    /// `[2 * dense, hidden]` tensor as `[dense, 2, hidden]` and takes the two
-    /// along the middle axis, so row `2i` is the gate's row `i` and row `2i + 1`
-    /// is the up's. Read as two halves instead, both projections are rows of the
-    /// right shape drawn from the wrong places, and the layer still runs.
-    fn split<'s>(w13: &Bf16<'_>, dim: usize, scratch: &mut Scratch<'s>) -> (&'s [f32], &'s [f32]) {
-        let rows = w13.out_dim() / 2;
-        let (gate, up) = (scratch.take(rows * dim), scratch.take(rows * dim));
-        w13.widen_rows_into(0, 2, gate);
-        w13.widen_rows_into(1, 2, up);
-        (gate, up)
     }
 
     fn view(&self) -> LayerMlp<'_> {
@@ -973,9 +1094,9 @@ impl<'a> Mlp<'a> {
     }
 }
 
-/// One bfloat16 weight widened into the call's scratch, which the next head
+/// One of a head's weights widened into the call's scratch, which the next head
 /// overwrites.
-fn widen<'s>(weight: &Bf16<'_>, scratch: &mut Scratch<'s>) -> &'s [f32] {
+fn widen<'s>(weight: &HeadWeight<'_>, scratch: &mut Scratch<'s>) -> &'s [f32] {
     let run = scratch.take(weight.values());
     weight.widen_into(run);
     run
@@ -1431,6 +1552,115 @@ mod tests {
     /// sits about twice the one and a tenth of the other.
     const CHECKPOINT_TOLERANCE: f32 = 3e-2;
 
+    /// A weight of a shape MXFP4 can hold: whole groups of 32 along the axis a
+    /// group spans, which the fixture's 48-wide heads are not.
+    fn weight(rows: usize, width: usize) -> Vec<f32> {
+        assert_eq!(width % crate::quant::GROUP_SIZE, 0, "{width} in groups");
+        fixture::Blob::snapped(
+            &(0..rows * width)
+                .map(|at| ((at % 23) as f32 - 11.0) / 3.0)
+                .collect::<Vec<f32>>(),
+        )
+    }
+
+    /// A shard of exactly the tensors given, opened where it is written.
+    fn shard(dir: &std::path::Path, tensors: Vec<(String, fixture::Blob)>) -> crate::Checkpoint {
+        let path = dir.join("mtp.safetensors");
+        safetensors::serialize_to_file(
+            tensors.iter().map(|(name, blob)| (name, blob)),
+            None,
+            &path,
+        )
+        .expect("the shard is written");
+        crate::Checkpoint::open(&path).expect("the shard opens")
+    }
+
+    /// **What says a weight is packed is the scales beside it**, and what a
+    /// packed one widens to is what the same numbers in bfloat16 widen to — bit
+    /// for bit, because both shards here are written from values MXFP4 stands
+    /// for exactly, so what the case compares is the reading rather than the
+    /// rounding.
+    ///
+    /// This is the whole of what a shard `quantize_mtp.py` wrote changes for a
+    /// head: which of two branches every one of its eight matmul weights takes,
+    /// decided per weight rather than per shard.
+    #[test]
+    fn a_weight_is_packed_where_scales_sit_beside_it_and_widens_to_the_same_floats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (rows, width) = (5, 64);
+        let values = weight(rows, width);
+        let (codes, scales) = fixture::Blob::mxfp4(&values, vec![rows, width]);
+        let ckpt = shard(
+            dir.path(),
+            vec![
+                (
+                    "plain.weight".to_string(),
+                    fixture::Blob::bf16(&values, vec![rows, width]),
+                ),
+                ("packed.weight".to_string(), codes),
+                ("packed.scales".to_string(), scales),
+            ],
+        );
+
+        let plain = matmul_weight(&ckpt, "plain.weight").expect("a bfloat16 weight");
+        let packed = matmul_weight(&ckpt, "packed.weight").expect("a packed weight");
+        assert!(matches!(plain, HeadWeight::Bf16 { .. }), "{plain:?}");
+        assert!(matches!(packed, HeadWeight::Packed(_)), "{packed:?}");
+
+        for weight in [plain, packed] {
+            assert_eq!((weight.out_dim(), weight.in_dim()), (rows, width));
+            let mut widened = vec![0.0; weight.values()];
+            weight.widen_into(&mut widened);
+            assert_eq!(widened, values, "{weight:?}");
+        }
+    }
+
+    /// **The SwiGLU is one tensor in bfloat16 and two when packed**, and the
+    /// gate and the up come out of either in the same order.
+    ///
+    /// The fused tensor holds them interleaved row by row, which a packed pair
+    /// cannot be — its codes, its group boundaries and its scale bytes would all
+    /// have to be strided through — so `quantize_mtp.py` writes the two halves
+    /// apart. That they land in the same two slots either way is what this pins,
+    /// and it is the mapping a wrong version of would still run: the two are the
+    /// same shape, so swapping them is a head that computes something.
+    #[test]
+    fn the_swiglus_two_halves_arrive_in_the_same_order_from_either_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (rows, width) = (3, 32);
+        let gate = weight(rows, width);
+        let up: Vec<f32> = weight(rows, width).into_iter().rev().collect();
+        let (gate_codes, gate_scales) = fixture::Blob::mxfp4(&gate, vec![rows, width]);
+        let (up_codes, up_scales) = fixture::Blob::mxfp4(&up, vec![rows, width]);
+        let ckpt = shard(
+            dir.path(),
+            vec![
+                (
+                    "fused.weight".to_string(),
+                    fixture::Blob::bf16(&interleave(&gate, &up, width), vec![2 * rows, width]),
+                ),
+                ("apart.gate.weight".to_string(), gate_codes),
+                ("apart.gate.scales".to_string(), gate_scales),
+                ("apart.up.weight".to_string(), up_codes),
+                ("apart.up.scales".to_string(), up_scales),
+            ],
+        );
+
+        for stem in ["fused", "apart"] {
+            let (read_gate, read_up) = swiglu(&ckpt, stem).expect("a swiglu");
+            for (want, got, half) in [(&gate, read_gate, "gate"), (&up, read_up, "up")] {
+                assert_eq!(
+                    (got.out_dim(), got.in_dim()),
+                    (rows, width),
+                    "{stem} {half}"
+                );
+                let mut widened = vec![0.0; got.values()];
+                got.widen_into(&mut widened);
+                assert_eq!(&widened, want, "{stem} {half}");
+            }
+        }
+    }
+
     #[test]
     fn the_heads_a_checkpoint_holds_answer_what_their_tensors_answer() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1537,14 +1767,17 @@ mod tests {
     /// into the one interleaved tensor the checkpoint holds.
     fn write_heads(path: &std::path::Path) {
         let fixture = fixture::open(FIXTURE);
-        let mut tensors: Vec<(String, Blob)> = Vec::new();
+        let mut tensors: Vec<(String, fixture::Blob)> = Vec::new();
         for (index, case) in CASES.iter().enumerate() {
             let of = |name: &str| {
                 let view = fixture::tensor(&fixture, &format!("{case}.{name}"));
                 (fixture::f32s(&view), view.shape().to_vec())
             };
             let mut put = |name: &str, (values, shape): (Vec<f32>, Vec<usize>)| {
-                tensors.push((format!("{MTP}.{index}.{name}"), Blob::bf16(&values, shape)))
+                tensors.push((
+                    format!("{MTP}.{index}.{name}"),
+                    fixture::Blob::bf16(&values, shape),
+                ))
             };
 
             for (mine, theirs) in NAMES {
@@ -1578,48 +1811,6 @@ mod tests {
             .zip(up.chunks_exact(width))
             .flat_map(|(gate, up)| [gate, up].concat())
             .collect()
-    }
-
-    /// A tensor as a checkpoint holds one: bfloat16, which is a float32 with
-    /// its low sixteen mantissa bits dropped.
-    struct Blob {
-        shape: Vec<usize>,
-        data: Vec<u8>,
-    }
-
-    impl Blob {
-        fn bf16(values: &[f32], shape: Vec<usize>) -> Self {
-            assert_eq!(
-                values.len(),
-                shape.iter().product::<usize>(),
-                "{shape:?} against {} values",
-                values.len()
-            );
-            Self {
-                shape,
-                data: values
-                    .iter()
-                    .flat_map(|value| {
-                        ((value.to_bits() >> crate::checkpoint::BF16_SHIFT) as u16).to_le_bytes()
-                    })
-                    .collect(),
-            }
-        }
-    }
-
-    impl safetensors::View for &Blob {
-        fn dtype(&self) -> crate::Dtype {
-            crate::Dtype::BF16
-        }
-        fn shape(&self) -> &[usize] {
-            &self.shape
-        }
-        fn data(&self) -> std::borrow::Cow<'_, [u8]> {
-            std::borrow::Cow::Borrowed(&self.data)
-        }
-        fn data_len(&self) -> usize {
-            self.data.len()
-        }
     }
 
     /// **The heads driven through the loop they exist for**: a generation that

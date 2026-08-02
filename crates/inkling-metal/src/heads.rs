@@ -1,19 +1,17 @@
 //! The multi-token prediction heads' multiplies, on the device.
 //!
 //! [`inkling_core::mtp`] is the authority on what a head computes; this is
-//! where its eight weights are multiplied. They are the one part of the model
-//! the quantisers did not touch — bfloat16, 532 MiB a head — so every one of
-//! them goes through [`crate::dense`], the kernel the routers' gates already
-//! use, rather than through the packed matmul the rest of the model does.
+//! where its eight weights are multiplied.
 //!
-//! **A head's block is a decoder layer and is wrapped as one.** What the
-//! quantiser left it in is the only thing that differs: every weight of the
-//! model's own forty-two layers is MXFP4 and every weight of these eight is
-//! bfloat16, so the five projections and the feed-forward network go through
-//! [`crate::dense`] where a layer's go through the packed matmul — and
-//! [`Multiply`](crate::Multiply) is the seam that says that is the whole of it.
-//! Everything around them is the layer's own: its norms, its four convolutions,
-//! its head norms and the attention step, which
+//! **A head's block is a decoder layer and is wrapped as one.** The format its
+//! weights are in is the only thing that differs from the stack's, and it is not
+//! decided here: every quantiser dropped or skipped `model.mtp.*`, so a head is
+//! bfloat16 where the shard beside the checkpoint is the original's and MXFP4
+//! where it has been packed since. `HeadWeight` is what arrives either way, and
+//! [`multiply`] is the whole of what it decides — [`crate::dense`], the kernel
+//! the routers' gates use, or the packed matmul every projection of the stack
+//! goes through. Everything around them is the layer's own: its norms, its four
+//! convolutions, its head norms and the attention step, which
 //! [`LayerDevice`](crate::LayerDevice) already holds.
 //!
 //! **So a head's state is where a layer's is.** The span it attends over and
@@ -22,27 +20,63 @@
 //! — which is what a head has to have before its dispatches can share one
 //! command buffer, and what `slack` at wrap time is for.
 //!
-//! **The fused gate and up are two weights over one tensor.** `w13_dn` holds
-//! them interleaved row by row, and
+//! **Neither format is copied.** A bfloat16 head's fused `w13_dn` holds its gate
+//! and its up projection interleaved row by row, and
 //! [`DenseWeight::wrap_rows`](crate::DenseWeight::wrap_rows) reads every other
-//! row of it — so both projections are the checkpoint's own bytes where the
-//! mapping put them, and nothing is de-interleaved into memory.
+//! row of it where it is mapped; a packed head's two halves are two tensors and
+//! are wrapped whole. Either way both projections are the checkpoint's own
+//! bytes, and nothing is de-interleaved or decoded into memory.
 
 use inkling_core::attention::Projections;
 use inkling_core::head::Tail;
 use inkling_core::layer::{DecoderCache, Passed};
-use inkling_core::mtp::{Guessed, HeadBackend, HeadDevice, HeadPacked, HeadStep};
+use inkling_core::mtp::{Guessed, HeadBackend, HeadDevice, HeadPacked, HeadStep, HeadWeight};
 use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::profile::{self, Op};
 
 use crate::dense::{DenseMatmul, DenseWeight};
 use crate::device::Device;
-use crate::matmul::{MatmulError, Multiply};
+use crate::matmul::{MatmulError, Multiply, PackedProjection};
 use crate::projections::{
     Block, DenseFfn, LayerDevice, LayerKernels, LayerMlpDevice, ProjectionError, Wrapping,
 };
 use crate::swiglu::SwiGlu;
 use crate::tail::{Landed, ModelTail};
+
+/// One of a head's weights on the device, through whichever kernel reads the
+/// format the shard holds it in.
+///
+/// **This is the whole of what a packed head changes here.** Everything the
+/// weight is multiplied *into* — the norms, the convolutions, the attention step,
+/// the SwiGLU, the command buffer all nineteen dispatches share — is the layer's
+/// own and asks nothing about the format, because
+/// [`Multiply`](crate::Multiply) is where the two meet.
+///
+/// Both wrap where the checkpoint mapped the bytes and copy none of them: the
+/// bfloat16 arm may be every other row of a tensor that fuses two weights, and
+/// the packed arm is a whole tensor with its block scales beside it.
+fn multiply<'a>(
+    device: &'a Device,
+    kernels: &'a LayerKernels,
+    matmul: &'a DenseMatmul,
+    weight: &HeadWeight<'a>,
+) -> Result<Box<dyn Multiply + 'a>, MatmulError> {
+    Ok(match weight {
+        HeadWeight::Bf16 {
+            weight,
+            first,
+            stride,
+        } => Box::new(DenseWeight::wrap_rows(
+            device, matmul, weight, *first, *stride,
+        )?),
+        HeadWeight::Packed(packed) => Box::new(PackedProjection::wrap_packed(
+            device,
+            kernels.matmul(),
+            packed,
+            packed.slices(),
+        )?),
+    })
+}
 
 /// One head on the device: the projection that reads the pair it is handed, and
 /// the decoder layer behind it.
@@ -51,7 +85,7 @@ use crate::tail::{Landed, ModelTail};
 /// the stack that holds it, and a head only ever through [`ModelHeads`].
 #[derive(Debug)]
 struct WrappedHead<'a> {
-    input_proj: DenseWeight<'a>,
+    input_proj: Box<dyn Multiply + 'a>,
     block: LayerDevice<'a>,
 }
 
@@ -92,18 +126,9 @@ impl<'a> ModelHeads<'a> {
         let wrapped = heads
             .iter()
             .map(|head| {
-                let whole = |weight| -> Result<Box<dyn Multiply + 'a>, MatmulError> {
-                    Ok(Box::new(DenseWeight::wrap(device, matmul, weight)?))
-                };
-                // The gate is the fused tensor's even rows and the up its odd
-                // ones — see the module documentation.
-                let interleaved = |first| -> Result<Box<dyn Multiply + 'a>, MatmulError> {
-                    Ok(Box::new(DenseWeight::wrap_rows(
-                        device, matmul, &head.w13, first, 2,
-                    )?))
-                };
+                let whole = |weight| multiply(device, kernels, matmul, weight);
                 Ok(WrappedHead {
-                    input_proj: DenseWeight::wrap(device, matmul, &head.input_proj)?,
+                    input_proj: whole(&head.input_proj)?,
                     block: LayerDevice::wrapping(
                         device,
                         kernels,
@@ -126,8 +151,8 @@ impl<'a> ModelHeads<'a> {
                             attn_sconv: &head.attn_sconv,
                             post_attention_layernorm: &head.post_attention_layernorm,
                             mlp: Some(LayerMlpDevice::Dense(Box::new(DenseFfn::over(
-                                interleaved(0)?,
-                                interleaved(1)?,
+                                whole(&head.gate)?,
+                                whole(&head.up)?,
                                 whole(&head.w2)?,
                                 swiglu,
                             )))),
@@ -151,7 +176,7 @@ impl<'a> ModelHeads<'a> {
 
 impl HeadBackend for ModelHeads<'_> {
     fn input_proj(&self, head: usize) -> Option<&dyn Projection> {
-        Some(&self.heads.get(head)?.input_proj as &dyn Projection)
+        Some(self.heads.get(head)?.input_proj.as_ref() as &dyn Projection)
     }
 
     fn attention(&self, head: usize) -> Option<&dyn Projections> {
@@ -253,8 +278,9 @@ impl WrappedHead<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inkling_core::fixture::deviation;
-    use inkling_core::weights::Bf16;
+    use inkling_core::Checkpoint;
+    use inkling_core::fixture::{Blob, deviation};
+    use inkling_core::weights::{Bf16, Packed};
 
     use crate::dense::testing::{narrowed, widened};
     use crate::testing::device;
@@ -330,6 +356,50 @@ mod tests {
             deviation(&gate.forward(&x), &on_the_cpu(&half(1), &x)) > TOLERANCE,
             "the two halves agree, so nothing here says which is which"
         );
+    }
+
+    /// **Either format through the same seam.** A head whose weights were
+    /// packed after the fact dispatches through the packed matmul where a
+    /// bfloat16 one dispatches through the dense kernel, and [`multiply`] is the
+    /// whole of what decides which — so what this asserts is that both answer
+    /// what the CPU answers over the weight each of them stands for.
+    ///
+    /// The values are snapped to the sixteen MXFP4 holds exactly, so the two
+    /// shards are the same numbers rather than numbers a rounding apart, and one
+    /// oracle serves both. A packed weight sent through the dense kernel would
+    /// read its codes as bfloat16 and answer nothing like this.
+    #[test]
+    fn a_weight_dispatches_through_the_kernel_that_reads_the_format_it_is_in() {
+        let Some(device) = device() else { return };
+        let matmul = DenseMatmul::new(&device).expect("the kernel compiles");
+        let kernels = LayerKernels::compile(&device).expect("the layer kernels compile");
+
+        let values = Blob::snapped(&weight(ROWS, 3));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packed.safetensors");
+        let (codes, scales) = Blob::mxfp4(&values, vec![ROWS, IN_DIM]);
+        safetensors::serialize_to_file([("w.weight", &codes), ("w.scales", &scales)], None, &path)
+            .expect("the shard is written");
+        let ckpt = Checkpoint::open(&path).expect("the shard opens");
+
+        let bytes = narrowed(&values);
+        let arms = [
+            HeadWeight::Packed(Packed::open(&ckpt, "w").expect("a packed pair")),
+            HeadWeight::Bf16 {
+                weight: Bf16::over(&bytes, ROWS, IN_DIM),
+                first: 0,
+                stride: 1,
+            },
+        ];
+
+        let x = rows(3);
+        let want = on_the_cpu(&values, &x);
+        for weight in arms {
+            let wrapped = multiply(&device, &kernels, &matmul, &weight).expect("the weight wraps");
+            assert_eq!((wrapped.out_dim(), wrapped.in_dim()), (ROWS, IN_DIM));
+            let agreed = deviation(&wrapped.forward(&x), &want);
+            assert!(agreed <= TOLERANCE, "{weight:?}: deviation {agreed:e}");
+        }
     }
 
     /// A weight that is a whole tensor is the weight this kernel always

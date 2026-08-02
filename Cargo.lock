@@ -344,6 +344,8 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "safetensors",
+ "tempfile",
  "thiserror",
 ]
 

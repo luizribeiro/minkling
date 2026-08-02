@@ -23,7 +23,7 @@ use inkling_core::layer::{
 };
 use inkling_core::model::{ModelCache, ModelWeights};
 use inkling_core::moe::{BankRows, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
-use inkling_core::mtp::{CheckpointHeads, head_config};
+use inkling_core::mtp::{CheckpointHeads, HeadWeight, head_config};
 use inkling_core::ops::{DenseMlp, DenseProjection, top_k};
 use inkling_core::quant::{Scratch, dequantize};
 use inkling_core::tokenizer::{Tokenizer, TokenizerError};
@@ -49,26 +49,39 @@ fn checkpoint_tensor<'a>(ckpt: &'a Checkpoint, name: &str) -> TensorView<'a> {
         .unwrap_or_else(|err| panic!("checkpoint holds {name}: {err}"))
 }
 
+/// How many tensors the shard beside the index holds, in either of the two
+/// formats a set of heads comes in.
+///
+/// 160 where it is the BF16 original's own, byte for byte, which is what every
+/// quantiser left behind. 240 where the heads have since been packed: the same
+/// 96 norms, convolution kernels and tables, and 72 packed pairs where there
+/// were 64 matmul weights — a packed shard holds the fused SwiGLU as two
+/// tensors, because a packed pair cannot be read with a row stride. See
+/// `quantize_mtp.py`.
+const HEAD_TENSORS: [usize; 2] = [160, 96 + 2 * 72];
+
 /// The thirty shards the mxfp4 index names, and the one it does not.
 ///
-/// `mtp.safetensors` is the 160 bfloat16 tensors of the eight multi-token
-/// prediction heads, which no quantiser touched and no index lists — see
-/// [`Checkpoint::open`]. Counted here because the count is what says the shard
-/// was mapped: every name in it is one the main stack has no use for, so a
-/// checkpoint that quietly dropped it would pass every other test in this file.
+/// `mtp.safetensors` is the eight multi-token prediction heads, which no index
+/// lists — see [`Checkpoint::open`]. Counted here because the count is what says
+/// the shard was mapped *and* that it is whole: every name in it is one the main
+/// stack has no use for, so a checkpoint that quietly dropped it would pass
+/// every other test in this file.
 #[test]
 fn mxfp4_checkpoint_spans_thirty_shards_and_the_one_beside_them() {
     let Some(dir) = checkpoint_dir() else { return };
     let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
 
     assert_eq!(ckpt.num_shards(), 31);
-    assert_eq!(ckpt.tensor_names().count(), 1508 + 160);
-    assert_eq!(
-        ckpt.tensor_names()
-            .filter(|name| name.starts_with("model.mtp."))
-            .count(),
-        160
+    let heads = ckpt
+        .tensor_names()
+        .filter(|name| name.starts_with("model.mtp."))
+        .count();
+    assert!(
+        HEAD_TENSORS.contains(&heads),
+        "{heads} head tensors, which is neither {HEAD_TENSORS:?}"
     );
+    assert_eq!(ckpt.tensor_names().count(), 1508 + heads);
 }
 
 /// The architecture of a multi-token prediction head, read off the checkpoint's
@@ -94,13 +107,12 @@ fn a_head_is_a_dense_decoder_layer_behind_a_projection_of_twice_the_width() {
 
     let (hidden, dense) = (text.hidden_size, text.dense_intermediate_size);
     for head in heads.head_projections() {
-        let widths = |weight: &Bf16<'_>| (weight.out_dim(), weight.in_dim());
+        let widths = |weight: &HeadWeight<'_>| (weight.out_dim(), weight.in_dim());
         assert_eq!(widths(&head.input_proj), (hidden, 2 * hidden), "input_proj");
-        assert_eq!(
-            widths(&head.w13),
-            (2 * dense, hidden),
-            "the fused gate and up"
-        );
+        // Each half of the SwiGLU, which the bfloat16 shard fuses into one
+        // tensor of twice the rows and reads as every other row of it.
+        assert_eq!(widths(&head.gate), (dense, hidden), "gate");
+        assert_eq!(widths(&head.up), (dense, hidden), "up");
         assert_eq!(widths(&head.w2), (hidden, dense), "down");
 
         let attention = head.config;
