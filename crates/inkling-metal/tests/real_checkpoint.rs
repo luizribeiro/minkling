@@ -2492,8 +2492,15 @@ impl<'d> Kernels<'d> {
     ) -> CheckpointHeads<'a> {
         let heads = CheckpointHeads::open(ckpt, config, mtp).expect("the heads open");
         let held = heads.head_projections();
-        let wrapped = ModelHeads::wrap(self.device, &self.dense, self.layers.attention(), &held)
-            .expect("the heads wrap");
+        let wrapped = ModelHeads::wrap(
+            self.device,
+            &self.layers,
+            &self.dense,
+            &self.swiglu,
+            &held,
+            inkling_core::mtp::FRONTIER,
+        )
+        .expect("the heads wrap");
         heads.with_backend(Box::new(wrapped))
     }
 }

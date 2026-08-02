@@ -6,24 +6,21 @@
 //! them goes through [`crate::dense`], the kernel the routers' gates already
 //! use, rather than through the packed matmul the rest of the model does.
 //!
-//! **The seam is one step out from a layer's.** A decoder layer hands the
-//! device everything between one hidden state and the next; a head hands it the
-//! eight multiplies and keeps the rest here — the two norms in front of it, the
-//! concatenation between them, its own attention step, its convolutions and its
-//! activation. That is the shape this engine's layers had before they were
-//! merged.
+//! **A head's block is a decoder layer and is wrapped as one.** What the
+//! quantiser left it in is the only thing that differs: every weight of the
+//! model's own forty-two layers is MXFP4 and every weight of these eight is
+//! bfloat16, so the five projections and the feed-forward network go through
+//! [`crate::dense`] where a layer's go through the packed matmul — and
+//! [`Multiply`](crate::Multiply) is the seam that says that is the whole of it.
+//! Everything around them is the layer's own: its norms, its four convolutions,
+//! its head norms and the attention step, which
+//! [`LayerDevice`](crate::LayerDevice) already holds.
 //!
-//! **What it costs is measured now and it is the larger of the two numbers.**
-//! `which_kernels_own_a_chain_of_heads` prices a chain of eight at 88
-//! dispatches in 48 submissions — six a head, against a whole decode step's
-//! fifteen — and about 390 microseconds of round trip on each, which is about
-//! half of a 4.5 ms guess against the 2.2 ms the device executes for. What made
-//! this seam defensible was the study's reading that a
-//! block's extra token is a third of a decode step where a head's whole chain is
-//! a tenth; a chain of eight is 1.71 decode steps. Merging a head into one
-//! command buffer means generalising every kernel a layer uses over a second
-//! weight format, and the README's speculation section is where that trade now
-//! stands.
+//! **So a head's state is where a layer's is.** The span it attends over and
+//! the four convolution windows behind it are the device's, held between rounds
+//! and rewound by [`ModelHeads::rewind`] rather than copied over on every call
+//! — which is what a head has to have before its dispatches can share one
+//! command buffer, and what `slack` at wrap time is for.
 //!
 //! **The fused gate and up are two weights over one tensor.** `w13_dn` holds
 //! them interleaved row by row, and
@@ -31,55 +28,35 @@
 //! row of it — so both projections are the checkpoint's own bytes where the
 //! mapping put them, and nothing is de-interleaved into memory.
 
-use inkling_core::attention::{AttentionStep, Projections, Qkvr};
-use inkling_core::mtp::{HeadBackend, HeadPacked};
+use inkling_core::attention::Projections;
+use inkling_core::layer::{DecoderCache, Passed};
+use inkling_core::mtp::{HeadBackend, HeadDevice, HeadPacked, HeadStep};
 use inkling_core::ops::{MlpProjections, Projection};
+use inkling_core::profile::{self, Op};
 
-use crate::attention::{FusedAttention, LayerAttention, Step};
 use crate::dense::{DenseMatmul, DenseWeight};
 use crate::device::Device;
-use crate::matmul::together;
-use crate::projections::ProjectionError;
+use crate::matmul::{MatmulError, Multiply};
+use crate::projections::{
+    Block, DenseFfn, LayerDevice, LayerKernels, LayerMlpDevice, ProjectionError, Wrapping,
+};
+use crate::swiglu::SwiGlu;
 
-/// One head's eight weights on the device.
+/// One head on the device: the projection that reads the pair it is handed, and
+/// the decoder layer behind it.
+///
+/// Not public, where [`crate::LayerDevice`] is: a caller reaches a layer through
+/// the stack that holds it, and a head only ever through [`ModelHeads`].
 #[derive(Debug)]
-pub struct HeadDevice<'a> {
+struct WrappedHead<'a> {
     input_proj: DenseWeight<'a>,
-    attention: HeadAttention<'a>,
-    mlp: HeadFfn<'a>,
-}
-
-/// A head's five attention projections and the step between them, which are a
-/// layer's over a weight format the quantiser left alone.
-#[derive(Debug)]
-pub struct HeadAttention<'a> {
-    /// The attention step, resident for the reason
-    /// [`LayerProjections`](crate::LayerProjections)'s is: what it holds is the
-    /// head's own band, and what running it here buys is the `[heads, queries,
-    /// keys]` scores and the mask beside them never being built at all. On the
-    /// CPU those are `queries * keys * heads` multiply-adds a head a round,
-    /// which is where a chain's cost stops being its weights and starts being
-    /// the context.
-    step: LayerAttention<'a>,
-    q_proj: DenseWeight<'a>,
-    k_proj: DenseWeight<'a>,
-    v_proj: DenseWeight<'a>,
-    r_proj: DenseWeight<'a>,
-    o_proj: DenseWeight<'a>,
-}
-
-/// A head's feed-forward network: the two halves of `w13_dn`, and `w2_md`.
-#[derive(Debug)]
-pub struct HeadFfn<'a> {
-    gate_proj: DenseWeight<'a>,
-    up_proj: DenseWeight<'a>,
-    down_proj: DenseWeight<'a>,
+    block: LayerDevice<'a>,
 }
 
 /// Every head's weights, wrapped where the checkpoint mapped them.
 #[derive(Debug)]
 pub struct ModelHeads<'a> {
-    heads: Vec<HeadDevice<'a>>,
+    heads: Vec<WrappedHead<'a>>,
 }
 
 impl<'a> ModelHeads<'a> {
@@ -87,31 +64,65 @@ impl<'a> ModelHeads<'a> {
     /// bfloat16 across the eight, handed to the GPU where the checkpoint mapped
     /// it and costing no resident set of its own — the same bargain
     /// [`ModelLayers::wrap`](crate::ModelLayers::wrap) makes for the stack.
+    ///
+    /// `slack` is how many timesteps a head has to be able to give back, which
+    /// for a chain is the frontier row every round runs and takes back again —
+    /// see [`FRONTIER`](inkling_core::mtp::FRONTIER). A head wrapped with none
+    /// holds its state as firmly as a layer of a run that never speculates.
     pub fn wrap(
         device: &'a Device,
+        kernels: &'a LayerKernels,
         matmul: &'a DenseMatmul,
-        attention: &'a FusedAttention,
+        swiglu: &'a SwiGlu,
         heads: &[HeadPacked<'a>],
+        slack: usize,
     ) -> Result<Self, ProjectionError> {
         let wrapped = heads
             .iter()
             .map(|head| {
-                let whole = |weight| DenseWeight::wrap(device, matmul, weight);
-                Ok(HeadDevice {
-                    input_proj: whole(&head.input_proj)?,
-                    attention: HeadAttention {
-                        step: LayerAttention::new(device, attention, head.config, &head.rel_proj)?,
-                        q_proj: whole(&head.attention.q_proj)?,
-                        k_proj: whole(&head.attention.k_proj)?,
-                        v_proj: whole(&head.attention.v_proj)?,
-                        r_proj: whole(&head.attention.r_proj)?,
-                        o_proj: whole(&head.attention.o_proj)?,
-                    },
-                    mlp: HeadFfn {
-                        gate_proj: DenseWeight::wrap_rows(device, matmul, &head.w13, 0, 2)?,
-                        up_proj: DenseWeight::wrap_rows(device, matmul, &head.w13, 1, 2)?,
-                        down_proj: whole(&head.w2)?,
-                    },
+                let whole = |weight| -> Result<Box<dyn Multiply + 'a>, MatmulError> {
+                    Ok(Box::new(DenseWeight::wrap(device, matmul, weight)?))
+                };
+                // The gate is the fused tensor's even rows and the up its odd
+                // ones — see the module documentation.
+                let interleaved = |first| -> Result<Box<dyn Multiply + 'a>, MatmulError> {
+                    Ok(Box::new(DenseWeight::wrap_rows(
+                        device, matmul, &head.w13, first, 2,
+                    )?))
+                };
+                Ok(WrappedHead {
+                    input_proj: DenseWeight::wrap(device, matmul, &head.input_proj)?,
+                    block: LayerDevice::wrapping(
+                        device,
+                        kernels,
+                        Wrapping {
+                            config: head.config,
+                            q_proj: whole(&head.attention.q_proj)?,
+                            k_proj: whole(&head.attention.k_proj)?,
+                            v_proj: whole(&head.attention.v_proj)?,
+                            r_proj: whole(&head.attention.r_proj)?,
+                            o_proj: whole(&head.attention.o_proj)?,
+                            input_layernorm: &head.input_layernorm,
+                            q_norm: &head.q_norm,
+                            k_norm: &head.k_norm,
+                            k_sconv: &head.k_sconv,
+                            v_sconv: &head.v_sconv,
+                            rel_proj: &head.rel_proj,
+                        },
+                        Block {
+                            dim: head.config.hidden,
+                            attn_sconv: &head.attn_sconv,
+                            post_attention_layernorm: &head.post_attention_layernorm,
+                            mlp: Some(LayerMlpDevice::Dense(Box::new(DenseFfn::over(
+                                interleaved(0)?,
+                                interleaved(1)?,
+                                whole(&head.w2)?,
+                                swiglu,
+                            )))),
+                            mlp_sconv: &head.mlp_sconv,
+                        },
+                        slack,
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, ProjectionError>>()?;
@@ -129,116 +140,75 @@ impl HeadBackend for ModelHeads<'_> {
     }
 
     fn attention(&self, head: usize) -> Option<&dyn Projections> {
-        Some(&self.heads.get(head)?.attention as &dyn Projections)
+        Some(self.heads.get(head)?.block.attention() as &dyn Projections)
     }
 
     fn mlp(&self, head: usize) -> Option<&dyn MlpProjections> {
-        Some(&self.heads.get(head)?.mlp as &dyn MlpProjections)
+        Some(self.heads.get(head)?.block.dense_mlp()? as &dyn MlpProjections)
+    }
+
+    /// A head whose projection *and* whose block are both here, which is the
+    /// condition for one command buffer — and `None` for one this does not
+    /// hold, which still runs, a submission a piece.
+    fn device(&self, head: usize) -> Option<&dyn HeadDevice> {
+        self.heads.get(head)?;
+        Some(self as &dyn HeadDevice)
+    }
+
+    /// Take back the last `rows` timesteps of everything head `head` holds for
+    /// the sequence in flight: its keys and values, and the four convolution
+    /// windows around them.
+    ///
+    /// **A head is rewound every round and a layer only after a rejection**,
+    /// which is the one way the two differ: the row a chain guessed from is a
+    /// row the model has not been asked about yet, so the round after it runs
+    /// that position again against the token the model produced.
+    fn rewind(&self, head: usize, rows: usize) {
+        if let Some(held) = self.heads.get(head) {
+            held.block.rewind(rows);
+        }
     }
 }
 
-impl Projections for HeadAttention<'_> {
-    /// The four that read one input, in one command buffer.
-    ///
-    /// The default runs them as four submissions and answers the same numbers;
-    /// what this saves is three round trips of about 250 microseconds each,
-    /// against four multiplies that are 3 MB of bfloat16 between them. It is
-    /// the same trade [`LayerProjections::qkvr`](crate::LayerProjections) makes
-    /// one step further in, where the norm in front of them is on the device
-    /// too.
-    fn qkvr(&self, x: &[f32]) -> Qkvr {
-        let [q, k, v, r] = together(self.q_proj.device(), |batch| {
-            let mut input = self.q_proj.device().buffer(x)?;
-            Ok([
-                self.q_proj.encode_over(batch, &mut input)?,
-                self.k_proj.encode_over(batch, &mut input)?,
-                self.v_proj.encode_over(batch, &mut input)?,
-                self.r_proj.encode_over(batch, &mut input)?,
-            ])
-        })
-        .unwrap_or_else(|err| panic!("a head's projections did not run: {err}"));
-        Qkvr { q, k, v, r }
-    }
-
-    /// The attention step and `o_proj`, in one command buffer.
-    ///
-    /// The mirror of [`LayerProjections::attend`](crate::LayerProjections), and
-    /// the same argument: the step multiplies activations against activations,
-    /// so what a backend does differently with it is decline to *build* a
-    /// tensor — the `[heads, queries, keys]` mask the reference materialises is
-    /// derived per element inside the kernel instead.
-    ///
-    /// The span is handed over as a slice on every call, where a layer's is
-    /// held on the device between them. That is the copy a head still pays and
-    /// a layer does not: the heads' caches are the CPU's, because a head is
-    /// rewound a row every round and what rewinds it is the proposer.
-    fn attend(&self, step: AttentionStep<'_>) -> Vec<f32> {
-        let [out] = together(self.q_proj.device(), |batch| {
-            let mut attended = self.step.encode(
-                batch,
-                Step {
-                    q: step.q,
-                    k: step.k,
-                    v: step.v,
-                    rel: step.rel,
-                    taus: step.taus,
-                    q_offset: step.q_offset,
-                },
-            )?;
-            Ok([self.o_proj.encode_over(batch, &mut attended)?])
-        })
-        .unwrap_or_else(|err| panic!("a head's attention step did not run: {err}"));
-        out
-    }
-
-    fn q_proj(&self) -> &dyn Projection {
-        &self.q_proj
-    }
-
-    fn k_proj(&self) -> &dyn Projection {
-        &self.k_proj
-    }
-
-    fn v_proj(&self) -> &dyn Projection {
-        &self.v_proj
-    }
-
-    fn r_proj(&self) -> &dyn Projection {
-        &self.r_proj
-    }
-
-    fn o_proj(&self) -> &dyn Projection {
-        &self.o_proj
+/// **One command buffer a head**, where the same eight multiplies asked for a
+/// piece at a time were six submissions and four CPU rows between them.
+///
+/// Where a chain has to end one is the guess: a head's rows have to be a token
+/// before the head after it can embed it, and turning a hidden state into a
+/// token is `lm_head` and an argmax over 201024 logits. So a head waits once,
+/// and what it waits for is everything between the pair of normed rows it was
+/// handed and the `[rows, hidden]` it answers with.
+impl HeadDevice for ModelHeads<'_> {
+    fn run(&self, head: usize, cache: &mut DecoderCache, step: HeadStep<'_>) -> Option<Passed> {
+        let held = self.heads.get(head)?;
+        Some(
+            held.run(cache, step)
+                .unwrap_or_else(|err| panic!("the head did not run: {err}")),
+        )
     }
 }
 
-impl MlpProjections for HeadFfn<'_> {
-    /// The two halves of the fused weight, in one command buffer — which is
-    /// what the interleave costs and does not cost: two dispatches over one
-    /// mapping, where a layer's separate gate and up are two dispatches over
-    /// two.
-    fn gate_up(&self, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
-        let [gate, up] = together(self.gate_proj.device(), |batch| {
-            let mut input = self.gate_proj.device().buffer(x)?;
-            Ok([
-                self.gate_proj.encode_over(batch, &mut input)?,
-                self.up_proj.encode_over(batch, &mut input)?,
-            ])
-        })
-        .unwrap_or_else(|err| panic!("a head's feed-forward network did not run: {err}"));
-        (gate, up)
-    }
-
-    fn gate_proj(&self) -> &dyn Projection {
-        &self.gate_proj
-    }
-
-    fn up_proj(&self) -> &dyn Projection {
-        &self.up_proj
-    }
-
-    fn down_proj(&self) -> &dyn Projection {
-        &self.down_proj
+impl WrappedHead<'_> {
+    /// The projection and the block encoded into one command buffer, submitted
+    /// and waited for.
+    ///
+    /// Nothing between the `[rows, 2 * hidden]` this is handed and the `[rows,
+    /// hidden]` it answers with is a value this process forms: what
+    /// `input_proj` produces is what the block's input layernorm reads, and the
+    /// twenty dispatches behind that are a layer's own.
+    fn run(&self, cache: &mut DecoderCache, step: HeadStep<'_>) -> Result<Passed, ProjectionError> {
+        let device = self.input_proj.device();
+        let mut batch = device.batch()?;
+        let mut input = device.buffer(step.input)?;
+        let mut x = self
+            .input_proj
+            .encode_over(&mut batch, &mut input)?
+            .buffer();
+        let rows = self
+            .block
+            .encode_into(&mut batch, cache, step.block, &mut x)?;
+        batch.wait()?;
+        Ok(Passed::Rows(profile::timed(Op::Readback, || rows.to_vec())))
     }
 }
 

@@ -45,7 +45,7 @@ use inkling_core::weights::Bf16;
 use crate::buffer::{Buffer, Bytes};
 use crate::device::{Device, MetalError};
 use crate::kernel::{Batch, Grid, Kernel, extent};
-use crate::matmul::{MatmulError, Pending};
+use crate::matmul::{MatmulError, Multiply, Pending};
 
 const ENTRY: &str = "dense_matmul";
 
@@ -370,6 +370,27 @@ impl Projection for DenseWeight<'_> {
     fn forward(&self, x: &[f32]) -> Vec<f32> {
         self.multiply(x)
             .unwrap_or_else(|err| panic!("the dense matmul did not run: {err}"))
+    }
+}
+
+/// The same seam [`crate::PackedProjection`] answers, over the format the
+/// quantiser left alone — so that a layer holding five of these cannot tell
+/// which kernel its dispatches went through.
+impl Multiply for DenseWeight<'_> {
+    fn device(&self) -> &Device {
+        DenseWeight::device(self)
+    }
+
+    fn encode(&self, batch: &mut Batch<'_>, x: &[f32]) -> Result<Pending, MatmulError> {
+        DenseWeight::encode(self, batch, x)
+    }
+
+    fn encode_over(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
+        DenseWeight::encode_over(self, batch, x)
     }
 }
 

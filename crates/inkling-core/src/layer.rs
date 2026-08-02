@@ -511,6 +511,42 @@ impl<'a> DecoderLayer<'a> {
         )
     }
 
+    /// Everything this layer runs, described rather than run.
+    ///
+    /// **A closure rather than a value**, because the description borrows what
+    /// this call built to make it — the row's log-scaling factors — and those
+    /// outlive the step and nothing else.
+    ///
+    /// `seen` is how many keys the sequence has, which decides where this
+    /// call's queries sit. It is passed rather than read off the cache so that
+    /// the caller can hand the cache to whoever runs the step: a backend
+    /// running the layer advances it, and this side only describes.
+    ///
+    /// Public because a multi-token prediction head's block is one of these and
+    /// is handed to a backend a step further out — see
+    /// [`MtpHead::forward`](crate::mtp::MtpHead::forward), which has a
+    /// projection in front of the layer and hands both over at once.
+    pub fn described<R>(
+        &self,
+        seen: usize,
+        x: Hidden<'_>,
+        queries: usize,
+        with: impl FnOnce(DecoderStep<'_>) -> R,
+    ) -> R {
+        let taus = self.attention.taus(seen, queries);
+        with(DecoderStep {
+            attention: self
+                .attention
+                .step(x.held(), Some(self.input_layernorm), &taus, seen),
+            attn_sconv: self.attn_sconv,
+            post_attention_layernorm: self.post_attention_layernorm,
+            eps: self.rms_norm_eps,
+            mlp: self.mlp,
+            queries,
+            mlp_sconv: self.mlp_sconv,
+        })
+    }
+
     /// The layer where `device` runs it, with the step it needs built here —
     /// because [`Attention::forward`] would run the attention rather than
     /// describe it, and what it would hand back is a value that never has to
@@ -524,20 +560,8 @@ impl<'a> DecoderLayer<'a> {
         device: Option<&dyn DecoderDevice>,
     ) -> Option<Passed> {
         let device = device?;
-        let offset = cache.attention.seen();
-        let taus = self.attention.taus(offset, queries);
-        let step = DecoderStep {
-            attention: self
-                .attention
-                .step(x.held(), Some(self.input_layernorm), &taus, offset),
-            attn_sconv: self.attn_sconv,
-            post_attention_layernorm: self.post_attention_layernorm,
-            eps: self.rms_norm_eps,
-            mlp: self.mlp,
-            queries,
-            mlp_sconv: self.mlp_sconv,
-        };
-        device.run(layer, cache, step)
+        let seen = cache.attention.seen();
+        self.described(seen, x, queries, |step| device.run(layer, cache, step))
     }
 }
 

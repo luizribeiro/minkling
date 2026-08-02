@@ -35,7 +35,7 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use inkling_core::mtp::CheckpointHeads;
+use inkling_core::mtp::{CheckpointHeads, FRONTIER};
 use inkling_core::{Checkpoint, CheckpointWeights, Config, TextConfig};
 use inkling_metal::{
     DenseMatmul, Device, ExpertGrouping, ExpertKernels, LayerKernels, ModelHeads, ModelLayers,
@@ -224,8 +224,15 @@ pub fn heads<'a>(
     };
 
     let packed = heads.head_projections();
-    let wrapped = ModelHeads::wrap(&gpu.device, &gpu.dense, gpu.kernels.attention(), &packed)
-        .context("giving the MTP heads to the Metal device")?;
+    let wrapped = ModelHeads::wrap(
+        &gpu.device,
+        &gpu.kernels,
+        &gpu.dense,
+        &gpu.swiglu,
+        &packed,
+        FRONTIER,
+    )
+    .context("giving the MTP heads to the Metal device")?;
     eprintln!(
         "{:<LABEL$}{} heads wrapped in {:.2?}, {depth} of them a round",
         "mtp",

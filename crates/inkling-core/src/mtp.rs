@@ -62,7 +62,7 @@ use crate::checkpoint::Checkpoint;
 use crate::config::{MtpConfig, TextConfig};
 use crate::generate::{Generator, Proposer, Round};
 use crate::layer::{
-    DecoderCache, DecoderLayer, DecoderWeights, Hidden, LayerMlp, NoExperts, Passed,
+    DecoderCache, DecoderLayer, DecoderStep, DecoderWeights, Hidden, LayerMlp, NoExperts, Passed,
 };
 use crate::model::{ModelCache, ModelWeights};
 use crate::ops::{DenseMlp, DenseProjection, MlpProjections, Projection, rms_norm};
@@ -142,19 +142,50 @@ impl<'a> MtpHead<'a> {
     ///
     /// `head` is the head's index, which is a decoder layer's index in the
     /// heads' own stack — see [`head_config`].
+    ///
+    /// **`device` is handed the projection and the block together**, and that
+    /// is the whole of why [`HeadDevice`] exists beside
+    /// [`DecoderDevice`](crate::layer::DecoderDevice): what `input_proj`
+    /// produces is what the block's first dispatch reads and nothing else looks
+    /// at it, so a backend given both runs a head in one command buffer where a
+    /// backend given the layer alone has to close one in front of it. The two
+    /// norms and the concatenation between them stay here — they are what makes
+    /// the pair a row of `2 * hidden`, and the projection is the first thing
+    /// that reads it.
     pub fn forward(
         &self,
         head: usize,
         cache: &mut DecoderCache,
         hidden: &[f32],
         embed: &[f32],
+        device: Option<&dyn HeadDevice>,
     ) -> Vec<f32> {
         assert_eq!(hidden.len(), embed.len(), "a hidden state per embedding");
-        let x = self.input_proj.forward(&self.concatenated(hidden, embed));
-        match self
-            .block
-            .forward(head, cache, Hidden::Rows(&x), &NoExperts, None)
-        {
+        let rows = Hidden::Rows(hidden).tokens(self.hidden());
+        let input = self.concatenated(hidden, embed);
+        let passed = device.and_then(|device| {
+            let seen = cache.attention().seen();
+            self.block
+                .described(seen, Hidden::Carried(rows), rows, |block| {
+                    device.run(
+                        head,
+                        cache,
+                        HeadStep {
+                            input: &input,
+                            block,
+                        },
+                    )
+                })
+        });
+        let passed = match passed {
+            Some(passed) => passed,
+            None => {
+                let x = self.input_proj.forward(&input);
+                self.block
+                    .forward(head, cache, Hidden::Rows(&x), &NoExperts, None)
+            }
+        };
+        match passed {
             Passed::Rows(rows) => rows,
             passed => panic!("a head's block answered with {passed:?}"),
         }
@@ -182,6 +213,37 @@ pub struct HeadNorms<'a> {
     pub embed_norm: &'a [f32],
 }
 
+/// Where a whole head runs, when it is not here.
+///
+/// The mirror of [`DecoderDevice`](crate::layer::DecoderDevice) one step out: a
+/// head is a decoder layer with a projection in front of it, and what that
+/// projection produces is read by the block's first dispatch and by nothing
+/// else — so the two belong in one command buffer, and a backend that could
+/// only be asked for the layer would have to close one between them.
+///
+/// **What does not come here is the pair of norms**, which is where a head's
+/// seam stops being a layer's: they are `[rows, hidden]` each and what
+/// `input_proj` reads is the `[rows, 2 * hidden]` they are laid into, so the
+/// concatenation is on this side and the projection is the first thing past it.
+pub trait HeadDevice {
+    /// Head `head`, or `None` where this backend does not hold all of it.
+    fn run(&self, head: usize, cache: &mut DecoderCache, step: HeadStep<'_>) -> Option<Passed>;
+}
+
+/// Everything one head runs past the two norms in front of it, described rather
+/// than run.
+#[derive(Debug, Clone, Copy)]
+pub struct HeadStep<'a> {
+    /// `[rows, 2 * hidden]`: each row's two normed halves laid end to end,
+    /// which is what `input_proj` was trained to read — see
+    /// [`MtpHead::concatenated`].
+    pub input: &'a [f32],
+    /// The decoder layer behind that projection, whose own input is what the
+    /// projection produced and is therefore a value nobody on this side sees —
+    /// which is what [`Hidden::Carried`] says.
+    pub block: DecoderStep<'a>,
+}
+
 /// Where a head's multiplies run, when they are not here.
 ///
 /// The mirror of [`LayerBackend`](crate::weights::LayerBackend), and shorter for
@@ -197,6 +259,35 @@ pub trait HeadBackend {
 
     /// Head `head`'s feed-forward network, or `None`.
     fn mlp(&self, head: usize) -> Option<&dyn MlpProjections>;
+
+    /// The whole of head `head` in one command buffer, or `None` where this
+    /// backend holds only some of it — see [`HeadDevice`].
+    ///
+    /// Defaulted where the three above are not, for
+    /// [`LayerBackend::decoder`](crate::weights::LayerBackend::decoder)'s
+    /// reason: a backend can answer for every weight a head has and still have
+    /// nothing to gain from being asked the head whole.
+    fn device(&self, head: usize) -> Option<&dyn HeadDevice> {
+        let _ = head;
+        None
+    }
+
+    /// Take back the last `rows` timesteps of whatever state this backend holds
+    /// for head `head` — the keys it appended, and the convolution windows it
+    /// advanced.
+    ///
+    /// Defaulted to nothing, for the reason
+    /// [`LayerBackend::rewind`](crate::weights::LayerBackend::rewind) is: a
+    /// backend that holds only weights holds nothing a sequence can be rewound
+    /// out of. A backend that runs a head's block keeps that head's span and its
+    /// four windows, and a [`DecoderCache`] rewound on this side alone would
+    /// leave them where the frontier row put them.
+    ///
+    /// Per head rather than over all of them, because a round runs the heads its
+    /// depth asked for and no others — see [`MtpProposer::propose`].
+    fn rewind(&self, head: usize, rows: usize) {
+        let (_, _) = (head, rows);
+    }
 }
 
 /// One head's tensors, as the checkpoint stores them.
@@ -458,7 +549,27 @@ impl<'a> CheckpointHeads<'a> {
             DecoderLayer::new(config, weights, mlp.view()),
             self.config.rms_norm_eps,
         )
-        .forward(head, cache, hidden, embed)
+        .forward(
+            head,
+            cache,
+            hidden,
+            embed,
+            backend.and_then(|backend| backend.device(head)),
+        )
+    }
+
+    /// Take back the last `rows` timesteps of head `head`'s own state, wherever
+    /// it is.
+    ///
+    /// **The cache is the caller's and this is the rest of it**, which is the
+    /// same division [`ModelWeights::rewind`](crate::model::ModelWeights::rewind)
+    /// makes for the stack: a backend running the head holds the keys it
+    /// appended and the windows it advanced, and a head rewound on one side only
+    /// is one whose position is one thing here and another there.
+    pub fn rewind(&self, head: usize, rows: usize) {
+        if let Some(backend) = self.backend.as_deref() {
+            backend.rewind(head, rows);
+        }
     }
 
     /// One head's attention tensors, its five projections widened into the
@@ -659,7 +770,12 @@ impl<'a, W: ModelWeights> MtpProposer<'a, W> {
 
 /// How many rows a round takes back from every head, which is the one whose
 /// embedding was the chain's own guess.
-const FRONTIER: usize = 1;
+///
+/// Public because it is what a backend holding a head's state has to be wrapped
+/// with: a window a rewind shifts has to have been built with room for it, and
+/// that is decided where the heads are wrapped rather than here. See
+/// [`HeadBackend::rewind`].
+pub const FRONTIER: usize = 1;
 
 impl<W: ModelWeights> Proposer for MtpProposer<'_, W> {
     fn depth(&self) -> usize {
@@ -698,9 +814,11 @@ impl<W: ModelWeights> Proposer for MtpProposer<'_, W> {
         }
 
         // The frontier row again next time, against the token the model
-        // produced rather than the one this chain guessed.
+        // produced rather than the one this chain guessed. Both sides of the
+        // head's state, for the reason `CheckpointHeads::rewind` gives.
         for head in 0..round.depth {
             self.caches.layer(head).rewind(FRONTIER);
+            self.heads.rewind(head, FRONTIER);
         }
         self.carried = Some(Carried {
             hidden: chained_row(round.hidden, hidden),
@@ -825,6 +943,8 @@ fn widen<'s>(weight: &Bf16<'_>, scratch: &mut Scratch<'s>) -> &'s [f32] {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use crate::attention::LogScaling;
     use crate::config::Config;
@@ -964,8 +1084,14 @@ mod tests {
             let head = self.head(norms, &projection);
             let cache = &mut head.cache();
             (
-                head.forward(0, cache, &calls.hidden, &calls.embed),
-                head.forward(0, cache, &calls.continue_hidden, &calls.continue_embed),
+                head.forward(0, cache, &calls.hidden, &calls.embed, None),
+                head.forward(
+                    0,
+                    cache,
+                    &calls.continue_hidden,
+                    &calls.continue_embed,
+                    None,
+                ),
             )
         }
 
@@ -1014,6 +1140,107 @@ mod tests {
         }
     }
 
+    /// A backend that answers for a whole head, and what it was handed.
+    ///
+    /// Nothing here multiplies. What a device makes of a head is that device's
+    /// own tests' question — `crates/inkling-metal` holds them — and what this
+    /// stands in for is the seam: which rows cross it, what the block behind
+    /// them is described as, and that the head answers with what came back.
+    #[derive(Default)]
+    struct Recorded {
+        input: RefCell<Vec<f32>>,
+        described: Cell<(usize, usize)>,
+        answer: Vec<f32>,
+    }
+
+    impl HeadDevice for Recorded {
+        fn run(&self, _: usize, _: &mut DecoderCache, step: HeadStep<'_>) -> Option<Passed> {
+            *self.input.borrow_mut() = step.input.to_vec();
+            self.described
+                .set((step.block.queries, step.block.attention.x.len()));
+            Some(Passed::Rows(self.answer.clone()))
+        }
+    }
+
+    /// A backend that holds a head's weights and not the whole of it, which is
+    /// the partial handover [`HeadBackend::device`] answers `None` for.
+    struct Declined;
+
+    impl HeadDevice for Declined {
+        fn run(&self, _: usize, _: &mut DecoderCache, _: HeadStep<'_>) -> Option<Passed> {
+            None
+        }
+    }
+
+    /// **What crosses the seam a whole head runs behind**: the pair of normed
+    /// rows `input_proj` reads, and a block described over rows this side does
+    /// not hold.
+    ///
+    /// The rows are the two halves laid end to end and normed apart — the same
+    /// value [`MtpHead::concatenated`] forms, which is asserted against a
+    /// separate spelling of it rather than against itself. What the block is
+    /// handed is a query count and *no rows at all*, because the rows it reads
+    /// are what the projection in front of it produced and nothing on this side
+    /// ever sees them.
+    #[test]
+    fn a_head_hands_a_device_the_normed_pair_and_a_block_over_rows_it_does_not_hold() {
+        let calls = Calls::load();
+        for head in Head::all() {
+            let width = head.hidden();
+            let rows = calls.hidden.len() / width;
+            let projection = head.projection();
+            let built = head.head(head.norms(), &projection);
+
+            let device = Recorded {
+                answer: (0..rows * width).map(|i| i as f32 / 8.0 - 1.0).collect(),
+                ..Recorded::default()
+            };
+            let got = built.forward(
+                0,
+                &mut built.cache(),
+                &calls.hidden,
+                &calls.embed,
+                Some(&device),
+            );
+            assert_eq!(
+                got, device.answer,
+                "{}: the head answered its own",
+                head.name
+            );
+            assert_eq!(
+                device.described.get(),
+                (rows, 0),
+                "{}: the block was described over {rows} rows and no values",
+                head.name
+            );
+
+            let eps = head.config.rms_norm_eps;
+            let normed = |rows: &[f32], weight: &[f32]| rms_norm(rows, weight, eps);
+            let pair: Vec<f32> = normed(&calls.hidden, &head.hidden_norm)
+                .chunks_exact(width)
+                .zip(normed(&calls.embed, &head.embed_norm).chunks_exact(width))
+                .flat_map(|(hidden, embed)| [hidden, embed].concat())
+                .collect();
+            assert_eq!(*device.input.borrow(), pair, "{}", head.name);
+        }
+    }
+
+    /// A device that declines the head leaves it where it always ran, and the
+    /// two answers are the same values rather than near ones: nothing about the
+    /// arithmetic moved, only who was asked.
+    #[test]
+    fn a_head_a_device_declines_is_the_head_this_side_runs() {
+        let calls = Calls::load();
+        for head in Head::all() {
+            let projection = head.projection();
+            let built = head.head(head.norms(), &projection);
+            let run = |device: Option<&dyn HeadDevice>| {
+                built.forward(0, &mut built.cache(), &calls.hidden, &calls.embed, device)
+            };
+            assert_eq!(run(Some(&Declined)), run(None), "{}", head.name);
+        }
+    }
+
     /// A head carries a cache like any decoder layer, and the continuation
     /// reads it. A head handed a fresh one every round would still guess.
     #[test]
@@ -1027,6 +1254,7 @@ mod tests {
                 &mut built.cache(),
                 &calls.continue_hidden,
                 &calls.continue_embed,
+                None,
             );
             let deviation = deviation(&fresh, &head.continue_out);
             assert!(
@@ -1422,7 +1650,7 @@ mod tests {
                 ("the hidden state twice", &calls.hidden, &calls.hidden),
                 ("the embedding twice", &calls.embed, &calls.embed),
             ] {
-                let got = built.forward(0, &mut built.cache(), hidden, embed);
+                let got = built.forward(0, &mut built.cache(), hidden, embed, None);
                 let deviation = deviation(&got, &head.prefill_out);
                 assert!(
                     deviation > TOLERANCE,

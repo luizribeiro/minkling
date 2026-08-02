@@ -507,6 +507,55 @@ impl Pending {
     }
 }
 
+/// One weight a layer's dispatches multiply through, whichever format it is
+/// stored in.
+///
+/// **Two formats and one layer.** Every projection of the model's own forty-two
+/// layers is MXFP4 and every weight of the eight MTP heads is bfloat16 — the
+/// quantiser dropped the heads rather than packing them — so what separates
+/// [`PackedProjection`] from [`DenseWeight`](crate::DenseWeight) is the bytes a
+/// dispatch reads and nothing about the layer around it. This is what says so:
+/// [`LayerProjections`](crate::LayerProjections) holds five of these and
+/// [`DenseFfn`](crate::DenseFfn) three, and neither knows which kernel answered.
+///
+/// [`Projection`] is the supertrait because that is the seam the CPU side
+/// already names — a caller with one row to multiply and nothing to batch it
+/// against wants that one, and both of these already answer it.
+pub trait Multiply: Projection + std::fmt::Debug {
+    /// The device this multiplies on, for a caller batching several of these
+    /// into one command buffer.
+    fn device(&self) -> &Device;
+
+    /// `[rows, in_dim]` this side holds, encoded into `batch` rather than
+    /// submitted on its own.
+    fn encode(&self, batch: &mut Batch<'_>, x: &[f32]) -> Result<Pending, MatmulError>;
+
+    /// The same multiply over rows a dispatch already left on the device.
+    fn encode_over(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError>;
+}
+
+impl Multiply for PackedProjection<'_> {
+    fn device(&self) -> &Device {
+        PackedProjection::device(self)
+    }
+
+    fn encode(&self, batch: &mut Batch<'_>, x: &[f32]) -> Result<Pending, MatmulError> {
+        PackedProjection::encode(self, batch, x)
+    }
+
+    fn encode_over(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+    ) -> Result<Pending, MatmulError> {
+        PackedProjection::encode_over(self, batch, x)
+    }
+}
+
 /// Everything `encode` put in one command buffer, run and read back.
 ///
 /// The shape a caller with several multiplies in hand wants, and the reason

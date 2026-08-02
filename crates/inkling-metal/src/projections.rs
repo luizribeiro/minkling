@@ -46,7 +46,9 @@
 
 use std::cell::RefCell;
 
-use inkling_core::attention::{AttentionCache, AttentionStep, LayerStep, Projections, Qkvr, Sdpa};
+use inkling_core::attention::{
+    AttentionCache, AttentionConfig, AttentionStep, LayerStep, Projections, Qkvr, Sdpa,
+};
 use inkling_core::layer::{DecoderCache, DecoderDevice, DecoderStep, Experts, LayerMlp, Passed};
 use inkling_core::mask::BandedMask;
 use inkling_core::ops::{MlpProjections, Projection};
@@ -58,7 +60,7 @@ use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
 use crate::experts::{ExpertKernels, LayerExperts};
 use crate::kernel::{Batch, Submitted};
-use crate::matmul::{MatmulError, PackedMatmul, PackedProjection, Pending, together};
+use crate::matmul::{MatmulError, Multiply, PackedMatmul, PackedProjection, Pending, together};
 use crate::norm::{LayerNorm, RmsNorm};
 use crate::sconv::{LayerConv, ShortConvolution};
 use crate::swiglu::SwiGlu;
@@ -70,6 +72,11 @@ use crate::swiglu::SwiGlu;
 /// [`ExpertBanks`](crate::ExpertBanks) holds to
 /// [`PackedExperts`](inkling_core::PackedExperts): the arithmetic is the
 /// checkpoint's, and what changes is that no weight is ever decoded to memory.
+/// **The five are [`Multiply`] rather than a format**, which is what lets a
+/// multi-token prediction head be this same layer: a head's block is a decoder
+/// layer whose weights the quantiser left in bfloat16, so the only thing it
+/// differs by is which kernel each of these five dispatches through — see
+/// [`LayerProjections::head`].
 #[derive(Debug)]
 pub struct LayerProjections<'a> {
     /// The norm whose output the first four consume, resident beside them.
@@ -79,11 +86,11 @@ pub struct LayerProjections<'a> {
     /// hidden state is never a `Vec<f32>` anywhere — see
     /// [`LayerProjections::normed_qkvr`].
     input_layernorm: LayerNorm<'a>,
-    q_proj: PackedProjection<'a>,
-    k_proj: PackedProjection<'a>,
-    v_proj: PackedProjection<'a>,
-    r_proj: PackedProjection<'a>,
-    o_proj: PackedProjection<'a>,
+    q_proj: Box<dyn Multiply + 'a>,
+    k_proj: Box<dyn Multiply + 'a>,
+    v_proj: Box<dyn Multiply + 'a>,
+    r_proj: Box<dyn Multiply + 'a>,
+    o_proj: Box<dyn Multiply + 'a>,
     /// The attention step between the four and the fifth, resident for the same
     /// reason the norm in front of them is: what it holds is the layer's band,
     /// and what that buys is that `o_proj` reads a buffer rather than a value
@@ -143,6 +150,62 @@ impl LayerKernels {
     }
 }
 
+/// What one attention layer is wrapped from: its five weights, already wrapped,
+/// and the small tensors that sit among them.
+///
+/// **A struct rather than eleven arguments**, because most of them are `[f32]`
+/// of interchangeable width — the two head norms are the same width as each
+/// other and so are the two convolutions — so a slot is named on both sides of
+/// the call. The five are [`Multiply`] because that is the whole of what a
+/// decoder layer and an MTP head's block differ by; everything else here is the
+/// same small tensor doing the same thing in both.
+pub(crate) struct Wrapping<'w, 'a> {
+    pub(crate) config: AttentionConfig,
+    pub(crate) q_proj: Box<dyn Multiply + 'a>,
+    pub(crate) k_proj: Box<dyn Multiply + 'a>,
+    pub(crate) v_proj: Box<dyn Multiply + 'a>,
+    pub(crate) r_proj: Box<dyn Multiply + 'a>,
+    pub(crate) o_proj: Box<dyn Multiply + 'a>,
+    pub(crate) input_layernorm: &'w [f32],
+    pub(crate) q_norm: &'w [f32],
+    pub(crate) k_norm: &'w [f32],
+    pub(crate) k_sconv: &'w [f32],
+    pub(crate) v_sconv: &'w [f32],
+    pub(crate) rel_proj: &'w [f32],
+}
+
+impl<'w, 'a> Wrapping<'w, 'a> {
+    /// One of the model's own layers, whose five weights are packed.
+    ///
+    /// Which name fills which slot is the whole of what this decides, and it is
+    /// what this module's cases are about: `q_proj` against `o_proj` and
+    /// `k_proj` against `v_proj` are the same shape either way round.
+    pub(crate) fn packed(
+        device: &'a Device,
+        matmul: &'a PackedMatmul,
+        layer: &'w LayerPacked<'a>,
+    ) -> Result<Self, MatmulError> {
+        let packed = &layer.attention;
+        let boxed = |weight| -> Result<Box<dyn Multiply + 'a>, MatmulError> {
+            Ok(Box::new(whole(device, matmul, weight)?))
+        };
+        Ok(Self {
+            config: layer.config,
+            q_proj: boxed(&packed.q_proj)?,
+            k_proj: boxed(&packed.k_proj)?,
+            v_proj: boxed(&packed.v_proj)?,
+            r_proj: boxed(&packed.r_proj)?,
+            o_proj: boxed(&packed.o_proj)?,
+            input_layernorm: &layer.input_layernorm,
+            q_norm: &layer.q_norm,
+            k_norm: &layer.k_norm,
+            k_sconv: &layer.k_sconv,
+            v_sconv: &layer.v_sconv,
+            rel_proj: &layer.rel_proj,
+        })
+    }
+}
+
 impl<'a> LayerProjections<'a> {
     /// Wrap a layer's five projections where the checkpoint mapped them, with
     /// the norm, the two convolutions and the attention step that sit among
@@ -165,8 +228,19 @@ impl<'a> LayerProjections<'a> {
         layer: &LayerPacked<'a>,
         slack: usize,
     ) -> Result<Self, ProjectionError> {
-        let (config, packed) = (layer.config, &layer.attention);
-        let matmul = &kernels.matmul;
+        let wrapping = Wrapping::packed(device, &kernels.matmul, layer)?;
+        Self::wrapping(device, kernels, wrapping, slack)
+    }
+
+    /// The same layer over weights somebody else wrapped, which is what a second
+    /// format arrives as — see [`ModelHeads::wrap`](crate::ModelHeads::wrap).
+    pub(crate) fn wrapping(
+        device: &'a Device,
+        kernels: &'a LayerKernels,
+        wrapping: Wrapping<'_, 'a>,
+        slack: usize,
+    ) -> Result<Self, ProjectionError> {
+        let config = wrapping.config;
         let sconv = |weight: &[f32]| {
             LayerConv::with_slack(device, &kernels.conv, config.kv_channels(), weight, slack)
         };
@@ -176,19 +250,19 @@ impl<'a> LayerProjections<'a> {
             input_layernorm: LayerNorm::new(
                 device,
                 &kernels.norm,
-                &layer.input_layernorm,
+                wrapping.input_layernorm,
                 config.rms_norm_eps,
             )?,
-            attention: LayerAttention::new(device, &kernels.attention, config, &layer.rel_proj)?,
-            k_sconv: sconv(&layer.k_sconv)?,
-            v_sconv: sconv(&layer.v_sconv)?,
-            q_norm: head_norm(&layer.q_norm)?,
-            k_norm: head_norm(&layer.k_norm)?,
-            q_proj: whole(device, matmul, &packed.q_proj)?,
-            k_proj: whole(device, matmul, &packed.k_proj)?,
-            v_proj: whole(device, matmul, &packed.v_proj)?,
-            r_proj: whole(device, matmul, &packed.r_proj)?,
-            o_proj: whole(device, matmul, &packed.o_proj)?,
+            attention: LayerAttention::new(device, &kernels.attention, config, wrapping.rel_proj)?,
+            k_sconv: sconv(wrapping.k_sconv)?,
+            v_sconv: sconv(wrapping.v_sconv)?,
+            q_norm: head_norm(wrapping.q_norm)?,
+            k_norm: head_norm(wrapping.k_norm)?,
+            q_proj: wrapping.q_proj,
+            k_proj: wrapping.k_proj,
+            v_proj: wrapping.v_proj,
+            r_proj: wrapping.r_proj,
+            o_proj: wrapping.o_proj,
         })
     }
 
@@ -540,23 +614,23 @@ impl Projections for LayerProjections<'_> {
     }
 
     fn q_proj(&self) -> &dyn Projection {
-        &self.q_proj
+        self.q_proj.as_ref()
     }
 
     fn k_proj(&self) -> &dyn Projection {
-        &self.k_proj
+        self.k_proj.as_ref()
     }
 
     fn v_proj(&self) -> &dyn Projection {
-        &self.v_proj
+        self.v_proj.as_ref()
     }
 
     fn r_proj(&self) -> &dyn Projection {
-        &self.r_proj
+        self.r_proj.as_ref()
     }
 
     fn o_proj(&self) -> &dyn Projection {
-        &self.o_proj
+        self.o_proj.as_ref()
     }
 }
 
@@ -567,9 +641,9 @@ impl Projections for LayerProjections<'_> {
 /// layers of forty-two have one.
 #[derive(Debug)]
 pub struct DenseFfn<'a> {
-    gate_proj: PackedProjection<'a>,
-    up_proj: PackedProjection<'a>,
-    down_proj: PackedProjection<'a>,
+    gate_proj: Box<dyn Multiply + 'a>,
+    up_proj: Box<dyn Multiply + 'a>,
+    down_proj: Box<dyn Multiply + 'a>,
     /// The activation between the pair and the third, which is not a weight and
     /// belongs to no layer — one pipeline serves the whole model, and it is here
     /// for the reason [`ExpertBanks`](crate::ExpertBanks) holds one: encoded
@@ -588,12 +662,29 @@ impl<'a> DenseFfn<'a> {
         swiglu: &'a SwiGlu,
         packed: &PackedMlp<'a>,
     ) -> Result<Self, MatmulError> {
-        Ok(Self {
-            gate_proj: whole(device, matmul, &packed.gate_proj)?,
-            up_proj: whole(device, matmul, &packed.up_proj)?,
-            down_proj: whole(device, matmul, &packed.down_proj)?,
+        Ok(Self::over(
+            Box::new(whole(device, matmul, &packed.gate_proj)?),
+            Box::new(whole(device, matmul, &packed.up_proj)?),
+            Box::new(whole(device, matmul, &packed.down_proj)?),
             swiglu,
-        })
+        ))
+    }
+
+    /// The same network over weights somebody else wrapped, which is what an MTP
+    /// head's fused `w13_dn` arrives as: two of these three are one tensor's even
+    /// rows and its odd ones.
+    pub(crate) fn over(
+        gate_proj: Box<dyn Multiply + 'a>,
+        up_proj: Box<dyn Multiply + 'a>,
+        down_proj: Box<dyn Multiply + 'a>,
+        swiglu: &'a SwiGlu,
+    ) -> Self {
+        Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            swiglu,
+        }
     }
 
     /// The whole network encoded into `batch`, over rows a dispatch already left
@@ -632,15 +723,15 @@ impl MlpProjections for DenseFfn<'_> {
     }
 
     fn gate_proj(&self) -> &dyn Projection {
-        &self.gate_proj
+        self.gate_proj.as_ref()
     }
 
     fn up_proj(&self) -> &dyn Projection {
-        &self.up_proj
+        self.up_proj.as_ref()
     }
 
     fn down_proj(&self) -> &dyn Projection {
-        &self.down_proj
+        self.down_proj.as_ref()
     }
 }
 
@@ -822,9 +913,76 @@ pub struct LayerDevice<'a> {
 /// The mirror of [`LayerMlp`](inkling_core::LayerMlp), and boxed on both sides
 /// because a layer holds one of them and the two are hundreds of bytes apart.
 #[derive(Debug)]
-enum LayerMlpDevice<'a> {
+pub(crate) enum LayerMlpDevice<'a> {
     Dense(Box<DenseFfn<'a>>),
     Sparse(Box<LayerExperts<'a>>),
+}
+
+/// What a layer is beside its attention: the two convolutions on its residual
+/// paths, the norm between them, and whichever MLP its index called for.
+///
+/// The companion of [`Wrapping`] and a struct for its reason — the two
+/// convolutions are the same width as each other and exchanging them is a layer
+/// that still runs, so a slot is named on both sides of the call.
+pub(crate) struct Block<'w, 'a> {
+    /// The width the two residual convolutions are over, which is the model's
+    /// hidden size rather than the key's.
+    pub(crate) dim: usize,
+    pub(crate) attn_sconv: &'w [f32],
+    pub(crate) post_attention_layernorm: &'w [f32],
+    /// `None` where the caller will fill the slot afterwards, which is what a
+    /// layer that routes to expert banks is — see [`ModelLayers::wrap`].
+    pub(crate) mlp: Option<LayerMlpDevice<'a>>,
+    pub(crate) mlp_sconv: &'w [f32],
+}
+
+impl<'a> LayerDevice<'a> {
+    /// The attention half, for a caller that hands a piece of a layer over at a
+    /// time — which every backend did before a layer was one command buffer,
+    /// and which a head handed to a backend that answers for its weights and
+    /// not for the whole of it still is.
+    pub(crate) fn attention(&self) -> &LayerProjections<'a> {
+        &self.attention
+    }
+
+    /// The feed-forward network of a layer that has one rather than two banks.
+    pub(crate) fn dense_mlp(&self) -> Option<&DenseFfn<'a>> {
+        match self.mlp.as_ref()? {
+            LayerMlpDevice::Dense(ffn) => Some(ffn),
+            LayerMlpDevice::Sparse(_) => None,
+        }
+    }
+
+    /// A whole layer around weights a caller has already wrapped.
+    ///
+    /// **Both kinds of layer this engine has come through here**: the model's
+    /// own forty-two, whose every weight is MXFP4, and the eight MTP heads'
+    /// blocks, whose every weight is the bfloat16 the quantiser skipped. What
+    /// they differ by is what [`Wrapping`] carries and nothing else, which is
+    /// what this signature is for.
+    pub(crate) fn wrapping(
+        device: &'a Device,
+        kernels: &'a LayerKernels,
+        attention: Wrapping<'_, 'a>,
+        block: Block<'_, 'a>,
+        slack: usize,
+    ) -> Result<Self, ProjectionError> {
+        let eps = attention.config.rms_norm_eps;
+        let residual =
+            |weight: &[f32]| LayerConv::with_slack(device, &kernels.conv, block.dim, weight, slack);
+        Ok(Self {
+            attn_sconv: residual(block.attn_sconv)?,
+            post_attention_layernorm: LayerNorm::new(
+                device,
+                &kernels.norm,
+                block.post_attention_layernorm,
+                eps,
+            )?,
+            mlp_sconv: residual(block.mlp_sconv)?,
+            mlp: block.mlp,
+            attention: LayerProjections::wrapping(device, kernels, attention, slack)?,
+        })
+    }
 }
 
 /// What a wrapped stack is, beside the weights: how many layers it has, the
@@ -862,26 +1020,25 @@ impl<'a> ModelLayers<'a> {
         let StackShape { layers, dim, slack } = stack;
         let mut wrapped: Vec<Option<LayerDevice<'a>>> = (0..layers).map(|_| None).collect();
         for layer in packed {
-            let residual =
-                |weight: &[f32]| LayerConv::with_slack(device, &kernels.conv, dim, weight, slack);
-            wrapped[layer.layer] = Some(LayerDevice {
-                attention: LayerProjections::wrap(device, kernels, layer, slack)?,
-                attn_sconv: residual(&layer.attn_sconv)?,
-                post_attention_layernorm: LayerNorm::new(
-                    device,
-                    &kernels.norm,
-                    &layer.post_attention_layernorm,
-                    layer.config.rms_norm_eps,
-                )?,
-                mlp: layer
-                    .dense_mlp
-                    .map(|mlp| {
-                        DenseFfn::wrap(device, &kernels.matmul, experts.swiglu, &mlp)
-                            .map(|ffn| LayerMlpDevice::Dense(Box::new(ffn)))
-                    })
-                    .transpose()?,
-                mlp_sconv: residual(&layer.mlp_sconv)?,
-            });
+            wrapped[layer.layer] = Some(LayerDevice::wrapping(
+                device,
+                kernels,
+                Wrapping::packed(device, &kernels.matmul, layer)?,
+                Block {
+                    dim,
+                    attn_sconv: &layer.attn_sconv,
+                    post_attention_layernorm: &layer.post_attention_layernorm,
+                    mlp: layer
+                        .dense_mlp
+                        .map(|mlp| {
+                            DenseFfn::wrap(device, &kernels.matmul, experts.swiglu, &mlp)
+                                .map(|ffn| LayerMlpDevice::Dense(Box::new(ffn)))
+                        })
+                        .transpose()?,
+                    mlp_sconv: &layer.mlp_sconv,
+                },
+                slack,
+            )?);
         }
         for bank in banks {
             let Some(held) = wrapped[bank.layer].as_mut() else {
@@ -937,10 +1094,7 @@ impl LayerBackend for ModelLayers<'_> {
     }
 
     fn dense_mlp(&self, layer: usize) -> Option<&dyn MlpProjections> {
-        match self.layer(layer)?.mlp.as_ref()? {
-            LayerMlpDevice::Dense(ffn) => Some(&**ffn as &dyn MlpProjections),
-            LayerMlpDevice::Sparse(_) => None,
-        }
+        Some(self.layer(layer)?.dense_mlp()? as &dyn MlpProjections)
     }
 
     fn experts(&self, layer: usize) -> Option<&dyn Experts> {
@@ -994,7 +1148,7 @@ impl LayerDevice<'_> {
     /// [`DecoderCache`](inkling_core::DecoderCache) holds for a layer that runs
     /// here — see [`crate::LayerConv::rewind`] for what they need of the
     /// caller.
-    fn rewind(&self, rows: usize) {
+    pub(crate) fn rewind(&self, rows: usize) {
         self.attention.rewind(rows);
         self.attn_sconv.rewind(rows);
         self.mlp_sconv.rewind(rows);
@@ -1179,7 +1333,7 @@ impl DecoderDevice for ModelLayers<'_> {
 /// this process forms, and whether either crosses back is
 /// [`ModelLayers::run`]'s question rather than this one's.
 impl LayerDevice<'_> {
-    fn encode_into(
+    pub(crate) fn encode_into(
         &self,
         batch: &mut Batch<'_>,
         cache: &mut DecoderCache,
@@ -1805,17 +1959,19 @@ mod tests {
         /// One packed weight of the given shape, uploaded — the seed is what
         /// makes two of them differ, and against weights that agreed an
         /// exchanged pair would change nothing.
-        fn weight(&self, seed: u32, in_dim: usize, out_dim: usize) -> PackedProjection<'a> {
+        fn weight(&self, seed: u32, in_dim: usize, out_dim: usize) -> Box<dyn Multiply + 'a> {
             let case = Case::seeded(seed, in_dim, out_dim, 1);
-            PackedProjection::upload(
-                self.device,
-                self.kernels.matmul(),
-                in_dim,
-                out_dim,
-                &pack(&case.codes),
-                &case.scales,
+            Box::new(
+                PackedProjection::upload(
+                    self.device,
+                    self.kernels.matmul(),
+                    in_dim,
+                    out_dim,
+                    &pack(&case.codes),
+                    &case.scales,
+                )
+                .expect("the weight's shapes pair"),
             )
-            .expect("the weight's shapes pair")
         }
 
         fn norm(&self, weight: &[f32]) -> LayerNorm<'a> {
