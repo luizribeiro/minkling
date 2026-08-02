@@ -1721,7 +1721,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::testing::{Case, Noise, pack};
     use super::*;
@@ -3100,6 +3100,78 @@ mod tests {
                 ));
             }
             eprintln!("{line}");
+        }
+    }
+
+    /// **What a tile shape costs to compile, and what it leaves a
+    /// threadgroup**, which are the two prices a wider tile pays that the sweep
+    /// above cannot see.
+    ///
+    /// **The first is here because P3 measured a compile this side had not
+    /// thought to price.** Putting a third entry in this source cost a prefill 2
+    /// to 3% of its device time before any call reached it, so a change that
+    /// widens a tile owes the same figure — the more so at 97 tokens, where a
+    /// fixed cost is a larger share of a shorter prefill. A column tile is not a
+    /// fourth entry: it is the same three, of which two got wider bodies. This
+    /// is what that is worth in wall time, taken over the whole source rather
+    /// than one entry because [`PackedMatmul::new`] is what a model load runs.
+    ///
+    /// **The second is where the sweep's cliff was expected to be, and is
+    /// not.** Every accumulator a tile carries is a register a lane holds for
+    /// the whole walk, and a pipeline that wants more of them than the hardware
+    /// will give a thread reports a narrower threadgroup — which
+    /// [`Batch::add`](crate::kernel::Batch) refuses rather than clamps, so a
+    /// tile too wide for [`THREADS_PER_GROUP`] would be a failure rather than a
+    /// slow kernel. The column that reports it is flat at the device's own 1024
+    /// from one column to eight, including the width that is half the speed of
+    /// four — so whatever the sweep turns on, it is not a limit this side can
+    /// read off the pipeline, and the guard below is a guard rather than an
+    /// explanation.
+    ///
+    /// Nothing asserts a duration. What is asserted is that the shipped shape
+    /// still fits the threadgroup this module dispatches in.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_tile_shape_costs_to_compile_and_what_it_leaves_a_threadgroup() {
+        let Some(device) = device() else { return };
+        const WIDTHS: [usize; 5] = [1, 2, 4, 6, 8];
+
+        // The first compile a process runs carries the compiler's own start-up
+        // and reads five times what the ones behind it do, which would land the
+        // whole of it on whichever width this loop happened to try first.
+        PackedMatmul::new(&device).expect("the shipped source compiles");
+        eprintln!(
+            "  {:<16}{:>12}{:>16}{:>18}",
+            "cols a tile", "compiling", "the tiled entry", "threads a group"
+        );
+        for cols in WIDTHS {
+            let source = a_tile_of(ROWS_A_TILE, cols);
+            let taken = Instant::now();
+            PackedMatmul::tiling(&device, &source, ROWS_A_TILE, cols)
+                .unwrap_or_else(|err| panic!("{cols} columns a tile compiles: {err}"));
+            let whole = taken.elapsed();
+
+            let taken = Instant::now();
+            let tiled = device
+                .compile(&source, TILED_ENTRY)
+                .expect("the tiled entry compiles");
+            let alone = taken.elapsed();
+
+            eprintln!(
+                "  {:<16}{:>12}{:>16}{:>18}",
+                cols,
+                format!("{whole:.0?}"),
+                format!("{alone:.0?}"),
+                tiled.max_threads_per_group(),
+            );
+            if cols == COLS_A_TILE {
+                assert!(
+                    tiled.max_threads_per_group() >= THREADS_PER_GROUP,
+                    "the shipped tile leaves a threadgroup {} threads where this module \
+                     dispatches {THREADS_PER_GROUP}",
+                    tiled.max_threads_per_group()
+                );
+            }
         }
     }
 
