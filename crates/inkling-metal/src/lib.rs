@@ -53,7 +53,9 @@ pub use experts::{ExpertBanks, ExpertKernels, LayerExperts};
 pub use kernel::{Grid, Kernel};
 pub use matmul::{MatmulError, PackedBank, PackedMatmul, PackedProjection};
 pub use norm::{LayerNorm, RmsNorm};
-pub use projections::{DenseFfn, LayerDevice, LayerKernels, LayerProjections, ModelLayers};
+pub use projections::{
+    DenseFfn, LayerDevice, LayerKernels, LayerProjections, ModelLayers, StackShape,
+};
 pub use router::{LayerRouter, Router, RouterWeights, RoutingWeights};
 pub use sconv::{LayerConv, ShortConvolution};
 pub use swiglu::SwiGlu;

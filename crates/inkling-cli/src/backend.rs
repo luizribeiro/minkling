@@ -38,7 +38,7 @@ use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, CheckpointWeights, TextConfig};
 use inkling_metal::{
     DenseMatmul, Device, ExpertKernels, LayerKernels, ModelLayers, MoeCombine, PackedProjection,
-    Router, RouterWeights, SwiGlu,
+    Router, RouterWeights, StackShape, SwiGlu,
 };
 
 use crate::LABEL;
@@ -120,10 +120,16 @@ pub fn open(backend: Backend) -> Result<Option<Gpu>> {
 /// The head is cut to the vocabulary on the way over, so the 966 padding rows
 /// the checkpoint carries are never indexed — the truncation
 /// [`inkling_core::head`] describes, honoured by not reaching the bytes.
+///
+/// `speculation` is how many timesteps a layer has to be able to give back,
+/// which is how far ahead this run will guess: the state a rejected token
+/// reached lives where the layer ran, so a device holding the layers has to be
+/// told before it wraps them. A run that speculates nothing asks for none.
 pub fn weights<'a>(
     gpu: Option<&'a Gpu>,
     ckpt: &'a Checkpoint,
     config: &'a TextConfig,
+    speculation: usize,
 ) -> Result<CheckpointWeights<'a>> {
     let weights = CheckpointWeights::open(ckpt, config)?;
     let Some(gpu) = gpu else {
@@ -152,8 +158,11 @@ pub fn weights<'a>(
         gpu.expert_kernels(),
         &packed,
         &banks,
-        config.num_hidden_layers,
-        config.hidden_size,
+        StackShape {
+            layers: config.num_hidden_layers,
+            dim: config.hidden_size,
+            slack: speculation,
+        },
     )
     .context("giving the model's layers to the Metal device")?;
     eprintln!(

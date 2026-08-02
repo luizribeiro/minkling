@@ -33,7 +33,7 @@ use inkling_core::{
 use inkling_metal::{
     DenseMatmul, DenseWeight, Device, ExpertKernels, LayerKernels, LayerProjections, LayerRouter,
     MetalError, ModelLayers, MoeCombine, PackedBank, PackedMatmul, PackedProjection, Router,
-    RouterWeights, SwiGlu,
+    RouterWeights, StackShape, SwiGlu,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -623,8 +623,11 @@ impl OnTheDevice {
             },
             &packed,
             &banks,
-            config.num_hidden_layers,
-            config.hidden_size,
+            StackShape {
+                layers: config.num_hidden_layers,
+                dim: config.hidden_size,
+                slack: 0,
+            },
         )
         .expect("the layers wrap");
 
@@ -1278,7 +1281,7 @@ fn a_layers_whole_attention_matches_its_pieces_run_apart() {
     let kernels = LayerKernels::compile(&device).expect("the layer kernels compile");
     let packed = weights.layer_projections();
     let layer = &packed[LAYER];
-    let five = LayerProjections::wrap(&device, &kernels, layer).expect("the layer wraps");
+    let five = LayerProjections::wrap(&device, &kernels, layer, 0).expect("the layer wraps");
 
     let shape = layer.config;
     let heads = HeadTensors::open(&ckpt, LAYER);

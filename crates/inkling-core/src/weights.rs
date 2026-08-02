@@ -60,7 +60,7 @@ use crate::layer::{
     DecoderCache, DecoderDevice, DecoderLayer, DecoderWeights, Experts, Hidden, LayerMlp,
     NoExperts, Passed,
 };
-use crate::model::{Model, ModelWeights};
+use crate::model::{Model, ModelCache, ModelWeights};
 use crate::moe::{ExpertBank, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
 use crate::ops::{DenseMlp, MlpProjections, Projection, linear};
 use crate::profile::{self, Op};
@@ -640,6 +640,20 @@ pub trait LayerBackend {
     /// which leaves the CPU path to decode them.
     fn experts(&self, layer: usize) -> Option<&dyn Experts>;
 
+    /// Take back the last `rows` timesteps of whatever state this backend holds
+    /// for the sequence in flight — the keys it appended, and the convolution
+    /// windows it advanced.
+    ///
+    /// Defaulted to nothing, because a backend that holds only weights holds
+    /// nothing a sequence can be rewound out of. What makes this a question for
+    /// the backend at all is [`DecoderDevice`]: a layer that runs there keeps
+    /// its own span and its own windows, and a
+    /// [`DecoderCache`](crate::layer::DecoderCache) rewound on this side would
+    /// leave them where the rejected tokens put them.
+    fn rewind(&self, rows: usize) {
+        let _ = rows;
+    }
+
     /// The whole of layer `layer` in one command buffer, or `None` where this
     /// backend holds only some of it — see [`DecoderDevice`].
     ///
@@ -1083,6 +1097,13 @@ impl ModelWeights for CheckpointWeights<'_> {
         self.embed_tokens
             .decode_slice(id)
             .unwrap_or_else(|err| panic!("embedding row {id} decodes: {err}"))
+    }
+
+    fn rewind(&self, cache: &mut ModelCache, rows: usize) {
+        cache.rewind(rows);
+        if let Some(backend) = self.backend.as_deref() {
+            backend.rewind(rows);
+        }
     }
 
     fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: Hidden<'_>) -> Passed {

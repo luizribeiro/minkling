@@ -247,6 +247,23 @@ impl KeyValues {
         self.held = 0;
     }
 
+    /// The span with the last `rows` keys unwanted.
+    ///
+    /// **This is the easy half of taking a speculative token back**, and it is
+    /// worth saying why: a key is addressed by its position, and the loop bound
+    /// is how many the sequence has, so a key nobody indexes is a key that is
+    /// not there. What is left over is a slot the next call writes. The
+    /// convolution windows either side of this are the half that had to be
+    /// designed for — see [`LayerConv::rewind`](crate::LayerConv::rewind).
+    fn rewind(&mut self, rows: usize) {
+        assert!(
+            rows <= self.held,
+            "a rewind of {rows} against a span holding {}",
+            self.held
+        );
+        self.held -= rows;
+    }
+
     /// Room for `keys` keys a head, growing the span if there is not.
     ///
     /// Powers of two, so a decode loop reallocates a logarithmic number of times
@@ -673,6 +690,15 @@ impl<'a> LayerAttention<'a> {
     /// Append `[rows, kv_heads * head_dim]` keys and values to the span.
     pub fn append(&self, k: &[f32], v: &[f32]) {
         self.span.borrow_mut().append(k, v);
+    }
+
+    /// Unwant the last `rows` keys and values of the span this layer holds.
+    ///
+    /// The convolution windows those keys came through are
+    /// [`LayerProjections`](crate::LayerProjections)'s to take back, and the
+    /// two have to move together: see [`crate::LayerConv::rewind`].
+    pub fn rewind(&self, rows: usize) {
+        self.span.borrow_mut().rewind(rows);
     }
 }
 
@@ -1996,6 +2022,51 @@ mod tests {
         let alone = through_the_span(&device, &layer, 0, first, &v[..4 * channels], &q, &rel);
         assert_eq!(layer.held(), 4, "the span started over");
         assert_eq!(alone, got);
+    }
+
+    /// Keys a rejected speculative token left in the span are keys nobody
+    /// indexes, and the answer says so: attending after a rewind is attending
+    /// over what the sequence had before those keys.
+    ///
+    /// Exact equality, because the kernel's loop bound is what a rewind moves
+    /// and the floats it reads are the same ones. The slots the rejected keys
+    /// wrote are left where they are — the next call overwrites them, and until
+    /// it does nothing reaches them.
+    #[test]
+    fn keys_a_rewind_took_back_are_keys_the_step_does_not_attend_over() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let (case, k, v) = streaming(8);
+        let layer = case.wrapped(&device, &attention);
+        let (heads, head_dim) = (case.config.heads, case.config.head_dim);
+        let channels = case.config.kv_channels();
+        let (q, rel) = (
+            values(heads * head_dim, 5),
+            values(heads * case.config.d_rel, 9),
+        );
+
+        let (kept, rejected) = (4, 2);
+        let of = |range: std::ops::Range<usize>| {
+            (
+                k[range.start * channels..range.end * channels].to_vec(),
+                v[range.start * channels..range.end * channels].to_vec(),
+            )
+        };
+        let (first_k, first_v) = of(0..kept);
+        let (wrong_k, wrong_v) = of(kept..kept + rejected);
+
+        through_the_span(&device, &layer, 0, &first_k, &first_v, &q, &rel);
+        let want = through_the_span(&device, &layer, kept, &wrong_k, &wrong_v, &q, &rel);
+        assert_eq!(layer.held(), kept + rejected);
+
+        layer.rewind(rejected);
+        assert_eq!(layer.held(), kept, "the span gave the keys back");
+        let got = through_the_span(&device, &layer, kept, &wrong_k, &wrong_v, &q, &rel);
+        assert_eq!(got, want, "the same keys again are the same answer");
+
+        layer.rewind(rejected);
+        let alone = through_the_span(&device, &layer, kept, &first_k, &first_v, &q, &rel);
+        assert_ne!(alone, want, "keys the step attended over regardless");
     }
 
     /// And a sequence whose count the span does not match is two sequences

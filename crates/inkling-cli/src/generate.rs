@@ -71,11 +71,13 @@ pub fn run(args: &Generate) -> Result<()> {
     }
     eprintln!("{:<LABEL$}{} tokens", "prompt", ids.len());
 
+    let speculation = 0;
+
     // Before the checkpoint is mapped, so that a backend this machine cannot
     // give ends the command in a millisecond rather than after a 130 GiB load.
     let gpu = backend::open(args.backend)?;
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
-    let weights = backend::weights(gpu.as_ref(), &checkpoint, &config.text_config)?;
+    let weights = backend::weights(gpu.as_ref(), &checkpoint, &config.text_config, speculation)?;
     let generator = weights.generator();
     let ending = Ending {
         budget: args.max_tokens,

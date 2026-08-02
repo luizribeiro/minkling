@@ -451,13 +451,15 @@ pub fn run(args: &Serve) -> Result<()> {
     let tokenizer = Tokenizer::open(&args.checkpoint, &config)?;
     let markers = markers(&tokenizer)?;
 
+    let speculation = 0;
+
     // The device before the checkpoint, so that a backend this machine cannot
     // give ends the process before a client can wait on a server that was going
     // to fail.
     let gpu = backend::open(args.backend)?;
     eprintln!("loading {}", args.checkpoint.display());
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
-    let weights = backend::weights(gpu.as_ref(), &checkpoint, &config.text_config)?;
+    let weights = backend::weights(gpu.as_ref(), &checkpoint, &config.text_config, speculation)?;
     let generator = weights.generator();
 
     let mut engine = Engine {

@@ -41,6 +41,7 @@
 use std::cell::{Cell, RefCell};
 
 use inkling_core::profile::{self, Op};
+use inkling_core::sconv::Held;
 
 use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
@@ -103,6 +104,12 @@ pub struct LayerConv<'a> {
     windows: RefCell<[Buffer<f32>; 2]>,
     /// Which of the two the next call reads.
     reading: Cell<usize>,
+    /// What each of them holds, which is the `taps - 1` the convolution reads
+    /// and the timesteps behind them a rejected speculative token is taken back
+    /// out of. The arithmetic is
+    /// [`ConvState`](inkling_core::ConvState)'s and so is the argument for it;
+    /// what differs here is only that the rows are on a device.
+    held: Cell<Held>,
     channels: usize,
     taps: usize,
 }
@@ -116,6 +123,24 @@ impl<'a> LayerConv<'a> {
         conv: &'a ShortConvolution,
         channels: usize,
         weight: &[f32],
+    ) -> Result<Self, MetalError> {
+        Self::with_slack(device, conv, channels, weight, 0)
+    }
+
+    /// The same, holding `slack` timesteps further back than the convolution
+    /// reads so that a speculative round can be rewound rather than replayed.
+    ///
+    /// What it costs a step is what the kernel writes: a window is written once
+    /// per call and read once, so a slack of eight takes the two windows of a
+    /// `[1, 4096]` convolution from 98 KB of traffic to 360 KB — against the
+    /// 5.9 GB a decode step reads, and against a replay that is a whole forward
+    /// pass. A layer whose sequence never speculates asks for none.
+    pub fn with_slack(
+        device: &'a Device,
+        conv: &'a ShortConvolution,
+        channels: usize,
+        weight: &[f32],
+        slack: usize,
     ) -> Result<Self, MetalError> {
         assert!(channels > 0, "a convolution has channels");
         assert_eq!(
@@ -131,16 +156,42 @@ impl<'a> LayerConv<'a> {
             taps - 1
         );
 
-        let window = || device.zeroed::<f32>((taps - 1) * channels);
+        let held = Held::new(channels, taps, slack);
+        let window = || device.zeroed::<f32>(held.floats());
         Ok(Self {
             weight: RefCell::new(device.buffer(weight)?),
             windows: RefCell::new([window()?, window()?]),
             reading: Cell::new(0),
+            held: Cell::new(held),
             device,
             conv,
             channels,
             taps,
         })
+    }
+
+    /// How many timesteps may still be taken back.
+    pub fn rewindable(&self) -> usize {
+        self.held.get().rewindable()
+    }
+
+    /// Take back the last `rows` timesteps of the window the next call will
+    /// read, leaving the window this convolution would have had without them.
+    ///
+    /// **The rows have to be there to be taken back**, which on a device means
+    /// the command buffer that wrote them has completed. Every caller of this
+    /// has read something back from the pass it is rewinding — a speculative
+    /// round decides what to take back by reading the logits of what it fed —
+    /// so the wait has already happened where this is reached.
+    ///
+    /// The same shift [`ConvState::rewind`](inkling_core::ConvState::rewind)
+    /// makes, on the buffer the device holds: unified memory is what lets a
+    /// window be moved along without a dispatch or a copy across a bus.
+    pub fn rewind(&self, rows: usize) {
+        let mut held = self.held.get();
+        let mut windows = self.windows.borrow_mut();
+        held.rewind(rows, windows[self.reading.get()].as_mut_slice());
+        self.held.set(held);
     }
 
     pub fn taps(&self) -> usize {
@@ -157,13 +208,16 @@ impl<'a> LayerConv<'a> {
         self.windows.borrow_mut()[self.reading.get()]
             .as_mut_slice()
             .fill(0.0);
+        let mut held = self.held.get();
+        held.restarted();
+        self.held.set(held);
     }
 
     /// The `taps - 1` timesteps preceding the next input, oldest first — the
     /// window as [`ConvState::history`](inkling_core::ConvState::history) hands
     /// it out.
     pub fn window(&self) -> Vec<f32> {
-        self.windows.borrow()[self.reading.get()].to_vec()
+        self.windows.borrow()[self.reading.get()].as_slice()[self.held.get().reading()..].to_vec()
     }
 
     /// `[rows, channels]` in and out, submitted on its own.
@@ -278,12 +332,13 @@ impl<'a> LayerConv<'a> {
         let moves = size_of::<f32>()
             * (2 * x.len()
                 + self.channels * self.taps
-                + 2 * (self.taps - 1) * self.channels
+                + 2 * self.held.get().floats()
                 + carried.as_ref().map_or(0, |_| x.len()));
         let fields = [
             extent(rows, "the rows of a call"),
             extent(self.channels, "the channels of a convolution"),
             extent(self.taps, "the taps of a kernel"),
+            extent(self.held.get().rows(), "the timesteps a window holds"),
             extent(landing.groups, "the groups of a row"),
             extent(landing.stride, "the rows a group has room for"),
             extent(landing.base, "where a call's rows start"),
@@ -313,7 +368,7 @@ impl<'a> LayerConv<'a> {
         // worth for the window left behind — which reads the same padded
         // sequence the outputs are cut from and writes somewhere no output
         // thread touches.
-        let threads = (rows + self.taps - 1) * self.channels;
+        let threads = (rows + self.held.get().rows()) * self.channels;
         batch.add(
             &self.conv.kernel,
             &[
@@ -330,6 +385,9 @@ impl<'a> LayerConv<'a> {
             moves,
         )?;
         self.reading.set(1 - self.reading.get());
+        let mut held = self.held.get();
+        held.advanced(rows);
+        self.held.set(held);
         Ok(())
     }
 
@@ -355,6 +413,7 @@ struct Shape {
     uint rows;
     uint channels;
     uint taps;
+    uint held;
     uint groups;
     uint stride;
     uint base;
@@ -364,6 +423,12 @@ struct Shape {
 /// One channel of one timestep of `window ++ scale * x`, which is the padded
 /// sequence every output row is cut from and the window left behind is the tail
 /// of.
+///
+/// **The window may hold more than the convolution reads**, which is what lets
+/// a speculative round be taken back — so the sequence starts `held` timesteps
+/// before the first row rather than `taps - 1`, and an output row reaches past
+/// the slack to find its own. `held` is `taps - 1` where nothing speculates,
+/// and then this is the sequence it always was.
 ///
 /// **The scale is on `x` alone.** What the window holds is what a previous call
 /// was given, and a previous call was given rows already scaled — it is scaled
@@ -377,11 +442,10 @@ inline float padded(
     uint at,
     uint c
 ) {
-    const uint lead = shape.taps - 1;
-    if (at < lead) {
+    if (at < shape.held) {
         return window[at * shape.channels + c];
     }
-    return scale * x[(at - lead) * shape.channels + c];
+    return scale * x[(at - shape.held) * shape.channels + c];
 }
 
 /// A depthwise causal convolution with a residual add, one thread to a channel
@@ -425,18 +489,20 @@ kernel void short_conv(
     device const float *carried [[buffer(7)]],
     uint id [[thread_position_in_grid]]
 ) {
-    const uint lead = shape.taps - 1;
-    if (id >= (shape.rows + lead) * shape.channels) {
+    if (id >= (shape.rows + shape.held) * shape.channels) {
         return;
     }
     const uint t = id / shape.channels;
     const uint c = id % shape.channels;
+    // What the window holds beyond what the convolution reads, which an output
+    // row skips to reach its own timesteps.
+    const uint slack = shape.held - (shape.taps - 1);
 
-    // The last `taps - 1` timesteps of the padded sequence, which is what the
-    // next call reads. A call shorter than the window cannot fill it, so part of
-    // what it keeps is part of what it was given — the reference takes the tail
-    // of the padding either way, and decoding one token at a time is entirely
-    // that case.
+    // The last `held` timesteps of the padded sequence, which is what the next
+    // call reads and what a rewind reaches back into. A call shorter than the
+    // window cannot fill it, so part of what it keeps is part of what it was
+    // given — the reference takes the tail of the padding either way, and
+    // decoding one token at a time is entirely that case.
     if (t >= shape.rows) {
         kept[(t - shape.rows) * shape.channels + c] = padded(x, window, shape, scale, t, c);
         return;
@@ -445,7 +511,7 @@ kernel void short_conv(
     device const float *taps = weight + (ulong)c * shape.taps;
     float acc = 0.0f;
     for (uint k = 0; k < shape.taps; ++k) {
-        acc += taps[k] * padded(x, window, shape, scale, t + k, c);
+        acc += taps[k] * padded(x, window, shape, scale, t + slack + k, c);
     }
 
     acc += scale * x[t * shape.channels + c];
@@ -578,6 +644,64 @@ mod tests {
             "worst deviation from the CPU over {} cases: {worst:e}",
             fx.batch
         );
+    }
+
+    /// The same rewind [`inkling_core::sconv`] states, on the device: rows fed,
+    /// taken back and replaced are the same sequence as rows that were never
+    /// fed — and the same sequence the CPU's own rewind produces.
+    ///
+    /// Exact against the device's own clean run, because both are the same
+    /// dispatch over the same floats and the only thing a rewind changes is
+    /// which call put a value in the window. Against the CPU it is the ordinary
+    /// tolerance, because the contraction that separates the two backends is
+    /// still there.
+    #[test]
+    fn rewinding_the_rows_a_dispatch_fed_leaves_the_window_it_had_before_them() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let fx = Synthetic::load();
+        let sequence = fx.sequence(&fx.input, 0).to_vec();
+        let wrong: Vec<f32> = sequence.iter().map(|value| -3.0 * value).collect();
+        let cpu = fx.on_the_cpu(&fx.weight);
+
+        for split in 1..fx.rows() {
+            let taken = fx.rows() - split;
+            let (before, after) = sequence.split_at(split * fx.channels);
+            let layer = LayerConv::with_slack(&device, &conv, fx.channels, &fx.weight, taken)
+                .expect("the kernel uploads");
+            layer.forward(before).expect("the dispatch completes");
+            layer
+                .forward(&wrong[split * fx.channels..])
+                .expect("the dispatch completes");
+            layer.rewind(taken);
+            let got = layer.forward(after).expect("the dispatch completes");
+
+            let clean = LayerConv::with_slack(&device, &conv, fx.channels, &fx.weight, taken)
+                .expect("the kernel uploads");
+            clean.forward(before).expect("the dispatch completes");
+            let want = clean.forward(after).expect("the dispatch completes");
+            assert_eq!(got, want, "{taken} rows taken back at {split}");
+            assert_eq!(layer.window(), clean.window(), "the window at {split}");
+
+            let mut state = cpu.state();
+            cpu.forward(&mut state, before, None);
+            let deviation = deviation(&got, &cpu.forward(&mut state, after, None));
+            assert!(deviation <= TOLERANCE, "at {split}: {deviation:e}");
+        }
+    }
+
+    /// A window that kept no slack is the window this kernel always had, and
+    /// asking it to give a timestep back is refused rather than answered out of
+    /// rows that are nobody's.
+    #[test]
+    fn a_window_without_slack_holds_what_the_convolution_reads_and_nothing_else() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let fx = Synthetic::load();
+        let layer = fx.wrapped(&device, &conv, &fx.weight);
+
+        assert_eq!(layer.window().len(), (fx.kernel_size - 1) * fx.channels);
+        assert_eq!(layer.rewindable(), 0);
     }
 
     /// **The property decode and continuous batching rest on**, on the device:

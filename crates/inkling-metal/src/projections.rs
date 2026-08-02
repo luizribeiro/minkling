@@ -156,11 +156,13 @@ impl<'a> LayerProjections<'a> {
         device: &'a Device,
         kernels: &'a LayerKernels,
         layer: &LayerPacked<'a>,
+        slack: usize,
     ) -> Result<Self, ProjectionError> {
         let (config, packed) = (layer.config, &layer.attention);
         let matmul = &kernels.matmul;
-        let sconv =
-            |weight: &[f32]| LayerConv::new(device, &kernels.conv, config.kv_channels(), weight);
+        let sconv = |weight: &[f32]| {
+            LayerConv::with_slack(device, &kernels.conv, config.kv_channels(), weight, slack)
+        };
         let head_norm =
             |weight: &[f32]| LayerNorm::new(device, &kernels.norm, weight, config.rms_norm_eps);
         Ok(Self {
@@ -181,6 +183,18 @@ impl<'a> LayerProjections<'a> {
             r_proj: whole(device, matmul, &packed.r_proj)?,
             o_proj: whole(device, matmul, &packed.o_proj)?,
         })
+    }
+
+    /// Take back the last `rows` timesteps of everything this layer's attention
+    /// carries for a sequence: the keys, the values, and the two convolution
+    /// windows behind the key and the value.
+    ///
+    /// All three or none — a sequence whose keys stop one timestep before its
+    /// windows do is one that still attends, over a position it half took back.
+    pub fn rewind(&self, rows: usize) {
+        self.attention.rewind(rows);
+        self.k_sconv.rewind(rows);
+        self.v_sconv.rewind(rows);
     }
 
     /// That the step being asked for is over the shape this layer was wrapped
@@ -727,9 +741,25 @@ enum LayerMlpDevice<'a> {
     Sparse(Box<LayerExperts<'a>>),
 }
 
+/// What a wrapped stack is, beside the weights: how many layers it has, the
+/// width they map through, and how many timesteps each has to be able to give
+/// back.
+///
+/// Three numbers rather than three arguments because they are one answer — the
+/// model's shape, as the thing wrapping it has to be told — and because the
+/// last of them is the only one a caller decides: `slack` is how far ahead the
+/// run will speculate, and a run that speculates nothing passes zero and wraps
+/// what this always wrapped. See [`crate::LayerConv::with_slack`].
+#[derive(Debug, Clone, Copy)]
+pub struct StackShape {
+    pub layers: usize,
+    pub dim: usize,
+    pub slack: usize,
+}
+
 impl<'a> ModelLayers<'a> {
-    /// Wrap every projection `packed` names and every bank `banks` names, over a
-    /// stack of `layers` mapping through `dim`.
+    /// Wrap every projection `packed` names and every bank `banks` names, over
+    /// the stack `stack` describes.
     ///
     /// The stack's length is stated rather than read off the last entry: a
     /// backend answering for none of the last layers would otherwise report a
@@ -741,14 +771,16 @@ impl<'a> ModelLayers<'a> {
         experts: ExpertKernels<'a>,
         packed: &[LayerPacked<'a>],
         banks: &[LayerBanks<'a>],
-        layers: usize,
-        dim: usize,
+        stack: StackShape,
     ) -> Result<Self, ProjectionError> {
+        let StackShape { layers, dim, slack } = stack;
         let mut wrapped: Vec<Option<LayerDevice<'a>>> = (0..layers).map(|_| None).collect();
         for layer in packed {
+            let residual =
+                |weight: &[f32]| LayerConv::with_slack(device, &kernels.conv, dim, weight, slack);
             wrapped[layer.layer] = Some(LayerDevice {
-                attention: LayerProjections::wrap(device, kernels, layer)?,
-                attn_sconv: LayerConv::new(device, &kernels.conv, dim, &layer.attn_sconv)?,
+                attention: LayerProjections::wrap(device, kernels, layer, slack)?,
+                attn_sconv: residual(&layer.attn_sconv)?,
                 post_attention_layernorm: LayerNorm::new(
                     device,
                     &kernels.norm,
@@ -762,7 +794,7 @@ impl<'a> ModelLayers<'a> {
                             .map(|ffn| LayerMlpDevice::Dense(Box::new(ffn)))
                     })
                     .transpose()?,
-                mlp_sconv: LayerConv::new(device, &kernels.conv, dim, &layer.mlp_sconv)?,
+                mlp_sconv: residual(&layer.mlp_sconv)?,
             });
         }
         for bank in banks {
@@ -840,6 +872,44 @@ impl LayerBackend for ModelLayers<'_> {
     fn decoder(&self, layer: usize) -> Option<&dyn DecoderDevice> {
         self.whole(layer)?;
         Some(self as &dyn DecoderDevice)
+    }
+
+    /// Every layer this holds, because a sequence is in every one of them.
+    ///
+    /// A layer the CPU kept has nothing here to take back and is skipped rather
+    /// than refused: its state is the cache, which the caller has already
+    /// rewound.
+    ///
+    /// **Between runs, and that is what the first line says.** A rewind reads
+    /// and writes windows the device holds, so the dispatches that wrote them
+    /// have to have run — and a run part way through is a command buffer with
+    /// dispatches in it that have not. There is no such run here when a caller
+    /// asks: what closes one is the last layer of the stack, whose rows every
+    /// caller reads back before it can know there is anything to take back.
+    fn rewind(&self, rows: usize) {
+        assert!(
+            self.carried.borrow().is_none(),
+            "a rewind while a run of layers is still being encoded"
+        );
+        for layer in self.layers.iter().flatten() {
+            layer.rewind(rows);
+        }
+    }
+}
+
+impl LayerDevice<'_> {
+    /// Take back the last `rows` timesteps of everything this layer holds for
+    /// the sequence in flight: its attention's keys and two windows, and the
+    /// two convolutions on its residual paths.
+    ///
+    /// Four windows and a span, which is the whole of what
+    /// [`DecoderCache`](inkling_core::DecoderCache) holds for a layer that runs
+    /// here — see [`crate::LayerConv::rewind`] for what they need of the
+    /// caller.
+    fn rewind(&self, rows: usize) {
+        self.attention.rewind(rows);
+        self.attn_sconv.rewind(rows);
+        self.mlp_sconv.rewind(rows);
     }
 }
 
@@ -1233,9 +1303,13 @@ mod tests {
         let ckpt = fixture::open(fixture::MXFP4);
 
         for (r_proj, o_proj) in LAST_TWO {
-            let five =
-                LayerProjections::wrap(&device, &kernels, &layer_packed(&ckpt, (r_proj, o_proj)))
-                    .expect("the five wrap");
+            let five = LayerProjections::wrap(
+                &device,
+                &kernels,
+                &layer_packed(&ckpt, (r_proj, o_proj)),
+                0,
+            )
+            .expect("the five wrap");
 
             each_answers(
                 &ckpt,
@@ -1323,6 +1397,7 @@ mod tests {
                 },
                 ..layer_packed(&ckpt, LAST_TWO[0])
             },
+            0,
         )
         .expect("the five wrap");
 
@@ -1369,7 +1444,7 @@ mod tests {
         let kernels = LayerKernels::compile(&device).expect("the kernels compile");
         let ckpt = fixture::open(fixture::MXFP4);
 
-        let five = LayerProjections::wrap(&device, &kernels, &layer_packed(&ckpt, LAST_TWO[0]))
+        let five = LayerProjections::wrap(&device, &kernels, &layer_packed(&ckpt, LAST_TWO[0]), 0)
             .expect("the five wrap");
 
         let config = shape();
@@ -1477,8 +1552,11 @@ mod tests {
             experts,
             &packed_layers,
             &[],
-            LAYERS,
-            IN_DIM,
+            StackShape {
+                layers: LAYERS,
+                dim: IN_DIM,
+                slack: 0,
+            },
         )
         .expect("the layers wrap");
 
@@ -1531,6 +1609,9 @@ mod tests {
         device: &'a Device,
         kernels: &'a LayerKernels,
         swiglu: &'a SwiGlu,
+        /// Timesteps every one of the layer's four windows can give back, which
+        /// is zero for every case but the one that rewinds.
+        slack: usize,
     }
 
     /// The shapes a `Narrow` layer is built to, which have to be whole groups of
@@ -1577,8 +1658,14 @@ mod tests {
         }
 
         fn conv(&self, channels: usize, weight: &[f32]) -> LayerConv<'a> {
-            LayerConv::new(self.device, &self.kernels.conv, channels, weight)
-                .expect("the kernel uploads")
+            LayerConv::with_slack(
+                self.device,
+                &self.kernels.conv,
+                channels,
+                weight,
+                self.slack,
+            )
+            .expect("the kernel uploads")
         }
 
         /// The whole layer on the device, with a dense feed-forward network in
@@ -1719,6 +1806,7 @@ mod tests {
             device: &device,
             kernels: &kernels,
             swiglu: &swiglu,
+            slack: 0,
         };
         let weights = NarrowWeights::new();
         let stack = stack(&device, vec![narrow.layer(&weights, 0)]);
@@ -1802,6 +1890,7 @@ mod tests {
             device: &device,
             kernels: &kernels,
             swiglu: &swiglu,
+            slack: 0,
         };
         let weights = NarrowWeights::new();
         let stack = stack(
@@ -1866,6 +1955,91 @@ mod tests {
         let agreed = deviation(&prefilled.0, &apart.0);
         assert!(agreed <= TOLERANCE, "the prefill: deviation {agreed:e}");
         assert_eq!(prefill, 6, "a submission a layer a call over three layers");
+    }
+
+    /// A stack of layers this backend holds whole, which is what a merged run is
+    /// asked of — see [`ModelLayers::run`].
+    /// **A rejected speculative token leaves nothing behind in a stack that ran
+    /// on the device.**
+    ///
+    /// The CPU path states this over its own five layers — see
+    /// [`inkling_core::model`] — and it has to hold here for a different
+    /// reason: what a layer left behind is not the cache the caller holds but
+    /// the span and the four windows the device holds, so a rewind that reached
+    /// only the first would leave a sequence that still runs and attends over a
+    /// position it half took back.
+    ///
+    /// Driven a row at a time over two layers, which is the shape that makes it
+    /// worth driving: a decode step is one command buffer spanning both layers,
+    /// so the dispatches that write the windows a rewind moves are the ones a
+    /// merged run defers — and the wait that has to have happened before a
+    /// caller can ask is the one at the end of the stack.
+    ///
+    /// Exact equality, because both runs are the same dispatches over the same
+    /// floats and the only thing a rewind changes is which call wrote a window.
+    #[test]
+    fn rewinding_a_run_of_layers_that_ran_on_the_device_leaves_them_where_it_found_them() {
+        let Some(device) = device() else { return };
+        let kernels = LayerKernels::compile(&device).expect("the kernels compile");
+        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
+        let weights = NarrowWeights::new();
+        let (x, more) = (hidden_rows(1), hidden_rows(1));
+        let wrong: Vec<f32> = more.iter().map(|value| -3.0 * value).collect();
+
+        let run = |slack: usize, rejected: Option<&[f32]>| {
+            let narrow = Narrow {
+                device: &device,
+                kernels: &kernels,
+                swiglu: &swiglu,
+                slack,
+            };
+            let stack = stack(
+                &device,
+                vec![narrow.layer(&weights, 0), narrow.layer(&weights, 0x99)],
+            );
+            let layers: Vec<DecoderLayer<'_>> = (0..2)
+                .map(|at| {
+                    let held = stack.layer(at).expect("the layer is here");
+                    DecoderLayer::new(
+                        NARROW,
+                        weights.decoder(&held.attention),
+                        LayerMlp::Dense(DenseMlp::backend(
+                            NARROW.hidden,
+                            NARROW_FFN,
+                            held.mlp.as_ref().and_then(dense).expect("a dense layer"),
+                            GLOBAL_SCALE,
+                        )),
+                    )
+                })
+                .collect();
+
+            let held = Some(&stack as &dyn DecoderDevice);
+            let caches = &mut [
+                DecoderCache::speculating(NARROW, NARROW.hidden, KERNEL_SIZE, slack),
+                DecoderCache::speculating(NARROW, NARROW.hidden, KERNEL_SIZE, slack),
+            ];
+            let through = |x: &[f32], caches: &mut [DecoderCache; 2]| {
+                let mut h = Passed::Rows(x.to_vec());
+                for (at, layer) in layers.iter().enumerate() {
+                    h = layer.forward(at, &mut caches[at], h.handed(), &NoExperts, held);
+                }
+                h.rows()
+            };
+
+            through(&x, caches);
+            if let Some(rejected) = rejected {
+                through(rejected, caches);
+                let rows = rejected.len() / NARROW.hidden;
+                for cache in caches.iter_mut() {
+                    cache.rewind(rows);
+                }
+                LayerBackend::rewind(&stack, rows);
+            }
+            through(&more, caches)
+        };
+
+        assert_eq!(run(1, Some(&wrong)), run(1, None), "a row taken back");
+        assert_eq!(run(0, None), run(1, None), "windows that kept slack");
     }
 
     /// A stack of layers this backend holds whole, which is what a merged run is

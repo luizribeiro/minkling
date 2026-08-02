@@ -41,17 +41,95 @@ pub struct ShortConv<'a> {
 /// never speculates asks for none and holds exactly what it did before.
 #[derive(Debug, Clone)]
 pub struct ConvState {
+    held: Held,
+    history: Vec<f32>,
+}
+
+/// The bookkeeping a rewindable window is, without the timesteps.
+///
+/// **Both backends hold the same window and neither holds it in the same
+/// place.** [`ConvState`] keeps its rows in a vector and
+/// `LayerConv` keeps them in a device buffer, and what is the
+/// same either way is the arithmetic: how many rows are there, which of them
+/// the convolution reads, how many are still the sequence's, and that taking
+/// `r` of them back is a shift of the rest along by `r`. So it is here, and
+/// each side hands it whatever holds the floats.
+#[derive(Debug, Clone, Copy)]
+pub struct Held {
     channels: usize,
     /// The `kernel_size - 1` timesteps a convolution reads, which is the tail
-    /// of `history`.
+    /// of the rows.
     window: usize,
-    history: Vec<f32>,
-    /// How many trailing rows of `history` are this sequence's own.
+    /// Timesteps held behind that, which is what a rewind spends.
+    slack: usize,
+    /// How many trailing rows are this sequence's own.
     ///
     /// A rewind shifts the rest along and leaves the front holding rows that
     /// belong to nothing, so this is what says how far back one may go again —
-    /// see [`ConvState::rewind`].
+    /// see [`Held::rewind`].
     kept: usize,
+}
+
+impl Held {
+    pub fn new(channels: usize, kernel_size: usize, slack: usize) -> Self {
+        assert!(kernel_size > 0, "a kernel needs at least one tap");
+        let window = kernel_size - 1;
+        Self {
+            channels,
+            window,
+            slack,
+            kept: window + slack,
+        }
+    }
+
+    /// Timesteps this holds at all, which is the window plus its slack.
+    pub fn rows(&self) -> usize {
+        self.window + self.slack
+    }
+
+    /// Floats this holds, which is what whoever holds them has to allocate.
+    pub fn floats(&self) -> usize {
+        self.rows() * self.channels
+    }
+
+    /// Where the window the convolution reads starts, in floats.
+    pub fn reading(&self) -> usize {
+        self.slack * self.channels
+    }
+
+    /// How many timesteps may still be taken back, which is what the slack
+    /// bought and what a rewind spends.
+    pub fn rewindable(&self) -> usize {
+        self.kept - self.window
+    }
+
+    /// The rows a call of `rows` timesteps leaves behind it.
+    pub fn advanced(&mut self, rows: usize) {
+        self.kept = (self.kept + rows).min(self.rows());
+    }
+
+    /// The rows this holds again, which is every one of them.
+    pub fn restarted(&mut self) {
+        self.kept = self.rows();
+    }
+
+    /// Take back the last `rows` timesteps of `timesteps`, leaving the window
+    /// the convolution would have had without them.
+    ///
+    /// The rest shift along, which leaves the front holding rows that are
+    /// nobody's — so what this can give back is bounded by [`Held::rewindable`]
+    /// rather than by the slack alone, and a call past that is refused rather
+    /// than answered from them.
+    pub fn rewind(&mut self, rows: usize, timesteps: &mut [f32]) {
+        assert!(
+            rows <= self.rewindable(),
+            "a rewind of {rows} against {} the window can give back",
+            self.rewindable()
+        );
+        assert_eq!(timesteps.len(), self.floats(), "the rows this holds");
+        timesteps.copy_within(..self.floats() - rows * self.channels, rows * self.channels);
+        self.kept -= rows;
+    }
 }
 
 impl ConvState {
@@ -72,57 +150,27 @@ impl ConvState {
     /// padding that makes the first output causal — so a rewind at the start of
     /// a sequence is allowed and gives back the same window.
     pub fn with_slack(channels: usize, kernel_size: usize, slack: usize) -> Self {
-        assert!(kernel_size > 0, "a kernel needs at least one tap");
-        let window = kernel_size - 1;
+        let held = Held::new(channels, kernel_size, slack);
         Self {
-            channels,
-            window,
-            history: vec![0.0; (window + slack) * channels],
-            kept: window + slack,
+            history: vec![0.0; held.floats()],
+            held,
         }
     }
 
     /// The `kernel_size - 1` timesteps preceding the next input, oldest first,
     /// which is the whole of what the convolution reads.
     pub fn history(&self) -> &[f32] {
-        &self.history[(self.rows() - self.window) * self.channels..]
+        &self.history[self.held.reading()..]
     }
 
-    /// Timesteps this holds at all, which is the window plus its slack.
-    fn rows(&self) -> usize {
-        match self.channels {
-            0 => 0,
-            channels => self.history.len() / channels,
-        }
-    }
-
-    /// Timesteps this holds behind the window the convolution reads.
-    fn slack(&self) -> usize {
-        self.rows() - self.window
-    }
-
-    /// How many timesteps may still be taken back, which is what the slack
-    /// bought and what a rewind spends.
+    /// How many timesteps may still be taken back.
     pub fn rewindable(&self) -> usize {
-        self.kept - self.window
+        self.held.rewindable()
     }
 
-    /// Take back the last `rows` inputs, leaving the window the convolution
-    /// would have had without them.
-    ///
-    /// The rest shift along, which leaves the front of the history holding rows
-    /// that are nobody's — so what this can give back is bounded by
-    /// [`ConvState::rewindable`] rather than by the slack alone, and a call
-    /// past that is refused rather than answered from them.
+    /// Take back the last `rows` inputs — see [`Held::rewind`].
     pub fn rewind(&mut self, rows: usize) {
-        assert!(
-            rows <= self.rewindable(),
-            "a rewind of {rows} against {} the window can give back",
-            self.rewindable()
-        );
-        let kept = (self.rows() - rows) * self.channels;
-        self.history.copy_within(..kept, rows * self.channels);
-        self.kept -= rows;
+        self.held.rewind(rows, &mut self.history);
     }
 }
 
@@ -174,7 +222,10 @@ impl<'a> ShortConv<'a> {
     /// padding leaking into the convolution's window.
     pub fn forward(&self, state: &mut ConvState, x: &[f32], mask: Option<&[bool]>) -> Vec<f32> {
         let _timed = profile::scope(Op::Sconv);
-        assert_eq!(state.channels, self.channels, "state is for another conv");
+        assert_eq!(
+            state.held.channels, self.channels,
+            "state is for another conv"
+        );
         assert_eq!(
             x.len() % self.channels,
             0,
@@ -188,14 +239,14 @@ impl<'a> ShortConv<'a> {
         }
 
         let padded = self.pad(state, x, mask);
-        let mut out = self.convolve(&padded[state.slack() * self.channels..], rows);
+        let mut out = self.convolve(&padded[state.held.reading()..], rows);
         for (out, residual) in out.iter_mut().zip(x) {
             *out += residual;
         }
 
         let tail = padded.len() - state.history.len();
         state.history.copy_from_slice(&padded[tail..]);
-        state.kept = (state.kept + rows).min(state.rows());
+        state.held.advanced(rows);
         out
     }
 
@@ -450,7 +501,7 @@ mod tests {
         let state = ConvState::new(8, 4);
         assert_eq!(state.history().len(), 3 * 8);
         assert_eq!(state.rewindable(), 0);
-        assert_eq!(state.rows(), 3);
+        assert_eq!(state.held.rows(), 3);
     }
 
     #[test]

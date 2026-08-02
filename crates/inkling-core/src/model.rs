@@ -85,6 +85,19 @@ pub trait ModelWeights {
     /// Row `id` of `embed_tokens`, `[hidden]` long.
     fn embedding_row(&self, id: usize) -> Vec<f32>;
 
+    /// Take the last `rows` timesteps back out of everything a sequence has
+    /// left behind, wherever that is.
+    ///
+    /// **One call rather than two, because a sequence's state is in two places
+    /// and both have to move.** `cache` is what this side holds and a backend
+    /// running the layers holds the rest — its own key spans and its own
+    /// convolution windows — so a caller that rewound the cache and forgot the
+    /// backend would leave a sequence whose position is one thing here and
+    /// another there, and which still answers.
+    fn rewind(&self, cache: &mut ModelCache, rows: usize) {
+        cache.rewind(rows);
+    }
+
     /// Layer `index` over `[tokens, hidden]`, continuing from `cache` and
     /// leaving this call's keys and convolution windows behind in it.
     ///
