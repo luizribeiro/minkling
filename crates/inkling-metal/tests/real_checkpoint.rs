@@ -2308,19 +2308,21 @@ fn what_a_speculative_round_costs_and_what_it_buys() {
 /// **Which kernels own the milliseconds a chain of heads costs**, and in how
 /// many submissions — the question the sweep above prints one number for.
 ///
-/// That number is the one figure of this engine's that has gone backwards. Four
-/// kernel milestones went into the main step and none of them touched the
-/// chain: a decode step fell 30% while the chain moved 37.92 ms to 37.63, so the
-/// depth that paid 1.31× pays 1.00×. What the sweep cannot say is *why*, and
-/// this project's record at answering that by reasoning is written down —
-/// `lm_head` was predicted at 54% of a step and measured 7.6%.
+/// That number was the one figure of this engine's that had gone backwards, and
+/// this is the table that said where it went. Four kernel milestones went into
+/// the main step and none of them touched the chain: a decode step fell 30%
+/// while the chain moved 37.92 ms to 37.63, so the depth that paid 1.31× paid
+/// 1.00×. What the sweep could not say is *why*, and this project's record at
+/// answering that by reasoning is written down — `lm_head` was predicted at 54%
+/// of a step and measured 7.6%.
 ///
-/// So the chain is put through the same two tables a decode step and a prefill
-/// go through, at the depth the sweep prices it at. What that comparison is for
-/// is the shape rather than the size: a decode step is 1077 dispatches in 15
-/// submissions because a run of layers commits as it fills a buffer and waits
-/// once, and a head hands the device its eight multiplies one command buffer at
-/// a time.
+/// What it said was 88 dispatches in 48 submissions, 1.8 a submission against a
+/// decode step's 71.8, and two thirds of a 43 ms chain waiting for them. It is
+/// 160 dispatches in 16 now — a head and the `lm_head` behind it — for the
+/// reason the same table gives a decode step's 15: what a backend is handed
+/// whole it can encode into one command buffer. The chain is put through the
+/// same two tables a decode step and a prefill go through, at the depth the
+/// sweep prices it at.
 ///
 /// Nothing asserts a share. What is asserted is that the table describes the
 /// chain — every dispatch timed, and the rows summing inside the wall time they
