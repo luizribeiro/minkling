@@ -181,10 +181,13 @@ decode step went 29.65 ms to 23.85 and the device's own clock went with it,
 token moved.
 
 **What the table says next is that the shapes disagree, and that acting on it
-buys nothing yet.** In isolation this kernel reaches 570 GB/s on the routed
-banks a decode step reads and 700 on a prefill's rows, against 170 on a
-`[1, 4096] @ [1024, 4096]ᵀ` key projection and 380 on the two `[4096, 4096]`
-ones — the shapes with too few output elements to fill eighty cores. Both of the
+buys nothing yet.** Over one synthetic bank small enough to stay in cache — so
+the figures rank the shapes rather than state a bandwidth — this kernel reaches
+570 GB/s at a routed bank's decode shape and 700 at a prefill's, against 170 at a
+`[1, 4096] @ [1024, 4096]ᵀ` key projection and 380 at the two `[4096, 4096]`
+ones: the shapes with too few output elements to fill eighty cores. What a cold
+weight costs instead is the 299 GB/s one dispatch of `lm_head` measures, and the
+375 the whole step does. Both of the
 levers that answered that elsewhere were measured here and neither pays.
 `dense_matmul`'s run of simdgroups over one output element is worth 18% on those
 same small shapes and gives up 29% on a routed bank's down projection and 11% on
@@ -530,12 +533,15 @@ measurement**, at two widths out of three; what separates them is unmeasured, an
 the sweep is the one that describes a run. Those six figures are that commit's
 own pair; the tables above are what the two cost now.
 
-A head's guess costs 4.7 ms, of which the 950 MB it reads — its own 532 MiB, and
-`lm_head` again to turn a hidden state into a token — is a smaller part than it
-looks: the packed matmul reading four bytes to a lane took `lm_head` 1.4× faster
-and took 0.15 ms off this, so most of the 4.7 is the five submissions a partial
-handover takes rather than the bytes. The study called the reference's per-head
-overhead "yours to win in Rust", and mlx-vlm was already near it at 3.9 ms.
+A head's guess costs 4.7 ms, of which about 3.4 is the 950 MB it reads — its own
+532 MiB, and `lm_head` again to turn a hidden state into a token — and the rest
+is the five submissions a partial handover takes. The study called the
+reference's per-head overhead "yours to win in Rust"; most of it turns out to be
+bandwidth, and mlx-vlm was already near it at 3.9 ms. **Only the `lm_head` half
+of those bytes is the packed matmul's**, and reading four to a lane took that
+dispatch 1.57 ms to 1.46 and the guess 4.85 to 4.70 — the same tenth of a
+millisecond arriving twice, which is what says the head's own bfloat16 tensors
+are the other half and no kernel here has been at them.
 
 **So every depth pays now.** Over 64 tokens of a structured prompt, three passes
 round-robin over the depths so that a drift moves them all, best pass each:

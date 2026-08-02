@@ -90,6 +90,13 @@ const BYTES_PER_GROUP: usize = GROUP_SIZE / CODES_PER_BYTE;
 /// 55% of what a step reads and give up 4% at eight, and a 97-token prefill 7%.
 /// See `what_a_packed_multiply_costs_at_each_width_a_lane_reads`.
 ///
+/// **The two cancel in a step, which is what makes this a constant and not a
+/// rule.** A dispatch knows its own element count and could pick a width from
+/// it the way [`crate::dense`] picks a reduction run, and eight bytes a lane was
+/// measured that far: 18.14 ms of device time against four's 18.12 over five
+/// alternating pairs. So what decides the number is the prefill, where four is
+/// ahead on its own.
+///
 /// A chunk has to divide [`BYTES_PER_GROUP`], so that the bytes one lane holds
 /// share one scale byte, and it has to divide a weight row, so that no lane
 /// reads past one. Both hold for 4, 8 and 16 against any `in_dim` this module
@@ -1905,6 +1912,16 @@ mod tests {
     /// Nothing asserts a rate. The numbers go to stderr for the commit message
     /// to quote, and what is asserted is that the shipped width was among the
     /// ones tried.
+    ///
+    /// **The rates here rank the widths and do not state a bandwidth.** One
+    /// weight is dispatched against `CALLS` times in a row, and the weights at
+    /// these shapes are a few megabytes, so what the second call reads is what
+    /// the first left in cache — where the banks a step routes through are six
+    /// of 256 out of 137 GB and are cold every time. A cold read of the same
+    /// kernel is the 299 GB/s
+    /// `one_dispatch_does_an_lm_head_shaped_multiply_without_meeting_the_watchdog`
+    /// measures over 0.41 GiB. Both are the same arithmetic, and a table that
+    /// mixed them would be a table about the cache.
     ///
     /// Read off the device's own clock over a command buffer of `CALLS`
     /// dispatches, because a submission is 225 microseconds and most of these
