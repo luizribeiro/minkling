@@ -9,6 +9,14 @@ rust-version.workspace = true
 name = "inklingrs"
 path = "src/main.rs"
 
+# Two builds of the engine weighed against each other, and the arms it weighs.
+# In this crate rather than beside it because it drives the same `backend` and
+# `config` the command does, and a measurement of an engine nobody runs is worth
+# nothing.
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true

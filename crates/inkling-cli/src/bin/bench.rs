@@ -1,0 +1,838 @@
+//! Two builds of this engine, weighed against each other in one sitting.
+//!
+//! # What it is for
+//!
+//! Every figure in the README is paired and alternating: build A, build B, run
+//! them one after the other with the order flipped each pair, and report whether
+//! the ranges overlap. That discipline is what makes a 3% claim a claim rather
+//! than a coin, and nothing here changes it.
+//!
+//! What it changes is the price. A flip used to mean checking out the other ref
+//! and rebuilding the Metal crate — several times a milestone, across three
+//! prompt lengths and up to seven pairs — and the rebuild bought nothing, because
+//! the two binaries do not change between pairs. So this binary is both halves of
+//! the arrangement: `alternate` drives two executables that were each built once,
+//! and `decode`, `prefill` and `sweep` are what those executables do.
+//!
+//! # The protocol between the two halves
+//!
+//! An arm prints one reading a line to stdout — `name value unit` — and anything
+//! it wants to say to a human on stderr. That is the whole contract, which is
+//! what lets the harness be about alternation and statistics and know nothing
+//! about what a decode step is. It also means an arm from an older commit works
+//! here for as long as it prints the same names.
+//!
+//! # What it does not do
+//!
+//! It does not run measurements beside each other. `.config/nextest.toml` records
+//! what a number taken beside another test is worth — M12 lost a day to a 15 ms
+//! device-time regression that was the suite around it — and one process at a
+//! time is as true here as it is there. One arm runs, then the other. Each opens
+//! one Metal device, which at a second apiece is the reason a run measures as
+//! much as it can once it has one.
+
+use std::fmt::Write as _;
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use inkling_cli::args::Backend;
+use inkling_cli::{backend, config};
+use inkling_core::mtp::{CheckpointHeads, MtpProposer};
+use inkling_core::workload::{DECODED, STRUCTURED_PROMPT, SWEPT, tiled};
+use inkling_core::{
+    Checkpoint, CheckpointWeights, Ending, ModelCache, TextConfig, Tokenizer, profile,
+};
+
+/// How long a prefill's prompt is, when nobody says. The middle of the three
+/// lengths this repo quotes.
+const PREFILLED: usize = 385;
+
+/// How many pairs `alternate` runs, when nobody says. Seven, which is what every
+/// paired figure in the README was taken over.
+const PAIRS: usize = 7;
+
+const USAGE: &str = "usage:\n  \
+    bench decode  <checkpoint> [--tokens <n>]\n  \
+    bench prefill <checkpoint> [--tokens <n>]\n  \
+    bench sweep   <checkpoint> [--tokens <n>] [--depth <k>]\n  \
+    bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
+
+/// What an invocation nobody could parse exits with, apart from one that ran and
+/// failed.
+const MISUSED: u8 = 2;
+
+fn main() -> ExitCode {
+    let job = match Job::parse(std::env::args().skip(1)) {
+        Ok(job) => job,
+        Err(err) => {
+            eprintln!("{err:#}\n\n{USAGE}");
+            return ExitCode::from(MISUSED);
+        }
+    };
+    match job.run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// One number an arm reported, as the harness reads it back.
+#[derive(Debug, Clone, PartialEq)]
+struct Reading {
+    name: String,
+    value: f64,
+    unit: String,
+}
+
+impl Reading {
+    fn new(name: impl Into<String>, value: f64, unit: &str) -> Self {
+        Self {
+            name: name.into(),
+            value,
+            unit: unit.to_string(),
+        }
+    }
+
+    /// As it crosses between the two halves. Four decimals because the smallest
+    /// thing anybody compares here is a hundredth of a millisecond and the
+    /// rounding should not be this line's.
+    fn line(&self) -> String {
+        format!("{} {:.4} {}", self.name, self.value, self.unit)
+    }
+}
+
+/// Every reading of one run, in the order the arm printed them.
+fn readings(printed: &str) -> Result<Vec<Reading>> {
+    printed
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                (Some(name), Some(value), Some(unit), None) => Ok(Reading::new(
+                    name,
+                    value
+                        .parse()
+                        .with_context(|| format!("{value} is not a number, in {line:?}"))?,
+                    unit,
+                )),
+                _ => bail!("{line:?} is not `name value unit`"),
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum What {
+    Decode,
+    Prefill,
+    Sweep,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Job {
+    /// One arm's worth of work: a checkpoint, and what to time against it.
+    Measure {
+        what: What,
+        checkpoint: PathBuf,
+        /// Tokens decoded, or — for a prefill — tokens in the prompt.
+        tokens: usize,
+        depth: usize,
+    },
+    /// The harness: two executables that already exist, run against each other.
+    Alternate {
+        pairs: usize,
+        arms: [PathBuf; 2],
+        args: Vec<String>,
+    },
+}
+
+impl Job {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut args = args.into_iter();
+        let what = match args.next().as_deref() {
+            Some("decode") => What::Decode,
+            Some("prefill") => What::Prefill,
+            Some("sweep") => What::Sweep,
+            Some("alternate") => return Self::alternating(args),
+            Some(word) => bail!("{word} is not one of decode, prefill, sweep or alternate"),
+            None => bail!("no measurement given"),
+        };
+
+        let mut checkpoint = None;
+        let mut tokens = None;
+        let mut depth = SWEPT;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--tokens" | "-n" => tokens = Some(count(&arg, &mut args)?),
+                "--depth" | "-k" => depth = count(&arg, &mut args)?,
+                _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
+                _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
+                _ => bail!("unexpected argument {arg}"),
+            }
+        }
+        Ok(Self::Measure {
+            what,
+            checkpoint: checkpoint.context("no path to a checkpoint directory")?,
+            tokens: tokens.unwrap_or(match what {
+                What::Prefill => PREFILLED,
+                _ => DECODED,
+            }),
+            depth,
+        })
+    }
+
+    fn alternating(args: impl Iterator<Item = String>) -> Result<Self> {
+        let mut args = args.into_iter();
+        let mut pairs = PAIRS;
+        let mut arms = Vec::new();
+        let mut shared = Vec::new();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--pairs" | "-p" => pairs = count(&arg, &mut args)?,
+                // Everything past the separator belongs to the arms, flags and
+                // all, which is what lets them take flags this does not have.
+                "--" => {
+                    shared.extend(args.by_ref());
+                    break;
+                }
+                _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
+                _ => arms.push(PathBuf::from(arg)),
+            }
+        }
+        let [a, b] = <[PathBuf; 2]>::try_from(arms).map_err(|arms: Vec<PathBuf>| {
+            anyhow::anyhow!("alternate takes two executables, given {}", arms.len())
+        })?;
+        Ok(Self::Alternate {
+            pairs,
+            arms: [a, b],
+            args: shared,
+        })
+    }
+
+    fn run(&self) -> Result<()> {
+        match self {
+            Self::Measure {
+                what,
+                checkpoint,
+                tokens,
+                depth,
+            } => {
+                for reading in measure(*what, checkpoint, *tokens, *depth)? {
+                    println!("{}", reading.line());
+                }
+                Ok(())
+            }
+            Self::Alternate { pairs, arms, args } => alternate(*pairs, arms, args),
+        }
+    }
+}
+
+/// A count of at least one, which every number this takes is: no measurement is
+/// defined over zero tokens, zero pairs or a sweep of no depths.
+fn count(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize> {
+    let value = args
+        .next()
+        .with_context(|| format!("{flag} takes a value"))?;
+    match value.parse() {
+        Ok(count) if count > 0 => Ok(count),
+        _ => bail!("{value} is not a count of at least one, after {flag}"),
+    }
+}
+
+/// One generation, and what it cost.
+struct Generated {
+    /// Every step, the prompt's prefill first.
+    steps: Vec<Duration>,
+    /// What the device executed for, per step of the regime being charged.
+    gpu: Duration,
+    tokens: usize,
+    rounds: usize,
+    rates: Vec<f64>,
+}
+
+impl Generated {
+    /// What one step of the regime charged took: the prefill, or the mean of the
+    /// decode steps after it.
+    ///
+    /// The two are not the same price, and a mean over both describes neither —
+    /// which is why the clock a decode figure comes from starts at the first
+    /// token rather than at the call.
+    fn step(&self) -> Duration {
+        match self.steps.split_first() {
+            Some((prefill, [])) => *prefill,
+            Some((_, decode)) => decode.iter().sum::<Duration>() / decode.len() as u32,
+            None => Duration::ZERO,
+        }
+    }
+
+    /// Tokens a round banked, which is what acceptance buys before the cost of
+    /// having guessed comes off it.
+    fn per_round(&self) -> f64 {
+        self.tokens as f64 / self.rounds.max(1) as f64
+    }
+}
+
+fn millis(elapsed: Duration) -> f64 {
+    elapsed.as_secs_f64() * 1e3
+}
+
+/// What this run of the engine is asked to time, taken once against a checkpoint
+/// this process opens exactly one device for.
+fn measure(what: What, dir: &Path, tokens: usize, depth: usize) -> Result<Vec<Reading>> {
+    let config = config::of_checkpoint(dir)?;
+    let text = &config.text_config;
+    let tokenizer = Tokenizer::open(dir, &config)?;
+    let prompt: Vec<usize> = tokenizer
+        .encode(STRUCTURED_PROMPT)?
+        .into_iter()
+        .map(|id| id as usize)
+        .collect();
+
+    let gpu = backend::open(Backend::Metal)?;
+    let ckpt = Checkpoint::open(dir)?;
+
+    // A prefill is one step and its prompt is the measurement, so the prompt is
+    // tiled to the length asked for.
+    let (ids, budget) = match what {
+        What::Prefill => (tiled(&prompt, tokens), 1),
+        _ => (prompt, tokens),
+    };
+    let deepest = match what {
+        What::Sweep => depth,
+        _ => 0,
+    };
+
+    let mut taken = Vec::new();
+    let mut unspeculated = None;
+    for depth in 0..=deepest {
+        // Wrapped at the depth being measured rather than at the deepest one:
+        // the windows a rejected token is taken back out of are wider by the
+        // depth, so this is the configuration a run of that depth actually has.
+        let weights = backend::weights(gpu.as_ref(), &ckpt, text, depth)?;
+        let tail = backend::tail_weights(&weights, text);
+        let heads = backend::heads(gpu.as_ref(), &ckpt, &config, depth, &tail)?;
+
+        // Thrown away, because the first generation of a process faults in the
+        // pages the rest of them read — 4.2 GiB of it once heads are mapped —
+        // and that belongs to a run's first token rather than to whichever arm
+        // ran first.
+        generate(
+            &weights,
+            heads.as_ref(),
+            text,
+            &ids[..ids.len().min(8)],
+            2,
+            depth,
+        );
+        let run = generate(&weights, heads.as_ref(), text, &ids, budget, depth);
+
+        match what {
+            What::Decode => {
+                taken.push(Reading::new("decode", millis(run.step()), "ms"));
+                taken.push(Reading::new("device", millis(run.gpu), "ms"));
+            }
+            What::Prefill => {
+                // The second of two, for the reason the timing tier prints both:
+                // the first prefill of a length is the one that faults its pages
+                // in, and what a prefill costs warm is the figure every other
+                // one here is comparable to.
+                let again = generate(&weights, heads.as_ref(), text, &ids, budget, depth);
+                taken.push(Reading::new("prefill", millis(again.step()), "ms"));
+                taken.push(Reading::new("device", millis(again.gpu), "ms"));
+                taken.push(Reading::new("cold", millis(run.step()), "ms"));
+            }
+            What::Sweep => {
+                let step = run.step();
+                let unspeculated = *unspeculated.get_or_insert(step);
+                taken.push(Reading::new(format!("k{depth}"), millis(step), "ms"));
+                taken.push(Reading::new(
+                    format!("k{depth}.device"),
+                    millis(run.gpu),
+                    "ms",
+                ));
+                // Against this run's own `k = 0` and not against another
+                // sitting's: a sweep whose speedup row is divided by a figure
+                // taken an hour earlier carries the drift between the two.
+                taken.push(Reading::new(
+                    format!("k{depth}.speedup"),
+                    unspeculated.as_secs_f64() / step.as_secs_f64(),
+                    "x",
+                ));
+                taken.push(Reading::new(
+                    format!("k{depth}.tokens"),
+                    run.per_round(),
+                    "/round",
+                ));
+                for (at, rate) in run.rates.iter().enumerate() {
+                    taken.push(Reading::new(
+                        format!("k{depth}.accept{}", at + 1),
+                        100.0 * rate,
+                        "%",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(taken)
+}
+
+/// One generation of `budget` tokens, timed a step at a time.
+fn generate(
+    weights: &CheckpointWeights<'_>,
+    heads: Option<&CheckpointHeads<'_>>,
+    config: &TextConfig,
+    ids: &[usize],
+    budget: usize,
+    depth: usize,
+) -> Generated {
+    let generator = weights.generator();
+    let cache = &mut ModelCache::speculating(config, depth);
+    let ending = Ending { budget, eos: None };
+    let mut proposer = heads
+        .filter(|_| depth > 0)
+        .map(|heads| MtpProposer::new(heads, generator, weights, depth));
+
+    let mut steps = Vec::new();
+    let mut tokens = 0;
+    // Cleared here so that what comes back is this generation's: wrapping the
+    // model charges the same accounts, and on a prefill there is no later step
+    // for it to be small beside.
+    profile::take();
+    let mut step = Instant::now();
+    {
+        let mut sink = |_: usize| {
+            steps.push(step.elapsed());
+            // The prefill's accounts, dropped where the prefill's duration is:
+            // a decode figure is about the steps after it.
+            if steps.len() == 1 && budget > 1 {
+                profile::take();
+            }
+            tokens += 1;
+            step = Instant::now();
+            ControlFlow::Continue(())
+        };
+        match proposer.as_mut() {
+            Some(proposer) => generator.speculate(cache, ids, ending, weights, proposer, &mut sink),
+            None => generator.stream(cache, ids, ending, weights, &mut sink),
+        };
+    }
+
+    let charged = u32::try_from(steps.len().saturating_sub(1).max(1)).unwrap_or(1);
+    Generated {
+        gpu: profile::take().per_step(charged).gpu(),
+        rounds: proposer.as_ref().map_or(tokens, MtpProposer::rounds),
+        rates: proposer
+            .map(|proposer| proposer.rates())
+            .unwrap_or_default(),
+        steps,
+        tokens,
+    }
+}
+
+/// Two executables, run against each other for `pairs` pairs with the order
+/// flipped each pair.
+fn alternate(pairs: usize, arms: &[PathBuf; 2], args: &[String]) -> Result<()> {
+    let mut taken: [Vec<Vec<Reading>>; 2] = [Vec::new(), Vec::new()];
+    for pair in 0..pairs {
+        // Flipped, so that neither arm always runs on the other's warm page
+        // cache and a drift over the sitting lands on both of them.
+        let order = if pair % 2 == 0 { [0, 1] } else { [1, 0] };
+        for arm in order {
+            let readings = ask(&arms[arm], args).with_context(|| {
+                format!("running {} for pair {}", arms[arm].display(), pair + 1)
+            })?;
+            eprintln!(
+                "pair {} of {pairs}, arm {}: {}",
+                pair + 1,
+                ["a", "b"][arm],
+                readings
+                    .iter()
+                    .map(|reading| reading.line())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            taken[arm].push(readings);
+        }
+    }
+    print!("{}", report(arms, &compare(&taken)?));
+    Ok(())
+}
+
+/// One run of one arm.
+///
+/// Its stdout is the readings and is read here; its stderr is inherited, which
+/// is the other half of the protocol: what an arm says to a human — which
+/// backend it wrapped, what it is part way through — reaches the terminal while
+/// it is still running, and a sweep that takes a minute an arm is not silent for
+/// it.
+fn ask(arm: &Path, args: &[String]) -> Result<Vec<Reading>> {
+    let ran = Command::new(arm)
+        .args(args)
+        .stderr(Stdio::inherit())
+        .output()
+        .with_context(|| format!("{} did not start", arm.display()))?;
+    if !ran.status.success() {
+        bail!(
+            "{} exited {}, saying what is above",
+            arm.display(),
+            ran.status
+        );
+    }
+    readings(&String::from_utf8_lossy(&ran.stdout))
+}
+
+/// What the two arms said about one metric.
+#[derive(Debug, PartialEq)]
+struct Comparison {
+    name: String,
+    unit: String,
+    /// The mean, then the smallest and largest reading, for each arm in turn.
+    arms: [(f64, f64, f64); 2],
+    /// Whether the two ranges lie across each other, which is what says the
+    /// difference between the means is not this machine's own state.
+    overlap: bool,
+    /// How many pairs moved the way the means did.
+    agreed: usize,
+    pairs: usize,
+}
+
+impl Comparison {
+    /// What b is against a, as a percentage. Divided by a mean rather than by
+    /// anything hard-coded, and every metric an arm reports here is a duration,
+    /// a rate or a share of one — none of which a run that produced a reading at
+    /// all can report as zero.
+    fn change(&self) -> f64 {
+        100.0 * (self.arms[1].0 / self.arms[0].0 - 1.0)
+    }
+
+    /// The standard this file's own README states for a real effect: every pair
+    /// moving the same way, and the two ranges not overlapping.
+    fn stands(&self) -> bool {
+        !self.overlap && self.agreed == self.pairs
+    }
+}
+
+fn compare(taken: &[Vec<Vec<Reading>>; 2]) -> Result<Vec<Comparison>> {
+    let names: Vec<(String, String)> = taken[0]
+        .first()
+        .context("no pairs were run")?
+        .iter()
+        .map(|reading| (reading.name.clone(), reading.unit.clone()))
+        .collect();
+    for arm in taken {
+        for run in arm {
+            let ran: Vec<(String, String)> = run
+                .iter()
+                .map(|reading| (reading.name.clone(), reading.unit.clone()))
+                .collect();
+            if ran != names {
+                bail!(
+                    "the arms do not report the same readings: {:?} against {:?}",
+                    names.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                    ran.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    Ok(names
+        .iter()
+        .enumerate()
+        .map(|(at, (name, unit))| {
+            let series =
+                |arm: usize| -> Vec<f64> { taken[arm].iter().map(|run| run[at].value).collect() };
+            let (a, b) = (series(0), series(1));
+            let stats = |values: &[f64]| {
+                (
+                    values.iter().sum::<f64>() / values.len() as f64,
+                    values.iter().copied().fold(f64::INFINITY, f64::min),
+                    values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                )
+            };
+            let (first, second) = (stats(&a), stats(&b));
+            let rose = second.0 > first.0;
+            Comparison {
+                name: name.clone(),
+                unit: unit.clone(),
+                arms: [first, second],
+                overlap: first.1 <= second.2 && second.1 <= first.2,
+                agreed: a
+                    .iter()
+                    .zip(&b)
+                    .filter(|(one, two)| (**two > **one) == rose && **two != **one)
+                    .count(),
+                pairs: a.len(),
+            }
+        })
+        .collect())
+}
+
+fn report(arms: &[PathBuf; 2], compared: &[Comparison]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\na  {}\nb  {}\n",
+        arms[0].display(),
+        arms[1].display()
+    );
+    let _ = writeln!(
+        out,
+        "  {:<16}{:>6}{:>11}{:>11}{:>9}  {:<17}{:<17}{:<9}{:<12}claim",
+        "", "unit", "a", "b", "change", "a range", "b range", "ranges", "pairs"
+    );
+    for row in compared {
+        let range = |arm: usize| format!("{:.3}-{:.3}", row.arms[arm].1, row.arms[arm].2);
+        let pairs = format!("{} of {}", row.agreed, row.pairs);
+        let _ = writeln!(
+            out,
+            "  {:<16}{:>6}{:>11.3}{:>11.3}{:>8.1}%  {:<17}{:<17}{:<9}{:<12}{}",
+            row.name,
+            row.unit,
+            row.arms[0].0,
+            row.arms[1].0,
+            row.change(),
+            range(0),
+            range(1),
+            if row.overlap { "across" } else { "apart" },
+            pairs,
+            if row.stands() {
+                "every pair the same way, ranges apart"
+            } else {
+                "no claim"
+            }
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn a_reading_is_a_name_a_number_and_a_unit() {
+        assert_eq!(
+            readings("decode 20.86 ms\ndevice 18.17 ms\n").expect("parses"),
+            [
+                Reading::new("decode", 20.86, "ms"),
+                Reading::new("device", 18.17, "ms")
+            ]
+        );
+    }
+
+    /// Blank lines are a formatting choice an arm is allowed; anything else on
+    /// stdout is an arm that is not speaking this protocol, and taking a mean
+    /// over what could be parsed out of it would report a measurement nobody
+    /// made.
+    #[test]
+    fn a_line_that_is_not_a_reading_is_refused_rather_than_skipped() {
+        assert_eq!(readings("\ndecode 20.86 ms\n\n").expect("parses").len(), 1);
+        for line in ["decode 20.86", "decode fast ms", "decode 20.86 ms please"] {
+            assert!(readings(line).is_err(), "{line:?} parsed");
+        }
+    }
+
+    fn generated(steps: &[u64], tokens: usize, rounds: usize) -> Generated {
+        Generated {
+            steps: steps.iter().map(|ms| Duration::from_millis(*ms)).collect(),
+            gpu: Duration::ZERO,
+            tokens,
+            rounds,
+            rates: Vec::new(),
+        }
+    }
+
+    /// The prefill is a step of another price and the decode figure is the mean
+    /// of the ones after it. A mean over both would describe neither, and it is
+    /// the prefill — twenty times a decode step — that would carry it.
+    #[test]
+    fn a_decode_figure_leaves_the_prefill_in_front_of_it_out() {
+        assert_eq!(
+            generated(&[1000, 20, 22, 24], 4, 4).step(),
+            Duration::from_millis(22)
+        );
+    }
+
+    /// One step is a prefill and has no decode step to be the mean of, which is
+    /// what `bench prefill` runs.
+    #[test]
+    fn a_run_of_one_step_is_that_step() {
+        assert_eq!(generated(&[1000], 1, 1).step(), Duration::from_millis(1000));
+        assert_eq!(generated(&[], 0, 0).step(), Duration::ZERO);
+    }
+
+    /// Tokens a round is what acceptance banked before the cost of having
+    /// guessed comes off it, and a run that speculated nothing banked one.
+    #[test]
+    fn tokens_a_round_is_what_was_banked_over_the_rounds_that_banked_it() {
+        assert!((generated(&[1, 1], 64, 35).per_round() - 1.829).abs() < 1e-3);
+        assert!((generated(&[1, 1], 64, 64).per_round() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_measurement_takes_a_checkpoint_and_its_own_defaults() {
+        assert_eq!(
+            Job::parse(["sweep".to_string(), "models/small".to_string()]).expect("parses"),
+            Job::Measure {
+                what: What::Sweep,
+                checkpoint: PathBuf::from("models/small"),
+                tokens: DECODED,
+                depth: SWEPT,
+            }
+        );
+        assert_eq!(
+            Job::parse(["prefill".to_string(), "models/small".to_string()]).expect("parses"),
+            Job::Measure {
+                what: What::Prefill,
+                checkpoint: PathBuf::from("models/small"),
+                tokens: PREFILLED,
+                depth: SWEPT,
+            }
+        );
+    }
+
+    /// The flags the recipe passes through, and the separator that says which
+    /// side of the harness the rest of the line belongs to.
+    #[test]
+    fn alternate_takes_two_arms_and_hands_everything_past_the_separator_to_both() {
+        let parsed = Job::parse(
+            [
+                "alternate",
+                "--pairs",
+                "3",
+                "a/bench",
+                "b/bench",
+                "--",
+                "prefill",
+                "--tokens",
+                "769",
+            ]
+            .map(str::to_string),
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed,
+            Job::Alternate {
+                pairs: 3,
+                arms: [PathBuf::from("a/bench"), PathBuf::from("b/bench")],
+                args: ["prefill", "--tokens", "769"].map(str::to_string).to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_invocation_that_names_one_arm_or_three_is_refused() {
+        for arms in [vec!["a"], vec!["a", "b", "c"]] {
+            let mut args = vec!["alternate".to_string()];
+            args.extend(arms.iter().map(|arm| arm.to_string()));
+            assert!(Job::parse(args).is_err(), "{arms:?} parsed");
+        }
+    }
+
+    #[test]
+    fn a_count_that_is_not_one_is_refused() {
+        for value in ["0", "-1", "many", ""] {
+            assert!(
+                Job::parse(["decode".to_string(), "-n".to_string(), value.to_string()]).is_err(),
+                "{value:?} parsed"
+            );
+        }
+    }
+
+    /// An executable that prints one reading and records that it ran, which is
+    /// what the alternation itself is checked against.
+    fn arm(dir: &Path, name: &str, value: f64) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho {name} >> {}\necho 'decode {value} ms'\n",
+                dir.join("order").display()
+            ),
+        )
+        .expect("the arm is written");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("the arm is runnable");
+        path
+    }
+
+    /// The arms swap places every pair, which is the whole reason this runs them
+    /// itself rather than running all of one and then all of the other.
+    #[test]
+    fn the_order_of_the_two_arms_flips_each_pair() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let a = arm(dir.path(), "a", 20.0);
+        let b = arm(dir.path(), "b", 19.0);
+
+        alternate(3, &[a, b], &[]).expect("the arms run");
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("order")).expect("the order is recorded"),
+            "a\nb\nb\na\na\nb\n"
+        );
+    }
+
+    fn readings_of(values: &[f64]) -> Vec<Vec<Reading>> {
+        values
+            .iter()
+            .map(|value| vec![Reading::new("decode", *value, "ms")])
+            .collect()
+    }
+
+    /// The standard the README states: every pair moving the same way and the
+    /// two ranges not overlapping.
+    #[test]
+    fn ranges_that_lie_apart_with_every_pair_agreeing_are_a_claim() {
+        let compared = compare(&[
+            readings_of(&[20.9, 21.0, 20.8]),
+            readings_of(&[20.0, 20.1, 19.9]),
+        ])
+        .expect("compares");
+
+        let [row] = &compared[..] else {
+            panic!("one metric, {compared:?}")
+        };
+        assert!((row.arms[0].0 - 20.9).abs() < 1e-9, "{:?}", row.arms[0]);
+        assert!((row.arms[1].0 - 20.0).abs() < 1e-9, "{:?}", row.arms[1]);
+        assert_eq!((row.arms[0].1, row.arms[0].2), (20.8, 21.0));
+        assert_eq!((row.arms[1].1, row.arms[1].2), (19.9, 20.1));
+        assert!(!row.overlap);
+        assert_eq!((row.agreed, row.pairs), (3, 3));
+        assert!(row.stands());
+        assert!((row.change() - -4.306).abs() < 1e-3, "{}", row.change());
+    }
+
+    /// A pair falling the other way is no claim at all, however the means read —
+    /// which is the case this repo has published more than once.
+    #[test]
+    fn a_pair_that_falls_the_other_way_is_not_a_claim() {
+        let compared = compare(&[
+            readings_of(&[20.9, 19.8, 20.8]),
+            readings_of(&[20.0, 20.1, 19.9]),
+        ])
+        .expect("compares");
+
+        assert_eq!((compared[0].agreed, compared[0].pairs), (2, 3));
+        assert!(compared[0].overlap);
+        assert!(!compared[0].stands());
+        assert!(report(&[PathBuf::from("a"), PathBuf::from("b")], &compared).contains("no claim"));
+    }
+
+    /// Two arms reporting different metrics cannot be compared row for row, and
+    /// lining them up by position would report one measurement under another's
+    /// name.
+    #[test]
+    fn arms_that_report_different_readings_are_refused() {
+        let mut b = readings_of(&[20.0]);
+        b[0][0].name = "prefill".to_string();
+        assert!(compare(&[readings_of(&[20.9]), b]).is_err());
+    }
+}
