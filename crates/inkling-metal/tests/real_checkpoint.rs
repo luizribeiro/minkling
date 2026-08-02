@@ -963,6 +963,40 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
     );
 }
 
+/// A checkpoint and a device that times each of its dispatches, or nothing with
+/// a reported skip.
+///
+/// The three cases that read a kernel table all need the same three things and
+/// all decline for the same three reasons, and none of them is a property of the
+/// code under test: no checkpoint, no Metal device, or a device that cannot
+/// timestamp a stage boundary — which this hardware answers `true` for and
+/// others need not.
+fn sampling_device() -> Option<(PathBuf, Device)> {
+    let dir = checkpoint_dir()?;
+    let device = device()?;
+    if !device.times_a_pass() {
+        eprintln!("skipping: this device does not sample at a stage boundary");
+        return None;
+    }
+    Some((dir, device))
+}
+
+/// What a sampled run's kernel rows say the device did: how many dispatches
+/// were timed and what they declared they moved.
+///
+/// Both together, because the three tables that read them read them for one
+/// thing — the count is what says the table describes the whole step, and the
+/// bytes are what the achieved column divides — and a case that took one without
+/// the other would be describing a fraction of a step in bytes.
+fn what_was_sampled(run: &OnTheDevice) -> (u64, u64) {
+    let kernels = run.profile.kernels();
+    assert!(!kernels.is_empty(), "nothing was sampled");
+    (
+        kernels.iter().map(|(_, each)| each.calls).sum(),
+        kernels.iter().map(|(_, each)| each.bytes).sum(),
+    )
+}
+
 /// What this machine's memory will hand a kernel per second, as the ceiling the
 /// achieved column is a fraction of.
 ///
@@ -1274,12 +1308,9 @@ fn what_a_decode_steps_round_trips_are_waiting_on() {
 #[test]
 #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
 fn which_kernels_own_a_decode_step() {
-    let Some(dir) = checkpoint_dir() else { return };
-    let Some(device) = device() else { return };
-    if !device.times_a_pass() {
-        eprintln!("skipping: this device does not sample at a stage boundary");
+    let Some((dir, device)) = sampling_device() else {
         return;
-    }
+    };
 
     // The unsampled step first, because what the rows below are worth is how
     // close they sum to the device time of a step nobody was asking about.
@@ -1292,15 +1323,13 @@ fn which_kernels_own_a_decode_step() {
         100.0 * (run.profile.dispatched().as_secs_f64() / unsampled.as_secs_f64() - 1.0)
     );
 
-    let kernels = run.profile.kernels();
-    assert!(!kernels.is_empty(), "nothing was sampled");
     // **The bytes are declared and not derived**, so a formula that dropped a
     // factor would move the whole bandwidth column and nothing would say so.
     // What checks it is a figure this repo has from somewhere else entirely: a
     // token reads six of each MoE layer's 256 experts and both shared ones plus
     // every layer's own projections, which the checkpoint's shapes put at 5.9 GB
     // of packed bytes.
-    let moved: u64 = kernels.iter().map(|(_, each)| each.bytes).sum();
+    let (timed, moved) = what_was_sampled(&run);
     assert!(
         (5e9..7e9).contains(&(moved as f64)),
         "a decode step moved {:.2} GB, where the checkpoint's active weights are 5.9",
@@ -1312,8 +1341,7 @@ fn which_kernels_own_a_decode_step() {
     // failure — so the count is what says the table describes the whole step.
     let (dispatches, ..) = run.per_decode_step();
     assert_eq!(
-        kernels.iter().map(|(_, each)| each.calls).sum::<u64>(),
-        dispatches,
+        timed, dispatches,
         "a decode step's dispatches were not all timed"
     );
     assert!(
@@ -1324,12 +1352,17 @@ fn which_kernels_own_a_decode_step() {
     );
 }
 
-/// The two prompt lengths a prefill is diagnosed at, the same two the README
-/// quotes wall times for. The 97-token one is left out on purpose: it is the
-/// only length short enough that a run of layers still merges, so its rows
-/// carry a scheduling difference the other two do not, and the question here is
-/// what a prefill's kernels cost rather than how they are submitted.
-const PREFILL_LENGTHS: [usize; 2] = [385, 769];
+/// The three prompt lengths this file's prefill figures are quoted at, and the
+/// three the README compares against the reference.
+const PREFILL_WALL_LENGTHS: [usize; 3] = [97, 385, 769];
+
+/// The two of those a prefill is *diagnosed* at. The 97-token one is left out on
+/// purpose: it is the only length short enough that a run of layers still
+/// merges, so its rows carry a scheduling difference the other two do not, and
+/// the question there is what a prefill's kernels cost rather than how they are
+/// submitted. A wall time is the one figure that scheduling belongs in, which is
+/// why the sweep above keeps all three.
+const PREFILL_LENGTHS: &[usize] = &[PREFILL_WALL_LENGTHS[1], PREFILL_WALL_LENGTHS[2]];
 
 /// **Where a prefill's time goes, kernel by kernel**, which is the same
 /// question `which_kernels_own_a_decode_step` asks of the other regime and has
@@ -1359,14 +1392,11 @@ const PREFILL_LENGTHS: [usize; 2] = [385, 769];
 #[test]
 #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
 fn where_a_prefill_spends_its_time() {
-    let Some(dir) = checkpoint_dir() else { return };
-    let Some(device) = device() else { return };
-    if !device.times_a_pass() {
-        eprintln!("skipping: this device does not sample at a stage boundary");
+    let Some((dir, device)) = sampling_device() else {
         return;
-    }
+    };
 
-    for tokens in PREFILL_LENGTHS {
+    for &tokens in PREFILL_LENGTHS {
         // **Two unsampled prefills and not one, and they go either side of
         // nothing.** A decode step's table takes one, to say how close the rows
         // sum to the device time of a step nobody was asking about. A prefill
@@ -1392,8 +1422,7 @@ fn where_a_prefill_spends_its_time() {
             round_trip_table(&run),
         );
 
-        let kernels = run.profile.kernels();
-        assert!(!kernels.is_empty(), "nothing was sampled");
+        let (timed, _) = what_was_sampled(&run);
         // The same two bounds a decode step's table is held to: the rows are
         // self time inside the wall time they were measured in, and the device
         // cannot have executed for longer than the step that waited for it.
@@ -1413,8 +1442,7 @@ fn where_a_prefill_spends_its_time() {
         // rather than a failure.
         let (dispatches, submissions, ..) = run.per_charged_step();
         assert_eq!(
-            kernels.iter().map(|(_, each)| each.calls).sum::<u64>(),
-            dispatches,
+            timed, dispatches,
             "a prefill's dispatches were not all timed"
         );
         // **A prefill of hundreds of tokens merges nothing**, because one of
@@ -1429,6 +1457,106 @@ fn where_a_prefill_spends_its_time() {
             submissions >= layers,
             "a prefill of {tokens} tokens went in {submissions} submissions, which is fewer than \
              its {layers} layers and so is a merged run rather than a layer at a time"
+        );
+    }
+}
+
+/// **What a prefill costs at each of the three lengths, and what it reads to do
+/// it.**
+///
+/// The wall time this repo's prefill claims are made in, beside the two figures
+/// that say where it goes: the device's own clock, and the bytes the dispatches
+/// declare they move. Nothing here has produced those three together before —
+/// `where_a_prefill_spends_its_time` divides one length up by kernel, and the
+/// wall times the README quotes were taken by hand.
+///
+/// **Bytes a token is the column to read.** A prefill's whole gap to the
+/// reference is byte count rather than execution — the packed matmul is nearer
+/// this machine's bandwidth at prefill shape than anywhere else this file
+/// measures — so what a change to it has to move is this column, and what a
+/// change to it has to *not* move is the tokens. A prefill that amortised
+/// nothing reads the same bytes a token whatever the prompt length; one that
+/// amortises something reads fewer as the prompt grows, and the shape of that
+/// column is the finding.
+///
+/// **Three runs a length: two unsampled and one asked.** The bytes are declared
+/// per dispatch and only reach the profile when the device is timing each of
+/// them, and timing each of them costs — see `what_timing_each_dispatch_costs`
+/// — so the wall time is read off the runs that were not asked and the bytes off
+/// the run that was. Two unsampled and not one for the reason
+/// `where_a_prefill_spends_its_time` gives: the first run of a length is the
+/// first read of the pages that length's rows fault in, and a single figure
+/// cannot tell that from this machine's state. Both are printed, and a pair that
+/// disagree is the reading rather than a mean of them.
+///
+/// The dispatch count is checked across the sampled run and the unsampled one,
+/// which is the premise the row rests on: the bytes describe the same dispatches
+/// the wall time was spent on, because sampling changes where the passes are cut
+/// and nothing about what they read.
+///
+/// **What a prefill holds is the allocation columns and not a resident set.**
+/// Six prefills in one process share a resident set that only grows, so what
+/// RSS says here is what the process has touched rather than what a prefill
+/// costs — `the_whole_stack_holds_its_resident_set_under_a_bound` is where a
+/// bound on that is asserted, in a process that runs one pass. What is a
+/// prefill's own is what the device allocated for it, which is counted per
+/// dispatch and freed as each layer's command buffer completes: the buffers
+/// column is how many and the MiB column is how much, and a change that made a
+/// layer hold something new moves both.
+///
+/// Nothing asserts a duration. What is asserted is that every dispatch was
+/// timed, so the byte column describes the whole prefill.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn what_a_prefill_costs_at_each_length() {
+    let Some((dir, device)) = sampling_device() else {
+        return;
+    };
+
+    eprintln!(
+        "  {:<12}{:>9}{:>9}{:>9}{:>12}{:>12}{:>10}{:>12}{:>10}{:>10}",
+        "prefill",
+        "wall",
+        "again",
+        "device",
+        "dispatches",
+        "submissions",
+        "buffers",
+        "allocated",
+        "moved",
+        "a token"
+    );
+    for tokens in PREFILL_WALL_LENGTHS {
+        let first = OnTheDevice::prefilling(&dir, &device, tokens, false);
+        let run = OnTheDevice::prefilling(&dir, &device, tokens, false);
+        let sampled = OnTheDevice::prefilling(&dir, &device, tokens, true);
+        let (timed, moved) = what_was_sampled(&sampled);
+        let (dispatches, submissions, buffers, bytes) = run.per_charged_step();
+
+        eprintln!(
+            "  {:<12}{:>9}{:>9}{:>9}{:>12}{:>12}{:>10}{:>12}{:>10}{:>10}",
+            format!("{tokens} tokens"),
+            format!("{:.2?}", first.each_charged_step()),
+            format!("{:.2?}", run.each_charged_step()),
+            format!("{:.2?}", run.profile.gpu()),
+            dispatches,
+            submissions,
+            buffers,
+            format!("{:.1} MiB", bytes as f64 / (1u64 << 20) as f64),
+            format!("{:.0} GB", moved as f64 / 1e9),
+            format!("{:.0} MB", moved as f64 / 1e6 / tokens as f64),
+        );
+
+        assert_eq!(
+            timed, dispatches,
+            "a prefill of {tokens} tokens read its bytes off dispatches the run it is timed \
+             beside did not make"
+        );
+        assert!(
+            run.profile.gpu() < run.each_charged_step(),
+            "the device reported executing for {:.2?} of a {:.2?} prefill of {tokens} tokens",
+            run.profile.gpu(),
+            run.each_charged_step()
         );
     }
 }
