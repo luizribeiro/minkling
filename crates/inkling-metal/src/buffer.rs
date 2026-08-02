@@ -82,7 +82,7 @@ impl Device {
                 size: size_of::<T>(),
             })?;
         let buffer = Buffer::of(self.raw().newBufferWithLength_options(bytes, STORAGE), len)?;
-        self.allocated();
+        self.allocated(bytes);
         Ok(buffer)
     }
 

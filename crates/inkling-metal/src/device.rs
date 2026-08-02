@@ -81,6 +81,7 @@ pub struct Device {
     dispatches: Cell<u64>,
     submissions: Cell<u64>,
     allocations: Cell<u64>,
+    allocated_bytes: Cell<u64>,
     /// The GPU's clock, while somebody is asking each dispatch what it cost on
     /// it. `None` — nobody is — is the default, because sampling is not free:
     /// see [`crate::sampling`].
@@ -99,6 +100,7 @@ impl Device {
             dispatches: Cell::new(0),
             submissions: Cell::new(0),
             allocations: Cell::new(0),
+            allocated_bytes: Cell::new(0),
             timestamps: RefCell::new(None),
         })
     }
@@ -163,8 +165,29 @@ impl Device {
         self.allocations.get()
     }
 
-    pub(crate) fn allocated(&self) {
+    /// How many bytes those allocations came to.
+    ///
+    /// A count of buffers says how a call was scheduled; what it does not say is
+    /// how much memory the call is holding, and the two move apart by orders of
+    /// magnitude under nothing but a row count — a layer allocates the same
+    /// buffers for one token as for seven hundred. This is the number a caller
+    /// that has to *bound* what it holds needs, and the difference between two
+    /// readings of it is what everything allocated in between came to.
+    ///
+    /// **A command buffer retains what is bound into it**, so nothing allocated
+    /// while one is being encoded can be freed before it completes — which is
+    /// what makes a difference of two readings a measurement of what is still
+    /// held rather than of what passed through. See
+    /// [`ModelLayers::carries`](crate::ModelLayers), which is the caller this
+    /// exists for.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes.get()
+    }
+
+    pub(crate) fn allocated(&self, bytes: usize) {
         self.allocations.set(self.allocations.get() + 1);
+        self.allocated_bytes
+            .set(self.allocated_bytes.get() + bytes as u64);
     }
 
     /// How many kernels this device has been asked to run.
@@ -232,6 +255,37 @@ mod tests {
 
         assert_eq!(zeroed.len(), 16);
         assert_eq!(filled.to_vec(), [1.0, 2.0]);
+    }
+
+    /// The bytes rather than the buffers, which is the number a caller bounding
+    /// what it holds reads — and the whole of what it adds is that the two
+    /// buffers below are one count apart and eight thousand bytes apart.
+    ///
+    /// Both are charged what the element type makes of the length, because a
+    /// `Buffer<T>`'s length is in elements and an allocation is in bytes; a
+    /// counter that charged the length would put a buffer of a thousand floats
+    /// at a quarter of what it costs.
+    #[test]
+    fn a_device_counts_the_bytes_those_buffers_came_to() {
+        let Some(device) = device() else { return };
+        let before = device.allocated_bytes();
+
+        let small = device.zeroed::<f32>(16).expect("the buffer allocates");
+        let large = device.zeroed::<f32>(2048).expect("the buffer allocates");
+        assert_eq!(
+            device.allocated_bytes() - before,
+            (16 + 2048) * size_of::<f32>() as u64,
+            "the bytes of both"
+        );
+
+        assert!(device.zeroed::<u8>(0).is_err(), "a buffer of nothing");
+        assert_eq!(
+            device.allocated_bytes() - before,
+            (16 + 2048) * size_of::<f32>() as u64,
+            "an allocation the device refused was charged"
+        );
+
+        assert_eq!(small.len() + large.len(), 16 + 2048);
     }
 
     /// What one allocation can hold is a design input for M2 and not trivia:
