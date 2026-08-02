@@ -53,7 +53,7 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 34 ms against mlx-vlm's 32 ms, and the timings go to
+A decode step is about 33 ms against mlx-vlm's 32 ms, and the timings go to
 stderr so stdout stays pipeable. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
@@ -62,7 +62,7 @@ rather than applied by a template this does not implement.
 **Every matmul in the model runs on the GPU, and no weight one of them reads is
 ever decoded to memory** — the MXFP4 ones in registers a nibble at a time, the
 routers' bfloat16 gates by a shift — and `--backend cpu` puts them all back:
-0.047 s a token against the CPU's 9.0. The experts were the first two thirds of
+0.033 s a token against the CPU's 9.0. The experts were the first two thirds of
 that. A token reads 6 of each MoE layer's 256 experts and both of its shared
 ones, which is 32 GB of float32 the CPU path decodes to multiply against and 4.3
 GB of packed bytes the GPU path indexes into and never decodes at all. The rest
@@ -89,7 +89,7 @@ inferred.** Every operation a forward pass runs opens a scope charged the time
 inside it that no scope inside *it* claimed, so the rows of a decode step sum to
 the step and what they leave over is a number rather than a shrug:
 
-    submit and wait       2    83%      of which the device executed for 26 ms
+    submit and wait       2    83%      of which the device executed for 24 ms
     dispatch encode    1077    14%
     readback              2     0%
     everything else                     3%
@@ -108,48 +108,65 @@ readback behind them, because what a layer answers with is now one tensor rather
 than five. **They cost more where they went than they cost here**, which is the
 first handover in this project of which that is true — see the layer's own
 paragraph below. Four fifths of a step is still a round trip, and the device is
-now executing for **92%** of it — two submissions, around work that is no longer
+now executing for **90%** of it — two submissions, around work that is no longer
 waited for a layer at a time. Nothing an operation of a layer would open a scope
 around is left in the table at all: what remains beside the round trip is
 encoding it, the sampling at the end, and the embedding at the start.
 
-**And now which kernel owns which of those 26 milliseconds.** The device
+**And now which kernel owns which of those 24 milliseconds.** The device
 timestamps a command buffer, and a decode step is two of them around 1077
-dispatches, so until this landed the 26 ms was one number with nine kernels
+dispatches, so until this landed that figure was one number with nine kernels
 behind it. It is now nine numbers, each beside the bytes that dispatch said it
 moves and what that comes to against this machine's 819 GB/s:
 
     kernel            calls    device   share       moved   achieved  of peak
-    packed_matmul       457   21.08ms   71.7%   5932.36 MB   281 GB/s     34%
-    rms_norm            168    2.53ms    8.6%      5.89 MB     2 GB/s      0%
-    dense_matmul         40    2.08ms    7.1%     85.24 MB    41 GB/s      5%
-    short_conv          168    1.30ms    4.4%     22.02 MB    17 GB/s      2%
-    fused_attention      42     763µs    2.6%      5.62 MB     7 GB/s      1%
-    router_top_k         40     545µs    1.9%      0.08 MB     0 GB/s      0%
-    swiglu               82     395µs    1.3%      8.26 MB    21 GB/s      3%
-    router_weights       40     377µs    1.3%      0.00 MB     0 GB/s      0%
-    moe_combine          40     322µs    1.1%      5.90 MB    18 GB/s      2%
+    packed_matmul       457   21.07ms   77.8%   5932.36 MB   282 GB/s     34%
+    rms_norm            168    1.67ms    6.2%      5.89 MB     4 GB/s      0%
+    short_conv          168    1.34ms    5.0%     22.02 MB    16 GB/s      2%
+    fused_attention      42     770µs    2.8%      5.62 MB     7 GB/s      1%
+    dense_matmul         40     590µs    2.2%     85.24 MB   145 GB/s     18%
+    router_top_k         40     544µs    2.0%      0.08 MB     0 GB/s      0%
+    swiglu               82     387µs    1.4%      8.26 MB    21 GB/s      3%
+    router_weights       40     381µs    1.4%      0.00 MB     0 GB/s      0%
+    moe_combine          40     343µs    1.3%      5.90 MB    17 GB/s      2%
 
-**The packed matmul is 72% of the device's time and it is the only kernel here
+**The packed matmul is 78% of the device's time and it is the only kernel here
 doing bandwidth's work.** Its 5.9 GB is what the checkpoint's shapes say a token
 reads — six of each MoE layer's 256 experts and both shared ones, plus every
 layer's own projections — arrived at from a dispatch's own declaration rather
 than from that arithmetic, and the two agree. 34% of the machine is not a
 finished kernel and it is not a decade off one either; M2's isolated matmul
-measured 284 to 424 GB/s, so 281 is the bottom of the range this kernel has
+measured 284 to 424 GB/s, so 282 is the bottom of the range this kernel has
 already been seen to reach.
 
-**The surprise is the other 28%.** The eight kernels under it are 8.3 ms of
-device time and 133 MB between them — a quarter of the step for 2% of the bytes
-— so not one of them is waiting on memory. `rms_norm` is the clearest: 168
-dispatches of a `[1, 4096]` row against a `[4096]` weight, 15 µs each to move 35
-KB, which is 2 GB/s and a third of a percent of the machine. A decode step gives
-that kernel one threadgroup and this GPU has 80 cores. `dense_matmul` is the
-same shape of problem at a different width — the routers' `[258, 4096]` gates
-are 2.1 MB in 52 µs — and `short_conv`, `router_top_k` and `fused_attention`
-join them. **What that says is that the next thing to attack is occupancy and
-not bandwidth**, which is the opposite of what a table with only the first row in
-it would have said.
+**The other 22% is not waiting on memory, and that was measurable rather than
+arguable.** The eight kernels under the matmul are 6.0 ms and 133 MB between
+them, and what the first version of this table asked was whether a fifth of a
+step for 2% of the bytes meant occupancy. The kernel's own shapes answered:
+`rms_norm` normalises a decode step's `[1, 4096]` hidden state as one group and
+a query head norm cuts the same 4096 values into 32, and the same values took
+17.6 microseconds one way and 5.3 the other, against 1.5 for an empty dispatch
+of either grid. **A group is reduced by one threadgroup, which is one core of
+eighty.**
+
+**But the remedy was not more threadgroups.** Splitting a group across them
+needs a second dispatch to combine what they left, and a dispatch costs 4
+microseconds to encode against the 6 the split would save — so what the two
+kernels below it actually bought was *more memory in flight per thread*, which
+costs no dispatch at all. `rms_norm` reads its group four floats to a lane where
+the width allows it and gives each group only the threads its lanes need: 2.53
+ms to 1.67, and a `[1, 4096]` norm from 17.6 microseconds to 8.0. `dense_matmul`
+reduces each output element across a run of simdgroups rather than one, as long
+a run as the dispatch can spare: 2.08 ms to 590 µs, 41 GB/s to 145, and a
+decode-shaped gate from 39 microseconds to 10. Neither added a dispatch and
+neither moved a token.
+
+**What is left says the same thing in the same voice.** `short_conv` is 5.0% for
+2% of the bytes and `fused_attention` 2.8% for 0.7%, and both are already 64 and
+32 threadgroups wide at decode — so whatever they are waiting on, it is not the
+one core the norm was on, and neither of the two remedies here is theirs. The
+matmul is 78% of a step now, which is the first time this table has been mostly
+one row.
 
 **The instrumentation is off by default and the reason is in the numbers.** This
 hardware answers `supportsCounterSampling:` with true for `AtStageBoundary` and
@@ -158,11 +175,11 @@ dispatches of one compute pass — so a timed dispatch is a compute pass of its
 own. What that is deliberately not is a command buffer of its own, which would
 put back the round trip two milestones went to remove and measure an engine
 nobody runs; the passes still go in the same two submissions. Over seven
-alternating pairs it costs **10.4 ms a step and 8.1 ms of device time, 8 µs a
+alternating pairs it costs **11.1 ms a step and 8.9 ms of device time, 8 µs a
 dispatch**, and the pass boundary lands *between* the spans rather than inside
-them: the rows above sum to 29.4 ms against the 26.9 ms those same pairs put an
+them: the rows above sum to 27.1 ms against the 24.4 ms those same pairs put an
 unsampled step's device time at, so each carries a couple of microseconds it
-would not have — 9% across the table, and more of it on the short rows than on
+would not have — 12% across the table, and more of it on the short rows than on
 the long one. The ranking is the finding; the absolute figures carry that.
 
 **A dispatch's shape is not an allocation.** Each of the 749 dispatches a step
