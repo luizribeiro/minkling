@@ -98,6 +98,10 @@ dump-attention-fixture:
 dump-layer-fixture:
     reference/.venv/bin/python reference/scripts/dump_layer_fixture.py
 
+# Regenerate the committed synthetic MTP heads the Rust head is tested against
+dump-mtp-fixture:
+    reference/.venv/bin/python reference/scripts/dump_mtp_fixture.py
+
 # Regenerate the committed synthetic model stack the Rust stack is tested against
 dump-stack-fixture:
     reference/.venv/bin/python reference/scripts/dump_stack_fixture.py

@@ -9,6 +9,7 @@ pub mod layer;
 pub mod mask;
 pub mod model;
 pub mod moe;
+pub mod mtp;
 pub mod ops;
 pub mod profile;
 pub mod quant;
@@ -37,6 +38,7 @@ pub use moe::{
     ExpertBank, ExpertBatch, GateWeights, Gathered, MoeConfig, MoeOutput, Routed, Routing,
     SparseMoe,
 };
+pub use mtp::{CheckpointHeads, HeadBackend, HeadNorms, HeadPacked, MtpHead, head_config};
 pub use ops::{
     DenseMlp, DenseProjection, MlpProjections, Projection, linear, rms_norm, softmax, swiglu,
 };

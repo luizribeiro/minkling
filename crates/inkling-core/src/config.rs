@@ -75,6 +75,15 @@ pub struct TextConfig {
 pub struct MtpConfig {
     pub num_nextn_predict_layers: usize,
     pub local_layer_ids: Vec<usize>,
+
+    /// Whether the hidden state one head hands the next is normed on the way.
+    ///
+    /// Read rather than assumed, because what it governs is the one link in the
+    /// chain the tensors say nothing about — see [`crate::mtp`]. Both published
+    /// checkpoints clear it and the heads are wired for that; a checkpoint that
+    /// set it is refused rather than run under the wrong chain.
+    #[serde(default)]
+    pub chain_hidden_post_norm: bool,
 }
 
 /// Per-sequence KV cost. Sliding layers are bounded by the window, so only the
@@ -149,7 +158,8 @@ pub const INKLING_SMALL: &str = r#"{
         "route_scale": 8.0, "use_gate_bias": true, "norm_after_topk": true,
         "shared_expert_sink": true
       },
-      "mtp_config": { "num_nextn_predict_layers": 8, "local_layer_ids": [0,2,4,5,6,7] }
+      "mtp_config": { "num_nextn_predict_layers": 8, "chain_hidden_post_norm": false,
+                      "local_layer_ids": [0,2,4,5,6,7] }
     }"#;
 
 #[cfg(test)]
@@ -261,5 +271,9 @@ mod tests {
         let m = cfg().mtp_config.expect("mtp_config");
         assert_eq!(m.num_nextn_predict_layers, 8);
         assert_eq!(m.local_layer_ids, vec![0, 2, 4, 5, 6, 7]);
+        assert!(
+            !m.chain_hidden_post_norm,
+            "the links between heads carry the hidden state raw"
+        );
     }
 }

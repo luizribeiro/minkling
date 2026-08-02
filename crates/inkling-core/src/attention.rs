@@ -596,6 +596,26 @@ impl<'a> AttentionProjections<'a> {
         Self(Held::Backend(projections))
     }
 
+    /// Whichever of the two the backend's answer called for, with `values`
+    /// reached only where it did not answer.
+    ///
+    /// A closure rather than five slices, because producing them is the cost
+    /// this exists to skip: on the arm a backend answers, nothing of the layer
+    /// is decoded or widened at all. Both stacks in this engine ask the same
+    /// question here and differ only in what that closure does — the main
+    /// stack's decodes MXFP4 into the pass's scratch, a head's widens bfloat16
+    /// into its own.
+    pub fn held_or(
+        hidden: usize,
+        backend: Option<&'a dyn Projections>,
+        values: impl FnOnce() -> DecodedProjections<'a>,
+    ) -> Self {
+        match backend {
+            Some(handed) => Self::backend(handed),
+            None => Self::decoded(hidden, values()),
+        }
+    }
+
     fn held(&self) -> &dyn Projections {
         match &self.0 {
             Held::Decoded(decoded) => decoded,

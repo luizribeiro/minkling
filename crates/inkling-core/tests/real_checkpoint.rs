@@ -23,6 +23,7 @@ use inkling_core::layer::{
 };
 use inkling_core::model::{ModelCache, ModelWeights};
 use inkling_core::moe::{BankRows, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
+use inkling_core::mtp::{CheckpointHeads, head_config};
 use inkling_core::ops::{DenseMlp, DenseProjection, top_k};
 use inkling_core::quant::{Scratch, dequantize};
 use inkling_core::tokenizer::{Tokenizer, TokenizerError};
@@ -68,6 +69,125 @@ fn mxfp4_checkpoint_spans_thirty_shards_and_the_one_beside_them() {
             .count(),
         160
     );
+}
+
+/// The architecture of a multi-token prediction head, read off the checkpoint's
+/// own tensors rather than taken from the study that named it.
+///
+/// Every width here is one the head shares with the main stack — the hidden
+/// size, the two head counts, the band, the dense FFN — so what the shapes
+/// actually settle is the three that are the head's own: `input_proj` eats two
+/// vectors of model width, and the feed-forward network is a *dense* SwiGLU at
+/// `dense_intermediate_size` with its gate and up fused into one tensor. A head
+/// carrying a `switch_mlp`, a router or an FFN at the per-expert width would be
+/// a different module.
+#[test]
+fn a_head_is_a_dense_decoder_layer_behind_a_projection_of_twice_the_width() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = fixture::config(&dir);
+    let mtp = config.mtp_config.as_ref().expect("an mtp_config");
+    let text = &config.text_config;
+
+    let heads = CheckpointHeads::open(&ckpt, text, mtp).expect("the heads open");
+    assert_eq!(heads.heads(), 8);
+
+    let (hidden, dense) = (text.hidden_size, text.dense_intermediate_size);
+    for head in heads.head_projections() {
+        let widths = |weight: &Bf16<'_>| (weight.out_dim(), weight.in_dim());
+        assert_eq!(widths(&head.input_proj), (hidden, 2 * hidden), "input_proj");
+        assert_eq!(
+            widths(&head.w13),
+            (2 * dense, hidden),
+            "the fused gate and up"
+        );
+        assert_eq!(widths(&head.w2), (hidden, dense), "down");
+
+        let attention = head.config;
+        for (name, weight, want) in [
+            (
+                "q_proj",
+                head.attention.q_proj,
+                attention.heads * attention.head_dim,
+            ),
+            ("k_proj", head.attention.k_proj, attention.kv_channels()),
+            ("v_proj", head.attention.v_proj, attention.kv_channels()),
+            (
+                "r_proj",
+                head.attention.r_proj,
+                attention.heads * attention.d_rel,
+            ),
+        ] {
+            assert_eq!(
+                widths(&weight),
+                (want, hidden),
+                "head {}: {name}",
+                head.head
+            );
+        }
+        assert_eq!(
+            widths(&head.attention.o_proj),
+            (hidden, attention.heads * attention.head_dim),
+            "head {}: o_proj",
+            head.head
+        );
+    }
+}
+
+/// Which heads are global, settled by a tensor rather than by the config.
+///
+/// `rel_logits_proj.proj` is `[d_rel, rel_extent]` and a layer's extent is its
+/// window where it has one, so the band's own width says whether the head that
+/// holds it attends over everything. That the tensors and
+/// `mtp_config.local_layer_ids` agree is what says the heads carry a layer plan
+/// of their own — heads 1 and 3 are global where the main stack's globals are
+/// 5, 11, 17, 23, 29, 35 and 41.
+#[test]
+fn the_bands_the_heads_carry_are_the_split_their_own_config_declares() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = fixture::config(&dir);
+    let mtp = config.mtp_config.as_ref().expect("an mtp_config");
+    let text = &config.text_config;
+
+    let plan = head_config(text, mtp);
+    let heads = CheckpointHeads::open(&ckpt, text, mtp).expect("the heads open");
+    assert_eq!(plan.global_layers(), vec![1, 3]);
+    assert_ne!(
+        plan.global_layers(),
+        text.global_layers(),
+        "a checkpoint whose two plans agreed could not settle this"
+    );
+
+    for head in heads.head_projections() {
+        let extent = head.rel_proj.len() / text.d_rel;
+        let want = match plan.layer_is_sliding(head.head) {
+            true => text.sliding_window_size,
+            false => text.rel_extent,
+        };
+        assert_eq!(extent, want, "head {}'s band", head.head);
+    }
+    assert_ne!(
+        text.sliding_window_size, text.rel_extent,
+        "a config whose window is its band could not settle this either"
+    );
+}
+
+/// What widening a head costs, which is what the CPU path holds while it runs
+/// one and what a backend that multiplies the checkpoint's own bytes never
+/// pays.
+#[test]
+fn one_head_widens_into_a_gigabyte_and_the_next_overwrites_it() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let config = fixture::config(&dir);
+    let mtp = config.mtp_config.as_ref().expect("an mtp_config");
+    let heads = CheckpointHeads::open(&ckpt, &config.text_config, mtp).expect("the heads open");
+
+    let floats = heads.scratch_floats();
+    let bytes = floats * size_of::<f32>();
+    assert_eq!(floats, 278_921_216, "{:.2} GB", bytes as f64 / 1e9);
+    assert!(bytes < 1_200_000_000, "{bytes} bytes for one head");
 }
 
 /// The gate a backend multiplies against, and the tensor beside it that is
@@ -129,12 +249,12 @@ fn opening_does_not_fault_in_the_weights() {
     let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
     let elapsed = started.elapsed();
     let after = fixture::resident_bytes();
-    assert_eq!(ckpt.num_shards(), 30);
+    assert_eq!(ckpt.num_shards(), 31);
 
     let grew = after.saturating_sub(before);
     eprintln!("open took {elapsed:?}, RSS {before} -> {after} (+{grew} bytes)");
 
-    // The mapped bytes are ~131 GiB. Reading 30 headers should cost single-digit
+    // The mapped bytes are ~135 GiB. Reading 31 headers should cost single-digit
     // MiB; a gibibyte is a loose bound that still catches an eager read.
     assert!(
         grew < (1 << 30),

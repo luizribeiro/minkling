@@ -52,7 +52,7 @@ use std::cell::{OnceCell, RefCell};
 use crate::attention::{
     AttentionConfig, AttentionProjections, AttentionWeights, DecodedProjections, Projections,
 };
-use crate::checkpoint::{Checkpoint, CheckpointError, Dtype, TensorView};
+use crate::checkpoint::{BF16_BYTES, BF16_SHIFT, Checkpoint, CheckpointError, Dtype, TensorView};
 use crate::config::TextConfig;
 use crate::generate::Generator;
 use crate::head::LmHead;
@@ -110,6 +110,9 @@ pub enum WeightsError {
         expected: usize,
         got: usize,
     },
+
+    #[error("this checkpoint's config asks for {what}, which this engine does not implement")]
+    Unsupported { what: String },
 }
 
 /// A tensor the checkpoint stores packed: `{name}.weight`, a `U32` of MXFP4
@@ -267,11 +270,58 @@ impl<'a> Bf16<'a> {
         self.view.data()
     }
 
+    /// How many values the weight holds, which is what widening it costs.
+    pub fn values(&self) -> usize {
+        self.out_dim * self.in_dim
+    }
+
     /// The same tensor widened, for a caller that multiplies against float32
     /// because it has no kernel that reads these bytes.
     pub fn to_f32(&self) -> Vec<f32> {
         let _timed = profile::scope(Op::Decode);
         self.view.to_f32().expect("a bfloat16 tensor widens")
+    }
+
+    /// The same values into a run the caller already has, for one that widens a
+    /// weight it will not keep — an MTP head's, which is 532 MiB of bfloat16
+    /// and is widened into a scratch the next head overwrites.
+    pub fn widen_into(&self, out: &mut [f32]) {
+        assert_eq!(out.len(), self.values(), "a run the whole weight fits in");
+        self.widen_rows_into(0, 1, out);
+    }
+
+    /// Every `stride`th row from `first`, widened into `out`.
+    ///
+    /// A stride because one weight in this model is two: a head's `w13_dn`
+    /// holds the gate and the up of its SwiGLU interleaved row by row, and the
+    /// two projections a multiply wants are the even rows and the odd ones. A
+    /// caller that widened it whole and then copied each half out would hold
+    /// both layouts of 268 MB at once.
+    pub fn widen_rows_into(&self, first: usize, stride: usize, out: &mut [f32]) {
+        let _timed = profile::scope(Op::Decode);
+        assert_eq!(
+            out.len() % self.in_dim,
+            0,
+            "{} values are not whole rows of {}",
+            out.len(),
+            self.in_dim
+        );
+        let rows = out.len() / self.in_dim;
+        assert!(
+            rows == 0 || first + stride * (rows - 1) < self.out_dim,
+            "{rows} rows from {first} in strides of {stride}, of a weight holding {}",
+            self.out_dim
+        );
+
+        let bytes = self.view.data();
+        for (row, out) in out.chunks_exact_mut(self.in_dim).enumerate() {
+            let start = (first + row * stride) * self.in_dim * BF16_BYTES;
+            let row = bytes[start..].chunks_exact(BF16_BYTES);
+            for (out, bytes) in out.iter_mut().zip(row) {
+                let bits = u16::from_le_bytes(bytes.try_into().expect("chunked into halves"));
+                *out = f32::from_bits(u32::from(bits) << BF16_SHIFT);
+            }
+        }
     }
 }
 
@@ -943,29 +993,25 @@ impl<'a> CheckpointWeights<'a> {
             k_sconv: &widened.k_sconv,
             v_sconv: &widened.v_sconv,
             rel_proj: &widened.rel_proj,
-            projections: match self
-                .backend
-                .as_deref()
-                .and_then(|backend| backend.attention(layer))
-            {
-                Some(handed) => AttentionProjections::backend(handed),
-                None => {
+            projections: AttentionProjections::held_or(
+                self.config.hidden_size,
+                self.backend
+                    .as_deref()
+                    .and_then(|backend| backend.attention(layer)),
+                || {
                     let [q_proj, k_proj, v_proj, r_proj, o_proj] =
                         ["q_proj", "k_proj", "v_proj", "r_proj", "o_proj"].map(|name| {
                             self.decoded(&format!("{module}.self_attn.{name}"), scratch)
                         });
-                    AttentionProjections::decoded(
-                        self.config.hidden_size,
-                        DecodedProjections {
-                            q_proj,
-                            k_proj,
-                            v_proj,
-                            r_proj,
-                            o_proj,
-                        },
-                    )
-                }
-            },
+                    DecodedProjections {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        r_proj,
+                        o_proj,
+                    }
+                },
+            ),
         }
     }
 
@@ -1137,7 +1183,7 @@ fn through(
 }
 
 /// A `BF16` or `F32` tensor's values.
-fn widened(ckpt: &Checkpoint, name: &str) -> Result<Vec<f32>, WeightsError> {
+pub(crate) fn widened(ckpt: &Checkpoint, name: &str) -> Result<Vec<f32>, WeightsError> {
     let view = ckpt.tensor(name)?;
     view.to_f32().ok_or_else(|| WeightsError::NotFloat {
         name: name.to_string(),

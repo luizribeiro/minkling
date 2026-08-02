@@ -1,0 +1,1146 @@
+//! The multi-token prediction heads: eight of them, each guessing one token
+//! further ahead than the last.
+//!
+//! Nothing here is a new op. A head is a decoder layer with three tensors in
+//! front of it:
+//!
+//! ```text
+//! hidden ─→ hidden_norm ─┐
+//!                        ├─→ [hidden; embed] ─→ input_proj ─→ block ─→ hidden'
+//! embed  ─→ embed_norm  ─┘        [2*h]          [h, 2*h]
+//! ```
+//!
+//! Head `d` at position `i` consumes the chained hidden state and the embedding
+//! of the token at `i + d + 1`, and its output predicts the token at `i + d + 2`
+//! — through the model's own final norm and `lm_head`, which is what makes a
+//! head's guess comparable to the model's own answer at all. Head 0 is chained
+//! from the main stack's *post*-final-norm hidden state; every head after it is
+//! chained from the one before it, raw. Both halves of that are `mtp_config`'s:
+//! `chain_hidden_post_norm: false` governs the links between heads, which are
+//! the raw ones, and says nothing about the main stack's, which is normed.
+//!
+//! # What the tensors fix and what they do not
+//!
+//! `input_proj` is `[hidden, 2 * hidden]`, which fixes that it consumes two
+//! normed vectors and not which half is which; and the checkpoint's embedding
+//! is already normed by the main stack's `embed_norm`, so whether a head's own
+//! `embed_norm` stacks on that or replaces it is undetermined. Neither is a
+//! choice this makes: `reference/results/mtp_acceptance.md` scored all eight
+//! combinations over 2171 positions and the answer is the doubly normed
+//! embedding beside the post-norm hidden state, `[hidden; embed]` — reversed,
+//! the projection reads the hidden state through the half of the weight trained
+//! for embeddings and the head agrees with the model on nothing.
+//!
+//! # The heads are a stack of their own
+//!
+//! `mtp_config` carries its own `local_layer_ids`, so head 1 and head 3 are
+//! global attention where the other six are sliding, and every head is dense —
+//! there is no `switch_mlp` under a head at all. [`head_config`] is the whole of
+//! that: the main stack's `TextConfig` with the heads' layer plan in place of
+//! its own, which is what every shape below is then derived from the same way a
+//! layer's are.
+//!
+//! # A head's guess is never load-bearing
+//!
+//! Everything here feeds [`crate::generate`]'s speculative loop, which verifies
+//! what a head guessed against the model's own answer and keeps only the prefix
+//! that matched. So a head standing on a cache that has drifted costs
+//! acceptance and cannot cost correctness — which is what makes it safe for the
+//! chain to guess from its own guesses, and what the proposer in
+//! [`crate::generate`] states.
+//!
+//! Pinned to mlx-vlm by `reference/fixtures/mtp.safetensors`: two synthetic
+//! heads, one sliding and one global, driven through the reference's own
+//! `InklingMTPLayer` twice against one cache.
+
+use std::cell::RefCell;
+
+use crate::attention::{
+    AttentionConfig, AttentionProjections, AttentionWeights, DecodedProjections, Projections,
+};
+use crate::checkpoint::Checkpoint;
+use crate::config::{MtpConfig, TextConfig};
+use crate::layer::{
+    DecoderCache, DecoderLayer, DecoderWeights, Hidden, LayerMlp, NoExperts, Passed,
+};
+use crate::ops::{DenseMlp, DenseProjection, MlpProjections, Projection, rms_norm};
+use crate::quant::Scratch;
+use crate::weights::{Bf16, WeightsError, widened};
+
+/// Where the heads' tensors live, which is a namespace of their own: the
+/// quantisers rewrote the main stack's names to mlx-vlm's and left these under
+/// the ones the original ships.
+const MTP: &str = "model.mtp.layers";
+
+/// The layer plan the heads run under: their own local/global split, all of
+/// them dense, and as many layers as there are heads.
+///
+/// The main stack's config in every other respect, because every other shape a
+/// head has is the model's — the hidden width, the head counts, the band, the
+/// convolution kernel and the dense FFN width are all read from the same
+/// fields. This is `mtp_text_config` in the acceptance study, which is what the
+/// study's numbers were measured through.
+pub fn head_config(text: &TextConfig, mtp: &MtpConfig) -> TextConfig {
+    TextConfig {
+        num_hidden_layers: mtp.num_nextn_predict_layers,
+        local_layer_ids: mtp.local_layer_ids.clone(),
+        dense_mlp_idx: mtp.num_nextn_predict_layers,
+        ..text.clone()
+    }
+}
+
+/// One head, from the pair of vectors it consumes to the hidden state it
+/// answers with.
+#[derive(Clone, Copy)]
+pub struct MtpHead<'a> {
+    hidden_norm: &'a [f32],
+    embed_norm: &'a [f32],
+    input_proj: &'a dyn Projection,
+    block: DecoderLayer<'a>,
+    eps: f32,
+}
+
+impl<'a> MtpHead<'a> {
+    pub fn new(
+        norms: HeadNorms<'a>,
+        input_proj: &'a dyn Projection,
+        block: DecoderLayer<'a>,
+        eps: f32,
+    ) -> Self {
+        let hidden = block.hidden();
+        assert_eq!(norms.hidden_norm.len(), hidden, "hidden_norm");
+        assert_eq!(norms.embed_norm.len(), hidden, "embed_norm");
+        assert_eq!(
+            (input_proj.in_dim(), input_proj.out_dim()),
+            (2 * hidden, hidden),
+            "input_proj against a hidden {hidden}"
+        );
+
+        Self {
+            hidden_norm: norms.hidden_norm,
+            embed_norm: norms.embed_norm,
+            input_proj,
+            block,
+            eps,
+        }
+    }
+
+    pub fn hidden(&self) -> usize {
+        self.block.hidden()
+    }
+
+    /// The state a sequence starts a head from, for this head's own shape.
+    pub fn cache(&self) -> DecoderCache {
+        self.block.cache()
+    }
+
+    /// `[rows, hidden]` of chained hidden state and `[rows, hidden]` of
+    /// embeddings in, `[rows, hidden]` out, continuing from `cache` and leaving
+    /// this call's keys and convolution windows behind in it.
+    ///
+    /// `head` is the head's index, which is a decoder layer's index in the
+    /// heads' own stack — see [`head_config`].
+    pub fn forward(
+        &self,
+        head: usize,
+        cache: &mut DecoderCache,
+        hidden: &[f32],
+        embed: &[f32],
+    ) -> Vec<f32> {
+        assert_eq!(hidden.len(), embed.len(), "a hidden state per embedding");
+        let x = self.input_proj.forward(&self.concatenated(hidden, embed));
+        match self
+            .block
+            .forward(head, cache, Hidden::Rows(&x), &NoExperts, None)
+        {
+            Passed::Rows(rows) => rows,
+            passed => panic!("a head's block answered with {passed:?}"),
+        }
+    }
+
+    /// Each row's two normed halves laid end to end, which is what
+    /// `input_proj` was trained to read.
+    fn concatenated(&self, hidden: &[f32], embed: &[f32]) -> Vec<f32> {
+        let width = self.hidden();
+        let normed = |rows: &[f32], weight: &[f32]| rms_norm(rows, weight, self.eps);
+        normed(hidden, self.hidden_norm)
+            .chunks_exact(width)
+            .zip(normed(embed, self.embed_norm).chunks_exact(width))
+            .flat_map(|(hidden, embed)| [hidden, embed].concat())
+            .collect()
+    }
+}
+
+/// The two RMSNorms in front of a head, which are the head's own and not the
+/// model's — the embedding they normalise has already been through
+/// `embed_norm` once.
+#[derive(Debug, Clone, Copy)]
+pub struct HeadNorms<'a> {
+    pub hidden_norm: &'a [f32],
+    pub embed_norm: &'a [f32],
+}
+
+/// Where a head's multiplies run, when they are not here.
+///
+/// The mirror of [`LayerBackend`](crate::weights::LayerBackend), and shorter for
+/// the reason a head is: every head is dense, so there is no bank to answer for,
+/// and what a head has that a layer does not is the projection in front of it.
+pub trait HeadBackend {
+    /// Head `head`'s `[hidden, 2 * hidden]` input projection, or `None` for a
+    /// head this does not answer for.
+    fn input_proj(&self, head: usize) -> Option<&dyn Projection>;
+
+    /// Head `head`'s five attention projections, or `None`.
+    fn attention(&self, head: usize) -> Option<&dyn Projections>;
+
+    /// Head `head`'s feed-forward network, or `None`.
+    fn mlp(&self, head: usize) -> Option<&dyn MlpProjections>;
+}
+
+/// One head's tensors, as the checkpoint stores them.
+///
+/// The eight big ones stay bfloat16 where they are mapped — 532 MiB a head,
+/// which is 4.2 GiB over the eight heads and the whole reason
+/// [`CheckpointHeads`] holds a scratch rather than a decoded weight. The small
+/// ones are widened once, for the reason [`Widened`](crate::weights) states: a
+/// norm has no packed form to be left in, and these come to 260 KB a head.
+#[derive(Debug)]
+struct HeadTensors<'a> {
+    hidden_norm: Vec<f32>,
+    embed_norm: Vec<f32>,
+    input_layernorm: Vec<f32>,
+    post_attention_layernorm: Vec<f32>,
+    attn_sconv: Vec<f32>,
+    mlp_sconv: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    k_sconv: Vec<f32>,
+    v_sconv: Vec<f32>,
+    rel_proj: Vec<f32>,
+    global_scale: f32,
+    input_proj: Bf16<'a>,
+    attention: HeadAttention<'a>,
+    /// The fused gate and up of the head's SwiGLU, `[2 * dense, hidden]` with
+    /// the two **interleaved** row by row — see [`Mlp::split`].
+    w13: Bf16<'a>,
+    w2: Bf16<'a>,
+}
+
+/// A head's five attention projections, still bfloat16.
+#[derive(Debug, Clone, Copy)]
+pub struct HeadAttention<'a> {
+    pub q_proj: Bf16<'a>,
+    pub k_proj: Bf16<'a>,
+    pub v_proj: Bf16<'a>,
+    pub r_proj: Bf16<'a>,
+    pub o_proj: Bf16<'a>,
+}
+
+/// One head's tensors, still bfloat16, for a backend that takes the weight
+/// rather than the values.
+#[derive(Debug, Clone)]
+pub struct HeadPacked<'a> {
+    pub head: usize,
+    pub config: AttentionConfig,
+    pub input_proj: Bf16<'a>,
+    pub attention: HeadAttention<'a>,
+    /// The fused `[2 * dense, hidden]` gate and up, interleaved row by row.
+    pub w13: Bf16<'a>,
+    pub w2: Bf16<'a>,
+    pub input_layernorm: Vec<f32>,
+    pub post_attention_layernorm: Vec<f32>,
+    pub attn_sconv: Vec<f32>,
+    pub mlp_sconv: Vec<f32>,
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
+    pub k_sconv: Vec<f32>,
+    pub v_sconv: Vec<f32>,
+    pub rel_proj: Vec<f32>,
+    pub global_scale: f32,
+}
+
+impl<'a> HeadTensors<'a> {
+    fn open(ckpt: &'a Checkpoint, head: usize) -> Result<Self, WeightsError> {
+        let module = format!("{MTP}.{head}");
+        let widened = |name: &str| widened(ckpt, &format!("{module}.{name}"));
+        let block = |name: &str| format!("transformer_block.{name}");
+        let matrix = |name: &str| Bf16::open(ckpt, &format!("{module}.{name}"));
+        let attn = |name: &str| matrix(&block(&format!("attn.{name}.weight")));
+        Ok(Self {
+            hidden_norm: widened("hidden_norm.weight")?,
+            embed_norm: widened("embed_norm.weight")?,
+            input_layernorm: widened(&block("attn_norm.weight"))?,
+            post_attention_layernorm: widened(&block("mlp_norm.weight"))?,
+            attn_sconv: widened(&block("attn_sconv.weight"))?,
+            mlp_sconv: widened(&block("mlp_sconv.weight"))?,
+            q_norm: widened(&block("attn.q_norm.weight"))?,
+            k_norm: widened(&block("attn.k_norm.weight"))?,
+            k_sconv: widened(&block("attn.k_sconv.weight"))?,
+            v_sconv: widened(&block("attn.v_sconv.weight"))?,
+            rel_proj: widened(&block("attn.rel_logits_proj.proj"))?,
+            global_scale: widened(&block("mlp.global_scale"))?[0],
+            input_proj: matrix("input_proj.weight")?,
+            attention: HeadAttention {
+                q_proj: attn("wq_du")?,
+                k_proj: attn("wk_dv")?,
+                v_proj: attn("wv_dv")?,
+                r_proj: attn("wr_du")?,
+                o_proj: attn("wo_ud")?,
+            },
+            w13: matrix(&block("mlp.w13_dn.weight"))?,
+            w2: matrix(&block("mlp.w2_md.weight"))?,
+        })
+    }
+
+    fn packed(&self, head: usize, config: AttentionConfig) -> HeadPacked<'a> {
+        HeadPacked {
+            head,
+            config,
+            input_proj: self.input_proj,
+            attention: self.attention,
+            w13: self.w13,
+            w2: self.w2,
+            input_layernorm: self.input_layernorm.clone(),
+            post_attention_layernorm: self.post_attention_layernorm.clone(),
+            attn_sconv: self.attn_sconv.clone(),
+            mlp_sconv: self.mlp_sconv.clone(),
+            q_norm: self.q_norm.clone(),
+            k_norm: self.k_norm.clone(),
+            k_sconv: self.k_sconv.clone(),
+            v_sconv: self.v_sconv.clone(),
+            rel_proj: self.rel_proj.clone(),
+            global_scale: self.global_scale,
+        }
+    }
+}
+
+/// The eight heads out of a checkpoint, widened only where a call reaches them.
+///
+/// The same bargain [`CheckpointWeights`](crate::weights::CheckpointWeights)
+/// makes, one format further back: a head's weights are bfloat16 rather than
+/// packed, so what this declines to do is widen them into memory. A backend
+/// that multiplies against the checkpoint's own bytes never widens one at all;
+/// the CPU path widens a head into a scratch the next head overwrites.
+///
+/// **The scratch is not allocated until a head is run here.** It is 1.1 GB —
+/// larger than everything else this process holds — and a run that never
+/// speculates never touches it, which is what keeps the resident set of a
+/// generation the same whether or not the heads are loaded.
+pub struct CheckpointHeads<'a> {
+    config: TextConfig,
+    heads: Vec<HeadTensors<'a>>,
+    backend: Option<Box<dyn HeadBackend + 'a>>,
+    scratch: RefCell<Vec<f32>>,
+}
+
+impl<'a> CheckpointHeads<'a> {
+    /// Map the heads' tensors, or say which one the checkpoint does not hold.
+    ///
+    /// An error rather than a panic, unlike the stack's: a checkpoint without
+    /// MTP tensors is an ordinary checkpoint, and the caller's answer to that
+    /// is to decode one token at a time rather than to abort.
+    pub fn open(
+        ckpt: &'a Checkpoint,
+        text: &TextConfig,
+        mtp: &MtpConfig,
+    ) -> Result<Self, WeightsError> {
+        if mtp.chain_hidden_post_norm {
+            return Err(WeightsError::Unsupported {
+                what: "chain_hidden_post_norm, which norms the link between two heads".to_string(),
+            });
+        }
+        let config = head_config(text, mtp);
+        let heads = (0..config.num_hidden_layers)
+            .map(|head| HeadTensors::open(ckpt, head))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            config,
+            heads,
+            backend: None,
+            scratch: RefCell::new(Vec::new()),
+        })
+    }
+
+    /// The same heads with their multiplies run somewhere else.
+    pub fn with_backend(mut self, backend: Box<dyn HeadBackend + 'a>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// The heads' own layer plan.
+    pub fn config(&self) -> &TextConfig {
+        &self.config
+    }
+
+    pub fn heads(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// Every head's tensors, still bfloat16, for a backend that takes the
+    /// weight rather than the values.
+    pub fn head_projections(&self) -> Vec<HeadPacked<'a>> {
+        self.heads
+            .iter()
+            .enumerate()
+            .map(|(head, tensors)| {
+                tensors.packed(head, AttentionConfig::for_layer(&self.config, head))
+            })
+            .collect()
+    }
+
+    /// How many float32 values widening one head takes, which is what the CPU
+    /// path decodes into and the whole of what it holds at once.
+    pub fn scratch_floats(&self) -> usize {
+        self.heads
+            .iter()
+            .map(|head| {
+                let attention = &head.attention;
+                head.input_proj.values()
+                    + attention.q_proj.values()
+                    + attention.k_proj.values()
+                    + attention.v_proj.values()
+                    + attention.r_proj.values()
+                    + attention.o_proj.values()
+                    + head.w13.values()
+                    + head.w2.values()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// `[rows, hidden]` of chained hidden state and the same of embeddings
+    /// through head `head`.
+    ///
+    /// The head is stood up around whatever answers for its weights and dropped
+    /// again, which is what lets the widened ones live in a buffer the next
+    /// head overwrites.
+    pub fn forward(
+        &self,
+        head: usize,
+        cache: &mut DecoderCache,
+        hidden: &[f32],
+        embed: &[f32],
+    ) -> Vec<f32> {
+        let mut buffer = self.scratch.borrow_mut();
+        if buffer.is_empty() && self.backend.is_none() {
+            buffer.resize(self.scratch_floats(), 0.0);
+        }
+        let mut scratch = Scratch::new(&mut buffer);
+
+        let tensors = &self.heads[head];
+        let backend = self.backend.as_deref();
+        let config = AttentionConfig::for_layer(&self.config, head);
+
+        let mlp = Mlp::of(self, head, &mut scratch);
+        let attention = self.attention(head, &mut scratch);
+        let input_proj = match backend.and_then(|backend| backend.input_proj(head)) {
+            Some(handed) => Handed::Backend(handed),
+            None => Handed::Widened(DenseProjection::new(
+                2 * self.config.hidden_size,
+                widen(&tensors.input_proj, &mut scratch),
+            )),
+        };
+        let weights = DecoderWeights {
+            attention,
+            input_layernorm: &tensors.input_layernorm,
+            post_attention_layernorm: &tensors.post_attention_layernorm,
+            attn_sconv: &tensors.attn_sconv,
+            mlp_sconv: &tensors.mlp_sconv,
+        };
+        MtpHead::new(
+            HeadNorms {
+                hidden_norm: &tensors.hidden_norm,
+                embed_norm: &tensors.embed_norm,
+            },
+            input_proj.projection(),
+            DecoderLayer::new(config, weights, mlp.view()),
+            self.config.rms_norm_eps,
+        )
+        .forward(head, cache, hidden, embed)
+    }
+
+    /// One head's attention tensors, its five projections widened into the
+    /// call's scratch unless a backend answers for them.
+    fn attention<'s>(&'s self, head: usize, scratch: &mut Scratch<'s>) -> AttentionWeights<'s> {
+        let tensors = &self.heads[head];
+        AttentionWeights {
+            q_norm: &tensors.q_norm,
+            k_norm: &tensors.k_norm,
+            k_sconv: &tensors.k_sconv,
+            v_sconv: &tensors.v_sconv,
+            rel_proj: &tensors.rel_proj,
+            projections: AttentionProjections::held_or(
+                self.config.hidden_size,
+                self.backend
+                    .as_deref()
+                    .and_then(|backend| backend.attention(head)),
+                || {
+                    let attention = &tensors.attention;
+                    let [q_proj, k_proj, v_proj, r_proj, o_proj] = [
+                        attention.q_proj,
+                        attention.k_proj,
+                        attention.v_proj,
+                        attention.r_proj,
+                        attention.o_proj,
+                    ]
+                    .map(|weight| widen(&weight, scratch));
+                    DecodedProjections {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        r_proj,
+                        o_proj,
+                    }
+                },
+            ),
+        }
+    }
+}
+
+/// A head's projection, wherever it is multiplied.
+enum Handed<'a> {
+    Backend(&'a dyn Projection),
+    Widened(DenseProjection<'a>),
+}
+
+impl Handed<'_> {
+    fn projection(&self) -> &dyn Projection {
+        match self {
+            Self::Backend(handed) => *handed,
+            Self::Widened(widened) => widened,
+        }
+    }
+}
+
+/// A head's feed-forward network, wherever its three multiplies run.
+enum Mlp<'a> {
+    Backend {
+        dim: usize,
+        hidden_dim: usize,
+        handed: &'a dyn MlpProjections,
+        global_scale: f32,
+    },
+    Widened {
+        dim: usize,
+        gate: &'a [f32],
+        up: &'a [f32],
+        down: &'a [f32],
+        global_scale: f32,
+    },
+}
+
+impl<'a> Mlp<'a> {
+    fn of<'s>(heads: &'s CheckpointHeads<'a>, head: usize, scratch: &mut Scratch<'s>) -> Mlp<'s> {
+        let tensors = &heads.heads[head];
+        let (dim, hidden_dim) = (
+            heads.config.hidden_size,
+            heads.config.dense_intermediate_size,
+        );
+        let global_scale = tensors.global_scale;
+        match heads
+            .backend
+            .as_deref()
+            .and_then(|backend| backend.mlp(head))
+        {
+            Some(handed) => Mlp::Backend {
+                dim,
+                hidden_dim,
+                handed,
+                global_scale,
+            },
+            None => {
+                let (gate, up) = Self::split(&tensors.w13, dim, scratch);
+                Mlp::Widened {
+                    dim,
+                    gate,
+                    up,
+                    down: widen(&tensors.w2, scratch),
+                    global_scale,
+                }
+            }
+        }
+    }
+
+    /// The fused `w13_dn` widened into the two projections a SwiGLU multiplies
+    /// through.
+    ///
+    /// **The two are interleaved, not stacked.** `_split_gate_up` reads the
+    /// `[2 * dense, hidden]` tensor as `[dense, 2, hidden]` and takes the two
+    /// along the middle axis, so row `2i` is the gate's row `i` and row `2i + 1`
+    /// is the up's. Read as two halves instead, both projections are rows of the
+    /// right shape drawn from the wrong places, and the layer still runs.
+    fn split<'s>(w13: &Bf16<'_>, dim: usize, scratch: &mut Scratch<'s>) -> (&'s [f32], &'s [f32]) {
+        let rows = w13.out_dim() / 2;
+        let (gate, up) = (scratch.take(rows * dim), scratch.take(rows * dim));
+        w13.widen_rows_into(0, 2, gate);
+        w13.widen_rows_into(1, 2, up);
+        (gate, up)
+    }
+
+    fn view(&self) -> LayerMlp<'_> {
+        LayerMlp::Dense(match self {
+            Self::Backend {
+                dim,
+                hidden_dim,
+                handed,
+                global_scale,
+            } => DenseMlp::backend(*dim, *hidden_dim, *handed, *global_scale),
+            Self::Widened {
+                dim,
+                gate,
+                up,
+                down,
+                global_scale,
+            } => DenseMlp::new(*dim, gate, up, down, *global_scale),
+        })
+    }
+}
+
+/// One bfloat16 weight widened into the call's scratch, which the next head
+/// overwrites.
+fn widen<'s>(weight: &Bf16<'_>, scratch: &mut Scratch<'s>) -> &'s [f32] {
+    let run = scratch.take(weight.values());
+    weight.widen_into(run);
+    run
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attention::LogScaling;
+    use crate::config::Config;
+    use crate::fixture::{self, LayerTensors, deviation};
+
+    /// Two synthetic heads and the two calls mlx-vlm drove each of them with,
+    /// from `just dump-mtp-fixture`.
+    const FIXTURE: &str = "mtp.safetensors";
+
+    /// One sliding head and one global one, which is the split
+    /// `mtp_config.local_layer_ids` makes and the main stack's does not.
+    const CASES: [&str; 2] = ["local", "global"];
+
+    /// The synthetic heads are float32 end to end, so only summation order
+    /// separates this from MLX — the same bound, for the same reason, as the
+    /// layer this runs one of. A head runs a longer chain than a layer does,
+    /// two norms and a projection further, and holds about as much of the bound
+    /// in reserve as that layer: worst observed when this landed, 3.5e-7, a
+    /// factor of nearly three. The weakest mutation these tests rely on
+    /// catching — the two norms in front of the head exchanged — moves the
+    /// answer by 6.9e-1, six decades above.
+    const TOLERANCE: f32 = 1e-6;
+
+    /// One synthetic head: the block it was built around, the three tensors in
+    /// front of it, and what it produced over the two calls.
+    struct Head {
+        name: String,
+        config: AttentionConfig,
+        block: LayerTensors,
+        hidden_norm: Vec<f32>,
+        embed_norm: Vec<f32>,
+        input_proj: Vec<f32>,
+        prefill_out: Vec<f32>,
+        continue_out: Vec<f32>,
+    }
+
+    /// The two sequences the fixture drove both heads with, hidden state and
+    /// embedding apart.
+    struct Calls {
+        hidden: Vec<f32>,
+        embed: Vec<f32>,
+        continue_hidden: Vec<f32>,
+        continue_embed: Vec<f32>,
+    }
+
+    impl Calls {
+        fn load() -> Self {
+            let ckpt = fixture::open(FIXTURE);
+            let of = |name: &str| fixture::f32s(&fixture::tensor(&ckpt, name));
+            Self {
+                hidden: of("hidden"),
+                embed: of("embed"),
+                continue_hidden: of("continue_hidden"),
+                continue_embed: of("continue_embed"),
+            }
+        }
+    }
+
+    impl Head {
+        fn load(case: &str) -> Self {
+            let ckpt = fixture::open(FIXTURE);
+            let of = |name: &str| fixture::f32s(&fixture::tensor(&ckpt, &format!("{case}.{name}")));
+            let recorded = of("config");
+            let &[
+                heads,
+                kv_heads,
+                head_dim,
+                d_rel,
+                sliding,
+                _,
+                eps,
+                floor,
+                alpha,
+            ] = recorded.as_slice()
+            else {
+                panic!("{case}: config carries nine scalars, got {recorded:?}")
+            };
+            let block = LayerTensors::load(&ckpt, &format!("{case}.transformer_block"));
+
+            Self {
+                name: case.to_string(),
+                config: AttentionConfig {
+                    hidden: block.hidden(),
+                    heads: heads as usize,
+                    kv_heads: kv_heads as usize,
+                    head_dim: head_dim as usize,
+                    d_rel: d_rel as usize,
+                    sliding: sliding as usize,
+                    rms_norm_eps: eps,
+                    log_scaling: (floor > 0.0).then(|| LogScaling::new(floor, alpha)),
+                },
+                hidden_norm: of("hidden_norm.weight"),
+                embed_norm: of("embed_norm.weight"),
+                input_proj: of("input_proj.weight"),
+                prefill_out: of("prefill_out"),
+                continue_out: of("continue_out"),
+                block,
+            }
+        }
+
+        fn all() -> Vec<Self> {
+            CASES.iter().map(|case| Self::load(case)).collect()
+        }
+
+        fn hidden(&self) -> usize {
+            self.block.hidden()
+        }
+
+        fn head<'a>(
+            &'a self,
+            norms: HeadNorms<'a>,
+            input_proj: &'a DenseProjection<'a>,
+        ) -> MtpHead<'a> {
+            MtpHead::new(
+                norms,
+                input_proj,
+                DecoderLayer::new(self.config, self.block.view(), self.block.mlp()),
+                self.config.rms_norm_eps,
+            )
+        }
+
+        fn norms(&self) -> HeadNorms<'_> {
+            HeadNorms {
+                hidden_norm: &self.hidden_norm,
+                embed_norm: &self.embed_norm,
+            }
+        }
+
+        fn projection(&self) -> DenseProjection<'_> {
+            DenseProjection::new(2 * self.hidden(), &self.input_proj)
+        }
+
+        /// The prefill and the continuation against one cache, as the dump
+        /// script drove the reference.
+        fn forward(&self, norms: HeadNorms<'_>, calls: &Calls) -> (Vec<f32>, Vec<f32>) {
+            let projection = self.projection();
+            let head = self.head(norms, &projection);
+            let cache = &mut head.cache();
+            (
+                head.forward(0, cache, &calls.hidden, &calls.embed),
+                head.forward(0, cache, &calls.continue_hidden, &calls.continue_embed),
+            )
+        }
+
+        fn deviation(&self, (prefill, rest): &(Vec<f32>, Vec<f32>)) -> f32 {
+            deviation(prefill, &self.prefill_out).max(deviation(rest, &self.continue_out))
+        }
+    }
+
+    #[test]
+    fn the_synthetic_heads_reproduce_mlx() {
+        let calls = Calls::load();
+        let mut worst = 0.0f32;
+        for head in Head::all() {
+            let deviation = head.deviation(&head.forward(head.norms(), &calls));
+            assert!(
+                deviation <= TOLERANCE,
+                "{}: deviation {deviation:e}",
+                head.name
+            );
+            worst = worst.max(deviation);
+        }
+        assert!(worst > 0.0, "float32 summation order cannot agree exactly");
+    }
+
+    /// The two halves `input_proj` reads are not interchangeable, and nothing
+    /// in its shape says which is which — a head fed them the other way round
+    /// runs, and is what the acceptance study measured at 0.8% against 77.7%.
+    ///
+    /// Stated by exchanging the two norms rather than the two vectors, which is
+    /// the same exchange on this side of them: a head that concatenated in the
+    /// other order would normalise the hidden state with `embed_norm` too.
+    #[test]
+    fn concatenating_the_two_halves_the_other_way_round_changes_the_answer() {
+        let calls = Calls::load();
+        for head in Head::all() {
+            let exchanged = HeadNorms {
+                hidden_norm: &head.embed_norm,
+                embed_norm: &head.hidden_norm,
+            };
+            let deviation = head.deviation(&head.forward(exchanged, &calls));
+            assert!(
+                deviation > TOLERANCE,
+                "{}: deviation {deviation:e}",
+                head.name
+            );
+        }
+    }
+
+    /// A head carries a cache like any decoder layer, and the continuation
+    /// reads it. A head handed a fresh one every round would still guess.
+    #[test]
+    fn the_continuation_reads_what_the_prefill_cached() {
+        let calls = Calls::load();
+        for head in Head::all() {
+            let projection = head.projection();
+            let built = head.head(head.norms(), &projection);
+            let fresh = built.forward(
+                0,
+                &mut built.cache(),
+                &calls.continue_hidden,
+                &calls.continue_embed,
+            );
+            let deviation = deviation(&fresh, &head.continue_out);
+            assert!(
+                deviation > TOLERANCE,
+                "{}: deviation {deviation:e}",
+                head.name
+            );
+        }
+    }
+
+    /// The heads' own local/global split, which is `mtp_config`'s and not the
+    /// main stack's. Read from the checkpoint's own config, so a config whose
+    /// two plans agreed could not settle it.
+    #[test]
+    fn a_head_reads_the_layer_plan_the_mtp_config_carries() {
+        let config: Config = serde_json::from_str(crate::config::INKLING_SMALL).expect("parses");
+        let mtp = config.mtp_config.expect("mtp_config");
+        let heads = head_config(&config.text_config, &mtp);
+
+        assert_eq!(heads.num_hidden_layers, 8);
+        assert_eq!(heads.global_layers(), vec![1, 3]);
+        assert_ne!(
+            heads.global_layers(),
+            config.text_config.global_layers(),
+            "a config whose two plans agreed could not settle this"
+        );
+        assert!(
+            (0..heads.num_hidden_layers).all(|head| heads.layer_is_dense(head)),
+            "every head is dense"
+        );
+    }
+
+    /// The config the fixture's heads were drawn against, in the shape a
+    /// checkpoint states one — every width here is one of the fixture's own,
+    /// and the fields a head does not read are the checkpoint's verbatim.
+    const FIXTURE_CONFIG: &str = r#"{
+      "text_config": {
+        "model_max_length": 1048576, "hidden_size": 32, "num_hidden_layers": 2,
+        "vocab_size": 64, "unpadded_vocab_size": null,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+        "swa_num_attention_heads": 4, "swa_num_key_value_heads": 2, "swa_head_dim": 8,
+        "sliding_window_size": 4, "local_layer_ids": [0, 1],
+        "d_rel": 3, "rel_extent": 6,
+        "log_scaling_n_floor": null, "log_scaling_alpha": 0.1,
+        "rms_norm_eps": 1e-06, "use_embed_norm": true,
+        "logits_mup_width_multiplier": 1.0,
+        "use_sconv": true, "sconv_kernel_size": 4,
+        "dense_mlp_idx": 0, "dense_intermediate_size": 48, "intermediate_size": 16,
+        "n_routed_experts": 16, "num_experts_per_tok": 3, "n_shared_experts": 2,
+        "route_scale": 8.0, "use_gate_bias": true, "norm_after_topk": true,
+        "shared_expert_sink": true
+      },
+      "mtp_config": { "num_nextn_predict_layers": 2, "chain_hidden_post_norm": false,
+                      "local_layer_ids": [0] }
+    }"#;
+
+    fn fixture_config() -> Config {
+        serde_json::from_str(FIXTURE_CONFIG).expect("the fixture's config parses")
+    }
+
+    /// The heads' layer plan, derived here, against the one the reference
+    /// derived for the same head — `mtp_text_config` in the dump script, read
+    /// back off the config tensor it recorded beside each head's output.
+    ///
+    /// The main stack's plan makes both of these heads sliding, so a port that
+    /// read `local_layer_ids` from the wrong config would give head 1 a window
+    /// it does not have and a band of the wrong width.
+    #[test]
+    fn the_derived_layer_plan_is_the_one_the_reference_derived() {
+        let config = fixture_config();
+        let plan = head_config(
+            &config.text_config,
+            config.mtp_config.as_ref().expect("an mtp_config"),
+        );
+        for (index, head) in Head::all().iter().enumerate() {
+            let derived = AttentionConfig::for_layer(&plan, index);
+            let recorded = head.config;
+            assert_eq!(
+                [
+                    derived.hidden,
+                    derived.heads,
+                    derived.kv_heads,
+                    derived.head_dim,
+                    derived.d_rel,
+                    derived.sliding
+                ],
+                [
+                    recorded.hidden,
+                    recorded.heads,
+                    recorded.kv_heads,
+                    recorded.head_dim,
+                    recorded.d_rel,
+                    recorded.sliding
+                ],
+                "{}",
+                head.name
+            );
+            assert!(
+                config.text_config.layer_is_sliding(index),
+                "the main stack's plan makes head {index} sliding, so reading it \
+                 instead has to show up in the case that is global here"
+            );
+        }
+    }
+
+    /// A head out of a checkpoint, against the same head handed its weights
+    /// directly.
+    ///
+    /// What this pins is everything between the two: the twenty tensor names
+    /// the heads ship under, which are the original's rather than mlx-vlm's;
+    /// that they are read as bfloat16; and the de-interleave of `w13_dn`, whose
+    /// even rows are the gate and whose odd rows are the up. Every one of those
+    /// is a mapping a wrong version of would still stand a head up — `wq_du`
+    /// and `wo_ud` are the same shape, and the two halves of `w13_dn` are the
+    /// same shape as each other.
+    ///
+    /// Not exact, because the checkpoint written here holds the fixture's
+    /// float32 weights rounded to bfloat16 once — half a quantum of each
+    /// weight's own magnitude, which is 2^-9 relative, carried through a whole
+    /// head. Worst observed when this landed: 1.4e-2. The weakest mapping
+    /// mistake it has to catch — the gate and the up read as two halves rather
+    /// than as the two interleaves — moves the answer by 2.8e-1, so this bound
+    /// sits about twice the one and a tenth of the other.
+    const CHECKPOINT_TOLERANCE: f32 = 3e-2;
+
+    #[test]
+    fn the_heads_a_checkpoint_holds_answer_what_their_tensors_answer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mtp.safetensors");
+        write_heads(&path);
+
+        let ckpt = crate::Checkpoint::open(&path).expect("the shard opens");
+        let config = fixture_config();
+        let heads = CheckpointHeads::open(
+            &ckpt,
+            &config.text_config,
+            config.mtp_config.as_ref().expect("an mtp_config"),
+        )
+        .expect("the heads open");
+        assert_eq!(heads.heads(), 2);
+
+        let calls = Calls::load();
+        for (index, head) in Head::all().iter().enumerate() {
+            let cache = &mut DecoderCache::new(head.config, head.hidden(), 4);
+            let got = heads.forward(index, cache, &calls.hidden, &calls.embed);
+            let deviation = deviation(&got, &head.prefill_out);
+            assert!(
+                deviation <= CHECKPOINT_TOLERANCE,
+                "{}: deviation {deviation:e}",
+                head.name
+            );
+        }
+    }
+
+    /// What a head is called here, against what the checkpoint calls it.
+    ///
+    /// The heads kept the original's names where the quantiser rewrote the main
+    /// stack's to mlx-vlm's, so this table is `_map_llm_layer` read backwards —
+    /// and it is the thing under test. Spelled out on both sides rather than
+    /// derived, because a rule that produced both names could produce both of
+    /// them wrong.
+    const NAMES: [(&str, &str); 17] = [
+        ("hidden_norm.weight", "hidden_norm.weight"),
+        ("embed_norm.weight", "embed_norm.weight"),
+        ("input_proj.weight", "input_proj.weight"),
+        (
+            "transformer_block.input_layernorm.weight",
+            "transformer_block.attn_norm.weight",
+        ),
+        (
+            "transformer_block.post_attention_layernorm.weight",
+            "transformer_block.mlp_norm.weight",
+        ),
+        (
+            "transformer_block.attn_sconv.conv.weight",
+            "transformer_block.attn_sconv.weight",
+        ),
+        (
+            "transformer_block.mlp_sconv.conv.weight",
+            "transformer_block.mlp_sconv.weight",
+        ),
+        (
+            "transformer_block.self_attn.q_norm.weight",
+            "transformer_block.attn.q_norm.weight",
+        ),
+        (
+            "transformer_block.self_attn.k_norm.weight",
+            "transformer_block.attn.k_norm.weight",
+        ),
+        (
+            "transformer_block.self_attn.k_sconv.conv.weight",
+            "transformer_block.attn.k_sconv.weight",
+        ),
+        (
+            "transformer_block.self_attn.v_sconv.conv.weight",
+            "transformer_block.attn.v_sconv.weight",
+        ),
+        (
+            "transformer_block.self_attn.rel_proj",
+            "transformer_block.attn.rel_logits_proj.proj",
+        ),
+        (
+            "transformer_block.self_attn.q_proj.weight",
+            "transformer_block.attn.wq_du.weight",
+        ),
+        (
+            "transformer_block.self_attn.k_proj.weight",
+            "transformer_block.attn.wk_dv.weight",
+        ),
+        (
+            "transformer_block.self_attn.v_proj.weight",
+            "transformer_block.attn.wv_dv.weight",
+        ),
+        (
+            "transformer_block.self_attn.r_proj.weight",
+            "transformer_block.attn.wr_du.weight",
+        ),
+        (
+            "transformer_block.self_attn.o_proj.weight",
+            "transformer_block.attn.wo_ud.weight",
+        ),
+    ];
+
+    /// The fixture's heads written out as a checkpoint writes them: bfloat16,
+    /// under the names the original ships, with the gate and the up fused back
+    /// into the one interleaved tensor the checkpoint holds.
+    fn write_heads(path: &std::path::Path) {
+        let fixture = fixture::open(FIXTURE);
+        let mut tensors: Vec<(String, Blob)> = Vec::new();
+        for (index, case) in CASES.iter().enumerate() {
+            let of = |name: &str| {
+                let view = fixture::tensor(&fixture, &format!("{case}.{name}"));
+                (fixture::f32s(&view), view.shape().to_vec())
+            };
+            let mut put = |name: &str, (values, shape): (Vec<f32>, Vec<usize>)| {
+                tensors.push((format!("{MTP}.{index}.{name}"), Blob::bf16(&values, shape)))
+            };
+
+            for (mine, theirs) in NAMES {
+                put(theirs, of(mine));
+            }
+            put(
+                "transformer_block.mlp.global_scale",
+                of("transformer_block.mlp.global_scale"),
+            );
+            put(
+                "transformer_block.mlp.w2_md.weight",
+                of("transformer_block.mlp.down_proj.weight"),
+            );
+
+            let (gate, shape) = of("transformer_block.mlp.gate_proj.weight");
+            let (up, _) = of("transformer_block.mlp.up_proj.weight");
+            let width = shape[1];
+            put(
+                "transformer_block.mlp.w13_dn.weight",
+                (interleave(&gate, &up, width), vec![2 * shape[0], width]),
+            );
+        }
+
+        safetensors::serialize_to_file(tensors.iter().map(|(name, blob)| (name, blob)), None, path)
+            .expect("the shard is written");
+    }
+
+    /// Two projections' rows alternated, which is how `w13_dn` holds them.
+    fn interleave(gate: &[f32], up: &[f32], width: usize) -> Vec<f32> {
+        gate.chunks_exact(width)
+            .zip(up.chunks_exact(width))
+            .flat_map(|(gate, up)| [gate, up].concat())
+            .collect()
+    }
+
+    /// A tensor as a checkpoint holds one: bfloat16, which is a float32 with
+    /// its low sixteen mantissa bits dropped.
+    struct Blob {
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    impl Blob {
+        fn bf16(values: &[f32], shape: Vec<usize>) -> Self {
+            assert_eq!(
+                values.len(),
+                shape.iter().product::<usize>(),
+                "{shape:?} against {} values",
+                values.len()
+            );
+            Self {
+                shape,
+                data: values
+                    .iter()
+                    .flat_map(|value| {
+                        ((value.to_bits() >> crate::checkpoint::BF16_SHIFT) as u16).to_le_bytes()
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    impl safetensors::View for &Blob {
+        fn dtype(&self) -> crate::Dtype {
+            crate::Dtype::BF16
+        }
+        fn shape(&self) -> &[usize] {
+            &self.shape
+        }
+        fn data(&self) -> std::borrow::Cow<'_, [u8]> {
+            std::borrow::Cow::Borrowed(&self.data)
+        }
+        fn data_len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    /// The two sequences a head consumes are not the same tensor, and a head
+    /// that read one of them twice would still run — the shapes are equal.
+    #[test]
+    fn a_head_reads_both_of_the_sequences_it_is_handed() {
+        let calls = Calls::load();
+        for head in Head::all() {
+            let projection = head.projection();
+            let built = head.head(head.norms(), &projection);
+            for (what, hidden, embed) in [
+                ("the hidden state twice", &calls.hidden, &calls.hidden),
+                ("the embedding twice", &calls.embed, &calls.embed),
+            ] {
+                let got = built.forward(0, &mut built.cache(), hidden, embed);
+                let deviation = deviation(&got, &head.prefill_out);
+                assert!(
+                    deviation > TOLERANCE,
+                    "{}: reading {what} deviates by only {deviation:e}",
+                    head.name
+                );
+            }
+        }
+    }
+}
