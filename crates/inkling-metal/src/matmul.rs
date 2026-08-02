@@ -31,12 +31,14 @@
 //! which is what makes a matmul this memory-bound run at the bandwidth rather
 //! than at a thirty-second of it.
 //!
-//! **Or one simdgroup per [`ROWS_A_TILE`] rows of it, where the rows share an
-//! expert.** The arrangement above reads the weight once per row of `x`, which
-//! is free at a decode step's single row and is the whole of a prefill's cost
-//! at hundreds: 385 tokens through this kernel moved the same bytes a token
-//! that 385 decode steps would have. `packed_matmul_rows` is the same walk with
-//! the sums of several rows carried through it, and the two are separate
+//! **Or one simdgroup per [`ROWS_A_TILE`] rows of it by [`COLS_A_TILE`]
+//! columns, where the rows share an expert.** The arrangement above reads the
+//! weight once per row of `x`, which is free at a decode step's single row and
+//! is the whole of a prefill's cost at hundreds: 385 tokens through this kernel
+//! moved the same bytes a token that 385 decode steps would have.
+//! `packed_matmul_rows` is the same walk with the sums of a tile carried through
+//! it — the rows to share a weight read, the columns to share the input read
+//! that sharing the weight then left it waiting on — and the two are separate
 //! entries out of one source so that the shape with nothing to win keeps the
 //! register budget it had.
 //!

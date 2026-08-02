@@ -404,47 +404,61 @@ few ulps apart, and one extra tile of keys already inside the window is what buy
 the stronger claim.
 
 **What it is not for is prefill wall time, and that belongs to the reference.**
-97, 385 and 769 tokens prefill here in **1.33, 3.84 and 6.62 s against the
-reference's 0.26, 0.68 and 1.13** — ×5.1, ×5.6 and ×5.9, both sides measured in
-the one sitting, and still widening with the prompt. **Five things have moved
-this row and only the last two were about it**: the matmul took it 1.90, 5.39
-and 10.14 s to 1.75, 4.70 and 8.87; the loop bound was written for a long
-context and paid at a short one, taking it to 1.73, 4.69 and 8.33; pipelining a
-decode step's run took the shortest length to 1.55 while the other two did not
-move, because a 97-token prefill still merges four layers to a run and a longer
-one merges none; then the row tile, 1.53 s to 1.45, 4.75 to 4.17 and 8.40 to
-7.78; and then the grouping below, over four alternating pairs a length in which
-every pair moved the same way and no two ranges overlapped — **1.47 s to 1.33,
-4.06 to 3.84 and 7.66 to 6.62**, and the device's own clock 0.69 to 0.59, 2.91
-to 2.40 and 6.01 to 5.11. Each pair re-measures both sides rather than reading
-the stage before it off this file, which is why the last one's `before` is 1.47,
-4.06 and 7.66 where the row above records 1.45, 4.17 and 7.78: a sitting a
-milestone apart is a different sitting.
+97, 385 and 769 tokens prefill here in **1.22, 3.20 and 5.52 s against the
+reference's 0.26, 0.68 and 1.14** — ×4.7, ×4.7 and ×4.8, both sides measured in
+the one sitting, in two rounds with the order of the two halves flipped. **The
+gap has stopped widening with the prompt**, which is the first sitting in this
+file of which that is true: the same two rounds put the commit before this one
+at ×5.0, ×5.6 and ×5.9, so what the column tile below took off is the slope
+rather than a constant. The reference did not move between the rounds — 0.26,
+0.68 and 1.14 both times, to the hundredth.
 
-**What a prefill holds is what it allocates, and this is the first change to it
-that allocated anything at all.** A tile is registers; a permutation is two
-`uint` a row that the sort writes and the bank reads. That is 1.4 MiB of the
-13741.2 MiB a 769-token prefill allocates, 80 buffers of the 1278, and it is
-held for as long as the layer's command buffer is — where the layer's own
-intermediates at that length are 37.8 MB apiece. The bound a merged run is
-traded against does not reach a prefill and still does not: ten tokens already
-pass it, so every prompt worth the name is a submission a layer, and 42 and 43
-submissions are what they were.
+**Six things have moved this row and only the last three were about it**: the
+matmul took it 1.90, 5.39 and 10.14 s to 1.75, 4.70 and 8.87; the loop bound was
+written for a long context and paid at a short one, taking it to 1.73, 4.69 and
+8.33; pipelining a decode step's run took the shortest length to 1.55 while the
+other two did not move, because a 97-token prefill still merges four layers to a
+run and a longer one merges none; then the row tile, 1.53 s to 1.45, 4.75 to
+4.17 and 8.40 to 7.78; then the grouping, 1.47 s to 1.33, 4.06 to 3.84 and 7.66
+to 6.62; and then the column tile below — over four alternating pairs a length in
+which every pair moved the same way and no two ranges overlapped, **1.31 s to
+1.22, 3.78 to 3.20 and 6.60 to 5.52**, ranges 1.27-1.33 against 1.20-1.23,
+3.67-3.86 against 3.14-3.25 and 6.53-6.69 against 5.44-5.60, and the device's own
+clock 0.59 to 0.50, 2.40 to 1.83 and 5.11 to 3.82. Each pair re-measures both
+sides rather than reading the stage before it off this file, which is why the
+last one's `before` is 1.31, 3.78 and 6.60 where the row above records 1.33, 3.84
+and 6.62: a sitting a milestone apart is a different sitting.
 
-**And the decode step did not move, which is the constraint this was done
+**What a prefill holds is what it allocates, and the grouping is the only change
+to it that allocated anything at all.** A tile is registers, on both of its
+axes; a permutation is two `uint` a row that the sort writes and the bank reads.
+That is 1.4 MiB of the 13741.2 MiB a 769-token prefill allocates, 80 buffers of
+the 1278, and it is held for as long as the layer's command buffer is — where
+the layer's own intermediates at that length are 37.8 MB apiece. The column tile
+adds nothing to either column: 1686.5, 6873.3 and 13741.2 MiB over 1127, 1157
+and 1278 buffers, the same figures to the tenth of a mebibyte either side of it,
+because sixteen running sums a lane are sixteen registers and not a buffer. The
+bound a merged run is traded against does not reach a prefill and still does
+not: ten tokens already pass it, so every prompt worth the name is a submission a
+layer, and 42 and 43 submissions are what they were.
+
+**And the decode step did not move, which is the constraint all of this was done
 under.** Over seven alternating pairs with the order alternating too, a step is
-20.25 ms against 20.33 and the device's own clock 18.23 against 18.33 — a
-difference of 0.4% with the two ranges lying inside each other, 19.87-20.94
-against 19.97-21.19, and four of the seven pairs falling the other way. By this
-file's own standard for a real effect — every pair moving the same way and the
-ranges not overlapping — that is no number at all. What says *why* is not the
-timing: `tiles` and `groups` are both false for every shape a decode step
-dispatches, so the table of a decode step's kernels has the same 457
-`packed_matmul` calls moving the same 5932.36 MB and **neither a
-`packed_matmul_rows` row nor a `packed_matmul_grouped` one**, in the same 1077
-dispatches, 15 submissions and 953 buffers of 17.6 MiB. The recorded
-continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]` did not change, and
-neither did the text speculation writes at every depth.
+20.21 ms against the 20.49 the commit before the column tile reads, and the
+device's own clock 18.17 against 18.40 — with the two ranges lying across each
+other, 20.00-20.96 against 20.02-21.30, and three of the seven pairs falling the
+other way. By this file's own standard for a real effect — every pair moving the
+same way and the ranges not overlapping — that is no number at all, and the
+grouping before it read the same way. What says *why* is not the timing: `tiles`
+and `groups` are both false for every shape a decode step dispatches, so the
+table of a decode step's kernels has the same 457 `packed_matmul` calls moving
+the same 5932.36 MB and **neither a `packed_matmul_rows` row nor a
+`packed_matmul_grouped` one**, in the same 1077 dispatches, 15 submissions and
+953 buffers of 17.6 MiB. The recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` did not change; nor did 48
+tokens of a longer prompt, byte for byte across the two builds at every depth
+speculation runs at — `k` of 0, 1, 2 and 4 — nor what `--backend cpu` answers,
+which no kernel change can reach and which is checked rather than assumed.
 
 **And now where those seconds go, which is a question this file has answered for
 a decode step and had never once asked of the other regime.** The same sampling,
@@ -545,9 +559,9 @@ kernel that has stopped being bandwidth-bound, and what it is bound by is
 visible in the loop: four packed bytes to a lane are eight codes, and eight
 codes against four rows are thirty-two input floats where untiled they are
 eight. The input is small and warm, but it is now read four times as often per
-byte of weight, and that is what the next tile has to share — one simdgroup over
-several *columns* as well as several rows, so that one read of the input serves
-more than one weight row.
+byte of weight, and that is what the *column* tile below shares. Those four rows
+are that commit's own; the tables under the column tile are what the same
+dispatches cost today.
 
 **And the 59.1% is taken too, by moving the rows rather than by tiling them.**
 A token's six rows name six different experts, so the tile above can never reach
@@ -576,7 +590,7 @@ what the bank reads, so it goes between them in the command buffer a layer
 already was. 1077 dispatches a prefill to 1117 at every length, and the
 submissions where they were: 22 at 97 tokens, 42 at 385 and 43 at 769.
 
-**What it bought, at 769 tokens:**
+**What it bought, at 769 tokens and as the rows stood then:**
 
     kernel                    calls    device      moved   achieved   of peak
     packed_matmul_grouped       120     2.64s    1035 GB   393 GB/s       48%
@@ -616,27 +630,101 @@ and the same 445 GB. Why a pipeline that never runs slows one that does is
 unexplained here; what is measured is that the grouping buys 1.06 s at that
 length against it.
 
-**One lever is left, and it is the input re-read.** Both tiled rows are far under
-the untiled kernel's 666 GB/s — 201 and 393 — and they are 4.85 s of a 5.11 s
-prefill's device time. Per output element a tile of four rows reads the same
-`in_dim` input floats an untiled call does and a quarter of the weight bytes, so
-the input is 32 bytes read for every byte of weight and the achieved column is
-reporting that ratio rather than the memory. **That wants a tile over columns as
-well as rows**, so that one read of the input serves several weight rows. It was
-not taken here: the grouping is the larger share of the bytes and the one nothing
-touched, and the two are independent — a column tile applies to whichever entry
-it is written into.
+**The lever that was left was the input re-read, and it is taken.** Both tiled
+rows sat far under the untiled kernel's 666 GB/s — 201 and 393 — and were 4.85 s
+of a 5.11 s prefill's device time. Per output element a tile of four rows reads
+the same `in_dim` input floats an untiled call does and a quarter of the weight
+bytes, so the input was 32 bytes read for every byte of weight and the achieved
+column was reporting that ratio rather than the memory. **A tile is four columns
+wide as well as four rows deep now**: one lane loads a packed byte from each of
+four consecutive weight rows and multiplies all four against the same two input
+floats, so one read of the input serves four output columns and the ratio falls
+to eight.
+
+**It is the same three entry points and not a fourth**, which is what P3's price
+for compiling a third one left this change owing. A column tile of one is the row
+tile exactly,
+so the column was written into the tile that was already there rather than
+beside it — `packed_matmul_rows` and `packed_matmul_grouped` are the same two
+entries with wider bodies, and the untiled kernel a decode step runs is
+untouched. What that costs to compile is nothing measurable: the whole source is
+380 to 500 microseconds at every width from one column to eight and the tiled
+entry alone 124 to 155, with the widths ordered the wrong way round for the body
+to be what decides it.
+
+**What it bought, at 769 tokens:**
+
+    kernel                    calls    device      moved   achieved   of peak
+    packed_matmul_grouped       120     1.86s    1035 GB   556 GB/s       68%
+    packed_matmul_rows          336     1.58s     445 GB   281 GB/s       34%
+    fused_attention              42   548.6ms       1 GB     3 GB/s        0%
+    group_by_expert              40    25.9ms       2 MB     0 GB/s        0%
+    packed_matmul                 1    0.70ms     436 MB   624 GB/s       76%
+
+against 2.64 s and 2.19 s for the same 120 and 336 calls before it, and at 385
+tokens 548 GB/s to 739 and 213 to 290. **1.39 s came off the two tiled rows and
+1.29 s off the prefill's device clock**, which is what says the change reached
+the rows it was aimed at and paid for itself nowhere else: the two were 4.83 s of
+5.11 and are 3.44 s of 3.82. The two rows big enough to have said otherwise did
+not — `fused_attention` moved 548.9 ms to 548.6 and `dense_matmul` 38.63 to
+38.64 — and `group_by_expert`, `moe_combine`, `swiglu`, both routers and the
+untiled `packed_matmul` are each within 4% on rows of 26 ms and under. The two
+that are not are `rms_norm` and `short_conv`, which moved 10.5 ms to 26.1 and
+21.7 to 15.7 in opposite directions for 9.6 ms between them — 0.25% of a
+prefill, on two of the smallest rows of a table that carries 8.4% of sampling
+bias, and neither kernel was touched.
+
+**Not one byte came off, and that is the point rather than a disappointment.**
+Every output column is its own weight row, so the columns of a tile share no
+weight byte and `PackedBank::moves` does not mention the width: 3840, 2484 and
+1951 MB a token declared, and 3838, 2117 and 1813 once the declared bound is
+replaced by the weight reads the kernel makes — the same six figures to the
+megabyte either side. **This is the exact inverse of the row tile's finding**,
+which took 1.447× of the bytes and 1.16× of the time. Bytes and time stopped
+moving together the moment this kernel stopped being bandwidth-bound, and a
+change that moves one without the other is what that looks like from each side
+in turn.
+
+**Four columns and not eight, and the sweep turns as hard as the height one
+did.** Wall time a dispatch at the shipped four rows, over the shapes and lengths
+a prefill gives this kernel:
+
+    columns a tile               1        2        3        4        6        8
+    q_proj, 385 tokens       410µs    361µs    324µs    282µs    334µs    493µs
+    k_proj, 385 tokens        98µs     96µs     85µs     73µs     87µs    124µs
+    shared gate/up, 385      425µs    365µs    336µs    292µs    359µs    486µs
+    shared down, 385         392µs    352µs    290µs    254µs    292µs    496µs
+    q_proj, 769 tokens       819µs    716µs    644µs    561µs    678µs    981µs
+    shared gate/up, 769      875µs    735µs    678µs    583µs    714µs    973µs
+
+Every shape turns at four and eight is slower than one column. **The rate this
+sweep prints is over bytes that do not move with the width**, unlike the height
+sweep's, which is what makes the columns comparable without an argument. A tile
+carries a running sum per row *per column*, so four beside four rows is 32
+accumulators a lane where the row tile alone wanted eight — but **that the turn
+is register pressure is a reading rather than a measurement**: the widest
+threadgroup the pipeline reports is the device's own 1024 at eight columns as at
+one, which is the one place this side could have seen it.
+
+**And the height did not move under it.** Re-swept at four columns, the rows a
+tile turn at four on four of the six shapes and at three on the other two by
+under 2%, which is where they turned at one column — so the two axes are
+independent to the resolution this measures at, and `ROWS_A_TILE` is where the
+row tile left it.
 
 **M9's hypothesis did not hold, and the table is what says so.** It was that
 every `(head, query)` threadgroup re-reading all keys is the next order of
 magnitude here. `fused_attention` is 4.4% of a 385-token prefill's device time
 and 7.5% of a 769-token one — growing with the prompt, as the hypothesis
 implies, and two orders below where the time is. An attention kernel that cost
-nothing at all would have taken 8.37 s to 7.82. Its share is 5.0% and 8.6% now
-that the matmul under it has shrunk, which is what a deferred finding looks like
-when everything around it improves and is the same thing that happened to
-`short_conv`; what has not changed is that it is not where a prefill's seconds
-are.
+nothing at all would have taken 8.37 s to 7.82. Its share is **7.9% and 13.3%**
+now that the matmul under it has shrunk twice, against 5.0% and 8.6% after the
+grouping and 4.4% and 7.5% when the table was first taken — 548.6 ms of device
+time at 769 tokens that has not moved by a millisecond across three changes to
+the row above it. That is what a deferred finding looks like when everything
+around it improves, and is the same thing that happened to `short_conv`; what
+has not changed is that it is not where a prefill's seconds are, and what has is
+that it is now the third-largest row rather than a rounding error.
 
 **Nor is it the round trips, and this time that is measured rather than argued
 from a submission count.** A prefill is one submission a layer — 42 of them at
