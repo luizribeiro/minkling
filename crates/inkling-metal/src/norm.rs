@@ -215,12 +215,37 @@ impl<'a> LayerNorm<'a> {
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
     ) -> Result<Buffer<f32>, MetalError> {
+        self.encode_last(batch, x, self.rows(x.len()))
+    }
+
+    /// The same normalisation over the **last** `rows` rows of what a dispatch
+    /// left on the device, leaving those rows alone on the other side.
+    ///
+    /// **A suffix rather than a range, because that is the shape the back of
+    /// the model asks for.** A pass produces a hidden state per token and the
+    /// head reads the last of them — one row at a prefill, and the block a
+    /// speculative round proposed at a decode step — so what the tail needs of
+    /// a buffer forty-two layers wrote is its final rows and nothing before
+    /// them. A norm is over a row and reads no other, so the answer for those
+    /// rows is what a norm over the whole call would have left in the same
+    /// places.
+    ///
+    /// The alternative was an offset on whatever reads the normed rows next,
+    /// which is [`crate::PackedMatmul`] — 70% of a decode step's device time,
+    /// against this kernel's 8.7%.
+    pub fn encode_last(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        rows: usize,
+    ) -> Result<Buffer<f32>, MetalError> {
         let _timed = profile::scope(Op::Encode);
-        let rows = self.rows(x.len());
-        let mut out = self.device.zeroed::<f32>(x.len())?;
+        let from = self.rows(x.len()) - rows;
+        let mut out = self.device.zeroed::<f32>(rows * self.width)?;
         self.encoding(
             batch,
             x,
+            from,
             None,
             Landing {
                 out: &mut out,
@@ -252,7 +277,7 @@ impl<'a> LayerNorm<'a> {
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
-        self.encoding(batch, x, scale, landing)
+        self.encoding(batch, x, 0, scale, landing)
     }
 
     /// Threads the threadgroup over one group holds: whole simdgroups enough to
@@ -298,6 +323,7 @@ impl<'a> LayerNorm<'a> {
         &self,
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
+        from: usize,
         scale: Option<&[f32]>,
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
@@ -309,7 +335,7 @@ impl<'a> LayerNorm<'a> {
             x.len(),
             landing.groups
         );
-        let rows = self.rows(x.len() / landing.groups);
+        let rows = self.rows(x.len() / landing.groups) - from;
         let scale = match scale {
             Some(scale) => {
                 assert_eq!(scale.len(), rows, "a scale a row");
@@ -325,6 +351,7 @@ impl<'a> LayerNorm<'a> {
             extent(self.width, "the width of a norm"),
             extent(landing.stride, "the rows a group has room for"),
             extent(landing.base, "where a call's rows start"),
+            extent(from, "where a call's rows are read from"),
             self.eps.to_bits(),
         ];
         let mut shape = self.device.inline(&fields)?;
@@ -337,8 +364,9 @@ impl<'a> LayerNorm<'a> {
         // never splits over the question.
         let grid = Grid::new(rows * landing.groups * self.threads, self.threads);
         // The rows in, the same rows out, the one weight every row of every call
-        // reads, and a scale for each row.
-        let moves = size_of::<f32>() * (2 * x.len() + self.width + rows);
+        // reads, and a scale for each row. A call over a suffix reads and writes
+        // its own rows and not the ones in front of them.
+        let moves = size_of::<f32>() * (2 * rows * landing.groups * self.width + self.width + rows);
         batch.add(
             &self.norm.kernel,
             &[
@@ -380,6 +408,7 @@ struct Shape {
     uint width;
     uint stride;
     uint base;
+    uint source;
     uint eps_bits;
 };
 
@@ -523,7 +552,9 @@ static void normalise(
 ///
 /// Where a group's rows land is [`Landing`](crate::Landing)'s three numbers —
 /// see there for why the transpose and the append are indexing rather than
-/// passes over a tensor.
+/// passes over a tensor. `source` is the other end of the same idea: the row of
+/// `x` this call's first row is, so that a caller wanting the rows the head
+/// reads dispatches over those rows rather than over the whole call.
 ///
 /// `scale` is one value per row, multiplied into every channel of it. Log
 /// scaling's `tau` is the only thing that ever sets it and everywhere else it is
@@ -556,7 +587,8 @@ kernel void rms_norm(
     const uint row = slot / shape.groups;
     const uint group = slot % shape.groups;
 
-    device const float *values = x + (ulong)slot * shape.width;
+    device const float *values =
+        x + ((ulong)shape.source * shape.groups + slot) * shape.width;
     device float *result =
         out + ((ulong)group * shape.stride + shape.base + row) * shape.width;
     const float row_scale = scale[row];
@@ -651,9 +683,52 @@ mod tests {
         );
     }
 
+    /// **A suffix answers for its own rows and reads none in front of them.**
+    /// The back of the model norms the rows the head reads out of a buffer
+    /// forty-two layers wrote, so what says this is indexing rather than a
+    /// second normalisation is that the values land where a norm over the whole
+    /// call left them — and that the rows before the suffix are not what came
+    /// back.
+    ///
+    /// The rows are all different, so a suffix taken from the wrong end is a
+    /// different answer rather than the same one.
+    #[test]
+    fn a_norm_over_a_suffix_answers_what_the_whole_call_answers_for_those_rows() {
+        let Some(device) = device() else { return };
+        const WIDTH: usize = 128;
+        const ROWS: usize = 5;
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let weight: Vec<f32> = (0..WIDTH).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+        let layer = LayerNorm::new(&device, &norm, &weight, 1e-6).expect("the weight uploads");
+        let rows: Vec<f32> = (0..ROWS * WIDTH)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) * (1 + i / WIDTH) as f32)
+            .collect();
+
+        let whole = layer.forward(&rows).expect("the dispatch completes");
+        for last in 1..=ROWS {
+            let mut x = device.buffer(&rows).expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let suffix = layer
+                .encode_last(&mut batch, &mut x, last)
+                .expect("the dispatch encodes");
+            batch.wait().expect("the dispatch completes");
+
+            assert_eq!(suffix.len(), last * WIDTH, "{last} rows");
+            assert_eq!(
+                suffix.to_vec(),
+                whole[(ROWS - last) * WIDTH..],
+                "the last {last} rows"
+            );
+        }
+    }
+
     /// What the bandwidth column divides by, against what the kernel reads: the
     /// rows in, the same rows out, the one weight every row of every call
     /// reduces against, and a scale a row.
+    ///
+    /// A suffix is charged its own rows, which is what keeps the tail's one-row
+    /// norm out of a table that would otherwise read it as a pass over the whole
+    /// prompt.
     #[test]
     fn a_dispatch_declares_the_rows_and_the_weight_it_reads() {
         let Some(device) = device() else { return };
