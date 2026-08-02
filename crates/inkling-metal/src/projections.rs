@@ -134,6 +134,13 @@ impl LayerKernels {
     pub fn matmul(&self) -> &PackedMatmul {
         &self.matmul
     }
+
+    /// The attention step, which the MTP heads dispatch through too: a head's
+    /// block is a decoder layer, so the operation is the same one and the
+    /// source names no shape.
+    pub fn attention(&self) -> &FusedAttention {
+        &self.attention
+    }
 }
 
 impl<'a> LayerProjections<'a> {

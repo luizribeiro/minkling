@@ -222,7 +222,7 @@ impl<'a> Packed<'a> {
 /// which no matmul reads and which [`CheckpointWeights`] widens once.
 #[derive(Debug, Clone, Copy)]
 pub struct Bf16<'a> {
-    view: TensorView<'a>,
+    bytes: &'a [u8],
     out_dim: usize,
     in_dim: usize,
 }
@@ -248,11 +248,23 @@ impl<'a> Bf16<'a> {
                 shape: view.shape().to_vec(),
             });
         };
-        Ok(Self {
-            view,
+        Ok(Self::over(view.data(), out_dim, in_dim))
+    }
+
+    /// The same over bytes a caller already holds, for one that has a bfloat16
+    /// weight of its own rather than a checkpoint's — a test's, and either half
+    /// of a tensor that fused two.
+    pub fn over(bytes: &'a [u8], out_dim: usize, in_dim: usize) -> Self {
+        assert_eq!(
+            bytes.len(),
+            out_dim * in_dim * BF16_BYTES,
+            "{out_dim} rows of {in_dim} bfloat16 values"
+        );
+        Self {
+            bytes,
             out_dim,
             in_dim,
-        })
+        }
     }
 
     /// The width a row of the input has to be.
@@ -267,7 +279,7 @@ impl<'a> Bf16<'a> {
 
     /// The bytes themselves, row-major, as the checkpoint holds them.
     pub fn bytes(&self) -> &'a [u8] {
-        self.view.data()
+        self.bytes
     }
 
     /// How many values the weight holds, which is what widening it costs.
@@ -278,8 +290,9 @@ impl<'a> Bf16<'a> {
     /// The same tensor widened, for a caller that multiplies against float32
     /// because it has no kernel that reads these bytes.
     pub fn to_f32(&self) -> Vec<f32> {
-        let _timed = profile::scope(Op::Decode);
-        self.view.to_f32().expect("a bfloat16 tensor widens")
+        let mut values = vec![0.0; self.values()];
+        self.widen_into(&mut values);
+        values
     }
 
     /// The same values into a run the caller already has, for one that widens a
@@ -313,7 +326,7 @@ impl<'a> Bf16<'a> {
             self.out_dim
         );
 
-        let bytes = self.view.data();
+        let bytes = self.bytes;
         for (row, out) in out.chunks_exact_mut(self.in_dim).enumerate() {
             let start = (first + row * stride) * self.in_dim * BF16_BYTES;
             let row = bytes[start..].chunks_exact(BF16_BYTES);

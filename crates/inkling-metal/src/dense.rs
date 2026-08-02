@@ -36,6 +36,7 @@
 use std::cell::RefCell;
 
 use inkling_core::checkpoint::{BF16_BYTES, BF16_SHIFT};
+use inkling_core::ops::Projection;
 use inkling_core::profile::{self, Op};
 use inkling_core::weights::Bf16;
 
@@ -116,6 +117,11 @@ pub struct DenseWeight<'a> {
     matmul: &'a DenseMatmul,
     in_dim: usize,
     out_dim: usize,
+    /// Rows of the tensor one row of this weight steps over, and where its
+    /// first row starts in bytes — 1 and 0 for a weight that is a tensor, and
+    /// what makes two weights out of one for a tensor that holds two.
+    stride: usize,
+    first: usize,
     /// Held behind a cell for the reason [`crate::PackedBank`]'s resident
     /// tensors are: binding a buffer to a dispatch borrows it exclusively, and
     /// the weight belongs to this rather than to a call.
@@ -149,13 +155,44 @@ impl<'a> DenseWeight<'a> {
         matmul: &'a DenseMatmul,
         weight: &Bf16<'a>,
     ) -> Result<Self, MatmulError> {
-        let (in_dim, out_dim) = (weight.in_dim(), weight.out_dim());
-        pairs(in_dim, out_dim, weight.bytes().len())?;
+        Self::wrap_rows(device, matmul, weight, 0, 1)
+    }
+
+    /// Every `stride`th row of a checkpoint's weight from `first`, read where
+    /// it is mapped.
+    ///
+    /// **One tensor is two weights where the checkpoint fused them.** An MTP
+    /// head's `w13_dn` is its SwiGLU's gate and up interleaved row by row, so
+    /// the two projections a multiply wants are its even rows and its odd ones
+    /// — and a stride is what lets both be read where they are rather than
+    /// de-interleaved into 268 MB of copies a head.
+    pub fn wrap_rows(
+        device: &'a Device,
+        matmul: &'a DenseMatmul,
+        weight: &Bf16<'a>,
+        first: usize,
+        stride: usize,
+    ) -> Result<Self, MatmulError> {
+        assert!(stride > 0, "a weight's rows step over its own");
+        assert!(first < stride, "row {first} of every {stride}");
+        let (in_dim, rows) = (weight.in_dim(), weight.out_dim());
+        pairs(in_dim, rows, weight.bytes().len())?;
         // SAFETY: the bytes are a `Checkpoint`'s mapping, which outlives this by
         // the lifetime they carry and which nothing writes — the assumption that
         // module already maps under.
         let mapped = unsafe { device.wrap(weight.bytes())? };
-        Self::over(device, matmul, in_dim, out_dim, Bytes::Mapped(mapped))
+        Self::over(
+            device,
+            matmul,
+            in_dim,
+            (rows - first).div_ceil(stride),
+            Bytes::Mapped(mapped),
+        )
+        .map(|held| Self {
+            first,
+            stride,
+            ..held
+        })
     }
 
     fn over(
@@ -171,6 +208,8 @@ impl<'a> DenseWeight<'a> {
             matmul,
             in_dim,
             out_dim,
+            stride: 1,
+            first: 0,
         })
     }
 
@@ -182,6 +221,12 @@ impl<'a> DenseWeight<'a> {
     /// The width a row of the output is.
     pub fn out_dim(&self) -> usize {
         self.out_dim
+    }
+
+    /// The device this multiplies on, for a caller batching several of these
+    /// into one command buffer.
+    pub fn device(&self) -> &'a Device {
+        self.device
     }
 
     /// `[rows, in_dim]` in, `[rows, out_dim]` out, submitted on its own.
@@ -254,6 +299,7 @@ impl<'a> DenseWeight<'a> {
         );
         let moves = self.in_dim * self.out_dim * BF16_BYTES
             + size_of::<f32>() * (x.len() + rows * self.out_dim);
+
         batch.add(
             kernel,
             &[shape.arg(), x.arg(), resident.arg(), out.arg()],
@@ -267,13 +313,36 @@ impl<'a> DenseWeight<'a> {
     /// call's own, which is what two multiplies of different heights sharing a
     /// command buffer needs them to be.
     fn shape(&self, rows: usize, simdgroups: usize) -> [u32; SHAPE_FIELDS] {
+        let first = self.first * self.in_dim * BF16_BYTES;
         [
             extent(rows, "the rows of a call"),
             extent(self.in_dim, "the width a weight maps from"),
             extent(self.out_dim, "the width a weight maps to"),
-            extent(self.resident.borrow().offset(), "where a weight starts"),
+            extent(
+                self.resident.borrow().offset() + first,
+                "where a weight starts",
+            ),
+            extent(self.stride, "the tensor's rows a row of this steps over"),
             extent(simdgroups, "the simdgroups over one output element"),
         ]
+    }
+}
+
+/// The same multiply as [`crate::PackedProjection`]'s, over the format the
+/// quantiser left alone — so that a caller holding a projection cannot tell
+/// which of the two answered.
+impl Projection for DenseWeight<'_> {
+    fn in_dim(&self) -> usize {
+        self.in_dim
+    }
+
+    fn out_dim(&self) -> usize {
+        self.out_dim
+    }
+
+    fn forward(&self, x: &[f32]) -> Vec<f32> {
+        self.multiply(x)
+            .unwrap_or_else(|err| panic!("the dense matmul did not run: {err}"))
     }
 }
 
@@ -316,7 +385,7 @@ fn pairs(in_dim: usize, out_dim: usize, bytes: usize) -> Result<(), MatmulError>
 }
 
 /// How many `uint`s the kernel's `Shape` struct declares.
-const SHAPE_FIELDS: usize = 5;
+const SHAPE_FIELDS: usize = 6;
 
 /// The kernel, with the format's two facts written into its prelude.
 ///
@@ -342,6 +411,7 @@ struct Shape {
     uint in_dim;
     uint out_dim;
     uint base;
+    uint stride;
     uint simdgroups;
 };
 
@@ -411,8 +481,12 @@ kernel void dense_matmul(
     const uint reach = shape.simdgroups * width;
     const uint start = (simd % shape.simdgroups) * width + lane;
 
+    // `stride` is how many of the tensor's rows one row of *this* weight steps
+    // over, which is 1 for every weight but the two an MTP head's `w13_dn`
+    // holds interleaved — see `DenseWeight::wrap_rows`. Where the weight starts
+    // is `base`, which carries the first row too.
     float sum = live ? weight_dot(
-        weight + shape.base + (ulong)col * shape.in_dim * BF16_BYTES,
+        weight + shape.base + (ulong)col * shape.stride * shape.in_dim * BF16_BYTES,
         x + (ulong)row * shape.in_dim,
         shape.in_dim,
         start,
