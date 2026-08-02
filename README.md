@@ -23,28 +23,30 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **467 of the 476 tests, no
+`just test` is the one to run while iterating: **499 of the 511 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
-30 that need weights report a skip and pass. It runs through libtest, which puts
-a crate's tests in one process: opening a Metal device costs a second, so the 133
+43 that need weights report a skip and pass. It runs through libtest, which puts
+a crate's tests in one process: opening a Metal device costs a second, so the 148
 kernel tests are 7.5 s sharing a process and 161 s with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass before a commit lands: **all 476 against a
-real checkpoint, four minutes thirty.** The 36 gated tests are what
+`just test-full` is what has to pass before a commit lands: **all 511 against a
+real checkpoint, four minutes.** The 43 gated tests are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
-generates the oracle's own continuation — and `--backend cpu` is the oracle they
-are measured against, at 9.0 s a decoded token, which is where most of those
+generates the oracle's own continuation, and that it generates the same
+continuation while guessing four tokens ahead — and `--backend cpu` is the
+oracle they are measured against, at 9.0 s a decoded token, which is where most of those
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the nine tests whose result *is* a number — a duration
+`just test-timing` is the twelve tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the two decode-step tables quoted
-above — run one at a time with nothing beside them. **A measurement taken while
-nine other tests ran is a measurement of the nine:** a round trip this repo has at
+above, what a speculative round costs — run one at a time with nothing beside
+them. **A measurement taken while eleven other tests ran is a measurement of
+the eleven:** a round trip this repo has at
 191 µs reports 598 under a parallel suite, and `.config/nextest.toml` records
 what believing a number like that once cost. `#[ignore]` is what keeps them out
 of the two runs above, and what selects them here.
@@ -373,9 +375,16 @@ per sequence — a 1M-token context fits in under 30 GiB. This is what makes dee
 batching plausible on one machine.
 
 **Short-conv state cannot be trimmed.** It keeps only the last `K-1` inputs, so
-rejected speculative tokens need restore-and-replay rather than truncation.
-Reordering along the batch dimension is fine, so continuous batching works, but
-MTP rejection and batching meet here and this is the hard part of the engine.
+a rejected speculative token cannot be taken out of it the way a key can:
+shortening the window needs the input *before* the ones it holds, and that
+input is gone. mlx-vlm's answer is to restore the state and replay the accepted
+tokens through the model, which is a whole second forward pass on every round
+that rejects one. **Here the window keeps more than it reads** — `slack`
+timesteps further back — so a rejection is a shift rather than a replay, and
+what it leaves is the window the sequence would have had, bit for bit. See
+"Speculating with the MTP heads" below. Reordering along the batch dimension is
+fine, so continuous batching works, but MTP rejection and batching meet here and
+this is the hard part of the engine.
 
 **The reference materialises the mask.** It builds a full `[B, H, LQ, S]`
 additive tensor — acceptable when decoding, quadratic when prefilling, and an
@@ -385,6 +394,101 @@ the scores get spelled out beside it. Together they are 57% of what a
 refused at a projected 406 GiB. `--backend metal` builds neither: the
 relative-position bias is computed per element inside the attention kernel,
 which is where a custom engine wins outright.
+
+## Speculating with the MTP heads
+
+    inklingrs generate models/Inkling-Small-mxfp4 --prompt '…' -n 64 --speculate 2
+
+Inkling ships **eight multi-token prediction heads** and nothing had ever run
+them: mlx-vlm drops every `model.mtp.*` tensor at load. A head is a decoder
+layer with three tensors in front of it — a norm over the hidden state it is
+chained from, a norm over the embedding of the token one position further
+ahead, and a `[4096, 8192]` projection that takes the pair back to model width
+— and head `d` guesses the token `d + 2` positions on. `reference/results/mtp_acceptance.md`
+is the study that settled the wiring; the engine verifies it against the
+tensors and reproduces one head against mlx-vlm's own module.
+
+**A round proposes `k`, verifies `k + 1` in one forward pass, and banks the
+longest prefix the model agreed with.** Position `i` of the block answers what
+follows everything fed up to row `i`, which — while the guesses were right — is
+the question the next decode step would have asked, so the first answer that
+disagrees is kept too: it is the model's own token from a prefix the model
+agrees with. **No guess is ever load-bearing**, and the tokens are identical
+with speculation on and off — the recorded continuation of the recorded prompt,
+at every depth, asserted in `just test-full` and again over 64 tokens in the
+timing tier.
+
+Rejected tokens are taken back rather than replayed: the keys are a counter,
+and the four convolution windows a layer keeps are shifted along inside the
+slack they were built with. On the device that is the same shift over a buffer
+the GPU holds, which unified memory makes a move rather than a copy.
+
+**What a round costs, measured here rather than inherited.** Against a warm
+cache, a 34-token prompt, and this engine's own 37.0 ms decode step:
+
+    tokens in the block    1      2      3      4      6      9
+    forward pass       35.1ms 54.2ms 68.4ms 75.2ms 95.1ms 127.8ms
+    × a decode step      0.95   1.46   1.85   2.03   2.57    3.45
+    submissions             2     43     43     43     43      43
+
+    heads chained          1      2      3      4      6      8
+    the chain           4.8ms  9.4ms 14.0ms 20.2ms 29.0ms  38.3ms
+    × a decode step      0.13   0.25   0.38   0.54   0.78    1.03
+
+**An extra token in the block costs 11.6 ms**, which is the acceptance study's
+finding reproduced on this engine's own numbers: it measured 10.5 ms against a
+31.8 ms step. Most of that is the MoE and is fundamental — one token reads 6
+routed experts a layer and nine tokens read up to 54, where the whole bargain of
+speculation elsewhere is that verifying `k` tokens costs about what decoding one
+does, because you re-read the same weights.
+
+**But the first extra token costs twice what the ones after it do, and the
+submissions column says why.** A decode step is two command buffers because a
+layer handed one row can leave what it produced where the next layer reads it; a
+call of more than one row cannot, because what a merged run holds is every
+intermediate of every layer in it until the buffer completes — so the engine
+draws that line at one row and a two-token block is 43 submissions where a
+one-token step is 2. At this machine's 250 µs a submission that is about 10 ms,
+against 11.6 ms of expert reads. It is a trade made deliberately for prefills of
+hundreds of tokens and never revisited for blocks of two or three, and it is the
+one number in this section that is nobody's law.
+
+A head's guess costs 4.8 ms, of which about 3.4 is the 950 MB it reads — its own
+532 MiB, and `lm_head` again to turn a hidden state into a token — and the rest
+is the five submissions a partial handover takes. The study called the
+reference's per-head overhead "yours to win in Rust"; most of it turns out to be
+bandwidth, and mlx-vlm was already near it at 3.9 ms.
+
+**So the speedup is thin.** Over 64 tokens of a structured prompt, three passes
+round-robin over the depths so that a drift moves them all, best pass each:
+
+    k                      0      1      2      3      4
+    ms/token           36.03  34.47  32.68  37.98  41.89
+    tokens a round      1.000  1.829  2.560  3.048  3.368
+    speedup             1.000  1.045  1.102  0.949  0.860
+    accepted, by depth         85%  91/74% 84/74/63% 82/65/53/47%
+
+**k = 2 is the depth that pays, at 1.10×**, against the study's projected 1.32×
+at the same depth. Acceptance is not what separates them — 2.56 tokens a round
+here against its pooled 2.36 — and neither is the chain, at 0.25 decode steps
+against its 0.24. It is the block: 1.85 decode steps here against its 1.55, of
+which the submissions are more than half. **Speculation divides a fixed win
+rather than adding one**, and the harder the decode step it is measured against
+has been made to work, the more of that ratio a block gives back.
+
+Acceptance is joint rather than marginal and cannot be otherwise in an engine: a
+round whose first guess was rejected never learns what its second was worth,
+because the position that guess was about is not the position the model went to.
+The study's teacher-forced replay could measure both. The spread across
+workloads is its headline finding and it holds here — 85% at the first head on
+structured text against the 44.9% it measured on prose — so the depth worth
+running is the workload's rather than the engine's, and `--speculate` takes it
+as a number for that reason.
+
+**The machinery costs a run that does not use it nothing**: 37.04 ms/token
+against 36.52 with four timesteps of slack in every window, which is inside the
+spread of three passes. A run that speculates nothing maps no head, allocates no
+scratch, and asks its windows for no slack at all.
 
 ## Weights
 

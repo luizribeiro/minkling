@@ -21,19 +21,21 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use inkling_core::fixture::{self, ACTIVATIONS, deviation, indices};
+use inkling_core::generate::{Proposer, Round};
 use inkling_core::moe::{Gate, GateWeights, MoeConfig, SparseMoe};
+use inkling_core::mtp::{CheckpointHeads, MtpProposer};
 use inkling_core::ops::linear;
 use inkling_core::profile::{self, Op, Profile};
 use inkling_core::quant::{BITS, dequantize_blocks_into};
 use inkling_core::{
     AttentionCache, AttentionStep, BandedMask, Bf16, Checkpoint, CheckpointWeights, Dtype, Ending,
     LayerStep, ModelCache, Packed as CorePacked, Projections, Sdpa, ShortConv, TensorView,
-    split_heads,
+    Tokenizer, split_heads,
 };
 use inkling_metal::{
     DenseMatmul, DenseWeight, Device, ExpertKernels, LayerKernels, LayerProjections, LayerRouter,
-    MetalError, ModelLayers, MoeCombine, PackedBank, PackedMatmul, PackedProjection, Router,
-    RouterWeights, StackShape, SwiGlu,
+    MetalError, ModelHeads, ModelLayers, MoeCombine, PackedBank, PackedMatmul, PackedProjection,
+    Router, RouterWeights, StackShape, SwiGlu,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -1518,4 +1520,435 @@ fn the_dense_matmul_reproduces_the_cpu_over_a_real_router_gate() {
         deviation > 0.0,
         "an exact match would mean the two are not summing independently"
     );
+}
+
+/// The prompt the speculative measurement runs against.
+///
+/// Templated, because the model answers a turn and continues raw text — and
+/// what a head is guessing about is what the model is doing. The acceptance
+/// study measured six regimes and found the spread between them larger than the
+/// spread between depths; this is one of them, the structured one, so what it
+/// says about acceptance is "on text like this" and nothing wider.
+const SPECULATIVE_PROMPT: &str = "<|message_user|><|content_text|>Count from 1 to 30. Put each on \
+     its own line in exactly the form 'Line N: N squared is M'. No \
+     commentary.<|end_message|><|message_model|>";
+
+/// How many tokens each depth decodes, which is what the acceptance and the
+/// throughput are both measured over.
+const SPECULATED_TOKENS: usize = 64;
+
+/// How many depths the block's cost is priced over, which is every one the
+/// checkpoint ships heads for.
+const DEPTHS: usize = 8;
+
+/// How deep the sweep of real generations goes.
+///
+/// Four, where the block is priced to eight: the study's pooled optimum was 2
+/// and its deepest paying depth 6, and every depth here is a whole generation
+/// rather than a repeat of one block.
+const SWEPT: usize = 4;
+
+/// How many times the sweep runs every depth, round-robin.
+const PASSES: usize = 3;
+
+/// A block's cost is measured this many times and averaged, after one run that
+/// is thrown away — the first pass over a shape pays for the driver's first
+/// look at the buffers it binds.
+const REPEATS: usize = 12;
+
+/// Everything a speculative round is made of, priced separately: what the
+/// machinery costs a run that never speculates, what a verify block costs
+/// against a warm cache, and what the two together buy over a real generation.
+///
+/// **The three are measured apart because they answer different questions.** A
+/// block's cost is the model's and grows with the tokens in it; acceptance is
+/// the workload's; and the speedup is what acceptance makes of the cost. The
+/// study measured all three against mlx-vlm and found the block's cost the one
+/// that decides it — 10.5 ms an extra token against a 31.8 ms step — so the
+/// second table is the one to read.
+///
+/// Every depth wraps the layers with the slack *it* needs rather than the
+/// deepest one's, because that is the configuration a run of that depth has:
+/// the windows a rejected token is taken back out of are wider by the depth,
+/// and what that costs is the first table.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn what_a_speculative_round_costs_and_what_it_buys() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    let config = fixture::config(&dir);
+    let text = &config.text_config;
+    let mtp = config.mtp_config.as_ref().expect("an mtp_config");
+    let tokenizer = Tokenizer::open(&dir, &config).expect("the tokenizer opens");
+    let ids: Vec<usize> = tokenizer
+        .encode(SPECULATIVE_PROMPT)
+        .expect("the prompt encodes")
+        .into_iter()
+        .map(|id| id as usize)
+        .collect();
+
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+
+    // The heads are 4.2 GiB of mapping, and a page joins the resident set when
+    // something reads it — so the first generation that speculates pays for
+    // faulting them in off disk and every later one does not. Warmed here, out
+    // of the clock, because that cost belongs to a run's first token and not to
+    // the depth that happened to be measured first.
+    {
+        let held = gpu.wrap(&ckpt, text, SWEPT);
+        let heads = gpu.heads(&ckpt, text, mtp);
+        Decoded::at(SWEPT, &held, &heads, text, &ids[..4]);
+    }
+
+    // What the machinery costs when nothing speculates: the same generation,
+    // over layers whose windows keep enough to take four tokens back and over
+    // layers that keep nothing.
+    eprintln!("\nwith nothing speculating, over {SPECULATED_TOKENS} tokens");
+    eprintln!("{:>7}  {:>10}", "slack", "ms/token");
+    let mut idle = Vec::new();
+    for slack in [0, 4] {
+        let held = gpu.wrap(&ckpt, text, slack);
+        let heads = gpu.heads(&ckpt, text, mtp);
+        let run = Decoded::at(0, &held, &heads, text, &ids);
+        eprintln!("{slack:>7}  {:>10.2}", run.step.as_secs_f64() * 1e3);
+        idle.push(run);
+    }
+    let decode = idle[0].step;
+
+    let held = gpu.wrap(&ckpt, text, 0);
+    eprintln!(
+        "\na verify block, against a warm cache of {} tokens",
+        ids.len()
+    );
+    eprintln!(
+        "{:>7}  {:>10}  {:>10}  {:>12}",
+        "tokens", "block", "xdecode", "submissions"
+    );
+    let mut block = Vec::new();
+    for tokens in 1..=DEPTHS + 1 {
+        let (cost, submissions) = time_block(&device, &held, text, &ids, tokens);
+        eprintln!(
+            "{tokens:>7}  {:>10.2?}  {:>10.3}  {submissions:>12}",
+            cost,
+            cost.as_secs_f64() / decode.as_secs_f64()
+        );
+        block.push(cost);
+    }
+    let extra = (block[DEPTHS].as_secs_f64() - block[0].as_secs_f64()) / DEPTHS as f64;
+    eprintln!("an extra token in the block: {:.2} ms", extra * 1e3);
+
+    eprintln!("\nthe chain of heads, over one row");
+    eprintln!("{:>7}  {:>10}  {:>10}", "heads", "chain", "xdecode");
+    for depth in 1..=DEPTHS {
+        let heads = gpu.heads(&ckpt, text, mtp);
+        let cost = time_chain(&held, &heads, text, &ids, depth);
+        eprintln!(
+            "{depth:>7}  {:>10.2?}  {:>10.3}",
+            cost,
+            cost.as_secs_f64() / decode.as_secs_f64()
+        );
+    }
+
+    // **Round-robin over the depths rather than a run apiece**, for the reason
+    // `.config/nextest.toml` records: a number taken once is a number about
+    // whatever else the machine was doing. Every pass runs every depth, so a
+    // drift that moves one moves them all, and what is reported is each depth's
+    // best pass — the one that shared the machine with the least.
+    let mut passes: Vec<Vec<Decoded>> = Vec::new();
+    for _ in 0..PASSES {
+        let mut pass = Vec::new();
+        for depth in 0..=SWEPT {
+            let held = gpu.wrap(&ckpt, text, depth);
+            let heads = gpu.heads(&ckpt, text, mtp);
+            pass.push(Decoded::at(depth, &held, &heads, text, &ids));
+        }
+        passes.push(pass);
+    }
+    let runs: Vec<&Decoded> = (0..=SWEPT)
+        .map(|depth| {
+            passes
+                .iter()
+                .map(|pass| &pass[depth])
+                .min_by_key(|run| run.step)
+                .expect("a pass")
+        })
+        .collect();
+    let decode = runs[0].step;
+
+    eprintln!("\nwhat the loop banked, over {SPECULATED_TOKENS} tokens");
+    eprintln!(
+        "{:>3}  {:>10}  {:>9}  {:>8}  {:>18}  accepted",
+        "k", "ms/token", "tok/round", "speedup", "passes"
+    );
+    for (depth, run) in runs.iter().enumerate() {
+        let spread: Vec<String> = passes
+            .iter()
+            .map(|pass| format!("{:.1}", pass[depth].step.as_secs_f64() * 1e3))
+            .collect();
+        eprintln!(
+            "{:>3}  {:>10.2}  {:>9.3}  {:>8.3}  {:>18}  {}",
+            run.depth,
+            run.step.as_secs_f64() * 1e3,
+            run.tokens_per_round(),
+            decode.as_secs_f64() / run.step.as_secs_f64(),
+            spread.join(" "),
+            run.acceptance()
+        );
+    }
+
+    // The property the whole thing rests on, and the reason the tokens are kept
+    // rather than only timed: a latency optimisation that moved a token would
+    // be a wrong engine, and every depth here ran the real heads against the
+    // real rollback.
+    for run in &runs[1..] {
+        assert_eq!(
+            run.tokens, runs[0].tokens,
+            "speculating {} deep changed the tokens",
+            run.depth
+        );
+    }
+}
+
+/// The kernels a speculative run compiles, held so that the weights wrapped
+/// against them can be built once per depth.
+struct Kernels<'d> {
+    device: &'d Device,
+    layers: LayerKernels,
+    dense: DenseMatmul,
+    swiglu: SwiGlu,
+    router: Router,
+    weights: RouterWeights,
+    combine: MoeCombine,
+}
+
+impl<'d> Kernels<'d> {
+    fn compile(device: &'d Device) -> Self {
+        Self {
+            device,
+            layers: LayerKernels::compile(device).expect("the layer kernels compile"),
+            dense: DenseMatmul::new(device).expect("the dense matmul compiles"),
+            swiglu: SwiGlu::new(device).expect("the swiglu compiles"),
+            router: Router::new(device).expect("the router compiles"),
+            weights: RouterWeights::new(device).expect("the weighting compiles"),
+            combine: MoeCombine::new(device).expect("the combine compiles"),
+        }
+    }
+
+    /// The whole model on the device, over layers that can give `slack`
+    /// timesteps back.
+    fn wrap<'a>(
+        &'a self,
+        ckpt: &'a Checkpoint,
+        config: &'a inkling_core::TextConfig,
+        slack: usize,
+    ) -> CheckpointWeights<'a>
+    where
+        'd: 'a,
+    {
+        let mapped = CheckpointWeights::open(ckpt, config).expect("the checkpoint's weights map");
+        let head = PackedProjection::wrap_packed(
+            self.device,
+            self.layers.matmul(),
+            &mapped.head_packed(),
+            mapped.head().vocab(),
+        )
+        .expect("the head wraps");
+        let banks = mapped.expert_banks();
+        let packed = mapped.layer_projections();
+        let layers = ModelLayers::wrap(
+            self.device,
+            &self.layers,
+            ExpertKernels {
+                matmul: self.layers.matmul(),
+                dense: &self.dense,
+                swiglu: &self.swiglu,
+                router: &self.router,
+                weights: &self.weights,
+                combine: &self.combine,
+            },
+            &packed,
+            &banks,
+            StackShape {
+                layers: config.num_hidden_layers,
+                dim: config.hidden_size,
+                slack,
+            },
+        )
+        .expect("the layers wrap");
+        mapped
+            .with_head(Box::new(head))
+            .with_backend(Box::new(layers))
+    }
+
+    /// The eight heads on the device.
+    fn heads<'a>(
+        &'a self,
+        ckpt: &'a Checkpoint,
+        config: &inkling_core::TextConfig,
+        mtp: &inkling_core::config::MtpConfig,
+    ) -> CheckpointHeads<'a> {
+        let heads = CheckpointHeads::open(ckpt, config, mtp).expect("the heads open");
+        let held = heads.head_projections();
+        let wrapped = ModelHeads::wrap(self.device, &self.dense, self.layers.attention(), &held)
+            .expect("the heads wrap");
+        heads.with_backend(Box::new(wrapped))
+    }
+}
+
+/// One generation at one depth: what it produced, what it cost, and what its
+/// heads guessed right.
+struct Decoded {
+    depth: usize,
+    tokens: Vec<usize>,
+    step: Duration,
+    rounds: usize,
+    rates: Vec<f64>,
+}
+
+impl Decoded {
+    fn at(
+        depth: usize,
+        weights: &CheckpointWeights<'_>,
+        heads: &CheckpointHeads<'_>,
+        config: &inkling_core::TextConfig,
+        ids: &[usize],
+    ) -> Self {
+        let generator = weights.generator();
+        let cache = &mut ModelCache::speculating(config, depth);
+        let ending = Ending {
+            budget: SPECULATED_TOKENS,
+            eos: None,
+        };
+        let mut proposer = MtpProposer::new(heads, generator, weights, depth);
+        let mut tokens = Vec::new();
+
+        // The prefill is a step of another price and is not in the mean — the
+        // clock starts once the prompt is in the cache, which is where a
+        // decode-step figure is comparable to any other in this file.
+        let mut started = None;
+        generator.speculate(cache, ids, ending, weights, &mut proposer, |id| {
+            started.get_or_insert_with(Instant::now);
+            tokens.push(id);
+            ControlFlow::Continue(())
+        });
+        let elapsed = started.expect("a token").elapsed();
+        Self {
+            depth,
+            rounds: proposer.rounds(),
+            step: elapsed / (tokens.len() - 1).max(1) as u32,
+            rates: proposer.rates(),
+            tokens,
+        }
+    }
+
+    /// Tokens a round banked, which is what acceptance buys before the cost of
+    /// having guessed is taken off it.
+    ///
+    /// Counted rather than inferred: a round is a forward pass, and the
+    /// proposer is asked for guesses once in each of them.
+    fn tokens_per_round(&self) -> f64 {
+        self.tokens.len() as f64 / self.rounds as f64
+    }
+
+    /// What [`MtpProposer::rates`] measured, as a row of a table.
+    fn acceptance(&self) -> String {
+        self.rates
+            .iter()
+            .map(|rate| format!("{:.0}%", 100.0 * rate))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// What `depth` heads cost to run over one row, which is what a round pays to
+/// have guessed.
+///
+/// A row rather than a block, because it is the shape a round has when nothing
+/// was accepted — and because what grows with the rows is the head's own
+/// attention rather than its weights, which are read once whatever the row
+/// count.
+fn time_chain(
+    weights: &CheckpointWeights<'_>,
+    heads: &CheckpointHeads<'_>,
+    config: &inkling_core::TextConfig,
+    ids: &[usize],
+    depth: usize,
+) -> Duration {
+    let generator = weights.generator();
+    let cache = &mut ModelCache::speculating(config, 0);
+    let hidden = generator
+        .model()
+        .final_norm(&generator.model().forward(cache, ids, weights));
+    let width = config.hidden_size;
+    let row = &hidden[hidden.len() - width..];
+
+    let mut proposer = MtpProposer::new(heads, generator, weights, depth);
+    let round = |proposer: &mut MtpProposer<'_, CheckpointWeights<'_>>| {
+        proposer.propose(Round {
+            hidden: row,
+            next: &ids[..1],
+            depth,
+        });
+    };
+    round(&mut proposer);
+    let started = Instant::now();
+    for _ in 0..REPEATS {
+        round(&mut proposer);
+    }
+    started.elapsed() / REPEATS as u32
+}
+
+/// What a forward pass over `tokens` costs against a cache holding `ids`, which
+/// is what a round pays to verify a block of that many.
+///
+/// Real decoded tokens rather than filler, for the reason the study gives: a
+/// block of one token repeated reaches the same six experts a single-token step
+/// does, which prices the block at a decode step and flatters speculation
+/// several-fold.
+fn time_block(
+    device: &Device,
+    weights: &CheckpointWeights<'_>,
+    config: &inkling_core::TextConfig,
+    ids: &[usize],
+    tokens: usize,
+) -> (Duration, u64) {
+    let generator = weights.generator();
+    let mut decoded = Vec::new();
+    let cache = &mut ModelCache::speculating(config, 0);
+    generator.stream(
+        cache,
+        ids,
+        Ending {
+            budget: tokens + 1,
+            eos: None,
+        },
+        weights,
+        |id| {
+            decoded.push(id);
+            ControlFlow::Continue(())
+        },
+    );
+
+    // A fresh cache each time, so every repeat is the same block against the
+    // same warm prompt rather than one sequence growing under the clock.
+    let block = &decoded[..tokens];
+    // The counters bracket the block alone, which is why the warm cache is
+    // filled before either of them starts: a prefill is a submission a layer,
+    // and counting it here would drown the number this column exists for.
+    let run = || {
+        let cache = &mut ModelCache::speculating(config, 0);
+        generator.logits(cache, ids, weights);
+        let submitted = device.submissions();
+        let started = Instant::now();
+        generator.logits(cache, block, weights);
+        (started.elapsed(), device.submissions() - submitted)
+    };
+    run();
+    let (elapsed, submissions): (Vec<Duration>, Vec<u64>) = (0..REPEATS).map(|_| run()).unzip();
+    (
+        elapsed.iter().sum::<Duration>() / REPEATS as u32,
+        submissions[0],
+    )
 }
