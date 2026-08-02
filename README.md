@@ -32,7 +32,7 @@ a crate's tests in one process: opening a Metal device costs a second, so the 16
 kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass before a commit lands: **all 552 against a
+`just test-full` is what has to pass at the ends of a series: **all 552 against a
 real checkpoint, ten minutes.** The 48 gated tests — the 36 above and twelve
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -51,6 +51,15 @@ the fifteen:** a round trip this repo has at
 191 µs reports 598 under a parallel suite, and `.config/nextest.toml` records
 what believing a number like that once cost. `#[ignore]` is what keeps them out
 of the two runs above, and what selects them here.
+
+**Which of the three a commit needs is not "all of them, every time".** `just
+test` after every edit; `just test-timing` for anything whose result is a number;
+`just test-full` before the first commit of a series and again before the last.
+Most of `test-full` is the CPU oracle at 9.0 s a decoded token, and that oracle
+cannot have changed between two commits that never touched the CPU path — so
+running it per commit is a series of six paying twenty minutes to re-prove the
+same thing five times. A commit that touches no `.rs` file needs none of the
+three; the pre-commit hooks already skip clippy on those by config.
 
 ### Measuring two refs against each other
 

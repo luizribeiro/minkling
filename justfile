@@ -13,8 +13,8 @@ sync:
     cd reference && uv sync
     reference/scripts/apply_patches.sh
 
-# Every assertion that needs no checkpoint, in about twelve seconds. What to run
-# while iterating.
+# Every assertion that needs no checkpoint, in about twelve seconds. **What to
+# run while iterating**, and what to run after every edit.
 #
 # One process a crate, because opening a Metal device costs a second and the 110
 # kernel tests would each pay it. Nothing here measures the process it runs in,
@@ -27,17 +27,30 @@ test:
     env -u INKLINGRS_CHECKPOINT cargo test --workspace
 
 # The measurements — a duration, a resident set, a profile table — one at a time
-# with nothing beside them. `#[ignore]` is what keeps these out of every run that
-# has tests beside them, and what selects them here; `.config/nextest.toml` says
-# what a number taken beside another test is worth.
+# with nothing beside them. **What to run for anything timed**, and the only
+# thing that runs the measurements at all.
+#
+# `#[ignore]` is what keeps these out of every run that has tests beside them,
+# and what selects them here; `.config/nextest.toml` says what a number taken
+# beside another test is worth. What this does not answer is whether a number
+# moved between two builds — see `just bench`, which is the paired arrangement
+# and does not rebuild between pairs.
 test-timing checkpoint=checkpoint:
     INKLINGRS_CHECKPOINT={{ absolute_path(checkpoint) }} \
         cargo nextest run --profile timing --run-ignored only
 
-# Everything, and what has to pass before a commit lands: the whole suite
-# against a real checkpoint, a process a test, then the measurements on their
-# own. About three minutes forty, most of it the CPU oracle at 9.0 s a decoded
-# token.
+# Everything against a real checkpoint, a process a test, then the measurements
+# on their own. About three minutes forty, most of it the CPU oracle at 9.0 s a
+# decoded token.
+#
+# **What it is for is the ends of a series, not every commit in one.** The CPU
+# oracle is most of those minutes and it cannot have changed between two commits
+# that never touched the CPU path, so an agent landing six commits paid twenty
+# minutes to re-prove it five times over. Run it before the first commit of a
+# series and again before the last; run `just test` in between, and
+# `just test-timing` for anything that reports a number. A commit that touches no
+# `.rs` file needs none of the three — the pre-commit hooks already skip clippy
+# on those by config.
 test-full checkpoint=checkpoint: && (test-timing checkpoint)
     INKLINGRS_CHECKPOINT={{ absolute_path(checkpoint) }} cargo nextest run
 
