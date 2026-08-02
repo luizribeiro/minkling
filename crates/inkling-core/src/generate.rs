@@ -69,7 +69,8 @@
 
 use std::ops::ControlFlow;
 
-use crate::head::LmHead;
+use crate::head::{LmHead, Tail, Tailed};
+use crate::layer::Passed;
 use crate::model::{Model, ModelCache, ModelWeights};
 use crate::ops::{Projection, top_k};
 use crate::profile::{self, Op};
@@ -152,8 +153,13 @@ pub trait Proposer {
 pub struct Round<'a> {
     /// `[rows, hidden]`, the **post-final-norm** hidden state of each row the
     /// round committed — which is what an MTP head is chained from, and is
-    /// already normed here because the loop needed the same tensor to make its
-    /// own logits out of.
+    /// already normed here because that is the tensor the model's own logits
+    /// come out of.
+    ///
+    /// Empty for a proposer of no depth. Nothing but a proposer reads this, so
+    /// a round that will not be asked for guesses does not ask for it either —
+    /// see [`Tail::chained`], where on a device that is a dispatch and a
+    /// crossing rather than a slice.
     pub hidden: &'a [f32],
     /// The token that follows each of those rows. The last is the one the model
     /// has just produced and the loop has yet to feed, so a proposer guessing
@@ -235,28 +241,76 @@ impl<'a> Generator<'a> {
         ids: &[usize],
         weights: &impl ModelWeights,
     ) -> Vec<f32> {
-        assert!(!ids.is_empty(), "a forward pass over no tokens");
-
-        let h = self.model.forward(cache, ids, weights);
-        let hidden = h.len() / ids.len();
-        let last = &h[h.len() - hidden..];
-        self.head
-            .forward(&self.model.final_norm(last), self.head_weights)
+        self.tailed(
+            cache,
+            ids,
+            Tail {
+                block: 1,
+                chained: false,
+            },
+            weights,
+        )
+        .logits
     }
 
-    /// The `[rows, vocab]` logits of the **last** `rows` of what the stack
-    /// produced, and the ids a greedy sampler takes from them.
+    /// The stack over `ids`, and the back of the model behind it: the final
+    /// norm, the muP divide and `lm_head` over the last `want.block` rows.
+    ///
+    /// **One call rather than three, because the three may be one command
+    /// buffer.** A backend that ran the last layer can run the norm and the
+    /// projection where that layer's rows already are — see
+    /// [`ModelWeights::tail`] — so what crosses back is what a token is taken
+    /// from, and asking the stack and then the head would be the round trip in
+    /// between. A backend that answered with rows is answered here, in the
+    /// three lines the reference writes.
+    pub fn tailed(
+        &self,
+        cache: &mut ModelCache,
+        ids: &[usize],
+        want: Tail,
+        weights: &impl ModelWeights,
+    ) -> Tailed {
+        assert!(!ids.is_empty(), "a forward pass over no tokens");
+        assert!(want.block <= ids.len(), "a block longer than the pass");
+
+        match self.model.forward(cache, ids, weights) {
+            Passed::Carried(rows) => weights
+                .tail(rows, want)
+                .expect("a stack that carried its last layer's rows holds the tail behind them"),
+            Passed::Rows(h) => self.on_this_side(&h, want),
+        }
+    }
+
+    /// The same tail, over rows this side is holding.
+    ///
+    /// The whole state is normed rather than the block alone, because the norm
+    /// is what a proposer is chained from and a row costs a pass over its own
+    /// 4096 values. What the head is then given is the block, which is where
+    /// the 200058-row projection is worth not running.
+    fn on_this_side(&self, h: &[f32], want: Tail) -> Tailed {
+        let hidden = self.model.hidden();
+        let normed = self.model.final_norm(h);
+        let block = &normed[normed.len() - want.block * hidden..];
+        let logits = self.head.forward(block, self.head_weights);
+        Tailed {
+            normed: match want.chained {
+                true => normed,
+                false => Vec::new(),
+            },
+            logits,
+        }
+    }
+
+    /// The ids a greedy sampler takes from `rows` rows of logits.
     ///
     /// Every row of a speculative block is a question — "what does the model
     /// say follows what was fed up to here" — and the answers are what the
     /// block is checked against. The rows in front of it are not: at a prefill
     /// they are the prompt, whose every position would be a pass over 200058
     /// rows of the head to answer a question nothing asks, and whose logits at
-    /// a 769-token prompt would be 615 MB.
-    fn picks(&self, normed: &[f32], rows: usize) -> Vec<usize> {
-        let hidden = self.model.hidden();
-        let block = &normed[normed.len() - rows * hidden..];
-        let logits = self.head.forward(block, self.head_weights);
+    /// a 769-token prompt would be 615 MB. So what a block asks for is
+    /// [`Tail::block`] and never the pass.
+    pub fn picks(logits: &[f32], rows: usize) -> Vec<usize> {
         logits
             .chunks_exact(logits.len() / rows)
             .map(greedy)
@@ -272,9 +326,13 @@ impl<'a> Generator<'a> {
     /// and the only way to learn which token that is is to put it through the
     /// same final norm and the same 200058-row projection the model's own
     /// answer goes through.
+    ///
+    /// This is the tail run *here*, on rows that have already crossed back. A
+    /// head whose backend holds the tail never reaches it — the guess comes
+    /// back beside the head's own rows, out of the head's own command buffer.
     pub fn id_from_hidden(&self, hidden: &[f32]) -> usize {
         let normed = self.model.final_norm(hidden);
-        self.picks(&normed, 1)[0]
+        greedy(&self.head.forward(&normed, self.head_weights))
     }
 
     /// `prompt` prefilled, then tokens decoded greedily until `ending` says to
@@ -376,10 +434,16 @@ impl<'a> Generator<'a> {
             let (rows, block) = (ids.len(), guesses.len() + 1);
             let base = rows - block;
 
-            let normed = self
-                .model
-                .final_norm(&self.model.forward(cache, &ids, weights));
-            let picks = self.picks(&normed, block);
+            let tailed = self.tailed(
+                cache,
+                &ids,
+                Tail {
+                    block,
+                    chained: proposer.depth() > 0,
+                },
+                weights,
+            );
+            let picks = Self::picks(&tailed.logits, block);
             let agreed = guesses
                 .iter()
                 .zip(&picks)
@@ -419,7 +483,10 @@ impl<'a> Generator<'a> {
             next.push(pending);
             guesses = proposer
                 .propose(Round {
-                    hidden: &normed[..kept * hidden],
+                    hidden: match tailed.normed.is_empty() {
+                        true => &[],
+                        false => &tailed.normed[..kept * hidden],
+                    },
                     next: &next,
                     depth: proposer.depth().min(left.saturating_sub(1)),
                 })

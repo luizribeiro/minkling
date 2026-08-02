@@ -30,14 +30,14 @@ use inkling_core::profile::{self, Op, Profile};
 use inkling_core::quant::{BITS, dequantize_blocks_into};
 use inkling_core::{
     AttentionCache, AttentionStep, BandedMask, Bf16, Checkpoint, CheckpointWeights, Dtype, Ending,
-    LayerStep, ModelCache, Packed as CorePacked, Projections, Sdpa, ShortConv, TensorView,
+    LayerStep, ModelCache, Packed as CorePacked, Projections, Sdpa, ShortConv, Tail, TensorView,
     Tokenizer, split_heads,
 };
 use inkling_metal::{
     DISPATCHES_A_SUBMISSION, DenseMatmul, DenseWeight, Device, ExpertGrouping, ExpertKernels,
-    LayerKernels, LayerProjections, LayerRouter, MetalError, ModelHeads, ModelLayers, MoeCombine,
-    PackedBank, PackedMatmul, PackedProjection, RoundTrip, Router, RouterWeights, StackShape,
-    SwiGlu,
+    LayerKernels, LayerProjections, LayerRouter, MetalError, ModelHeads, ModelLayers, ModelTail,
+    MoeCombine, PackedBank, PackedMatmul, PackedProjection, RoundTrip, Router, RouterWeights,
+    StackShape, SwiGlu, TailWeights,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -543,22 +543,31 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// why it is asserted, since a layer that started forcing a *wait* would leave
 /// this number where it is and the step nowhere near it.
 ///
+/// **The last layer is a layer with something after it now**, and that is the
+/// two dispatches added here and the submission taken away: the final norm and
+/// `lm_head` go into the buffer layer 41 left open, so the run does not end at
+/// the layer and the head does not open one of its own. Whether that buffer is
+/// the one layer 41 encoded into or a fresh one is the same greedy rule, walked
+/// past the end of the stack rather than stopping short of it.
+///
 /// A prefill wide enough that one layer reaches the bytes a run may hold is
 /// still one a layer, and deliberately — see `ModelLayers::carries`, where what
-/// a merged run holds is traded against what it saves. This counts a decode
-/// step, whose forty-two layers are far under that budget.
+/// a merged run holds is traded against what it saves. Such a call ends its run
+/// at the last layer whatever the tail is, and the tail runs where it always
+/// did. This counts a decode step, whose forty-two layers are far under that
+/// budget.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
     let width = |layer: u64| if layer < dense { 14 + 4 } else { 14 + 12 };
-    let (mut dispatches, mut encoded, mut submissions) = (0, 0, 1);
+    let (mut dispatches, mut encoded, mut submissions) = (0, 0, 0);
     for layer in 0..layers {
         dispatches += width(layer);
         encoded += width(layer);
-        if layer + 1 < layers && encoded >= DISPATCHES_A_SUBMISSION as u64 {
+        if encoded >= DISPATCHES_A_SUBMISSION as u64 {
             submissions += 1;
             encoded = 0;
         }
     }
-    (dispatches + 1, submissions + 1)
+    (dispatches + 2, submissions + 1)
 }
 
 /// What a run of the engine is asked for, since standing the model up is the
@@ -741,6 +750,7 @@ impl OnTheDevice {
             },
             &packed,
             &banks,
+            wrap_tail(device, &kernels, &weights, &config),
             StackShape {
                 layers: config.num_hidden_layers,
                 dim: config.hidden_size,
@@ -989,6 +999,113 @@ fn the_generated_tokens_match_the_oracle_with_the_model_on_the_device() {
         "peak RSS {} bytes is over the bound of {RESIDENT_BOUND}",
         run.peak
     );
+}
+
+/// **The device tail against the host tail, on real logits — which is what has
+/// to hold before any figure this milestone reports means anything.**
+///
+/// Moving the final norm and the muP divide onto the GPU is the one piece of
+/// tail work this project deferred every time it came up, and the reason was
+/// numerical rather than structural: Apple silicon has no f64 to accumulate a
+/// sum of squares in, a norm is a reduction, and a reduction that reassociates
+/// differently moves a logit. A moved logit at the top of the distribution is a
+/// different token.
+///
+/// So the two tails are run over the same rows and compared where it matters.
+/// The same prompt goes through two stacks that differ in nothing but who runs
+/// the last three operations — the layers are the same wrapped weights and the
+/// same dispatches, so what they hand the tail is bit for bit the same hidden
+/// state — and what is asserted is the **argmax**, at every row of the block and
+/// at the eight decode steps behind it. The logits themselves are held to a
+/// tolerance, and the margin at each position is printed beside it: what says a
+/// tail is safe is not that the logits agree to an ulp but that the gap between
+/// the first and second logit is decades wider than the disagreement.
+///
+/// The divide is the half of this that *is* exact — see `inkling_metal::tail`,
+/// where the multiplier is folded into the norm's weight only when doing so
+/// moves no bit — so what this measures is the norm's own reassociation, which
+/// is the same one every other norm in this engine already has.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn the_device_tail_takes_the_token_the_host_tail_takes() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    let config = fixture::config(&dir).text_config;
+    let text = &config;
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+    let ids = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+
+    let held = gpu.wrap(&ckpt, text, 0);
+    let apart = gpu.without_a_tail(&ckpt, text);
+    let want = Tail {
+        block: 1,
+        chained: true,
+    };
+
+    // The prompt, and then a decode step at a time — because the two regimes
+    // hand the tail different shapes: a prefill's block is one row out of many
+    // and a decode step's is the whole call, which is the arm that folds.
+    let (device_cache, host_cache) = (&mut ModelCache::new(text), &mut ModelCache::new(text));
+    let (mut on_device, mut on_host) = (ids.clone(), ids.clone());
+    let (mut worst, mut narrowest) = (0.0f32, f32::INFINITY);
+
+    for step in 0..=GENERATED {
+        let ours = held
+            .generator()
+            .tailed(device_cache, &on_device, want, &held);
+        let theirs = apart.generator().tailed(host_cache, &on_host, want, &apart);
+
+        let (ours_id, theirs_id) = (
+            inkling_core::Generator::picks(&ours.logits, 1)[0],
+            inkling_core::Generator::picks(&theirs.logits, 1)[0],
+        );
+        assert_eq!(
+            ours.logits.len(),
+            theirs.logits.len(),
+            "step {step}: the two tails answered different widths"
+        );
+
+        // What the argmax had to survive: how far the two tails' logits are
+        // apart, against how far the best logit is from the second best.
+        let apartness = deviation(&ours.logits, &theirs.logits);
+        let margin = margin(&theirs.logits);
+        eprintln!(
+            "step {step:>2}: token {theirs_id:>6}  logits apart {apartness:.3e}  \
+             margin {margin:.3e}  normed apart {:.3e}",
+            deviation(&ours.normed, &theirs.normed)
+        );
+        assert_eq!(
+            ours_id, theirs_id,
+            "step {step}: the device tail took a different token"
+        );
+        worst = worst.max(apartness);
+        narrowest = narrowest.min(margin);
+
+        on_device = vec![ours_id];
+        on_host = vec![theirs_id];
+    }
+
+    eprintln!(
+        "worst disagreement {worst:.3e} against the narrowest margin {narrowest:.3e}, \
+         a factor of {:.0}",
+        narrowest / worst
+    );
+    assert!(
+        worst < narrowest,
+        "the two tails disagree by more than a token's margin"
+    );
+}
+
+/// How far the best logit of a row is from the second best, relative to the
+/// row's own peak — the scale `deviation` reports a disagreement on, so that
+/// the two are comparable.
+fn margin(logits: &[f32]) -> f32 {
+    let mut sorted = logits.to_vec();
+    sorted.sort_by(|a, b| b.partial_cmp(a).expect("logits are finite"));
+    let peak = sorted[0].abs().max(sorted[sorted.len() - 1].abs());
+    (sorted[0] - sorted[1]) / peak
 }
 
 /// A checkpoint and a device that times each of its dispatches, or nothing with
@@ -2192,7 +2309,7 @@ fn what_a_speculative_round_costs_and_what_it_buys() {
     // the depth that happened to be measured first.
     {
         let held = gpu.wrap(&ckpt, text, SWEPT);
-        let heads = gpu.heads(&ckpt, text, mtp);
+        let heads = gpu.heads(&ckpt, text, mtp, gpu.tail(&held, text));
         Decoded::at(SWEPT, &held, &heads, text, &ids[..4]);
     }
 
@@ -2204,7 +2321,7 @@ fn what_a_speculative_round_costs_and_what_it_buys() {
     let mut idle = Vec::new();
     for slack in [0, 4] {
         let held = gpu.wrap(&ckpt, text, slack);
-        let heads = gpu.heads(&ckpt, text, mtp);
+        let heads = gpu.heads(&ckpt, text, mtp, gpu.tail(&held, text));
         let run = Decoded::at(0, &held, &heads, text, &ids);
         eprintln!("{slack:>7}  {:>10.2}", run.step.as_secs_f64() * 1e3);
         idle.push(run);
@@ -2236,7 +2353,7 @@ fn what_a_speculative_round_costs_and_what_it_buys() {
     eprintln!("\nthe chain of heads, over one row");
     eprintln!("{:>7}  {:>10}  {:>10}", "heads", "chain", "xdecode");
     for depth in 1..=DEPTHS {
-        let heads = gpu.heads(&ckpt, text, mtp);
+        let heads = gpu.heads(&ckpt, text, mtp, gpu.tail(&held, text));
         let cost = time_chain(&device, &held, &heads, text, &ids, depth).each;
         eprintln!(
             "{depth:>7}  {:>10.2?}  {:>10.3}",
@@ -2255,7 +2372,7 @@ fn what_a_speculative_round_costs_and_what_it_buys() {
         let mut pass = Vec::new();
         for depth in 0..=SWEPT {
             let held = gpu.wrap(&ckpt, text, depth);
-            let heads = gpu.heads(&ckpt, text, mtp);
+            let heads = gpu.heads(&ckpt, text, mtp, gpu.tail(&held, text));
             pass.push(Decoded::at(depth, &held, &heads, text, &ids));
         }
         passes.push(pass);
@@ -2348,7 +2465,7 @@ fn which_kernels_own_a_chain_of_heads() {
     let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
     let gpu = Kernels::compile(&device);
     let held = gpu.wrap(&ckpt, text, 0);
-    let heads = gpu.heads(&ckpt, text, mtp);
+    let heads = gpu.heads(&ckpt, text, mtp, gpu.tail(&held, text));
 
     // The unsampled chain first, for the reason `which_kernels_own_a_decode_step`
     // takes one: what the rows below are worth is how close they sum to the
@@ -2449,6 +2566,33 @@ impl<'d> Kernels<'d> {
     where
         'd: 'a,
     {
+        self.wrapping(ckpt, config, slack, true)
+    }
+
+    /// The same, with the final norm and the muP divide left on the CPU and
+    /// `lm_head` in a submission of its own — which is where all three were, and
+    /// what the tail is held against.
+    fn without_a_tail<'a>(
+        &'a self,
+        ckpt: &'a Checkpoint,
+        config: &'a inkling_core::TextConfig,
+    ) -> CheckpointWeights<'a>
+    where
+        'd: 'a,
+    {
+        self.wrapping(ckpt, config, 0, false)
+    }
+
+    fn wrapping<'a>(
+        &'a self,
+        ckpt: &'a Checkpoint,
+        config: &'a inkling_core::TextConfig,
+        slack: usize,
+        tail: bool,
+    ) -> CheckpointWeights<'a>
+    where
+        'd: 'a,
+    {
         let mapped = CheckpointWeights::open(ckpt, config).expect("the checkpoint's weights map");
         let head = PackedProjection::wrap_packed(
             self.device,
@@ -2473,6 +2617,8 @@ impl<'d> Kernels<'d> {
             },
             &packed,
             &banks,
+            tail.then(|| wrap_tail(self.device, &self.layers, &mapped, config))
+                .flatten(),
             StackShape {
                 layers: config.num_hidden_layers,
                 dim: config.hidden_size,
@@ -2485,12 +2631,26 @@ impl<'d> Kernels<'d> {
             .with_backend(Box::new(layers))
     }
 
+    /// The model's tail, for a caller wrapping the heads that run in front of
+    /// it — see [`wrap_tail`].
+    fn tail<'a>(
+        &'a self,
+        weights: &CheckpointWeights<'a>,
+        config: &inkling_core::TextConfig,
+    ) -> Option<ModelTail<'a>>
+    where
+        'd: 'a,
+    {
+        wrap_tail(self.device, &self.layers, weights, config)
+    }
+
     /// The eight heads on the device.
     fn heads<'a>(
         &'a self,
         ckpt: &'a Checkpoint,
         config: &inkling_core::TextConfig,
         mtp: &inkling_core::config::MtpConfig,
+        tail: Option<ModelTail<'a>>,
     ) -> CheckpointHeads<'a> {
         let heads = CheckpointHeads::open(ckpt, config, mtp).expect("the heads open");
         let held = heads.head_projections();
@@ -2500,11 +2660,40 @@ impl<'d> Kernels<'d> {
             &self.dense,
             &self.swiglu,
             &held,
+            tail,
             inkling_core::mtp::FRONTIER,
         )
         .expect("the heads wrap");
         heads.with_backend(Box::new(wrapped))
     }
+}
+
+/// The model's tail on the device: its final norm, the muP divide and
+/// `lm_head`, which is what closes a decode step's one command buffer and a
+/// head's.
+///
+/// Built here rather than taken from a shape, because what it is made of is
+/// four things out of the checkpoint and the point of assembling them in one
+/// place is that they cannot come from different ones.
+fn wrap_tail<'a>(
+    device: &'a Device,
+    kernels: &'a LayerKernels,
+    weights: &CheckpointWeights<'a>,
+    config: &inkling_core::TextConfig,
+) -> Option<ModelTail<'a>> {
+    ModelTail::wrap(
+        device,
+        kernels.norm(),
+        kernels.matmul(),
+        &TailWeights {
+            norm: weights.final_norm().to_vec(),
+            eps: config.rms_norm_eps,
+            mup: weights.head().mup(),
+            head: weights.head_packed(),
+            vocab: weights.head().vocab(),
+        },
+    )
+    .expect("the tail wraps")
 }
 
 /// One generation at one depth: what it produced, what it cost, and what its
@@ -2594,8 +2783,16 @@ fn time_chain(
     let generator = weights.generator();
     let cache = &mut ModelCache::speculating(config, 0);
     let hidden = generator
-        .model()
-        .final_norm(&generator.model().forward(cache, ids, weights));
+        .tailed(
+            cache,
+            ids,
+            Tail {
+                block: 1,
+                chained: true,
+            },
+            weights,
+        )
+        .normed;
     let width = config.hidden_size;
     let row = &hidden[hidden.len() - width..];
 

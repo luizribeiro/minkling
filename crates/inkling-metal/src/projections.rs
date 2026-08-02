@@ -49,6 +49,7 @@ use std::cell::RefCell;
 use inkling_core::attention::{
     AttentionCache, AttentionConfig, AttentionStep, LayerStep, Projections, Qkvr, Sdpa,
 };
+use inkling_core::head::{Tail, Tailed};
 use inkling_core::layer::{DecoderCache, DecoderDevice, DecoderStep, Experts, LayerMlp, Passed};
 use inkling_core::mask::BandedMask;
 use inkling_core::ops::{MlpProjections, Projection};
@@ -64,6 +65,7 @@ use crate::matmul::{MatmulError, Multiply, PackedMatmul, PackedProjection, Pendi
 use crate::norm::{LayerNorm, RmsNorm};
 use crate::sconv::{LayerConv, ShortConvolution};
 use crate::swiglu::SwiGlu;
+use crate::tail::ModelTail;
 
 /// One attention layer's five projections on the device.
 ///
@@ -147,6 +149,12 @@ impl LayerKernels {
     /// source names no shape.
     pub fn attention(&self) -> &FusedAttention {
         &self.attention
+    }
+
+    /// The RMSNorm, which is a layer's four and the model's own final one — the
+    /// same kernel over a different weight, which is all any of them are.
+    pub fn norm(&self) -> &RmsNorm {
+        &self.norm
     }
 }
 
@@ -769,6 +777,13 @@ pub struct ModelLayers<'a> {
     /// [`ModelLayers::carries`] and [`RETAINED_BUDGET`], which is what
     /// [`ModelLayers::wrap`] puts here.
     budget: u64,
+    /// The final norm, the muP divide and `lm_head`, where this holds them —
+    /// which is what makes the *last* layer of the stack a layer with something
+    /// after it, and so a layer whose rows can stay where they are.
+    ///
+    /// `None` leaves the tail on the CPU and the head in a submission of its
+    /// own, which is where both were and what a partial handover still gets.
+    tail: Option<ModelTail<'a>>,
     /// The command buffer a run of layers is being encoded into, and what the
     /// last of them left in it — `None` between runs.
     ///
@@ -1015,6 +1030,7 @@ impl<'a> ModelLayers<'a> {
         experts: ExpertKernels<'a>,
         packed: &[LayerPacked<'a>],
         banks: &[LayerBanks<'a>],
+        tail: Option<ModelTail<'a>>,
         stack: StackShape,
     ) -> Result<Self, ProjectionError> {
         let StackShape { layers, dim, slack } = stack;
@@ -1050,6 +1066,7 @@ impl<'a> ModelLayers<'a> {
         Ok(Self {
             layers: wrapped,
             device,
+            tail,
             budget: RETAINED_BUDGET,
             carried: RefCell::new(None),
             flight: RefCell::new(Vec::new()),
@@ -1114,6 +1131,24 @@ impl LayerBackend for ModelLayers<'_> {
     fn decoder(&self, layer: usize) -> Option<&dyn DecoderDevice> {
         self.whole(layer)?;
         Some(self as &dyn DecoderDevice)
+    }
+
+    /// The back of the model behind the run the last layer left open — and
+    /// `None` where there is no such run, which is a stack this holds only part
+    /// of, or a call wide enough that its last layer reached the bytes a run may
+    /// retain.
+    fn tail(&self, rows: usize, want: Tail) -> Option<Tailed> {
+        let tail = self.tail.as_ref()?;
+        let run = self.carried.borrow_mut().take()?;
+        assert_eq!(
+            run.rows.len(),
+            rows * tail.hidden(),
+            "the tail was handed {rows} rows against what the stack left"
+        );
+        Some(
+            self.encode_tail(run, tail, want)
+                .unwrap_or_else(|err| panic!("the tail did not run: {err}")),
+        )
     }
 
     /// Every layer this holds, because a sequence is in every one of them.
@@ -1184,8 +1219,47 @@ impl<'a> ModelLayers<'a> {
     /// carrying, and it needs no model of what a layer's dispatches ask for. A
     /// span that doubled while the run was open is counted too, which overstates
     /// a run by a buffer that outlives it and is the conservative direction.
+    ///
+    /// **The last layer of the stack is a layer with something after it where
+    /// the tail is here**, and that is the second clause read one step further
+    /// along: the norm reads what the layer wrote and the projection reads what
+    /// the norm wrote, so there is a reader on this device and no reason for the
+    /// rows to cross. The budget is asked first either way, which is what keeps
+    /// a prefill's last layer ending its run as it always did.
     fn carries(&self, layer: usize, retained: u64) -> bool {
-        retained < self.budget && self.whole(layer + 1).is_some()
+        retained < self.budget
+            && (self.whole(layer + 1).is_some()
+                || (layer + 1 == self.layers.len() && self.tail.is_some()))
+    }
+
+    /// The tail encoded into the run the last layer left open, submitted, and
+    /// read back.
+    ///
+    /// This is where a decode step ends now, and it ends here rather than a
+    /// submission later: the same command buffer that ran the forty-two layers
+    /// runs the norm, the divide and the 200058-row projection, and what crosses
+    /// back is the logits a token is taken from.
+    fn encode_tail(
+        &self,
+        run: Carried<'a>,
+        tail: &ModelTail<'a>,
+        want: Tail,
+    ) -> Result<Tailed, ProjectionError> {
+        let Carried {
+            mut batch,
+            at,
+            mut rows,
+            ..
+        } = run;
+        assert_eq!(
+            at + 1,
+            self.layers.len(),
+            "the tail was handed what layer {at} left"
+        );
+        let landed = tail.encode_into(&mut batch, &mut rows, want)?;
+        self.flight.borrow_mut().push(batch.submit());
+        self.landed()?;
+        Ok(landed.read())
     }
 
     /// The layer encoded into the run's command buffer, opening one where there
@@ -1872,6 +1946,7 @@ mod tests {
             experts,
             &packed_layers,
             &[],
+            None,
             StackShape {
                 layers: LAYERS,
                 dim: IN_DIM,
@@ -2547,6 +2622,7 @@ mod tests {
     /// *these* layers is what makes the same two cases drivable.
     fn stack<'a>(device: &'a Device, held: Vec<LayerDevice<'a>>, budget: u64) -> ModelLayers<'a> {
         ModelLayers {
+            tail: None,
             layers: held.into_iter().map(Some).collect(),
             device,
             budget,

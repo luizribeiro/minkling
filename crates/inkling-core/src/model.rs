@@ -62,6 +62,13 @@
 //! into logits — so they are two methods here, [`Model::forward`] and
 //! [`Model::final_norm`], rather than one method behind a flag.
 //!
+//! **It is not this side's either, where a backend will have it.** The norm
+//! reads what the last layer wrote and `lm_head` reads what the norm wrote, so
+//! a device that ran the stack can run both without either value crossing back
+//! — which is [`ModelWeights::tail`], and is why [`Model::forward`] answers
+//! with a [`Passed`] rather than with rows. What is here is what runs when
+//! nobody else will.
+//!
 //! Pinned to mlx-vlm by `reference/fixtures/stack.safetensors`, a five-layer
 //! synthetic model driven through the reference's own `InklingModel`, and by the
 //! recorded `layers_out` and `norm_out` of
@@ -71,6 +78,7 @@
 use crate::attention::AttentionConfig;
 use crate::config::TextConfig;
 use crate::embed::Embed;
+use crate::head::{Tail, Tailed};
 use crate::layer::{DecoderCache, Hidden, Passed};
 use crate::ops::rms_norm;
 
@@ -111,6 +119,26 @@ pub trait ModelWeights {
     /// the next layer, so the only thing it needs of a hidden state it never
     /// sees is that the last layer's is a value again.
     fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: Hidden<'_>) -> Passed;
+
+    /// The final norm, the muP divide and `lm_head` behind the `rows` the last
+    /// layer left where they lie, and `None` from a backend that answered that
+    /// layer with rows.
+    ///
+    /// **The mirror of [`Passed::Carried`] at the other end of the stack.** A
+    /// layer's output stays on a device because the layer after it reads it
+    /// there; the last layer's output has no layer after it, and what reads it
+    /// is the tail — so a backend holding the tail is a backend for which the
+    /// stack has one more thing to carry to, and the only value that crosses
+    /// back is what a token is taken from.
+    ///
+    /// Defaulted to `None` for the reason
+    /// [`LayerBackend::decoder`](crate::weights::LayerBackend::decoder) is
+    /// defaulted: on this side the norm and the divide are loops over slices
+    /// and what folding them would buy is a round trip rather than arithmetic.
+    fn tail(&self, rows: usize, want: Tail) -> Option<Tailed> {
+        let (_, _) = (rows, want);
+        None
+    }
 }
 
 /// Everything one sequence carries between calls to the model: one
@@ -225,12 +253,18 @@ impl<'a> Model<'a> {
     /// `[tokens]` ids in, the `[tokens, hidden]` hidden state the last layer
     /// produced out — *before* the final norm, which is
     /// [`Model::final_norm`]'s.
+    ///
+    /// **Answered rather than handed over**, because the last layer's rows are
+    /// the one hidden state whose reader may be on the same device that wrote
+    /// them: [`ModelWeights::tail`] is what reads them there, and a stack that
+    /// carried them answers with a count. A caller with no tail to ask for
+    /// takes [`Passed::rows`], which is what every fixture here does.
     pub fn forward(
         &self,
         cache: &mut ModelCache,
         ids: &[usize],
         weights: &impl ModelWeights,
-    ) -> Vec<f32> {
+    ) -> Passed {
         assert_eq!(
             cache.layers.len(),
             self.layers,
@@ -241,7 +275,7 @@ impl<'a> Model<'a> {
         for (index, cache) in cache.layers.iter_mut().enumerate() {
             h = weights.run_layer(index, cache, h.handed());
         }
-        h.rows()
+        h
     }
 
     /// `[tokens]` ids as the `[tokens, hidden]` the stack would have started
@@ -337,8 +371,8 @@ mod tests {
         let model = stack.model();
         let cache = &mut ModelCache::new(&stack.config);
         [
-            model.forward(cache, &stack.ids, stack),
-            model.forward(cache, &stack.continue_ids, stack),
+            model.forward(cache, &stack.ids, stack).rows(),
+            model.forward(cache, &stack.continue_ids, stack).rows(),
         ]
     }
 
@@ -444,11 +478,14 @@ mod tests {
         let stack = Stack::load();
         let recorded = Recorded::load();
 
-        let fresh = stack.model().forward(
-            &mut ModelCache::new(&stack.config),
-            &stack.continue_ids,
-            &stack,
-        );
+        let fresh = stack
+            .model()
+            .forward(
+                &mut ModelCache::new(&stack.config),
+                &stack.continue_ids,
+                &stack,
+            )
+            .rows();
         let deviation = deviation(&fresh, &recorded.calls[1].layers_out);
         assert!(deviation > TOLERANCE, "deviation {deviation:e}");
     }
@@ -505,11 +542,11 @@ mod tests {
             model.forward(cache, &sequence[..split], &stack);
             model.forward(cache, &wrong, &stack);
             cache.rewind(taken);
-            let after = model.forward(cache, &sequence[split..], &stack);
+            let after = model.forward(cache, &sequence[split..], &stack).rows();
 
             let clean = &mut ModelCache::speculating(&stack.config, taken);
             model.forward(clean, &sequence[..split], &stack);
-            let want = model.forward(clean, &sequence[split..], &stack);
+            let want = model.forward(clean, &sequence[split..], &stack).rows();
             assert_eq!(after, want, "{taken} tokens taken back at {split}");
         }
     }

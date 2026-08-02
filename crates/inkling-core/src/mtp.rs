@@ -60,7 +60,7 @@ use crate::attention::{
 };
 use crate::checkpoint::Checkpoint;
 use crate::config::{MtpConfig, TextConfig};
-use crate::generate::{Generator, Proposer, Round};
+use crate::generate::{Generator, Proposer, Round, greedy};
 use crate::layer::{
     DecoderCache, DecoderLayer, DecoderStep, DecoderWeights, Hidden, LayerMlp, NoExperts, Passed,
 };
@@ -159,11 +159,11 @@ impl<'a> MtpHead<'a> {
         hidden: &[f32],
         embed: &[f32],
         device: Option<&dyn HeadDevice>,
-    ) -> Vec<f32> {
+    ) -> Guessed {
         assert_eq!(hidden.len(), embed.len(), "a hidden state per embedding");
         let rows = Hidden::Rows(hidden).tokens(self.hidden());
         let input = self.concatenated(hidden, embed);
-        let passed = device.and_then(|device| {
+        let guessed = device.and_then(|device| {
             let seen = cache.attention().seen();
             self.block
                 .described(seen, Hidden::Carried(rows), rows, |block| {
@@ -177,16 +177,20 @@ impl<'a> MtpHead<'a> {
                     )
                 })
         });
-        let passed = match passed {
-            Some(passed) => passed,
+        let guessed = match guessed {
+            Some(guessed) => guessed,
             None => {
                 let x = self.input_proj.forward(&input);
-                self.block
-                    .forward(head, cache, Hidden::Rows(&x), &NoExperts, None)
+                Guessed {
+                    hidden: self
+                        .block
+                        .forward(head, cache, Hidden::Rows(&x), &NoExperts, None),
+                    logits: None,
+                }
             }
         };
-        match passed {
-            Passed::Rows(rows) => rows,
+        match guessed.hidden {
+            Passed::Rows(_) => guessed,
             passed => panic!("a head's block answered with {passed:?}"),
         }
     }
@@ -227,7 +231,28 @@ pub struct HeadNorms<'a> {
 /// concatenation is on this side and the projection is the first thing past it.
 pub trait HeadDevice {
     /// Head `head`, or `None` where this backend does not hold all of it.
-    fn run(&self, head: usize, cache: &mut DecoderCache, step: HeadStep<'_>) -> Option<Passed>;
+    fn run(&self, head: usize, cache: &mut DecoderCache, step: HeadStep<'_>) -> Option<Guessed>;
+}
+
+/// What a head answers with: the state it produced, and — where the backend ran
+/// the model's own tail behind it — what its last row names.
+///
+/// **The guess is here because it is what closes the head's command buffer.** A
+/// head's rows have to *be* a token before the head after it can embed one, and
+/// turning a hidden state into a token is the model's final norm, the muP
+/// divide and `lm_head`. A backend that holds those runs them where the head's
+/// rows already are and answers both at once; one that does not answers the
+/// rows, and [`Generator::id_from_hidden`](crate::Generator::id_from_hidden) is
+/// the same three operations back on this side, a submission later.
+#[derive(Debug, PartialEq)]
+pub struct Guessed {
+    /// `[rows, hidden]`, which is what the head after this one is chained from
+    /// — and always rows rather than a count, because the two norms in front of
+    /// that head are on this side.
+    pub hidden: Passed,
+    /// `[vocab]` for the last of those rows, and `None` where the backend
+    /// stopped at the rows.
+    pub logits: Option<Vec<f32>>,
 }
 
 /// Everything one head runs past the two norms in front of it, described rather
@@ -513,7 +538,7 @@ impl<'a> CheckpointHeads<'a> {
         cache: &mut DecoderCache,
         hidden: &[f32],
         embed: &[f32],
-    ) -> Vec<f32> {
+    ) -> Guessed {
         let mut buffer = self.scratch.borrow_mut();
         if buffer.is_empty() && self.backend.is_none() {
             buffer.resize(self.scratch_floats(), 0.0);
@@ -791,6 +816,14 @@ impl<W: ModelWeights> Proposer for MtpProposer<'_, W> {
     /// start their caches over.
     fn propose(&mut self, round: Round<'_>) -> &[usize] {
         self.rounds += 1;
+        // A chain of no heads is handed no hidden state to be chained from, and
+        // there is nothing here that reading one would be for: no head to run,
+        // no guess to score, and no frontier row to carry into a round that will
+        // ask the same nothing. See [`Tail::chained`](crate::Tail::chained),
+        // where that absence is a dispatch and a crossing.
+        if self.depth == 0 {
+            return &self.guesses;
+        }
         let (mut chained, mut tokens) = self.rows(&round);
         self.score(&tokens);
         let hidden = self.heads.config().hidden_size;
@@ -803,12 +836,19 @@ impl<W: ModelWeights> Proposer for MtpProposer<'_, W> {
                 .generator
                 .model()
                 .embeddings(&tokens[head..head + rows], self.weights);
-            chained = self
+            let guessed = self
                 .heads
                 .forward(head, self.caches.layer(head), &chained, &embed);
-            let guess = self
-                .generator
-                .id_from_hidden(&chained[(rows - 1) * hidden..]);
+            chained = guessed.hidden.rows();
+            // The tail where the head ran it, and where it did not: a guess is
+            // the same token either way, and what differs is whether reading it
+            // cost a second submission.
+            let guess = match &guessed.logits {
+                Some(logits) => greedy(logits),
+                None => self
+                    .generator
+                    .id_from_hidden(&chained[(rows - 1) * hidden..]),
+            };
             self.guesses.push(guess);
             tokens.push(guess);
         }
@@ -1084,14 +1124,18 @@ mod tests {
             let head = self.head(norms, &projection);
             let cache = &mut head.cache();
             (
-                head.forward(0, cache, &calls.hidden, &calls.embed, None),
+                head.forward(0, cache, &calls.hidden, &calls.embed, None)
+                    .hidden
+                    .rows(),
                 head.forward(
                     0,
                     cache,
                     &calls.continue_hidden,
                     &calls.continue_embed,
                     None,
-                ),
+                )
+                .hidden
+                .rows(),
             )
         }
 
@@ -1154,11 +1198,14 @@ mod tests {
     }
 
     impl HeadDevice for Recorded {
-        fn run(&self, _: usize, _: &mut DecoderCache, step: HeadStep<'_>) -> Option<Passed> {
+        fn run(&self, _: usize, _: &mut DecoderCache, step: HeadStep<'_>) -> Option<Guessed> {
             *self.input.borrow_mut() = step.input.to_vec();
             self.described
                 .set((step.block.queries, step.block.attention.x.len()));
-            Some(Passed::Rows(self.answer.clone()))
+            Some(Guessed {
+                hidden: Passed::Rows(self.answer.clone()),
+                logits: None,
+            })
         }
     }
 
@@ -1167,7 +1214,7 @@ mod tests {
     struct Declined;
 
     impl HeadDevice for Declined {
-        fn run(&self, _: usize, _: &mut DecoderCache, _: HeadStep<'_>) -> Option<Passed> {
+        fn run(&self, _: usize, _: &mut DecoderCache, _: HeadStep<'_>) -> Option<Guessed> {
             None
         }
     }
@@ -1203,7 +1250,8 @@ mod tests {
                 Some(&device),
             );
             assert_eq!(
-                got, device.answer,
+                got.hidden.rows(),
+                device.answer,
                 "{}: the head answered its own",
                 head.name
             );
@@ -1249,13 +1297,16 @@ mod tests {
         for head in Head::all() {
             let projection = head.projection();
             let built = head.head(head.norms(), &projection);
-            let fresh = built.forward(
-                0,
-                &mut built.cache(),
-                &calls.continue_hidden,
-                &calls.continue_embed,
-                None,
-            );
+            let fresh = built
+                .forward(
+                    0,
+                    &mut built.cache(),
+                    &calls.continue_hidden,
+                    &calls.continue_embed,
+                    None,
+                )
+                .hidden
+                .rows();
             let deviation = deviation(&fresh, &head.continue_out);
             assert!(
                 deviation > TOLERANCE,
@@ -1399,7 +1450,10 @@ mod tests {
         let calls = Calls::load();
         for (index, head) in Head::all().iter().enumerate() {
             let cache = &mut DecoderCache::new(head.config, head.hidden(), 4);
-            let got = heads.forward(index, cache, &calls.hidden, &calls.embed);
+            let got = heads
+                .forward(index, cache, &calls.hidden, &calls.embed)
+                .hidden
+                .rows();
             let deviation = deviation(&got, &head.prefill_out);
             assert!(
                 deviation <= CHECKPOINT_TOLERANCE,
@@ -1650,7 +1704,10 @@ mod tests {
                 ("the hidden state twice", &calls.hidden, &calls.hidden),
                 ("the embedding twice", &calls.embed, &calls.embed),
             ] {
-                let got = built.forward(0, &mut built.cache(), hidden, embed, None);
+                let got = built
+                    .forward(0, &mut built.cache(), hidden, embed, None)
+                    .hidden
+                    .rows();
                 let deviation = deviation(&got, &head.prefill_out);
                 assert!(
                     deviation > TOLERANCE,

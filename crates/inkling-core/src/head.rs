@@ -55,6 +55,44 @@ use crate::config::TextConfig;
 use crate::ops::Projection;
 use crate::profile::{self, Op};
 
+/// What a caller wants of the back of the model, which is not the same two
+/// things every time.
+///
+/// **The logits are wanted for the rows a token is taken from and the normed
+/// state for the rows something is chained from**, and those are different
+/// rows: a prefill takes one token out of a prompt's worth of positions, and a
+/// speculative round hands every row it committed to the heads. So a caller
+/// says which of the two it is asking for rather than being handed both and
+/// throwing one away — where a backend that runs the tail on a device would be
+/// throwing away a dispatch and a crossing rather than a slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tail {
+    /// How many of the pass's last rows a token is taken from.
+    pub block: usize,
+    /// Whether the `[rows, hidden]` normed state is wanted beside them.
+    ///
+    /// Only a proposer reads it — an MTP head is chained from the model's own
+    /// final norm — so a run that speculates nothing asks for none and the
+    /// norm behind it is never dispatched. See
+    /// [`Round::hidden`](crate::generate::Round::hidden).
+    pub chained: bool,
+}
+
+/// What the back of the model answers with, wherever it ran.
+///
+/// One value rather than two calls because the two halves come out of one
+/// command buffer on a backend that holds the tail: the same normed rows the
+/// projection reads are the rows a head is chained from, and asking for them
+/// separately is the round trip this exists to remove.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tailed {
+    /// `[rows, hidden]` through the final norm, and empty where
+    /// [`Tail::chained`] did not ask for it.
+    pub normed: Vec<f32>,
+    /// `[block, vocab]`, the muP divide and the projection behind that norm.
+    pub logits: Vec<f32>,
+}
+
 /// `_logits_from_norm`: the muP divide, the projection, and the cut at the
 /// unpadded vocabulary.
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +124,18 @@ impl LmHead {
     /// How many logits a token gets.
     pub fn vocab(&self) -> usize {
         self.vocab
+    }
+
+    /// `logits_mup_width_multiplier`, which the hidden state is divided by
+    /// before it is projected.
+    ///
+    /// Asked for by a backend that means to run the divide where the norm in
+    /// front of it ran — see [`Tail`]. It is the multiplier rather than its
+    /// reciprocal because what the reference does is a division, and whether
+    /// that can be folded into something else without moving a bit is the
+    /// backend's question to answer about its own arithmetic.
+    pub fn mup(&self) -> f32 {
+        self.mup
     }
 
     /// Whether `weights` is this head's `[vocab, hidden]` projection, which the

@@ -39,7 +39,8 @@ use inkling_core::mtp::{CheckpointHeads, FRONTIER};
 use inkling_core::{Checkpoint, CheckpointWeights, Config, TextConfig};
 use inkling_metal::{
     DenseMatmul, Device, ExpertGrouping, ExpertKernels, LayerKernels, ModelHeads, ModelLayers,
-    MoeCombine, PackedProjection, Router, RouterWeights, StackShape, SwiGlu,
+    ModelTail, MoeCombine, PackedProjection, Router, RouterWeights, StackShape, SwiGlu,
+    TailWeights,
 };
 
 use crate::LABEL;
@@ -91,6 +92,23 @@ impl Gpu {
             weights,
             combine,
         })
+    }
+
+    /// The model's final norm, muP divide and `lm_head`, wrapped for whoever
+    /// will run the rows in front of them.
+    ///
+    /// Asked for twice on a speculating run — once by the stack and once by the
+    /// heads — because what each of them holds has to be reachable from the
+    /// command buffer it is already encoding into. What that costs is a second
+    /// binding over the same mapped pages and a second 16 KB copy of the norm's
+    /// weight, and no bytes of `lm_head` either time.
+    fn tail<'a>(&'a self, weights: &TailWeights<'a>) -> Result<Option<ModelTail<'a>>> {
+        Ok(ModelTail::wrap(
+            &self.device,
+            self.kernels.norm(),
+            self.kernels.matmul(),
+            weights,
+        )?)
     }
 
     /// The six a MoE layer dispatches through, which is five of this and the
@@ -155,6 +173,9 @@ pub fn weights<'a>(
     )
     .context("giving lm_head to the Metal device")?;
 
+    let tail = gpu
+        .tail(&tail_weights(&weights, config))
+        .context("giving the model's tail to the Metal device")?;
     let banks = weights.expert_banks();
     let packed = weights.layer_projections();
     let layers = ModelLayers::wrap(
@@ -163,6 +184,7 @@ pub fn weights<'a>(
         gpu.expert_kernels(),
         &packed,
         &banks,
+        tail,
         StackShape {
             layers: config.num_hidden_layers,
             dim: config.hidden_size,
@@ -185,6 +207,22 @@ pub fn weights<'a>(
         .with_backend(Box::new(layers)))
 }
 
+/// What the back of the model is, out of the checkpoint the front of it came
+/// from.
+///
+/// Assembled here rather than by each backend because the four pieces are one
+/// answer, for the reason [`CheckpointWeights::generator`] assembles the same
+/// three: a tail built from one checkpoint's norm and another's head would run.
+pub fn tail_weights<'a>(weights: &CheckpointWeights<'a>, config: &TextConfig) -> TailWeights<'a> {
+    TailWeights {
+        norm: weights.final_norm().to_vec(),
+        eps: config.rms_norm_eps,
+        mup: weights.head().mup(),
+        head: weights.head_packed(),
+        vocab: weights.head().vocab(),
+    }
+}
+
 /// The multi-token prediction heads, with their multiplies wherever the backend
 /// puts them.
 ///
@@ -202,6 +240,7 @@ pub fn heads<'a>(
     ckpt: &'a Checkpoint,
     config: &Config,
     depth: usize,
+    tail: &TailWeights<'a>,
 ) -> Result<Option<CheckpointHeads<'a>>> {
     if depth == 0 {
         return Ok(None);
@@ -230,6 +269,8 @@ pub fn heads<'a>(
         &gpu.dense,
         &gpu.swiglu,
         &packed,
+        gpu.tail(tail)
+            .context("giving the model's tail to the Metal device")?,
         FRONTIER,
     )
     .context("giving the MTP heads to the Metal device")?;

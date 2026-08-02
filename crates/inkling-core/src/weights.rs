@@ -55,7 +55,7 @@ use crate::attention::{
 use crate::checkpoint::{BF16_BYTES, BF16_SHIFT, Checkpoint, CheckpointError, Dtype, TensorView};
 use crate::config::TextConfig;
 use crate::generate::Generator;
-use crate::head::LmHead;
+use crate::head::{LmHead, Tail, Tailed};
 use crate::layer::{
     DecoderCache, DecoderDevice, DecoderLayer, DecoderWeights, Experts, Hidden, LayerMlp,
     NoExperts, Passed,
@@ -678,6 +678,22 @@ pub trait LayerBackend {
         let _ = layer;
         None
     }
+
+    /// The final norm, the muP divide and `lm_head` behind the rows the last
+    /// layer left where they lie — see
+    /// [`ModelWeights::tail`](crate::ModelWeights::tail), whose question this
+    /// is.
+    ///
+    /// It is here rather than beside the head's own [`Projection`] because of
+    /// what the two ends of it read: the norm reads what the last layer wrote
+    /// and the projection reads what the norm wrote, so the thing that can run
+    /// them without a value crossing back is the thing that ran the layer. The
+    /// final norm's weight goes over with them, for the reason
+    /// [`LayerPacked::input_layernorm`] goes over with a layer's projections.
+    fn tail(&self, rows: usize, want: Tail) -> Option<Tailed> {
+        let (_, _) = (rows, want);
+        None
+    }
 }
 
 /// One MoE layer's two banks and its router's gate, still as the checkpoint
@@ -960,6 +976,17 @@ impl<'a> CheckpointWeights<'a> {
         self.lm_head
     }
 
+    /// The weight of the model's final norm, widened once at
+    /// [`CheckpointWeights::open`] the way every other bfloat16 tensor here is.
+    ///
+    /// Asked for by a backend that means to run the tail — see
+    /// [`LayerBackend::tail`]. 16 KB, and the same values [`Model`] is built
+    /// over, so the two ends of the seam cannot be normalising against
+    /// different weights.
+    pub fn final_norm(&self) -> &[f32] {
+        &self.norm
+    }
+
     /// What the head multiplies against, which is the backend this was opened
     /// with or the one [`CheckpointWeights::with_head`] put in its place.
     pub fn head_projection(&self) -> &dyn Projection {
@@ -1142,6 +1169,10 @@ impl ModelWeights for CheckpointWeights<'_> {
             Some(experts) => layer.forward(index, cache, x, experts, device),
             None => layer.forward(index, cache, x, &mlp, device),
         }
+    }
+
+    fn tail(&self, rows: usize, want: Tail) -> Option<Tailed> {
+        self.backend.as_deref()?.tail(rows, want)
     }
 }
 

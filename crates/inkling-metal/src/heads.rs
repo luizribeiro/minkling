@@ -29,8 +29,9 @@
 //! mapping put them, and nothing is de-interleaved into memory.
 
 use inkling_core::attention::Projections;
+use inkling_core::head::Tail;
 use inkling_core::layer::{DecoderCache, Passed};
-use inkling_core::mtp::{HeadBackend, HeadDevice, HeadPacked, HeadStep};
+use inkling_core::mtp::{Guessed, HeadBackend, HeadDevice, HeadPacked, HeadStep};
 use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::profile::{self, Op};
 
@@ -41,6 +42,7 @@ use crate::projections::{
     Block, DenseFfn, LayerDevice, LayerKernels, LayerMlpDevice, ProjectionError, Wrapping,
 };
 use crate::swiglu::SwiGlu;
+use crate::tail::{Landed, ModelTail};
 
 /// One head on the device: the projection that reads the pair it is handed, and
 /// the decoder layer behind it.
@@ -57,6 +59,15 @@ struct WrappedHead<'a> {
 #[derive(Debug)]
 pub struct ModelHeads<'a> {
     heads: Vec<WrappedHead<'a>>,
+    /// The model's own final norm, muP divide and `lm_head`, where this holds
+    /// them — which is the second half of a head's command buffer and half of
+    /// a chain's submissions.
+    ///
+    /// A head's rows have to *be* a token before the head after it can embed
+    /// one, so the guess is what closes the buffer either way; what the tail
+    /// decides is whether reading it costs another. `None` leaves it where it
+    /// was, one submission behind each of the eight.
+    tail: Option<ModelTail<'a>>,
 }
 
 impl<'a> ModelHeads<'a> {
@@ -75,6 +86,7 @@ impl<'a> ModelHeads<'a> {
         matmul: &'a DenseMatmul,
         swiglu: &'a SwiGlu,
         heads: &[HeadPacked<'a>],
+        tail: Option<ModelTail<'a>>,
         slack: usize,
     ) -> Result<Self, ProjectionError> {
         let wrapped = heads
@@ -126,7 +138,10 @@ impl<'a> ModelHeads<'a> {
                 })
             })
             .collect::<Result<Vec<_>, ProjectionError>>()?;
-        Ok(Self { heads: wrapped })
+        Ok(Self {
+            heads: wrapped,
+            tail,
+        })
     }
 
     pub fn heads(&self) -> usize {
@@ -179,10 +194,10 @@ impl HeadBackend for ModelHeads<'_> {
 /// and what it waits for is everything between the pair of normed rows it was
 /// handed and the `[rows, hidden]` it answers with.
 impl HeadDevice for ModelHeads<'_> {
-    fn run(&self, head: usize, cache: &mut DecoderCache, step: HeadStep<'_>) -> Option<Passed> {
+    fn run(&self, head: usize, cache: &mut DecoderCache, step: HeadStep<'_>) -> Option<Guessed> {
         let held = self.heads.get(head)?;
         Some(
-            held.run(cache, step)
+            held.run(cache, step, self.tail.as_ref())
                 .unwrap_or_else(|err| panic!("the head did not run: {err}")),
         )
     }
@@ -196,7 +211,12 @@ impl WrappedHead<'_> {
     /// hidden]` it answers with is a value this process forms: what
     /// `input_proj` produces is what the block's input layernorm reads, and the
     /// twenty dispatches behind that are a layer's own.
-    fn run(&self, cache: &mut DecoderCache, step: HeadStep<'_>) -> Result<Passed, ProjectionError> {
+    fn run(
+        &self,
+        cache: &mut DecoderCache,
+        step: HeadStep<'_>,
+        tail: Option<&ModelTail<'_>>,
+    ) -> Result<Guessed, ProjectionError> {
         let device = self.input_proj.device();
         let mut batch = device.batch()?;
         let mut input = device.buffer(step.input)?;
@@ -204,11 +224,29 @@ impl WrappedHead<'_> {
             .input_proj
             .encode_over(&mut batch, &mut input)?
             .buffer();
-        let rows = self
+        let mut rows = self
             .block
             .encode_into(&mut batch, cache, step.block, &mut x)?;
+        // The last row alone, and undivided rows nobody wants: what a head is
+        // chained from is its own state, which is these rows before any norm,
+        // and what the guess needs is the model's tail over the last of them.
+        let landed = tail
+            .map(|tail| {
+                tail.encode_into(
+                    &mut batch,
+                    &mut rows,
+                    Tail {
+                        block: 1,
+                        chained: false,
+                    },
+                )
+            })
+            .transpose()?;
         batch.wait()?;
-        Ok(Passed::Rows(profile::timed(Op::Readback, || rows.to_vec())))
+        Ok(Guessed {
+            hidden: Passed::Rows(profile::timed(Op::Readback, || rows.to_vec())),
+            logits: landed.as_ref().map(Landed::logits),
+        })
     }
 }
 

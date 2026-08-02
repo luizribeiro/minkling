@@ -42,6 +42,7 @@ pub mod router;
 pub mod sampling;
 pub mod sconv;
 pub mod swiglu;
+pub mod tail;
 
 #[cfg(test)]
 mod testing;
@@ -64,3 +65,4 @@ pub use projections::{
 pub use router::{LayerRouter, Router, RouterWeights, RoutingWeights};
 pub use sconv::{LayerConv, ShortConvolution};
 pub use swiglu::SwiGlu;
+pub use tail::{ModelTail, TailWeights};

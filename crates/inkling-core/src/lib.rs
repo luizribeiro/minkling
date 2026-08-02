@@ -30,7 +30,7 @@ pub use config::{Config, TextConfig};
 pub use detokenize::{Utf8Stream, char_byte, piece_bytes};
 pub use embed::Embed;
 pub use generate::{Ending, Generator, Stop, greedy};
-pub use head::LmHead;
+pub use head::{LmHead, Tail, Tailed};
 pub use layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
 pub use mask::{BandedMask, MASKED, is_masked};
 pub use model::{Model, ModelCache, ModelWeights};

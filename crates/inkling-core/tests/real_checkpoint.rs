@@ -1132,7 +1132,9 @@ fn the_whole_stack_reproduces_the_reference_against_real_weights() {
 
     let watched = Watched::new(&weights, &activations);
     let started = Instant::now();
-    let got = model.forward(&mut ModelCache::new(&config), &ids, &watched);
+    let got = model
+        .forward(&mut ModelCache::new(&config), &ids, &watched)
+        .rows();
     let normed = model.final_norm(&got);
     eprintln!(
         "42 layers over {} tokens in {:?}",
@@ -1901,7 +1903,9 @@ fn the_argmax_survives_the_whole_model_against_real_weights() {
     let weights = CheckpointWeights::open(&ckpt, &config).expect("the checkpoint's weights map");
     let model = weights.model();
     let started = Instant::now();
-    let hidden = model.forward(&mut ModelCache::new(&config), &ids, &weights);
+    let hidden = model
+        .forward(&mut ModelCache::new(&config), &ids, &weights)
+        .rows();
     let logits = head_logits(&weights, &model.final_norm(&hidden));
     eprintln!("{} tokens to logits in {:?}", ids.len(), started.elapsed());
 
