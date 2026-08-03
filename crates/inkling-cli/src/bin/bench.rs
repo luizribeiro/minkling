@@ -701,8 +701,15 @@ impl Comparison {
 
     /// The standard this file's own README states for a real effect: every pair
     /// moving the same way, and the two ranges not overlapping.
+    ///
+    /// **Neither test means anything over one pair** — a range of one reading is
+    /// a point, and one pair cannot disagree with itself — so a single pair is
+    /// never a claim however far apart the two readings fall. Two can, and two is
+    /// still not many: a null run of one build against itself over two pairs
+    /// reports the ranges apart and every pair agreeing at 0.6%, and over seven
+    /// it reports neither. Seven is the default for that reason.
     fn stands(&self) -> bool {
-        !self.overlap && self.agreed == self.pairs
+        self.pairs > 1 && !self.overlap && self.agreed == self.pairs
     }
 }
 
@@ -1092,6 +1099,17 @@ mod tests {
     fn an_arm_whose_path_was_cut_in_half_is_refused() {
         let err = ask(&["/no/such/bench".to_string()], &[]).expect_err("refused");
         assert!(format!("{err:#}").contains("is not a file"), "{err:#}");
+    }
+
+    /// One pair is two readings, and two readings always lie apart and always
+    /// agree with themselves. What the report says about them has to be that
+    /// they say nothing.
+    #[test]
+    fn one_pair_is_never_a_claim() {
+        let compared = compare(&[readings_of(&[20.9]), readings_of(&[20.0])]).expect("compares");
+        assert_eq!((compared[0].agreed, compared[0].pairs), (1, 1));
+        assert!(!compared[0].overlap);
+        assert!(!compared[0].stands());
     }
 
     fn readings_of(values: &[f64]) -> Vec<Vec<Reading>> {
