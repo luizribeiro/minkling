@@ -472,6 +472,19 @@ impl Kernel {
         self.pipeline.maxTotalThreadsPerThreadgroup()
     }
 
+    /// The threadgroup memory this kernel's own arrays declare, against which
+    /// [`Device::most_threadgroup_bytes`](crate::Device::most_threadgroup_bytes)
+    /// says how many of its threadgroups a core can hold at once.
+    ///
+    /// **Threadgroups a core holds is the occupancy figure a kernel of this
+    /// shape lives or dies by**, and it is the one this side can read rather
+    /// than infer: a threadgroup declaring more than half of what a core has
+    /// runs alone on it, with nothing to interleave against on every barrier and
+    /// every dependent read.
+    pub fn threadgroup_memory(&self) -> usize {
+        self.pipeline.staticThreadgroupMemoryLength()
+    }
+
     /// How many threads of this kernel execute in lockstep, which is what a
     /// `simd_`-prefixed reduction inside it reduces over.
     ///

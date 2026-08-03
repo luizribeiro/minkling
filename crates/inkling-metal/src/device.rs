@@ -313,6 +313,15 @@ impl Device {
         self.raw.maxBufferLength()
     }
 
+    /// The threadgroup memory one threadgroup may declare, which is what a
+    /// kernel's own [`Kernel::threadgroup_memory`](crate::Kernel::threadgroup_memory)
+    /// has to be read against: the two divide into how many threadgroups a core
+    /// can hold at once, and that is the one occupancy figure this side can ask
+    /// for rather than infer from a clock.
+    pub fn most_threadgroup_bytes(&self) -> usize {
+        self.raw.maxThreadgroupMemoryLength()
+    }
+
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.raw
     }

@@ -3716,6 +3716,148 @@ mod tests {
         }
     }
 
+    /// The same walk with the tile's values read where they lie rather than
+    /// staged, which is the one thing that decides this kernel's threadgroup
+    /// memory: the four arrays beside `staged` are 3 KB and `staged` is 16.
+    ///
+    /// The tile is unpinned from the staging as it goes, so that what the arm
+    /// varies is the memory and not the number of keys a tile holds — the two
+    /// are one expression in the shipped kernel and would otherwise move
+    /// together.
+    fn reading_the_values_where_they_lie() -> String {
+        let narrowed = instead_of(
+            &source(),
+            &format!("constant uint STAGED_VALUES = {STAGED_VALUES};"),
+            "constant uint STAGED_VALUES = 4;",
+        );
+        let unpinned = instead_of(
+            &narrowed,
+            "min(simds * KEYS_PER_SIMD, STAGED_VALUES / shape.head_dim)",
+            "simds * KEYS_PER_SIMD",
+        );
+        let unstaged = instead_of(
+            &unpinned,
+            "        for (uint at = local; at < held * shape.head_dim; at += threads) {\n            staged[at] = tiled[at];\n        }\n",
+            "",
+        );
+        instead_of(
+            &unstaged,
+            "staged[s * shape.head_dim + d]",
+            "tiled[s * shape.head_dim + d]",
+        )
+    }
+
+    /// The same source with a threadgroup array of `floats` nobody reads for
+    /// anything, which is how the occupancy knob is turned without moving
+    /// anything else.
+    ///
+    /// **It has to be written and read or the compiler drops it**, and whether
+    /// it did is checked rather than hoped for:
+    /// [`Kernel::threadgroup_memory`] is what the arm reports, so an array that
+    /// was optimised away shows up as a row that did not move.
+    ///
+    /// **What is touched is the same 256 floats at every size**, which is what
+    /// keeps this a knob on the memory rather than on the work: a fill over the
+    /// whole array would grow with it and the arm would price two things. The
+    /// fill and the read walk the same indices from the same threads, so no
+    /// barrier stands between them and the value read is the zero that was
+    /// already there.
+    fn with_ballast(source: &str, floats: usize) -> String {
+        assert!(floats >= MOST_CHANNELS, "the ballast covers a whole head");
+        let declared = instead_of(
+            source,
+            "    threadgroup float staged[STAGED_VALUES];",
+            &format!(
+                "    threadgroup float staged[STAGED_VALUES];\n\
+                 \x20   threadgroup float ballast[{floats}];\n\
+                 \x20   for (uint at = local; at < {MOST_CHANNELS}u; at += threads) {{\n\
+                 \x20       ballast[at] = 0.0f;\n\
+                 \x20   }}"
+            ),
+        );
+        instead_of(
+            &declared,
+            "weighted[d] = 0.0f;",
+            "weighted[d] = ballast[d];",
+        )
+    }
+
+    /// **How many threadgroups of this kernel a core can hold, and what holding
+    /// more of them would be worth** — the occupancy candidate, turned by a knob
+    /// that changes nothing else.
+    ///
+    /// A threadgroup here is one query row of one head, and it declares 19 KB of
+    /// the 32 an Apple GPU allows. Two of those do not fit, so a core runs one
+    /// at a time: 256 threads where the hardware schedules far more, and nothing
+    /// to interleave against on any of the four barriers a tile takes. **That is
+    /// arithmetic off two numbers the device states**, and this is what says
+    /// whether it costs anything.
+    ///
+    /// The knob is a threadgroup array nobody reads. Ballast added to the
+    /// shipped kernel can only lower residency and ballast added to a kernel
+    /// that stages nothing can only raise it, so the two halves of the table
+    /// approach the same question from either side — and every arm walks the
+    /// same tiles over the same keys with the same instructions, which is what
+    /// "changes nothing else" has to mean for the row to be readable.
+    ///
+    /// **The unstaged rows are not a proposal.** Reading a tile's values where
+    /// they lie is what this kernel did before the staging, and the staging is
+    /// worth what it is worth; the arm is here because it is the only way to get
+    /// this walk under 16 KB at all.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn how_many_threadgroups_of_a_prefills_attention_a_core_holds() {
+        let Some(device) = device() else { return };
+        /// Ballast the shipped kernel can take before it passes what a
+        /// threadgroup may declare, and what the unstaged one can take to reach
+        /// the same place.
+        const STAGED_BALLAST: [usize; 3] = [0, 1024, 3072];
+        const UNSTAGED_BALLAST: [usize; 11] =
+            [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096, 5120, 7168];
+
+        let most = device.most_threadgroup_bytes();
+        let cells = bound_cells();
+        let header: String = cells
+            .iter()
+            .map(|(tokens, _, what)| format!("{:>17}", format!("{tokens} {what}")))
+            .collect();
+        eprintln!(
+            "  a threadgroup may declare {} KiB of a core's own memory",
+            most / 1024
+        );
+        eprintln!("  {:<18}{:>14}{header}", "the values", "a threadgroup");
+
+        for (what, source) in [
+            ("staged", source()),
+            ("where they lie", reading_the_values_where_they_lie()),
+        ] {
+            let ballast: &[usize] = match what {
+                "staged" => &STAGED_BALLAST,
+                _ => &UNSTAGED_BALLAST,
+            };
+            for &floats in ballast {
+                let written = match floats {
+                    0 => source.clone(),
+                    floats => with_ballast(&source, floats),
+                };
+                let attention =
+                    FusedAttention::from_source(&device, &written).expect("the arm compiles");
+                let held = attention.global.threadgroup_memory();
+                let taken: String = cells
+                    .iter()
+                    .map(|&(tokens, sliding, _)| {
+                        let each = a_prefill_costs(&device, &attention, tokens, sliding);
+                        format!("{:>17}", format!("{each:.2?}"))
+                    })
+                    .collect();
+                eprintln!(
+                    "  {what:<18}{:>14}{taken}",
+                    format!("{:.0} KiB", held as f64 / 1024.0),
+                );
+            }
+        }
+    }
+
     /// A layer whose span grows past what it starts with, and a sequence long
     /// enough to make it: `LEAST_KEYS` slots and a few more.
     ///

@@ -1694,6 +1694,67 @@ A2's 352 GFLOP/s on a part that does far more: the walk issues about a hundred
 lane-instructions per key of which a handful are the multiply-adds the answer
 needs.
 
+### What a threadgroup's memory is worth, which is the occupancy term
+
+**Occupancy was on the candidate list and it is turnable by a knob that moves
+nothing else.** A threadgroup here is one query row of one head and declares 19
+KiB — `staged` is 16 of it — against the 32 KiB a threadgroup may declare on this
+part. `how_many_threadgroups_of_a_prefills_attention_a_core_holds` adds a
+threadgroup array nobody reads for anything and sweeps its size. The array is
+declared last, so every address the kernel uses is where it was; the fill touches
+the same 256 floats at every size, so the work is where it was; and the arm is
+checked against `staticThreadgroupMemoryLength` rather than hoped for, so an array
+the compiler dropped would show as a row that did not move.
+
+**The values are also read where they lie in the lower half of the table**, which
+is the only way to get this walk under 16 KiB at all — the staging is what the
+memory *is*. It is not a proposal; it is the second half of the same knob.
+
+    the values      a threadgroup   2048 global  2048 window   8192 global  8192 window
+    staged                 19 KiB       92.63ms      44.45ms         1.25s     196.69ms
+    staged                 23 KiB      120.20ms      57.70ms         1.63s     255.89ms
+    staged                 31 KiB      176.35ms      84.34ms         2.41s     373.76ms
+    where they lie          3 KiB      114.64ms      52.79ms         1.61s     236.61ms
+    where they lie          5 KiB      114.50ms      52.78ms         1.61s     236.05ms
+    where they lie          7 KiB      114.29ms      52.69ms         1.61s     235.84ms
+    where they lie          9 KiB      114.69ms      53.16ms         1.61s     239.41ms
+    where they lie         11 KiB      114.38ms      52.53ms         1.60s     234.90ms
+    where they lie         13 KiB       71.12ms      34.33ms      918.95ms     151.72ms
+    where they lie         15 KiB       76.72ms      36.73ms         1.03s     163.03ms
+    where they lie         17 KiB       92.16ms      43.64ms         1.25s     193.52ms
+    where they lie         19 KiB       92.12ms      43.67ms         1.25s     193.54ms
+    where they lie         23 KiB      120.52ms      57.62ms         1.64s     256.19ms
+    where they lie         31 KiB      177.27ms      84.54ms         2.45s     375.65ms
+
+**The row is a function of the declared memory and of nothing else in it.**
+Staged at 19 KiB is 92.63 ms and unstaged at 19 KiB is 92.12, which is 0.6% apart
+on a kernel whose values come from threadgroup memory in one and from device
+memory in the other — so **at prefill shape the staging buys nothing at all, and
+the whole of what it does to this row is declare 16 KiB.** That is not what it was
+put there for: the figure the staging was fitted against is one query over 1200
+keys, 726 µs to 458, which is a decode-shaped call where a tile is fetched once
+and used once. Here 32 heads and their neighbouring rows walk almost the same
+keys at almost the same time and the cache is already doing it.
+
+**The turn is at 13 KiB and it is worth 23 to 27%.** 71.12 ms against the shipped
+kernel's 92.63 at 2048 tokens — 23.2% — and 918.95 ms against 1.25 s at 8192,
+which is 26.5%; the two windowed columns are 22.8 and 22.9%, so the one column
+that is worth more than the rest is the one the prefill table is largest on.
+Above the turn the row rises the way falling
+residency reads — 17 and 19 KiB are one figure, 23 is 30% worse, 31 is 92% worse.
+**Below it the row is a flat plateau at 114 ms**, 3 KiB to 11 KiB, five arms
+agreeing to 0.4%, which is what a residency capped by something other than memory
+looks like — and that plateau is 61% *worse* than the turn rather than better.
+
+**So the curve is a U and this file cannot say why the left arm of it is there.**
+More threadgroups a core is better down to some count and worse below it, and the
+mechanism — whether it is the core's cache being shared among more streams, or a
+scheduler limit the plateau is pinned at — is not settled here. What is measured
+is the share: **occupancy is worth 23 to 27% of this kernel, the shipped one is on
+the wrong side of the turn, and the only thing standing between it and the turn is
+16 KiB of staging that has been shown to buy nothing at this shape.** Nothing was
+changed.
+
 ### What this leaves for whoever caps the spans
 
 **A prefill writes every key of a layer before that layer's one attention
