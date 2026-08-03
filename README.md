@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **581 of the 610 tests, no
+`just test` is the one to run while iterating: **583 of the 617 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,8 +32,8 @@ a crate's tests in one process: opening a Metal device costs a second, so the 16
 kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 610 against a
-real checkpoint, ten minutes.** The 49 gated tests — the 37 above and twelve
+`just test-full` is what has to pass at the ends of a series: **all 617 against a
+real checkpoint, ten minutes.** The 51 gated tests — the 37 above and fourteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the twenty-nine tests whose result *is* a number — a duration
+`just test-timing` is the thirty-four tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -98,11 +98,13 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 20 ms — 16.5 ms a token speculating two deep, which is
-60.7 tokens a second — and the timings go to stderr so stdout stays pipeable.
+A decode step is about 19 ms — 16.1 ms a token speculating two deep, which is
+62.2 tokens a second — and the timings go to stderr so stdout stays pipeable.
 **Both of those are taken at an eight-token context and neither is what a user
-feels**; "Against the reference, end to end" below is the figure that is, and it
-does not read the same way at every prompt length. The prompt reaches the tokenizer as it stands,
+feels**; "Against the reference, end to end" and "Where a decode step goes as the
+context grows" below are the figures that are, and they do not read the same way
+at every prompt length — 20.0 ms a token at a 97-token context and 28.7 at
+8192. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
 rather than applied by a template this does not implement.
@@ -241,6 +243,31 @@ moves and what that comes to against this machine's 819 GB/s:
     router_weights       40    380µs     1.8%      0.00 MB     0 GB/s      0%
     moe_combine          40    335µs     1.6%      5.90 MB    18 GB/s      2%
 
+**That table is a true table about a context nobody has, and saying so is this
+milestone's finding.** It is taken over the eight-token prompt the activation
+capture recorded, as every decode figure in this file was until
+`which_kernels_own_a_decode_step_at_each_context` took the same table at 97, 385
+and 769 keys. Exactly one row moves with the context and the rest are flat inside
+20%:
+
+    kernel                97 keys   385 keys   769 keys
+    packed_matmul         16.55ms    15.68ms    15.22ms
+    fused_attention        3.93ms    12.50ms    17.35ms
+    rms_norm               2.05ms     1.93ms     1.88ms
+    short_conv             1.64ms     2.00ms     2.29ms
+    router_top_k           614µs      577µs      559µs
+    dense_matmul           487µs      469µs      457µs
+    swiglu                 454µs      436µs      420µs
+    router_weights         414µs      397µs      380µs
+    moe_combine            366µs      345µs      343µs
+
+The matmul reads the model once whatever the context, so its 5932.36 MB is the
+same figure in all three columns. **`fused_attention` is the whole of the
+growth** — 13.4 ms of it against a step that grew by 14.0 — and the paragraph
+below is what was done about it. Those rows carry the sampling bias the last
+line of the table names, which is why they are read against each other rather
+than quoted absolutely.
+
 **The packed matmul is 70% of the device's time and it is the only kernel here
 doing bandwidth's work.** Its 5.9 GB is what the checkpoint's shapes say a token
 reads — six of each MoE layer's 256 experts and both shared ones, plus every
@@ -294,10 +321,10 @@ work:
     residual path       64 groups        4.51µs   2.01µs                55%
 
     fused_attention     32 groups    a dispatch   launch        the step
-    over     8 keys                       9.31µs   1.81µs             80%
-    over    97 keys                      74.60µs   1.44µs             98%
-    over   512 keys                     368.50µs   1.90µs             99%
-    over  4096 keys                       2.57ms   1.29µs            100%
+    over     8 keys                      10.16µs   1.43µs             86%
+    over    97 keys                      31.89µs   1.89µs             94%
+    over   512 keys                      59.74µs   1.59µs             97%
+    over  4096 keys                     409.31µs   1.69µs            100%
 
 **`short_conv` is a dead end and the numbers say how much of one.** Four a layer
 at those two shapes is 684 µs a step measured on their own, against the 1.37 ms
@@ -311,22 +338,53 @@ share of shrank by a quarter and the kernel did not. The only thing that removes
 dispatch, and the four are four because they convolve four different things.
 **Nothing here was changed.**
 
-**`fused_attention`'s 4.1% is not a property of the kernel.** The launch is under
-2% of it past a hundred keys and the rest tracks the span: the marginal key costs
-0.62 µs between 97 and 4096, and the per-key figure falls from 1.18 µs at eight
-keys to 0.63 at four thousand as a 32-key tile stops being mostly empty. So what
-that row reports is the *context the profile is taken at*, which is the recorded
-prompt and eight generated tokens. Read off the rows above, the same 42 dispatches
-are 4.9 ms at the 155-key context the paired measurement below decodes over, and
-15.5 ms at 512. The kernel is not waiting on occupancy and it is not waiting on a
-floor. It is walking the span — and it was walking all of it, on 35 layers that
-cap at a 512-token window. That is M9's deferred finding arriving as this one's
-diagnosis, and where the work went: neither of the two remedies this table has
-used before, but the loop bound whose table is under the attention step above.
-**It buys nothing at the context this profile is taken at and nothing at the one
-the comparison below decodes over** — the window is 512 and neither reaches it —
-which is why this row is where it was and why the change is a prefill and
-long-context one that a decode step pays a compare for.
+**`fused_attention` was waiting on itself, and it took a table at three contexts
+to see it.** The launch is under 2% of it past a hundred keys and the rest tracked
+the span — but so did the *rate*, which is what says the span was not the
+problem. This kernel gave one threadgroup to each of 32 query heads, so a decode
+step ran 32 threadgroups on a machine with 80 cores: 48 idle, and the 32 that
+were not had one threadgroup apiece with nothing to interleave against, on a
+loop whose every 32-key tile is four barriers and a dependent read. It held 9 to
+16 GB/s against this machine's 819 from 97 keys to 65536 — a kernel that is
+neither near the memory nor getting further from it, which is the signature of a
+dependent chain rather than of a bandwidth.
+
+**So the span is cut across threadgroups and the two halves are folded.** A
+threadgroup takes one split of one query and leaves an unnormalised weighted sum
+beside the peak it is relative to; `attention_combine` takes the largest peak,
+rescales every split onto it and normalises. That is the lever "Sampling on the
+device" below records the argmax taking, for the same reason and against the same
+finding: one threadgroup over a row of the vocabulary was this process's own
+argmax to within its spread, and the whole of what a device argmax was worth
+turned out to be the cut. `rms_norm` measured the same arithmetic and declined
+it, which is why this is a number rather than a rule — a split costs a dispatch,
+so it has to buy more than one.
+
+**The cut is over the whole span on tile boundaries and not over the live
+range**, which is what keeps the loop bound above exact: a kernel with the bound
+removed walks the same tiles, so a split holding no live key leaves a peak of
+`-1e30` or `-INFINITY` that the fold rescales by a zero that is exact.
+`the_bounded_loop_is_the_unbounded_one_bit_for_bit` is unchanged and is now
+driven through a 32-way split rather than, as it had been, through none.
+
+**What it is worth, on the 42 dispatches the stack runs**, one query at both
+kinds of layer:
+
+    keys                      97      385      769     2048     8192    32768
+    before               2.81ms  10.09ms  14.32ms  18.96ms  40.14ms 145.38ms
+    after                1.22ms   2.28ms   3.87ms   7.19ms  16.06ms  28.58ms
+    after, refitted      1.34ms   2.46ms   4.33ms      —        —        —
+
+The per-key cost of a global layer went **0.588 µs to 0.076**, and it holds that
+figure from 769 keys to 65536 — so the row is still linear in the context and the
+slope is 7.7 times shallower. The windowed layers were already flat past their
+window and are now flat lower.
+
+**And one split is the kernel that was there**, which is what lets a prefill be
+untouched: `splits_for` gives 1 wherever the grid already fills the machine — a
+769-token prefill is 24608 threadgroups — so no fold is encoded, nothing is
+allocated for one, and the dispatch is the same arithmetic over the same tiles
+writing the same bits.
 
 The matmul is 70% of the device's time, which is what keeps this table mostly one
 row.
@@ -394,7 +452,7 @@ share nothing: the four projections a layer's normed hidden state feeds, the nor
 that makes it, the two convolutions and two head norms behind two of them, the
 attention step beside the projection it feeds, the convolution and add on the
 residual path behind that, the norm over what they left, and every dispatch the
-MLP then runs — 1078 dispatches, and the only thing that ends a command buffer
+MLP then runs — 1122 dispatches, and the only thing that ends a command buffer
 is a run reaching the dispatches it commits at or somebody reading the logits. **What those have in common is that a seam had to be able to express
 them.** Handing a backend one bank at a time, none of it is visible: it takes a
 call that is given the whole layer to see that the gate reads the hidden state
@@ -787,11 +845,13 @@ of a 769-token prefill — 13.3% of the passes the profile sums and 14.4% of the
 3.80 s the command buffers clocked — and an attention kernel
 that cost nothing at all would take that prefill's 5.39 s to 4.84. That is what
 the paragraph below always said and it still holds. **What changed is the other
-regime**: the same span-walking is 19 ms of every decode token at a 769-token
+regime**: the same span-walking was 19 ms of every decode token at a 769-token
 context, which over 128 generated tokens is 2.4 s — larger than the whole
-`packed_matmul_grouped` row. See "Against the reference, end to end". The kernel
-this milestone should have been about is this one, and the measurement that says
-so is the cross-engine table rather than the prefill profile.
+`packed_matmul_grouped` row. **That is where the work then went, and it is 4.3 ms
+now** — see the split under "And now which kernel owns which of those 18
+milliseconds". The kernel this milestone should have been about was this one, and
+the measurement that said so was the cross-engine table rather than the prefill
+profile.
 
 **M9's hypothesis did not hold against a prefill, and the table is what says so.** It was that
 every `(head, query)` threadgroup re-reading all keys is the next order of
@@ -1002,7 +1062,7 @@ it would have held unmerged. A call whose own layer already reaches the budget
 merges nothing and is one submission a layer, which is what a long prefill is.
 
 **The budget was sized by the checkpoint's shapes and is now sized against a
-measurement.** A decode step allocates 17.6 MiB across the 953 buffers its one
+measurement.** A decode step allocates 20 to 34 MiB across the 997 buffers its one
 run retains, so the 160 MiB the budget allows is about nine rows of this stack —
 which is the deepest block the eight heads can ask for, and the width the table
 under "Speculating with the MTP heads" still submits in fourteen, the same as a
@@ -1104,11 +1164,14 @@ is the whole of why the two long-prompt rows read as they do. 23.04 to 23.74 ms
 across an eight-fold context is mlx-vlm holding still; 23.54 to 42.58 is this
 engine walking the span. **The 20.59 ms this file quotes for a decode step is
 taken at an eight-token context**, and it is a true figure about a context nobody
-has — the same 42 `fused_attention` dispatches the table under "Speculating with
-the MTP heads" prices at 4.9 ms over 155 keys are 15.5 ms over 512, and that is
-the row moving. The shape fits: 35 of 42 layers cap at a 512-token window, so the
-median step grows by 9.1 ms between 97 and 385 keys and by 3.8 ms between 385 and
-769, where a linear walk would have grown by more the second time.
+has.
+
+**Both halves of that paragraph were then measured past 769 tokens and both are
+wrong out there.** See "Where a decode step goes as the context grows" below: the
+reference is flat to 769 and takes a threefold step at 2048, and this engine's
+own row is no longer the one that grows fastest. The table above is a paired
+sitting inside a range where a coding workload has not begun, and it is kept for
+what it is.
 
 **The one row that is not a claim is the honest one to name.** `97 × 128` at
 `k = 0` reads 23.54 ms against 23.04 with the ranges across each other and six of
@@ -1142,6 +1205,82 @@ the prompt is long against its answer; the moment a generation is long, the deco
 step's growth with the context is the larger number, and at `k = 0` it is the only
 number. Both are the same fact from two sides — a prefill reads the model once per
 token, and a decode step walks every key it has.
+
+## Where a decode step goes as the context grows
+
+**Every decode figure above, either engine's, was taken at a prompt of 769 tokens
+or fewer.** A coding turn opens at thousands and grows all session, so "the
+reference is flat in the context" was a claim about eightfold, made where the
+workload has not begun. Swept out to where one lives — ours by
+`what_a_decode_step_costs_as_the_context_grows`, the reference by
+`reference/scripts/context_sweep.py`, one sitting each, unspeculated:
+
+    context      before   ours   mlx-vlm    ours tokens/s   ours peak   mlx-vlm peak
+       97        21.99  19.99     23.58     50.0 v 42.4      0.23 GiB    130.99 GiB
+      385        31.04  21.34     23.67     46.9 v 42.3      1.24 GiB    131.94 GiB
+      769        36.03  21.91     24.52     45.7 v 40.8      1.26 GiB    132.97 GiB
+     2048        41.56  24.85     77.85     40.2 v 12.8      1.98 GiB    135.86 GiB
+     4096        50.19  26.09     74.93     38.3 v 13.3      2.78 GiB    136.70 GiB
+     8192        67.17  28.65     78.70     34.9 v 12.7      4.35 GiB    138.60 GiB
+    16384          —      —       79.36        —  v 12.6         —       142.44 GiB
+    32768          —      —       91.27        —  v 11.0         —       150.18 GiB
+
+**The reference is not flat, and that overturns the premise this milestone
+started from.** 23.6 to 24.5 ms from 97 to 769 is the whole of the range the
+cross-engine table covers; at 2048 it is 77.9 ms and it stays near 78 to 16384.
+Whatever produces that step is not diagnosed here — the reference is the target
+rather than the object of study — but the shape is not a slope, it is a
+discontinuity between 769 and 2048 with a plateau after it. **So flat to 769 was
+never an existence proof of flat at 8k**, and the thing it was being used to
+prove is one this engine now does better than the proof.
+
+**This engine is ahead at every context measured**, where before the split it
+lost 385 and 769 and won the rest. It is 2.7× ahead at 8192 and its own row grew
+by 8.7 ms across an 84-fold context where it used to grow by 45. Both columns are
+one sitting apiece and neither is paired — what makes them readable is that the
+effects are 2× to 6× and this host drifts 1.7%. The eight-token figures under
+"Sampling on the device" are what is paired, and they are what moved least.
+
+**Linear, and the slope is the number to carry.** Ours is 19.99 ms at 97 keys
+and 28.65 at 8192, which is **1.07 µs a token of context** where before it was
+5.6 — and `what_the_attention_step_costs_as_the_context_grows` says why it stays
+linear rather than turning: the 7 global layers cost 0.076 µs a key and hold that
+figure to 65536, where the 35 windowed ones are flat past their window. Carried
+out, that is about 55 ms a token at 32768 and 130 at 100k, against a reference
+measured at 91 ms at 32768. **Those two are arithmetic and are labelled as such**;
+what is measured stops at 8192, and what stopped it is that a prefill to 16384
+costs five minutes here and to 32768 fourteen.
+
+### The keys a sequence keeps, which the window does not bound
+
+**35 of the 42 layers can never read past their own last 512 keys and all 42
+retain every key the sequence has seen.** `KeyValues::reserve` allocates against
+the keys a sequence has, in powers of two, and consults
+`AttentionConfig::sliding` nowhere. What
+`what_a_context_costs_in_keys_and_values` weighs is that against the window:
+
+    context      the spans   windowed    if capped   over
+       97           42 MiB     35 MiB       42 MiB   ×1.0
+      769          336 MiB    280 MiB      196 MiB   ×1.7
+     8192         2688 MiB   2240 MiB      588 MiB   ×4.6
+    32768        10752 MiB   8960 MiB     1932 MiB   ×5.6
+    65536        21504 MiB  17920 MiB     3724 MiB   ×5.8
+
+**The architecture note below claims 28 KiB/token and a 1M-token context under
+30 GiB, and that is a claim about a design this engine does not implement.** It
+is arrived at by growing the 7 global layers and holding the 35 windowed ones at
+their window; here all 42 grow, and in float32 rather than the note's bfloat16.
+The third column is this engine's own power-of-two rule applied to the keys a
+layer may reach rather than the keys it has seen — the case asserts that a global
+layer's two columns agree, which is what makes it that rather than a second guess.
+
+**It is not a regression and it is not the reference's fault either**:
+`InklingModel.make_cache` hands every one of mlx-vlm's 42 layers a plain
+`KVCache` too, and its own peak grows 131.0 to 150.2 GiB across the sweep against
+our 0.23 to 4.35. **Nothing here was changed.** Capping a windowed layer means a
+ring buffer — the kernel's key addressing, `rewind`'s interaction with a
+speculative round, and what a prefill writes — and the size of the prize is the
+column above rather than a paragraph.
 
 ## The tail of a step
 
@@ -1357,6 +1496,34 @@ ms/token, 60.7 tokens/s** against 17.61 and 56.8. The deeper the round, the more
 this is worth — 1.5% at `k = 0` and 8.7% at `k = 4` — because a round of depth
 `k` takes `k + 1` argmaxes on the chain and one on the block, and every one of
 them was a pass over 200058 floats on this side.
+
+**The split over the key span then moved every one of those absolute figures and
+narrowed every ratio**, over seven alternating pairs against the commit before
+it, on the same checkpoint:
+
+    k                      0      1      2      3      4
+    before ms/token    20.563 17.135 16.363 16.813 19.481
+    after  ms/token    19.414 16.583 16.078 16.591 19.351
+    before speedup     1.000  1.200  1.257  1.223  1.056
+    after  speedup     1.000  1.171  1.207  1.170  1.003
+    device, before     19.460 15.861 14.950 15.004 17.517
+    device, after      18.600 15.428 14.680 14.874 17.437
+
+**Every depth is cheaper a token and every speedup is smaller, and those are the
+same fact.** `k = 0` fell by 5.6% — seven pairs of seven, ranges apart — and the
+speculating depths by 1 to 3%, so the ratios narrowed because the baseline moved
+further than the rounds did. `k = 4` is 1.003× where it was 1.056×, which is the
+one claim above this table gives back: it is 130 µs faster a token and no longer
+comfortably worth running. **Acceptance is identical to the digit at every depth
+in the same sitting** — 84.8%, 87.0/78.3%, 85/65/55%, 82.4/64.7/52.9/47.1% — and
+tokens a round are 1.829, 2.560, 2.909 and 3.368 either side, which is what says
+no guess moved. The recorded continuation did not change, nor did any of the 583
+gated cases.
+
+Those figures are all taken at a 34-token prompt over 64 tokens, where a span of
+98 keys is four tiles and the split is four. What the same change is worth at a
+context somebody has is under "Where a decode step goes as the context grows",
+and it is a great deal more.
 
 **The device's own clock did not move at any depth**, which is the whole of what
 says this is the asking rather than the work: 19.47 against 19.49, 15.87 against
