@@ -2323,6 +2323,15 @@ where A4's sweep stopped and could not have seen the far edge. Three of them is 
 declaration in (20, 26.67] KiB; the shipped figure is 24. That is **12.2% and
 15.6%** against declaring nothing, bought with memory nobody reads.
 
+**Those two percentages are the boost clock's and the sustained clock's are 8.7
+and 12.5** — see "Whether the occupancy turn survives a warm, order-reversed
+re-run", which re-took this table warm and in both orders. The turn, its
+declaration and its far edge are where this table puts them on either clock; what
+a sweep this short cannot do is leave the boost window, and a prefill never
+enters it. **The row above is kept as taken** because everything the rest of this
+section says about `volatile` and about the decode path was established against
+it.
+
 **`volatile` is load-bearing here and was measured rather than assumed.** A
 thread stores a zero to its own slot and loads it back on the next line, which is
 exactly the shape a forwarding pass removes: without `volatile` the pipeline
@@ -3541,6 +3550,100 @@ What A3's question this does *not* answer is whether a block pays on the
 reference numerics, where the scores stay a `simd_sum`. Nothing here separates
 the block from the instruction — they arrived together and the flag is what let
 them.
+
+## Re-measuring what nobody had re-measured
+
+**This milestone shipped no kernel and that is what it was for.** Three of this
+file's headline numbers rested on measurement that was stale, suspect, or taken
+in a state nobody had checked: a cross-engine column three milestones old, an
+occupancy turn whose effect is smaller than a known measurement artifact, and an
+acceptance figure a milestone had reported as no longer reproducing. Each is
+settled below, and the one that moved is not the one that was expected to.
+
+### That the host was settled, which is the first thing and was not free before
+
+**A8 reported a decode step at 32.8 ms against the 19.8 this file records, on an
+unchanged commit**, and correctly declined to publish an absolute figure on it.
+So nothing here was taken until a known quantity reproduced. `bench decode` at
+`42effa1`, five consecutive runs:
+
+    decode  19.441  19.407  19.435  19.433  19.486 ms
+    device  18.618  18.599  18.628  18.579  18.650 ms
+
+That is a 0.4% spread on both rows and it is the file's own figure rather than
+A8's. **And the paired harness was then run against itself** —
+`just bench HEAD~1 . decode`, seven pairs, where `HEAD~1` differs from the
+working tree by test code alone:
+
+                unit        a        b   change  ranges   pairs      claim
+    decode        ms   19.447   19.440    -0.0%  across   2 of 7  no claim
+    device        ms   18.630   18.610    -0.1%  across   3 of 7  no claim
+
+**A null pair reading no claim is what says the instrument is not inventing
+effects**, and it is the control this file has never printed. Whatever A8's host
+was in, it is not this one; nothing here diagnoses it either.
+
+### Whether the occupancy turn survives a warm, order-reversed re-run
+
+**It does, and the way it survives is worth more than the fact.** External work
+reproducing the threadgroup-memory experiment could not reproduce "declaring dead
+threadgroup memory helps": its own first sweep showed a 1.7× win that vanished
+once it added thirty warm-up dispatches and swept up-then-down. That artifact is
+*larger* than the 12 to 16% this file's matmul sweep reports, and its sign is
+exactly the one that manufactures the result — so the sweeps now warm the device
+for two seconds and run their arms up the list and then down it.
+
+**No ordering artifact exists in any of the three sweeps.** Up and down agree to
+a tenth of a percent at every arm of every one, which is the whole question and
+the answer is flat.
+
+The attention sweep reproduces A5's table digit for digit in both passes — 114.67
+and 114.60 ms at 11.25 KiB against 71.59 and 71.64 at 11.50, the same sharp step
+at the same declaration, and the shipped 12.5 KiB still **22.5% and 26.6%** ahead
+of the 19 KiB it replaced at 2048 and 8192 tokens on a global layer, against the
+22.6 and 26.1 A5 recorded. The staging table reproduces too, both ways: staging
+the values is the best of the four arms at all four cells, and the exception A8
+named is where A8 named it.
+
+**The matmul sweep is the one that moved, and it moved in magnitude and not in
+shape:**
+
+    a threadgroup    q_proj, tiled    a routed bank     q_proj, warm    a bank, warm
+     0 KiB                  5.90ms          19.55ms           5.98ms         19.68ms
+     8 KiB                  5.52ms          18.32ms           5.53ms         17.64ms
+    12 KiB                  5.27ms          17.14ms           5.48ms         17.50ms
+    16 KiB                  5.23ms          16.84ms           5.45ms         17.36ms
+    20 KiB                  5.20ms          16.63ms           5.44ms         17.23ms
+    24 KiB                  5.18ms          16.49ms           5.46ms         17.21ms
+    26 KiB                  5.18ms          16.50ms           5.46ms         17.21ms
+    28 KiB                  6.00ms          18.63ms           6.28ms         19.41ms
+    32 KiB                  6.00ms          18.64ms           6.27ms         19.43ms
+
+**The turn is at the same declaration, the far edge is at the same declaration,
+and what the shipped 24 KiB is worth against declaring nothing is 12.2% and 15.6%
+cold against 8.7% and 12.5% warm.** The two left columns are the sweep with the
+warm-up taken out, run as a control, and they reproduce A5's recorded row to the
+hundredth — so the difference is the warm-up and nothing else about the sitting.
+
+**Which clock a sweep reports is the finding, and it is not the artifact the
+external work found.** A ramp would move the arms *by their position in the
+sweep*, and both passes agreeing to a tenth of a percent rules that out on either
+clock. What the warm-up moves is which clock every arm is on at once: an arm of
+this sweep is about 300 ms and there are eleven, so the whole of it fits inside
+this part's boost window, where a single row of the attention sweep is seconds
+and is on the sustained clock by its second arm whatever it opened on. **That is
+why one of the two moved and the other did not**, and it is why the attention
+figures needed no correction.
+
+**The warm column is the one to carry**, because a prefill of any length runs on
+the sustained clock and never on the boost one. What it corrects is a diagnostic
+rather than a claim: **A5's shipped changes were measured by paired, alternating,
+in-model prefills**, which a clock state cannot reach — 12715 to 12239 ms and
+12291 to 11245 at 2048 tokens, every pair the same way — and those stand. The
+26.4 s of a 133 s prefill is a measurement and not this sweep's arithmetic.
+
+**So the turn holds, with the ordering stated, and the number beside it is
+smaller than the one this file carried on one of the two kernels.**
 
 ## The tail of a step
 
