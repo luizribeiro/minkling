@@ -48,7 +48,7 @@ use inkling_core::workload::{
 use inkling_core::{
     Checkpoint, CheckpointWeights, Ending, ModelCache, TextConfig, Tokenizer, profile,
 };
-use inkling_metal::{Numerics, PackedMatmul};
+use inkling_metal::{FusedAttention, Numerics, PackedMatmul};
 
 /// How long a prefill's prompt is, when nobody says. The middle of the three
 /// lengths this repo quotes.
@@ -912,14 +912,20 @@ fn diverge(dir: &Path, tokens: usize) -> Result<Vec<Reading>> {
     // tokenizer is: a prompt's length in tokens is the only length that decides
     // it, and a byte count beside the text is a proxy that has already been
     // wrong once.
+    //
+    // **Both floors and not the larger of them by luck.** The matmul's entries
+    // are reached by a call of rows and the attention block by a call of query
+    // rows, and a prefill is one length that has to clear both — so the corpus
+    // is held to whichever is higher rather than to the one that happened to be
+    // written down when the corpus was assembled.
+    let reaches = PackedMatmul::SHORTEST_BLOCKED_CALL.max(FusedAttention::SHORTEST_BLOCKED_CALL);
     for (at, ids) in prompts.iter().enumerate() {
-        if ids.len() < PackedMatmul::SHORTEST_BLOCKED_CALL {
+        if ids.len() < reaches {
             bail!(
-                "prompt {} is {} tokens, under the {} a call needs to reach the entries this \
-                 measurement exists to compare",
+                "prompt {} is {} tokens, under the {reaches} a call needs to reach the entries \
+                 this measurement exists to compare",
                 at + 1,
                 ids.len(),
-                PackedMatmul::SHORTEST_BLOCKED_CALL
             );
         }
     }
