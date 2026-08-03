@@ -1822,6 +1822,22 @@ Four scale loads and sixteen multiply-adds per four bytes read as 100 and 101%,
 and one `simd_sum` per output element at the end of a walk thousands of bytes
 long reads the same.
 
+**Two of the candidates have no row here because the kernel has no such term.**
+There is no transcendental in a packed multiply — the group scale is an exponent
+shifted into place and every product is exact — and there is no
+`threadgroup_barrier` anywhere in the tile, which is what makes a simdgroup per
+tile the unit rather than a threadgroup. So the transcendental's share and
+synchronisation's share on both matmul rows are **zero by construction** rather
+than by measurement, where on the attention rows they are measured at nothing and
+4%.
+
+**All of these tables are on the command buffer's own clock and not on a
+per-dispatch sample.** `crate::testing::device_time` divides
+`GPUEndTime - GPUStartTime` by the dispatches a buffer holds, so none of them
+carries the 18% of over-reporting a compute pass a dispatch adds — see "The
+instrumentation is off by default". The counter sample buffers were used for one
+thing only: the in-model per-kernel table this milestone re-took as its arbiter.
+
 ### What a threadgroup's memory is worth on a kernel that declares none
 
 **A tile of this kernel holds no threadgroup memory at all**, so it runs at
