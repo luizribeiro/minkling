@@ -587,6 +587,15 @@ struct Asked {
     prompt: Option<usize>,
     /// How many tokens the run produces, the prefill's own being the first.
     generated: usize,
+    /// Decode steps thrown away after the prefill before the profile starts.
+    ///
+    /// **The step after a long prefill is not a decode step.** The cross-engine
+    /// table records step 1 at 736 and 783 ms against medians of 32.6 and 36.4
+    /// at the two long prompts: it is what the prefill deferred — 13741 MiB over
+    /// 1278 buffers released when its command buffer completes — arriving on the
+    /// step after it. A profile that charged it would put that release in the
+    /// rows of every step it was divided by.
+    settle: usize,
     /// Whether the device times each dispatch.
     sampling: bool,
 }
@@ -598,7 +607,20 @@ impl Asked {
         Self {
             prompt: None,
             generated: GENERATED,
+            settle: 0,
             sampling: false,
+        }
+    }
+
+    /// The same, over a prompt tiled to `prompt` tokens — **a decode step at a
+    /// context somebody might have**, where [`Asked::decoding`] is one at the
+    /// eight tokens the recorded prompt has.
+    fn decoding_at(prompt: usize) -> Self {
+        Self {
+            prompt: Some(prompt),
+            generated: 1 + SETTLED + CHARGED,
+            settle: SETTLED,
+            ..Self::decoding()
         }
     }
 
@@ -607,6 +629,7 @@ impl Asked {
         Self {
             prompt: Some(prompt),
             generated: 1,
+            settle: 0,
             sampling: false,
         }
     }
@@ -623,7 +646,32 @@ impl Asked {
     fn charges_the_prefill(&self) -> bool {
         self.generated == 1
     }
+
+    /// Steps whose accounts are cleared rather than charged: the prefill, and
+    /// whatever it deferred onto the steps behind it.
+    fn discarded(&self) -> usize {
+        1 + self.settle
+    }
 }
+
+/// Decode steps a context's table throws away before it starts charging.
+///
+/// **Two at every length, including the ones that do not need it.** Only a long
+/// prompt has a step to discard — the cross-engine table records step 1 at 736
+/// and 783 ms at 385 and 769 tokens against medians of 32.6 and 36.4, where at
+/// 97 the longest step is 25.55 ms and falls at step 125. Discarding a fixed two
+/// is what keeps the three rows means over the same steps of the same
+/// generation, which is the whole use they are put to; discarding by length
+/// would make the shortest row a mean over something the other two are not.
+///
+/// Two rather than one because a span doubling is also a step nobody wants in a
+/// mean, and where it falls is the prompt's rather than this constant's.
+const SETTLED: usize = 2;
+
+/// Decode steps a context's table is the mean of, which is what the recorded
+/// prompt's own generation charges: [`GENERATED`] tokens are one prefill and
+/// this many decode steps, so the two tables are means over the same number.
+const CHARGED: usize = GENERATED - 1;
 
 /// One run of the engine with every weight it has a kernel for on the device,
 /// over the prompt the activation capture recorded.
@@ -685,14 +733,23 @@ impl OnTheDevice {
     /// to say what it costs is to run the same thing both ways — see
     /// `what_timing_each_dispatch_costs`.
     fn generating(dir: &Path, device: &Device, sampling: bool) -> Self {
-        let asked = Asked::decoding();
-        Self::running(dir, device, if sampling { asked.sampled() } else { asked })
+        Self::maybe_sampling(dir, device, Asked::decoding(), sampling)
     }
 
     /// One prefill of `prompt` tokens and nothing after it, which is the step
     /// the cases below are about.
     fn prefilling(dir: &Path, device: &Device, prompt: usize, sampling: bool) -> Self {
-        let asked = Asked::prefilling(prompt);
+        Self::maybe_sampling(dir, device, Asked::prefilling(prompt), sampling)
+    }
+
+    /// The decode steps after a prompt tiled to `prompt` tokens, which is the
+    /// same regime [`OnTheDevice::generating`] charges at a context a user would
+    /// actually have.
+    fn decoding_at(dir: &Path, device: &Device, prompt: usize, sampling: bool) -> Self {
+        Self::maybe_sampling(dir, device, Asked::decoding_at(prompt), sampling)
+    }
+
+    fn maybe_sampling(dir: &Path, device: &Device, asked: Asked, sampling: bool) -> Self {
         Self::running(dir, device, if sampling { asked.sampled() } else { asked })
     }
 
@@ -791,7 +848,7 @@ impl OnTheDevice {
                 read(&mut run);
                 run.peak = run.peak.max(fixture::resident_bytes());
                 run.got.push(id);
-                if run.steps.len() == 1 && !asked.charges_the_prefill() {
+                if run.steps.len() <= asked.discarded() && !asked.charges_the_prefill() {
                     profile::take();
                     device.round_trips();
                 }
@@ -814,13 +871,17 @@ impl OnTheDevice {
         if self.asked.charges_the_prefill() {
             1
         } else {
-            self.decode_steps()
+            self.decode_steps() - self.asked.settle as u32
         }
     }
 
     /// The index into [`Self::steps`] of the first step the profile describes.
     fn charged_from(&self) -> usize {
-        usize::from(!self.asked.charges_the_prefill())
+        if self.asked.charges_the_prefill() {
+            0
+        } else {
+            self.asked.discarded()
+        }
     }
 
     /// What one step of the regime the profile describes took: the prefill, or
@@ -831,6 +892,20 @@ impl OnTheDevice {
     /// here is for.
     fn each_charged_step(&self) -> Duration {
         self.steps[self.charged_from()..].iter().sum::<Duration>() / self.charged_steps()
+    }
+
+    /// The median of the charged steps.
+    ///
+    /// **A mean that is not the median is a reading of something else**, which
+    /// the cross-engine table found the hard way: its mean at a 769-token prompt
+    /// is 42.58 ms against a median of 36.44, and what separates them is the one
+    /// step the prefill deferred onto. [`Asked::settle`] takes that step out, so
+    /// the two should agree here — and printing both is what says whether it
+    /// did.
+    fn median_charged_step(&self) -> Duration {
+        let mut charged: Vec<Duration> = self.steps[self.charged_from()..].to_vec();
+        charged.sort_unstable();
+        charged.get(charged.len() / 2).copied().unwrap_or_default()
     }
 
     /// The `(dispatches, submissions, allocations, allocated bytes)` of the last
@@ -861,13 +936,30 @@ impl OnTheDevice {
         self
     }
 
+    /// The keys the first and last charged decode step attend over.
+    ///
+    /// **A decode step's cost is a function of this and the record did not say
+    /// it.** A prefill of `prompt` tokens leaves that many keys, and the `i`th
+    /// decode step after it appends one and attends over `prompt + i` — so the
+    /// charged steps span a range rather than sitting at a context, and a table
+    /// that named neither is what let eleven milestones quote an eight-token
+    /// figure as a decode figure.
+    fn context(&self) -> (usize, usize) {
+        let first = self.prompt + self.charged_from();
+        (first, first + self.charged_steps() as usize - 1)
+    }
+
     /// This run's charged regime, for the tables that read one.
     fn measured(&self) -> Measured<'_> {
+        let (first, last) = self.context();
         Measured {
             regime: if self.asked.charges_the_prefill() {
                 format!("prefill of {} tokens", self.prompt)
             } else {
-                "decode step".to_string()
+                format!(
+                    "decode step, a {}-token prompt and {first} to {last} keys",
+                    self.prompt
+                )
             },
             step: self.each_charged_step(),
             steps: self.charged_steps(),
@@ -1550,6 +1642,143 @@ fn which_kernels_own_a_decode_step() {
         run.profile.dispatched(),
         run.profile.gpu()
     );
+}
+
+/// **Which kernels own a decode step at a context somebody actually has**,
+/// which is the same table as the case above at the three lengths the
+/// cross-engine comparison decodes over rather than at the recorded prompt's
+/// eight.
+///
+/// **The case above is a true table about a context nobody has.** Every decode
+/// figure this repo has ever quoted was taken over the eight-token prompt the
+/// activation capture recorded — the head merge, the device tail, the packed
+/// heads, the device argmax — and `just bench-engines` then found the reference
+/// flat in the context and this engine not: 23.5 ms a token at 97 keys against
+/// 42.6 at 769, where mlx-vlm reads 23.0 and 23.7. A step that grows with the
+/// context has a row in this table that grows with it, and one table at one
+/// length cannot say which.
+///
+/// **Three lengths and not two, because the two questions differ.** A prefill is
+/// diagnosed at two — 97 tokens is the only length whose layers still merge into
+/// one run, which is a scheduling difference and not a kernel one. Here every
+/// length runs the same fourteen submissions over the same 1078 dispatches, so
+/// the 97-token row is a row about the kernels like the other two and is the one
+/// the reference is indistinguishable from.
+///
+/// Nothing asserts a share or a slope. What is asserted is what the case above
+/// asserts — that every dispatch was timed and that the passes stay inside the
+/// command buffers they were cut out of — at each of the three.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn which_kernels_own_a_decode_step_at_each_context() {
+    let Some((dir, device)) = sampling_device() else {
+        return;
+    };
+
+    for &prompt in &PREFILL_WALL_LENGTHS {
+        let unsampled = OnTheDevice::decoding_at(&dir, &device, prompt, false);
+        let run = OnTheDevice::decoding_at(&dir, &device, prompt, true);
+        eprintln!("{}", step_table(&run.measured()));
+        eprintln!(
+            "  against a {:.2?} unsampled step of {:.2?} device time, so the rows carry \
+             {:+.1}% of asking",
+            unsampled.each_charged_step(),
+            unsampled.profile.gpu(),
+            100.0
+                * (run.profile.dispatched().as_secs_f64() / unsampled.profile.gpu().as_secs_f64()
+                    - 1.0)
+        );
+
+        let (timed, moved) = what_was_sampled(&run.profile);
+        // The same bound the eight-token case makes, and it holds at every
+        // length for the reason the prefill table gives from the other side: a
+        // decode step reads the model once whatever the context, and what grows
+        // with the context is the span attention walks rather than the weights.
+        assert!(
+            (5e9..7e9).contains(&(moved as f64)),
+            "a decode step at {prompt} tokens moved {:.2} GB, where the checkpoint's active \
+             weights are 5.9",
+            moved as f64 / 1e9
+        );
+        let (dispatches, ..) = run.per_decode_step();
+        assert_eq!(
+            timed, dispatches,
+            "a decode step at {prompt} tokens did not have all its dispatches timed"
+        );
+        assert!(
+            run.profile.dispatched() <= run.profile.gpu(),
+            "at {prompt} tokens the passes claim {:.2?} of a command buffer the device clocked \
+             at {:.2?}",
+            run.profile.dispatched(),
+            run.profile.gpu()
+        );
+    }
+}
+
+/// The contexts a decode step is priced at once the workload is a coding one.
+///
+/// **Every decode figure this repo has ever taken tops out at 769 tokens** —
+/// the cross-engine table's longest prompt — and a coding turn opens at
+/// thousands and grows all session. Whether a step is linear in the context or
+/// plateaus cannot be told apart over an eightfold range, and it is what decides
+/// whether the engine is usable at 32k at all.
+///
+/// Stopping at 8192 is a wall-time judgement rather than a claim: a prefill here
+/// is the cost of reaching a row, and the two lengths past this one are 5 and 14
+/// minutes of it. `what_the_attention_step_costs_as_the_context_grows` carries
+/// the shape out to 65536 for the price of a dispatch, and this is what says the
+/// shape it carries is the step's.
+const GROWN_CONTEXTS: [usize; 6] = [97, 385, 769, 2048, 4096, 8192];
+
+/// **What a decode step costs, and what a sequence holds, as the context
+/// grows.**
+///
+/// Three columns nothing in this repo had: a decode step past 769 tokens, the
+/// peak resident set beside it, and both against the same lengths the reference
+/// is swept over by `reference/scripts/context_sweep.py`. The last is the one
+/// that had to be measured rather than assumed — the cross-engine table found
+/// mlx-vlm flat from 97 to 769 and this file read that as flat, where the
+/// reference's own sweep puts it at 24 ms to 769 and 78 ms from 2048 on.
+///
+/// **The memory column is a claim about the architecture and not about this
+/// run.** 35 of the 42 layers cap at a 512-token window, so a sequence's keys
+/// and values should grow on 7 of them; `KeyValues::reserve` allocates against
+/// the keys a sequence has seen instead, and
+/// `what_a_context_costs_in_keys_and_values` is where that is weighed exactly.
+/// What this adds is what the whole process holds around it.
+///
+/// Nothing asserts a slope. What is asserted is that each row generated the
+/// tokens it was asked for, so a row is not a run that stopped early.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn what_a_decode_step_costs_as_the_context_grows() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    eprintln!(
+        "{:>8}{:>11}{:>11}{:>11}{:>11}{:>11}{:>10}",
+        "context", "prefill", "a token", "median", "device", "tokens/s", "peak"
+    );
+    for context in GROWN_CONTEXTS {
+        let run = OnTheDevice::decoding_at(&dir, &device, context, false);
+        let step = run.each_charged_step();
+        assert_eq!(
+            run.got.len(),
+            run.asked.generated,
+            "the run at {context} tokens stopped after {} of {} tokens",
+            run.got.len(),
+            run.asked.generated
+        );
+        eprintln!(
+            "{context:>8}{:>11}{:>11}{:>11}{:>11}{:>11}{:>10}",
+            format!("{:.0?}", run.steps[0]),
+            format!("{step:.2?}"),
+            format!("{:.2?}", run.median_charged_step()),
+            format!("{:.2?}", run.profile.gpu()),
+            format!("{:.1}", 1.0 / step.as_secs_f64()),
+            format!("{:.2} GiB", run.peak as f64 / (1u64 << 30) as f64),
+        );
+    }
 }
 
 /// The three prompt lengths this file's prefill figures are quoted at, and the
