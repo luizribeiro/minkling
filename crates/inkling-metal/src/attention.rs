@@ -248,6 +248,46 @@ fn tile_keys(head_dim: usize) -> usize {
     (THREADS_PER_GROUP / NARROWEST_SIMD * KEYS_PER_SIMD).min(STAGED_VALUES / head_dim)
 }
 
+/// Keys the query at `position` walks, which is the kernel's own `[reach, last)`
+/// — the causal bound, the window behind it, and the tile the window is rounded
+/// down to so that the bounded loop stays the unbounded one bit for bit.
+///
+/// A tile wider than the kernel's own would round `reach` further down and count
+/// keys the walk skips. It cannot be narrower: `tile_keys` takes the widest a
+/// simdgroup floor allows, for the reason [`NARROWEST_SIMD`] gives — so this is
+/// exact where a simdgroup is 32 lanes and an over-count of under a tile a row
+/// anywhere else.
+fn keys_walked(position: usize, keys: usize, sliding: usize, tile: usize) -> usize {
+    let last = keys.min(position + 1);
+    let reach = match sliding {
+        0 => 0,
+        window if position >= window => (position - (window - 1)) / tile * tile,
+        _ => 0,
+    };
+    last.saturating_sub(reach)
+}
+
+/// The same summed over a call's query rows, which is what separates a decode
+/// step's declared bytes from a prefill's.
+///
+/// **A span is read once a query row and not once a call**, which is the whole
+/// of the difference between the two regimes: a decode step's one row walks a
+/// span and a prefill of `n` rows through a global layer walks `n²/2` keys.
+///
+/// Summed rather than closed-form, because the bound above is the kernel's and a
+/// second expression for it is a second thing that can drift from the source.
+fn keys_a_call_walks(
+    queries: usize,
+    q_offset: usize,
+    keys: usize,
+    sliding: usize,
+    tile: usize,
+) -> usize {
+    (0..queries)
+        .map(|i| keys_walked(q_offset + i, keys, sliding, tile))
+        .sum()
+}
+
 /// How many splits a call of `pairs` query-head threadgroups over `keys` keys
 /// cuts its span into.
 ///
@@ -825,23 +865,36 @@ impl<'a> LayerAttention<'a> {
         // barriers below uniform: a threadgroup either runs a split or returns
         // from one, and never splits over the question.
         let grid = Grid::new(pairs * splits * THREADS_PER_GROUP, THREADS_PER_GROUP);
-        // **The spans are bound whole and read to `step.keys`**, which is the
-        // difference between what this dispatch binds and what it moves: a
-        // layer's keys and values have room for a thousand and an eight-token
-        // sequence has eight. The band is the same distinction again — the
-        // projection is `[rel_extent, d_rel]` and a call reaches the distances
-        // its keys span. Beside them the queries in and the same shape out, the
-        // relative features, and a scale for each query.
+        // **The spans are bound whole and walked a query row at a time**, which
+        // is the difference between what this dispatch binds and what it moves:
+        // a layer's keys and values have room for a thousand, an eight-token
+        // sequence has eight, and a call of `n` rows reads the ones each of them
+        // reaches. So the keys are charged per *query head* rather than per KV
+        // head — four query heads share a span here and each threadgroup walks
+        // it for itself, and a figure that charged the span once would be the
+        // distinct bytes rather than the reads. The band is the same distinction
+        // again — the projection is `[rel_extent, d_rel]` and a call reaches the
+        // distances its keys span. Beside them the queries in and the same shape
+        // out, the relative features, and a scale for each query.
         //
         // A split call writes partials where an unsplit one writes the row, and
         // the fold below is charged reading them — so the pair of dispatches is
-        // charged the row once between them however many splits made it.
+        // charged the row once between them however many splits made it. The
+        // walk itself is charged the same whichever way it is cut: the splits
+        // partition `[0, keys)`, so between them they hold each live key once.
         let row = out.len();
         let staged = pairs * splits * partial;
+        let walked = keys_a_call_walks(
+            queries,
+            step.q_offset,
+            step.keys,
+            self.config.sliding,
+            tile_keys(head_dim),
+        );
         let moves = size_of::<f32>()
             * (step.q.len()
                 + if splits == 1 { row } else { staged }
-                + 2 * kv_heads * step.keys * head_dim
+                + 2 * heads * walked * head_dim
                 + step.rel.len()
                 + step.keys.min(self.rel_extent) * self.config.d_rel
                 + queries);
@@ -1657,18 +1710,52 @@ mod tests {
         }
 
         /// What the bandwidth column divides by, against what the kernel reads:
-        /// the queries in and the same shape out, the keys and values this call
-        /// reaches, the relative features, the band's coefficients for the
-        /// distances those keys span, and a scale a query.
+        /// the queries in and the same shape out, the keys and values each query
+        /// row of this call walks, the relative features, the band's
+        /// coefficients for the distances those keys span, and a scale a query.
+        ///
+        /// **Both dispatches where the span is cut**, because that is what a
+        /// caller encodes and what the profile sums: the split call writes
+        /// partials where an unsplit one writes the row and the fold reads them
+        /// back and writes the row itself, so a cut adds the partials twice. How
+        /// many splits is [`splits_for`]'s and is not what this is checking.
         fn moves(&self) -> usize {
             let rel_extent = self.proj.len() / self.config.d_rel;
+            let pairs = self.config.heads * self.queries;
+            let splits = splits_for(pairs, self.keys, self.config.head_dim);
+            let folded = match splits {
+                1 => 0,
+                splits => 2 * pairs * splits * (self.config.head_dim + 2),
+            };
             size_of::<f32>()
                 * (2 * self.q.len()
-                    + self.k.len()
-                    + self.v.len()
+                    + 2 * self.config.heads * self.walked() * self.config.head_dim
                     + self.rel.len()
                     + self.keys.min(rel_extent) * self.config.d_rel
-                    + self.queries)
+                    + self.queries
+                    + folded)
+        }
+
+        /// The keys this call's threadgroups walk, counted one key at a time
+        /// against the loop bound written out rather than differenced the way
+        /// [`keys_a_call_walks`] differences it — so the two agree only where
+        /// both are right, which is what `branch` is to the band.
+        fn walked(&self) -> usize {
+            let tile = tile_keys(self.config.head_dim);
+            (0..self.queries)
+                .map(|i| i + self.q_offset)
+                .map(|position| {
+                    (0..self.keys)
+                        .filter(|&key| key <= position)
+                        .filter(|&key| match self.config.sliding {
+                            window if window > 0 && position >= window => {
+                                key >= (position - (window - 1)) / tile * tile
+                            }
+                            _ => true,
+                        })
+                        .count()
+                })
+                .sum()
         }
 
         fn wrapped<'d>(
@@ -1868,25 +1955,82 @@ mod tests {
     /// branches happen to be live, and the mutations below would be measuring an
     /// empty set.
     #[test]
-    fn a_dispatch_declares_the_keys_it_reaches_rather_than_the_span_it_binds() {
+    fn a_dispatch_declares_the_keys_each_of_its_query_rows_walks() {
         let Some(device) = device() else { return };
         let attention = FusedAttention::new(&device).expect("the kernel compiles");
-        let case = decode_shaped(16);
-        let layer = case.wrapped(&device, &attention);
-        layer.hold(0, case.keys).expect("the span reserves");
 
-        let moved = crate::testing::moved(&device, |batch| {
-            layer.encode(batch, case.step()).expect("the step encodes");
-        });
+        let declared = |case: &Case| -> u64 {
+            let layer = case.wrapped(&device, &attention);
+            layer.hold(0, case.keys).expect("the span reserves");
+            let moved = crate::testing::moved(&device, |batch| {
+                layer.encode(batch, case.step()).expect("the step encodes");
+            });
+            assert_eq!(moved as usize, case.moves(), "{}", case.name);
+            moved
+        };
 
-        assert_eq!(moved as usize, case.moves());
         // The span the layer holds has room for 64 keys and this call reaches
         // sixteen. A figure taken off what was bound would be charging the step
         // for keys no sequence has yet.
+        let case = decode_shaped(16);
+        let over_one_row = declared(&case);
         assert!(
-            (moved as usize) < size_of::<f32>() * 2 * LEAST_KEYS * case.config.kv_channels(),
-            "the whole reserved span was charged for the keys a call reaches"
+            (over_one_row as usize)
+                < size_of::<f32>() * 2 * LEAST_KEYS * case.config.heads * case.config.head_dim,
+            "{over_one_row} bytes is the whole reserved span rather than the keys a call reaches"
         );
+
+        // **A block of rows is charged a span a row**, which is the half a
+        // single-row call cannot tell apart: nine rows over sixteen keys walk 108
+        // of them between them, where the causal bound leaves the first row eight.
+        let over_nine_rows = declared(&blocked(16, 0, 9));
+        assert!(
+            over_nine_rows > 4 * over_one_row,
+            "{over_nine_rows} bytes over nine rows against {over_one_row} over one"
+        );
+
+        // **And a windowed row is charged its window rather than its span**,
+        // which is the other bound in the loop and the one no global case
+        // reaches. Both shapes a prefill runs it at, since the window and the
+        // causal bound are live together only over a block.
+        let over_a_window = declared(&windowed(600, SLIDING_WINDOW));
+        let over_the_span = declared(&windowed(600, 0));
+        assert!(
+            over_a_window < over_the_span,
+            "a window of {SLIDING_WINDOW} was charged {over_a_window} bytes against the \
+             {over_the_span} of the whole 600-key span"
+        );
+        declared(&blocked(600, SLIDING_WINDOW, 9));
+    }
+
+    /// The keys a query row walks, at the four bounds that decide it: a global
+    /// row walks everything up to itself, a windowed row walks its window
+    /// rounded out to a tile, a row inside its first window walks everything,
+    /// and a call of `n` rows from nothing walks `n(n + 1)/2`.
+    ///
+    /// **Worked out by hand rather than read off the code**, because the whole
+    /// use the figure is put to is dividing a bandwidth column and a formula
+    /// that agreed with itself would divide it wrongly and say nothing.
+    #[test]
+    fn a_query_row_walks_the_keys_its_window_and_its_position_leave_it() {
+        let tile = tile_keys(128);
+        assert_eq!(tile, 32);
+
+        assert_eq!(keys_walked(768, 769, 0, tile), 769);
+        // 768 - 511 is 257, which rounds down to the tile at 256 — so a windowed
+        // row walks its 512 keys and the part-tile the alignment leaves in.
+        assert_eq!(keys_walked(768, 769, 512, tile), 769 - 256);
+        assert_eq!(keys_walked(400, 769, 512, tile), 401);
+
+        assert_eq!(keys_a_call_walks(4, 0, 4, 0, tile), 1 + 2 + 3 + 4);
+        assert_eq!(
+            keys_a_call_walks(2048, 0, 2048, 0, tile),
+            2048 * 2049 / 2,
+            "a global prefill walks the square"
+        );
+        // The same prompt through a window is linear in it instead, at the
+        // window plus what the tile alignment leaves.
+        assert!(keys_a_call_walks(2048, 0, 2048, 512, tile) < 2048 * 544);
     }
 
     /// What the bandwidth column divides by, against what the kernel reads.
