@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **589 of the 628 tests, no
+`just test` is the one to run while iterating: **585 of the 623 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,7 +32,7 @@ a crate's tests in one process: opening a Metal device costs a second, so the 16
 kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 628 against a
+`just test-full` is what has to pass at the ends of a series: **all 623 against a
 real checkpoint, ten minutes.** The 52 gated tests — the 37 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the thirty-nine tests whose result *is* a number — a duration
+`just test-timing` is the thirty-eight tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -1505,12 +1505,19 @@ grows.
 ### Carrying a block of query rows through one tile of keys
 
 **The lever the section above sized was taken, and it is bit-identical to the
-kernel it replaces and slower than it at every height.** `QUERIES_A_BLOCK` gives
+kernel it replaces and slower than it at every height.** `QUERIES_A_BLOCK` gave
 a threadgroup a block of consecutive query rows of one head instead of a single
-row: the block stages one tile of values, reads each key of that tile once, and
-the `R` dots the key feeds come off that one read. Both the sweep and the
-identity case are in the tree; the shipped height is **one**, which is the
-kernel that was always there.
+row: the block staged one tile of values, read each key of that tile once, and
+the `R` dots the key feeds came off that one read.
+
+**It was then given back, and what is in the tree is the kernel that was always
+there.** The block lives in `c2095cb` with its own bit-for-bit case and its own
+sweep, and both are re-runnable from that commit; what is *not* worth carrying
+is the block itself, which cost 0.4% of a prefill's device clock at a height of
+one for a lever the section below shows could never have paid. The reading that
+kills it needs no block at all — it is a two-line mutation of the kernel that
+ships — so the disproof stays free and permanent while the disproved thing does
+not stay at all.
 
 **Tiles outer and rows inner, which is what makes it identical rather than
 close.** A row takes part in exactly the tiles its own `[reach, last)` gave it,
@@ -1522,9 +1529,10 @@ rescaled by `exp(peak - peak)`, which is a NaN where its peak is still
 the sum, and `keys_a_call_walks` is that: a global prefill's `n²/2` becomes
 `n²/8 + n/2` at four rows, ×3.99 at 2048 tokens.
 
-**`a_block_of_query_rows_is_a_row_at_a_time_bit_for_bit` is the case, and it is
-on the bits rather than on the floats** — `-0.0` and `0.0` compare equal as
-floats and are two different answers. Sixteen cases at heights of two and four
+**`a_block_of_query_rows_is_a_row_at_a_time_bit_for_bit`, in `c2095cb`, is the
+case, and it is on the bits rather than on the floats** — `-0.0` and `0.0`
+compare equal as floats and are two different answers. Sixteen cases at heights
+of two and four
 against a height of one, each driven unsplit and through an eight-way fold:
 six with a short last block, eight windowed — six of them holding a block whose
 rows do reach back to different keys, which is the thing the block is easiest to
@@ -1534,7 +1542,8 @@ long. **Not one bit of one element moved**, at either height.
 
 **And the sweep is emphatic in the wrong direction.** One dispatch of `n` query
 rows over `n` keys, both kinds of layer, against the same dispatch a row a
-threadgroup:
+threadgroup — `what_a_prefills_attention_costs_at_each_height_a_block_carries`,
+in `c2095cb`:
 
     tokens   a block      global   against  window 512   against   the stack
       2048         1     94.04ms     ×1.00     45.18ms     ×1.00       2.24s
@@ -1569,12 +1578,12 @@ arithmetic; its whole working set is one 16 KB tile that never leaves the cache.
 What separates the two is the memory and nothing else:
 
     tokens         layer    the span    one slot     of it
-      2048        global     94.10ms     79.26ms       84%
-      2048    window 512     45.18ms     38.54ms       85%
-      4096        global    339.35ms    280.05ms       83%
-      4096    window 512     96.83ms     82.54ms       85%
-      8192        global       1.27s       1.02s       81%
-      8192    window 512    200.10ms    170.54ms       85%
+      2048        global     92.67ms     78.06ms       84%
+      2048    window 512     44.43ms     37.89ms       85%
+      4096        global    335.02ms    276.60ms       83%
+      4096    window 512     95.23ms     81.15ms       85%
+      8192        global       1.25s       1.01s       81%
+      8192    window 512    196.64ms    167.69ms       85%
 
 **So the memory is 15 to 19% of this kernel and the other four fifths are not
 the keys.** A lever that removed *every* key and value fetch would take a fifth
@@ -1593,16 +1602,18 @@ about the time. It is the same shape of finding as
 looked like the largest deficit in the table was an artefact of its denominator
 — met on the one kernel that had not yet had its denominator checked.
 
-**What the block costs by existing is 0.4% of a prefill's device time**, and it
-is measured rather than waved at: over four alternating pairs at 2048 tokens,
-every pair moving the same way and the ranges apart, the device's own clock is
-10671.7 ms against 10710.7 and the wall is 12629.6 against 12697.5 with the
-ranges across each other and no claim. At a height of one the kernel is the
-kernel that was there — the same tiles, the same bound, the same grid, the same
-splits — and what the 40 ms buys is that the largest premise this repo has
-carried is falsifiable in the tree rather than in a paragraph. A decode step did
-not move at all: 19.463 ms against 19.475 over seven pairs, ranges across, three
-of the seven falling the other way.
+**What the block cost by existing was 0.4% of a prefill's device time**, and
+that is why it is not here: over four alternating pairs at 2048 tokens, every
+pair moving the same way and the ranges apart, the device's own clock read
+10671.7 ms against 10710.7 with the wall at 12629.6 against 12697.5 and its
+ranges across. At a height of one the kernel walked the same tiles under the
+same bound over the same grid with the same splits, so the 40 ms bought nothing
+but a sweep — and the mutation above reproduces the finding on the kernel that
+ships, to the same six percentages. Given back, the two attention rows read
+92.67 and 44.43 ms at 2048 tokens against the 94.04 and 45.18 the block's own
+height of one measured, which is the 0.4% arriving where it was spent. A decode
+step never moved either way: 19.463 ms against 19.475 over seven pairs, ranges
+across, three of the seven falling the other way.
 
 ### What this leaves for whoever caps the spans
 
@@ -1629,10 +1640,11 @@ counts and buys no microsecond of this section's.
 
 ### What did not move, which is everything
 
-The block ships at a height of one, so the kernel a call dispatches walks the
-same tiles under the same bound over the same grid with the same split count.
-The list below is a check on that claim rather than a comparison, and it is what
-says so:
+Nothing here touches a dispatch: the block is given back and what a call
+dispatches is the kernel `3e41885` left, byte for byte, with two measurements
+beside it. The list below is a check on that claim rather than a comparison, and
+it is what says so — its middle column taken while the block was in the tree at
+a height of one, and its last after it came out:
 
     context     e7168ce     3e41885      here
        97         19.99       19.98     19.97
@@ -1655,8 +1667,13 @@ drifts 1.7%, and the same table. The reads either side of it are the same reads:
 
 **The prefill wall, one sitting a length, against the four lengths this file
 records:** 12.83, 25.57, 54.32 and 134.42 s against 12.66, 25.36, 54.25 and
-133.63 — 0.6 to 1.3% on a host with 1.7% of drift and a paired 2048 reading that
-puts the device's own clock 0.4% up and the wall inside its own spread. **The
+133.63 — 0.6 to 1.3% on a host with 1.7% of drift, taken while the block was in
+the tree. Paired against `157fb6a` with the block back out, a 2048-token prefill
+is 10670.5 ms of device time against 10670.7 over four pairs, ranges across and
+two of the four falling either way, and a decode step 19.501 ms against 19.506
+over seven with the device's own clock 18.673 against 18.682: **no claim on any
+of the four rows, which is what the 0.4% coming off looks like from the other
+side.** **The
 reference was not re-measured**: nothing here changes what mlx-vlm does, so its
 34.31 s at 16384 and the ×3.89 beside it stand as A2 took them, and a paired
 cross-engine sitting was not spent to re-prove an arm that did not change.
@@ -1669,7 +1686,7 @@ and 82/65/53/47% below that — the packed heads' own recorded row, digit for
 digit. `the_bounded_loop_is_the_unbounded_one_bit_for_bit`,
 `a_query_row_walks_the_keys_its_window_and_its_position_leave_it` and
 `a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` pass
-unrelaxed, and so do all 589 tests of the run against a real checkpoint.
+unrelaxed, and so do all 585 tests of the run against a real checkpoint.
 
 ## The tail of a step
 

@@ -91,57 +91,6 @@ const KEYS_PER_SIMD: usize = 4;
 /// the most a threadgroup can hold.
 const MOST_SIMDGROUPS: usize = 32;
 
-/// Query rows one threadgroup carries through one tile of keys.
-///
-/// **One, and the sweep that says so is the finding rather than the number.**
-/// The kernel gives a threadgroup to a query of a head, and every one of them
-/// walks the key span for itself: at 16384 tokens one global layer issues 4.4 TB
-/// of key and value reads against a distinct span of 134 MB. Over its device
-/// time that is 704 GB/s against this machine's 819, which read as a bandwidth
-/// says the kernel is at the memory and the only lever left is to read less.
-///
-/// A block of `R` rows is that lever. It stages one tile of values and reads
-/// each key of it once, and the `R` dots that key feeds come off that one read —
-/// **tiles outer and rows inner**, so each row walks the tiles its own bound
-/// gave it in the order it gave them, accumulating the same products into the
-/// same running peak, total and weighted sum. It is bit-identical to a row at a
-/// time and
-/// `a_block_of_query_rows_is_a_row_at_a_time_bit_for_bit` is what says so.
-///
-/// **And it is slower at every height, because 704 GB/s was an amplification
-/// and not a bandwidth.** The reads a walk issues are not the traffic it makes:
-/// 32 query heads and their neighbouring rows walk almost the same keys at
-/// almost the same time, so a tile fetched for one is in cache for the rest.
-/// `whether_a_prefills_attention_is_waiting_on_the_keys_it_reads` prices that
-/// directly — the same kernel reading every key and value from slot zero, whose
-/// whole working set is one 16 KB tile, is **81 to 85%** of reading the span —
-/// so the memory is fifteen to nineteen per cent of this kernel, and a lever
-/// that divides its reads by four is worth at most three quarters of that.
-/// Swept, a block of two is ×0.95 and a block of four ×0.72; eight does not
-/// compile, the arrays a block carries being 3 KB a row against the 32 KB an
-/// Apple GPU allows. See
-/// `what_a_prefills_attention_costs_at_each_height_a_block_carries`.
-///
-/// The block stays here at a height of one — which is the kernel that was
-/// always here, dispatch for dispatch — for the reason `ROWS_A_TILE`'s own
-/// sweep compiles heights nothing runs: the two cases above are what the number
-/// rests on, and a constant whose sweep had been deleted is a number nobody can
-/// re-ask.
-///
-/// A height above one must be no wider than the narrowest simdgroup, because the
-/// band entry of row `r` is derived by lane `r`.
-const QUERIES_A_BLOCK: usize = 1;
-
-/// Query rows under which a call takes no block whatever the height compiled.
-///
-/// **The decode regime would keep the dispatch it has, by construction rather
-/// than by measurement.** One query row has nothing to share a tile with, and
-/// the widest block a speculative round can propose is nine — the deepest the
-/// eight MTP heads ask for. Both are under this, so a decode step and every
-/// round it verifies reach the same grid with the same split count at any
-/// height, and the figures this file pins them to cannot move.
-const LEAST_BLOCK: usize = 10;
-
 /// Channels one head may have, which bounds the staged query row and the
 /// weighted sum beside it. Inkling's `head_dim` is 128.
 const MOST_CHANNELS: usize = 256;
@@ -251,8 +200,7 @@ pub enum AttentionError {
 /// names no shape, so one of these serves all forty-two.
 #[derive(Debug)]
 pub struct FusedAttention {
-    /// The entry a global layer's call is charged to, a query row a
-    /// threadgroup.
+    /// The entry a global layer's call is charged to.
     global: Kernel,
     /// The same pipeline under the other name, for the 35 layers whose queries
     /// stop at their window. **Two rows and one kernel**: a prefill's two terms
@@ -262,52 +210,23 @@ pub struct FusedAttention {
     /// The fold behind a split call, out of the same source string: the two
     /// entries share [`Shape`] and a mutation to one is a source a test has to
     /// be able to compile both out of.
-    ///
-    /// One of these at any block height, because the partials it folds are
-    /// indexed by the query row and the split — a block shares nothing of them
-    /// — so the fold cannot tell how the rows that wrote them were grouped.
     combine: Kernel,
-    /// Query rows a threadgroup carries, which this side has to know because it
-    /// lays out the grid the kernel's own `QUERIES_A_BLOCK` divides.
-    ///
-    /// [`QUERIES_A_BLOCK`] on everything but the two cases that sweep it.
-    rows_a_block: usize,
 }
 
 impl FusedAttention {
     pub fn new(device: &Device) -> Result<Self, MetalError> {
-        Self::from_source(device, source)
+        Self::from_source(device, &source())
     }
 
     /// [`FusedAttention::new`] out of a source string of the caller's own, which
     /// is how a test puts a deliberately wrong kernel through the same plumbing
     /// as the right one and measures the difference.
-    ///
-    /// **Asked for at a height rather than handed over**, because the engine
-    /// compiles two and a mutant that reached only one of them would leave the
-    /// other regime measuring the kernel it was supposed to be replacing.
-    pub(crate) fn from_source(
-        device: &Device,
-        source: impl Fn(usize) -> String,
-    ) -> Result<Self, MetalError> {
-        Self::blocking(device, source, QUERIES_A_BLOCK)
-    }
-
-    /// The same at a block height the caller names, which is what lets the
-    /// bit-for-bit case put a height of one beside the shipped one out of the
-    /// same string.
-    pub(crate) fn blocking(
-        device: &Device,
-        source: impl Fn(usize) -> String,
-        rows_a_block: usize,
-    ) -> Result<Self, MetalError> {
-        let written = source(rows_a_block);
-        let global = device.compile(&written, ENTRY)?;
+    pub(crate) fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
+        let global = device.compile(source, ENTRY)?;
         Ok(Self {
             windowed: global.under(WINDOWED),
             global: global.under(GLOBAL),
-            combine: device.compile(&written, COMBINE)?,
-            rows_a_block,
+            combine: device.compile(source, COMBINE)?,
         })
     }
 
@@ -329,84 +248,44 @@ fn tile_keys(head_dim: usize) -> usize {
     (THREADS_PER_GROUP / NARROWEST_SIMD * KEYS_PER_SIMD).min(STAGED_VALUES / head_dim)
 }
 
-/// The first key the query at `position` may reach, which is the kernel's own
-/// `reach` — the window behind the query, rounded down to a tile so that the
-/// bounded loop stays the unbounded one bit for bit.
+/// Keys the query at `position` walks, which is the kernel's own `[reach, last)`
+/// — the causal bound, the window behind it, and the tile the window is rounded
+/// down to so that the bounded loop stays the unbounded one bit for bit.
 ///
-/// A tile wider than the kernel's own would round this further down and count
+/// A tile wider than the kernel's own would round `reach` further down and count
 /// keys the walk skips. It cannot be narrower: `tile_keys` takes the widest a
 /// simdgroup floor allows, for the reason [`NARROWEST_SIMD`] gives — so this is
 /// exact where a simdgroup is 32 lanes and an over-count of under a tile a row
 /// anywhere else.
-fn reach_of(position: usize, sliding: usize, tile: usize) -> usize {
-    match sliding {
-        window if window > 0 && position >= window => (position - (window - 1)) / tile * tile,
-        _ => 0,
-    }
-}
-
-/// Keys the query at `position` walks, which is the kernel's own
-/// `[reach, last)` — the causal bound and the window behind it.
-///
-/// What a *block* of rows walks is [`keys_a_call_walks`], and it is the union of
-/// this over the rows rather than the sum, which is why nothing outside the
-/// cases below reaches this any more.
-#[cfg(test)]
 fn keys_walked(position: usize, keys: usize, sliding: usize, tile: usize) -> usize {
-    keys.min(position + 1)
-        .saturating_sub(reach_of(position, sliding, tile))
+    let last = keys.min(position + 1);
+    let reach = match sliding {
+        0 => 0,
+        window if position >= window => (position - (window - 1)) / tile * tile,
+        _ => 0,
+    };
+    last.saturating_sub(reach)
 }
 
-/// The same summed over a call's blocks of query rows, which is what separates a
-/// decode step's declared bytes from a prefill's — and, since the block, what
-/// separates this milestone's prefill from the one before it.
+/// The same summed over a call's query rows, which is what separates a decode
+/// step's declared bytes from a prefill's.
 ///
-/// **A span is read once a *block* and not once a query row.** A threadgroup
-/// carrying `rows` rows stages each tile of keys and values once and every row
-/// of the block scores against that one read, so what a block reads is the union
-/// of its rows' walks: from the first row's `reach` — the smallest, since the
-/// bound only moves forward with the position — to the last row's `last`, the
-/// largest. At `rows` of one that is a row's own walk and the sum is what it
-/// always was; at four it is about a quarter of it, which is the whole of the
-/// change.
+/// **A span is read once a query row and not once a call**, which is the whole
+/// of the difference between the two regimes: a decode step's one row walks a
+/// span and a prefill of `n` rows through a global layer walks `n²/2` keys.
 ///
-/// The union is a range rather than a set of them because the rows of a block
-/// overlap: row `r + 1` reaches back at least to row `r`'s own position, so
-/// there is no key between two rows' walks that neither wants.
-///
-/// Summed rather than closed-form, because the bounds above are the kernel's and
-/// a second expression for them is a second thing that can drift from the
-/// source.
+/// Summed rather than closed-form, because the bound above is the kernel's and a
+/// second expression for it is a second thing that can drift from the source.
 fn keys_a_call_walks(
     queries: usize,
     q_offset: usize,
     keys: usize,
     sliding: usize,
     tile: usize,
-    rows_a_block: usize,
 ) -> usize {
     (0..queries)
-        .step_by(rows_a_block)
-        .map(|base| {
-            let rows = rows_a_block.min(queries - base);
-            let opens = reach_of(q_offset + base, sliding, tile);
-            let closes = keys.min(q_offset + base + rows);
-            closes.saturating_sub(opens)
-        })
+        .map(|i| keys_walked(q_offset + i, keys, sliding, tile))
         .sum()
-}
-
-/// Query rows one threadgroup of this call carries, which is the height the
-/// kernel it reaches was compiled at.
-///
-/// [`LEAST_BLOCK`] is where the two regimes are separated, and it is a shape
-/// rather than a measurement: everything under it is a decode step or a round
-/// verifying one, and those keep the kernel they had.
-fn rows_a_block(queries: usize, height: usize) -> usize {
-    match queries >= LEAST_BLOCK {
-        true => height,
-        false => 1,
-    }
 }
 
 /// How many splits a call of `pairs` query-head threadgroups over `keys` keys
@@ -948,26 +827,6 @@ impl<'a> LayerAttention<'a> {
         );
 
         let pairs = heads * queries;
-        let rows_a_block = rows_a_block(queries, self.attention.rows_a_block);
-        let blocks = heads * queries.div_ceil(rows_a_block);
-        // **The split is still decided on the query rows and not on the blocks,
-        // and that is deliberate.** A block divides the threadgroups a call
-        // gives the machine, so the predicate read against `blocks` would cut
-        // some calls it does not cut now — and **a cut is not bit-identical**.
-        // Splitting the span accumulates each split's softmax apart and folds
-        // them, which lands a few ulps from one running total over the same
-        // tiles, so a call whose split count moved under it would answer
-        // differently for a reason that has nothing to do with the block. The
-        // one claim this milestone makes is that no token moved; a predicate
-        // that changed its mind about the cut would cost that claim to buy a
-        // threadgroup count for calls of ten to sixty rows, which nothing but a
-        // very short prompt is.
-        //
-        // What it gives up is nothing where the grid is short: everything under
-        // [`LEAST_BLOCK`] takes no block at all, so a decode step and every
-        // round it verifies reach this with the number they always had, and
-        // every call that *is* blocked has hundreds of threadgroups before the
-        // block and dozens after it.
         let splits = self
             .pinned
             .get()
@@ -1001,20 +860,19 @@ impl<'a> LayerAttention<'a> {
             splits => pairs * splits * partial,
         })?;
 
-        // A threadgroup to each split of each block of each head, which is what
-        // makes the block the threadgroup's own position and so what makes the
+        // A threadgroup to each split of each query of each head, which is what
+        // makes the pair the threadgroup's own position and so what makes the
         // barriers below uniform: a threadgroup either runs a split or returns
         // from one, and never splits over the question.
-        let grid = Grid::new(blocks * splits * THREADS_PER_GROUP, THREADS_PER_GROUP);
+        let grid = Grid::new(pairs * splits * THREADS_PER_GROUP, THREADS_PER_GROUP);
         // **The spans are bound whole and walked a query row at a time**, which
         // is the difference between what this dispatch binds and what it moves:
         // a layer's keys and values have room for a thousand, an eight-token
-        // sequence has eight, and a call of `n` rows reads the ones the blocks
-        // they fall in reach. So the keys are charged per *query head* rather
-        // than per KV head — four query heads share a span here and each
-        // threadgroup walks it for itself, and a figure that charged the span
-        // once would be the distinct bytes rather than the reads. What a block
-        // took off is inside `walked`. The band is the same distinction
+        // sequence has eight, and a call of `n` rows reads the ones each of them
+        // reaches. So the keys are charged per *query head* rather than per KV
+        // head — four query heads share a span here and each threadgroup walks
+        // it for itself, and a figure that charged the span once would be the
+        // distinct bytes rather than the reads. The band is the same distinction
         // again — the projection is `[rel_extent, d_rel]` and a call reaches the
         // distances its keys span. Beside them the queries in and the same shape
         // out, the relative features, and a scale for each query.
@@ -1032,7 +890,6 @@ impl<'a> LayerAttention<'a> {
             step.keys,
             self.config.sliding,
             tile_keys(head_dim),
-            rows_a_block,
         );
         let moves = size_of::<f32>()
             * (step.q.len()
@@ -1167,17 +1024,14 @@ fn by_distance(proj: &[f32], d_rel: usize, rel_extent: usize) -> Vec<f32> {
 /// the reference rather than about this kernel — the CPU path emits it and the
 /// committed masks hold the bfloat16 rounding of it, and a second spelling here
 /// is one that can drift from the module that owns it.
-fn source(rows_a_block: usize) -> String {
-    let most_scores = MOST_SIMDGROUPS * KEYS_PER_SIMD;
+fn source() -> String {
     format!(
         "constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n\
          constant uint MOST_CHANNELS = {MOST_CHANNELS};\n\
          constant uint MOST_FEATURES = {MOST_FEATURES};\n\
-         constant uint MOST_SCORES = {most_scores};\n\
          constant uint MOST_SPLITS = {MOST_SPLITS};\n\
          constant uint KEYS_PER_SIMD = {KEYS_PER_SIMD};\n\
          constant uint STAGED_VALUES = {STAGED_VALUES};\n\
-         constant uint QUERIES_A_BLOCK = {rows_a_block};\n\
          constant float MASKED = {MASKED:e}f;\n{BODY}"
     )
 }
@@ -1253,12 +1107,99 @@ inline float banded_entry(
     return bias * tau;
 }
 
-/// The keys the query at `position` may reach, as `(reach, last)`.
+/// The attention step for one query of one head: score every key, bias it, mask
+/// it, softmax the row and weight the values by it.
 ///
-/// Named rather than written where it is used because a block asks it of every
-/// row it carries, and the two ends it answers with are what decide which tiles
-/// of the block's walk that row takes part in.
-inline uint2 reach_and_last(constant Shape &shape, int position, uint tile) {
+/// One threadgroup to a query of a head. The keys are walked in tiles of
+/// `simdgroups * KEYS_PER_SIMD`, and each tile is two phases with the barriers
+/// between them:
+///
+/// - **Score.** A simdgroup to a key: lane `l` walks the key's channels from `l`
+///   in strides of the simdgroup width and the group sums what the lanes held,
+///   so the 32 lanes of one reduction read 32 consecutive channels. Lane 0 adds
+///   the band's entry, which it derives rather than reads.
+/// - **Weight.** A thread to a channel: the tile's exponents are formed once in
+///   threadgroup memory, and each thread carries its own channel's weighted sum
+///   across every tile. The values themselves are staged first, by the whole
+///   threadgroup and in the order they lie, so that what a thread then walks is
+///   threadgroup memory rather than a chain of `head_dim`-spaced device reads.
+///
+/// The running peak and total are every thread's rather than one thread's and
+/// broadcast: each reduces the same tile out of the same threadgroup memory, and
+/// what that costs at 32 entries is less than the barrier a broadcast needs.
+kernel void fused_attention(
+    constant Shape &shape [[buffer(0)]],
+    device const float *q [[buffer(1)]],
+    device const float *k [[buffer(2)]],
+    device const float *v [[buffer(3)]],
+    device const float *rel [[buffer(4)]],
+    device const float *proj [[buffer(5)]],
+    device const float *taus [[buffer(6)]],
+    device float *out [[buffer(7)]],
+    device float *partials [[buffer(8)]],
+    uint slot [[threadgroup_position_in_grid]],
+    uint local [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint width [[threads_per_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint simds [[simdgroups_per_threadgroup]]
+) {
+    threadgroup float query[MOST_CHANNELS];
+    threadgroup float weighted[MOST_CHANNELS];
+    threadgroup float features[MOST_FEATURES];
+    threadgroup float scores[MOST_SIMDGROUPS * KEYS_PER_SIMD];
+    threadgroup float staged[STAGED_VALUES];
+
+    // A threadgroup is one split of one query of one head, split-minor — so the
+    // splits of a pair are consecutive threadgroups, which is the order they are
+    // written in and the order the combine reads them in.
+    const uint pair = slot / shape.splits;
+    const uint split = slot % shape.splits;
+
+    // Unreachable under the grid this is dispatched over, which gives exactly
+    // one threadgroup to each split of each query of each head. It is here for
+    // what it would have to be if that ever stopped being true: the pair is the
+    // threadgroup's own position, so this turns away a whole group and never
+    // splits one — and a bounds check on `local` instead would leave some
+    // threads at the barriers below and others past them, which is undefined
+    // rather than slow.
+    if (pair >= shape.heads * shape.queries) {
+        return;
+    }
+
+    const uint head = pair / shape.queries;
+    const uint i = pair % shape.queries;
+    // Each KV head serves a contiguous block of query heads: with 32 query heads
+    // over 8 KV heads, query heads 0..4 all read KV head 0. Striding instead —
+    // `head % kv_heads` — pairs every query head with keys of the right shape.
+    const uint kv = head / (shape.heads / shape.kv_heads);
+    const float scale = as_type<float>(shape.scale_bits);
+    const float tau = taus[i];
+
+    // `key_stride` rather than `keys`: a span the layer keeps between steps has
+    // room for more keys than the sequence has put in it, so what separates one
+    // KV head's keys from the next is the slots allocated and not the slots
+    // filled. A call handed the span whole passes the same number twice.
+    device const float *q_row = q + (ulong)pair * shape.head_dim;
+    device const float *keys_of = k + (ulong)kv * shape.key_stride * shape.head_dim;
+    device const float *values_of = v + (ulong)kv * shape.key_stride * shape.head_dim;
+    device const float *rel_row = rel + ((ulong)i * shape.heads + head) * shape.d_rel;
+
+    for (uint d = local; d < shape.head_dim; d += threads) {
+        query[d] = q_row[d];
+        weighted[d] = 0.0f;
+    }
+    for (uint c = local; c < shape.d_rel; c += threads) {
+        features[c] = rel_row[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int position = (int)(i + shape.q_offset);
+    const uint tile = min(simds * KEYS_PER_SIMD, STAGED_VALUES / shape.head_dim);
+    float peak = -INFINITY;
+    float total = 0.0f;
+
     // BOUND: the keys this query can reach, which is where two of
     // `banded_entry`'s four branches are answered by not walking rather than by
     // walking and discarding. Nothing at or after the query's own position is
@@ -1285,131 +1226,6 @@ inline uint2 reach_and_last(constant Shape &shape, int position, uint tile) {
     const uint reach = shape.sliding > 0 && (uint)position >= shape.sliding
         ? ((uint)position - (shape.sliding - 1u)) / tile * tile
         : 0u;
-    // BOUNDED: what the two above come to, and where a kernel with the bound
-    // taken off rejoins this one.
-    return uint2(reach, last);
-}
-
-/// The attention step for a block of `QUERIES_A_BLOCK` consecutive queries of
-/// one head: score every key, bias it, mask it, softmax each row and weight the
-/// values by it.
-///
-/// One threadgroup to a block of a head. The keys are walked in tiles of
-/// `simdgroups * KEYS_PER_SIMD`, and each tile is two phases with the barriers
-/// between them:
-///
-/// - **Score.** A simdgroup to a key: lane `l` walks the key's channels from `l`
-///   in strides of the simdgroup width and the group sums what the lanes held,
-///   so the 32 lanes of one reduction read 32 consecutive channels. **One read
-///   of a channel feeds every row of the block** — which is the whole of what a
-///   block is for, and is why the row loop is inside the channel loop rather
-///   than around it. Lane `r` adds row `r`'s band entry, which it derives rather
-///   than reads, so the block's entries are formed beside each other instead of
-///   `QUERIES_A_BLOCK` times over by lane 0.
-/// - **Weight.** A thread to a channel: the tile's exponents are formed once in
-///   threadgroup memory, and each thread carries its own channel's weighted sum
-///   across every tile, one per row of the block. The values themselves are
-///   staged first, by the whole threadgroup and in the order they lie, so that
-///   what a thread then walks is threadgroup memory rather than a chain of
-///   `head_dim`-spaced device reads — and the block stages them once for all of
-///   its rows.
-///
-/// **Tiles outer and rows inner, which is what makes a block bit-identical to
-/// the rows it carries.** A row takes part in exactly the tiles its own
-/// `[reach, last)` gave it, in the same order, and the tiles the block walks
-/// that the row is not in are skipped by that row entirely — so its running
-/// peak, total and weighted sum see the same values in the same order they saw
-/// a threadgroup at a time. A row with no live key in a tile rescales by
-/// nothing rather than by `exp(peak - peak)`, which would be a NaN where the
-/// peak is still `-INFINITY`.
-///
-/// The running peak and total are every thread's rather than one thread's and
-/// broadcast: each reduces the same tile out of the same threadgroup memory, and
-/// what that costs at 32 entries is less than the barrier a broadcast needs.
-kernel void fused_attention(
-    constant Shape &shape [[buffer(0)]],
-    device const float *q [[buffer(1)]],
-    device const float *k [[buffer(2)]],
-    device const float *v [[buffer(3)]],
-    device const float *rel [[buffer(4)]],
-    device const float *proj [[buffer(5)]],
-    device const float *taus [[buffer(6)]],
-    device float *out [[buffer(7)]],
-    device float *partials [[buffer(8)]],
-    uint slot [[threadgroup_position_in_grid]],
-    uint local [[thread_position_in_threadgroup]],
-    uint threads [[threads_per_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint width [[threads_per_simdgroup]],
-    uint simd [[simdgroup_index_in_threadgroup]],
-    uint simds [[simdgroups_per_threadgroup]]
-) {
-    threadgroup float query[QUERIES_A_BLOCK * MOST_CHANNELS];
-    threadgroup float weighted[QUERIES_A_BLOCK * MOST_CHANNELS];
-    threadgroup float features[QUERIES_A_BLOCK * MOST_FEATURES];
-    threadgroup float scores[QUERIES_A_BLOCK * MOST_SCORES];
-    threadgroup float staged[STAGED_VALUES];
-
-    // A threadgroup is one split of one block of one head, split-minor — so the
-    // splits of a block are consecutive threadgroups, which is the order they
-    // are written in.
-    const uint blocks = (shape.queries + QUERIES_A_BLOCK - 1u) / QUERIES_A_BLOCK;
-    const uint pair = slot / shape.splits;
-    const uint split = slot % shape.splits;
-
-    // Unreachable under the grid this is dispatched over, which gives exactly
-    // one threadgroup to each split of each block of each head. It is here for
-    // what it would have to be if that ever stopped being true: the block is the
-    // threadgroup's own position, so this turns away a whole group and never
-    // splits one — and a bounds check on `local` instead would leave some
-    // threads at the barriers below and others past them, which is undefined
-    // rather than slow.
-    if (pair >= shape.heads * blocks) {
-        return;
-    }
-
-    const uint head = pair / blocks;
-    const uint base = (pair % blocks) * QUERIES_A_BLOCK;
-    // The last block of a call is short wherever the height does not divide the
-    // queries. Its dead rows stage a zeroed query and a zeroed band, walk no
-    // tile and write nothing.
-    const uint rows = min((uint)QUERIES_A_BLOCK, shape.queries - base);
-    // Each KV head serves a contiguous block of query heads: with 32 query heads
-    // over 8 KV heads, query heads 0..4 all read KV head 0. Striding instead —
-    // `head % kv_heads` — pairs every query head with keys of the right shape.
-    const uint kv = head / (shape.heads / shape.kv_heads);
-    const float scale = as_type<float>(shape.scale_bits);
-
-    // `key_stride` rather than `keys`: a span the layer keeps between steps has
-    // room for more keys than the sequence has put in it, so what separates one
-    // KV head's keys from the next is the slots allocated and not the slots
-    // filled. A call handed the span whole passes the same number twice.
-    device const float *keys_of = k + (ulong)kv * shape.key_stride * shape.head_dim;
-    device const float *values_of = v + (ulong)kv * shape.key_stride * shape.head_dim;
-
-    for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-        // A dead row's pointers are the first row's, so that no address past the
-        // buffers is formed to be conditionally not read.
-        const uint i = base + (r < rows ? r : 0u);
-        device const float *q_row = q + ((ulong)head * shape.queries + i) * shape.head_dim;
-        device const float *rel_row = rel + ((ulong)i * shape.heads + head) * shape.d_rel;
-        for (uint d = local; d < shape.head_dim; d += threads) {
-            query[r * MOST_CHANNELS + d] = r < rows ? q_row[d] : 0.0f;
-            weighted[r * MOST_CHANNELS + d] = 0.0f;
-        }
-        for (uint c = local; c < shape.d_rel; c += threads) {
-            features[r * MOST_FEATURES + c] = r < rows ? rel_row[c] : 0.0f;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint tile = min(simds * KEYS_PER_SIMD, STAGED_VALUES / shape.head_dim);
-    float peak[QUERIES_A_BLOCK];
-    float total[QUERIES_A_BLOCK];
-    for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-        peak[r] = -INFINITY;
-        total[r] = 0.0f;
-    }
 
     // SPLIT: this threadgroup's share of the walk, in whole tiles.
     //
@@ -1424,46 +1240,17 @@ kernel void fused_attention(
     // `-1e30` or `-INFINITY` that the combine rescales by an exact zero.
     //
     // A split is at least one tile, so `per_split * tile` never cuts a tile in
-    // half and the ends below stay on the alignment `reach` already has.
+    // half and `from` stays on the alignment `reach` already has.
     const uint spans = (shape.keys + tile - 1u) / tile;
     const uint per_split = (spans + shape.splits - 1u) / shape.splits;
-    const uint cut = split * per_split * tile;
-    const uint until = min(shape.keys, (split + 1u) * per_split * tile);
-
-    // Where each row of the block starts and stops, and where the block does.
-    // **The block's own range is the union of its rows'**, which is a range
-    // rather than a scattering because row `r + 1` reaches back at least as far
-    // as row `r`'s own position: `reach` only moves forward with the query and
-    // never past it.
-    uint opens[QUERIES_A_BLOCK];
-    uint closes[QUERIES_A_BLOCK];
-    uint from = shape.keys;
-    uint to = 0u;
-    for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-        const uint at = base + (r < rows ? r : 0u);
-        const uint2 span = reach_and_last(shape, (int)(at + shape.q_offset), tile);
-        opens[r] = max(span.x, cut);
-        closes[r] = r < rows ? min(span.y, until) : 0u;
-        from = r < rows ? min(from, opens[r]) : from;
-        to = max(to, closes[r]);
-    }
+    const uint from = max(reach, split * per_split * tile);
+    const uint to = min(last, min(shape.keys, (split + 1u) * per_split * tile));
 
     for (uint first = from; first < to; first += tile) {
         const uint held = min(tile, to - first);
-        // Keys of this tile each row of the block takes part in, which is its
-        // own `held` where it takes part at all and nothing where the tile is
-        // outside its bound. Worked out once and read by the three phases
-        // below, all of which have to agree about it.
-        uint live[QUERIES_A_BLOCK];
-        for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-            live[r] = first >= opens[r] && first < closes[r]
-                ? min(tile, closes[r] - first)
-                : 0u;
-        }
 
         // The tile's values, brought in by the whole threadgroup in the order
-        // they lie rather than by each thread down its own channel — once for
-        // every row of the block.
+        // they lie rather than by each thread down its own channel.
         device const float *tiled = values_of + (ulong)first * shape.head_dim;
         for (uint at = local; at < held * shape.head_dim; at += threads) {
             staged[at] = tiled[at];
@@ -1476,99 +1263,52 @@ kernel void fused_attention(
             }
             const uint j = first + s;
 
-            // **One read of a channel, one product a row.** The channel loop is
-            // outside the row loop, so the key arrives once and feeds every row
-            // of the block; each row's products are still summed over `d` in
-            // the order a single-row threadgroup summed them, and each row's
-            // reduction is still one `simd_sum` over the same lanes.
-            float dots[QUERIES_A_BLOCK];
-            for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-                dots[r] = 0.0f;
-            }
+            float dot = 0.0f;
             device const float *key = keys_of + (ulong)j * shape.head_dim;
             for (uint d = lane; d < shape.head_dim; d += width) {
-                const float channel = key[d];
-                for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-                    dots[r] += query[r * MOST_CHANNELS + d] * channel;
-                }
+                dot += query[d] * key[d];
             }
-            for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-                const float dot = simd_sum(dots[r]);
-                // A lane to a row, so the block's band entries are derived
-                // beside each other rather than one after another by lane 0 —
-                // which is `QUERIES_A_BLOCK * d_rel` serial multiplies where
-                // the rest of the simdgroup has nothing to do.
-                if (lane == r && r < rows) {
-                    const int position = (int)(base + r + shape.q_offset);
-                    const float entry = banded_entry(
-                        proj,
-                        features + r * MOST_FEATURES,
-                        shape,
-                        position - (int)j,
-                        taus[base + r]
-                    );
-                    scores[r * MOST_SCORES + s] = dot * scale + entry;
-                }
+            dot = simd_sum(dot);
+            if (lane == 0) {
+                const float entry =
+                    banded_entry(proj, features, shape, position - (int)j, tau);
+                scores[s] = dot * scale + entry;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // A row with no live key in this tile takes no part in it: its peak,
-        // total and weighted sum are what they were, which is what `rescale` of
-        // one and a `live` of nothing come to below — and what an unguarded
-        // `exp(peak - peak)` would answer with a NaN for, the peak of a row
-        // whose first tile has not arrived being `-INFINITY`.
-        float rescale[QUERIES_A_BLOCK];
-        for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-            rescale[r] = 1.0f;
-            if (live[r] == 0u) {
-                continue;
-            }
-            threadgroup const float *row = scores + r * MOST_SCORES;
-            float top = peak[r];
-            for (uint s = 0; s < live[r]; ++s) {
-                top = fmax(top, row[s]);
-            }
-            // A tile whose largest score is below the running peak rescales by
-            // one and a first tile rescales what is not there yet by
-            // `exp(-INFINITY)`, which is zero. Neither is a case worth branching
-            // on.
-            //
-            // `precise` for the reason the RMSNorm kernel's `rsqrt` is: the
-            // default is a hardware approximation, and every weight this row
-            // hands a value comes out of one of these.
-            rescale[r] = precise::exp(peak[r] - top);
-            peak[r] = top;
+        float top = peak;
+        for (uint s = 0; s < held; ++s) {
+            top = fmax(top, scores[s]);
+        }
+        // A tile whose largest score is below the running peak rescales by one
+        // and a first tile rescales what is not there yet by `exp(-INFINITY)`,
+        // which is zero. Neither is a case worth branching on.
+        //
+        // `precise` for the reason the RMSNorm kernel's `rsqrt` is: the default
+        // is a hardware approximation, and every weight this row hands a value
+        // comes out of one of these.
+        const float rescale = precise::exp(peak - top);
+        peak = top;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint s = local; s < held; s += threads) {
+            scores[s] = precise::exp(scores[s] - top);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-            threadgroup float *row = scores + r * MOST_SCORES;
-            for (uint s = local; s < live[r]; s += threads) {
-                row[s] = precise::exp(row[s] - peak[r]);
-            }
+        float sum = 0.0f;
+        for (uint s = 0; s < held; ++s) {
+            sum += scores[s];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        total = total * rescale + sum;
 
-        for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-            if (live[r] == 0u) {
-                continue;
+        for (uint d = local; d < shape.head_dim; d += threads) {
+            float acc = weighted[d] * rescale;
+            for (uint s = 0; s < held; ++s) {
+                acc += scores[s] * staged[s * shape.head_dim + d];
             }
-            threadgroup const float *row = scores + r * MOST_SCORES;
-            float sum = 0.0f;
-            for (uint s = 0; s < live[r]; ++s) {
-                sum += row[s];
-            }
-            total[r] = total[r] * rescale[r] + sum;
-
-            threadgroup float *carried = weighted + r * MOST_CHANNELS;
-            for (uint d = local; d < shape.head_dim; d += threads) {
-                float acc = carried[d] * rescale[r];
-                for (uint s = 0; s < live[r]; ++s) {
-                    acc += row[s] * staged[s * shape.head_dim + d];
-                }
-                carried[d] = acc;
-            }
+            weighted[d] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1577,7 +1317,7 @@ kernel void fused_attention(
     // partials and the dispatch that folds them are what a split call needs and
     // what an unsplit one would only pay for, so the branch is here rather than
     // in a second kernel: at one split this is the same arithmetic over the same
-    // tiles writing the same rows, which is what lets a prefill go on being the
+    // tiles writing the same row, which is what lets a prefill go on being the
     // dispatch it was.
     //
     // `[queries, heads * head_dim]` rather than the `[heads, queries, head_dim]`
@@ -1587,17 +1327,10 @@ kernel void fused_attention(
     // A call over no keys leaves a total of zero, which is a forward pass over
     // no tokens rather than a row to divide by it.
     if (shape.splits == 1u) {
-        for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-            if (r >= rows) {
-                continue;
-            }
-            device float *result =
-                out + ((ulong)(base + r) * shape.heads + head) * shape.head_dim;
-            threadgroup const float *carried = weighted + r * MOST_CHANNELS;
-            const float norm = total[r] > 0.0f ? 1.0f / total[r] : 0.0f;
-            for (uint d = local; d < shape.head_dim; d += threads) {
-                result[d] = carried[d] * norm;
-            }
+        device float *result = out + ((ulong)i * shape.heads + head) * shape.head_dim;
+        const float norm = total > 0.0f ? 1.0f / total : 0.0f;
+        for (uint d = local; d < shape.head_dim; d += threads) {
+            result[d] = weighted[d] * norm;
         }
         return;
     }
@@ -1606,26 +1339,13 @@ kernel void fused_attention(
     // to — which is what the combine needs and what a normalised row could not
     // give it, since two splits' totals are not comparable until they have been
     // shifted onto one peak.
-    //
-    // **Indexed by the query row and not by the threadgroup**, which is what
-    // leaves the fold unable to tell how the rows that wrote these were
-    // grouped: the layout is `[heads, queries, splits, head_dim + 2]` at every
-    // block height, including the one.
-    for (uint r = 0; r < QUERIES_A_BLOCK; ++r) {
-        if (r >= rows) {
-            continue;
-        }
-        device float *part = partials
-            + (((ulong)head * shape.queries + base + r) * shape.splits + split)
-                * (shape.head_dim + 2u);
-        threadgroup const float *carried = weighted + r * MOST_CHANNELS;
-        for (uint d = local; d < shape.head_dim; d += threads) {
-            part[d] = carried[d];
-        }
-        if (local == 0) {
-            part[shape.head_dim] = peak[r];
-            part[shape.head_dim + 1u] = total[r];
-        }
+    device float *part = partials + (ulong)slot * (shape.head_dim + 2u);
+    for (uint d = local; d < shape.head_dim; d += threads) {
+        part[d] = weighted[d];
+    }
+    if (local == 0) {
+        part[shape.head_dim] = peak;
+        part[shape.head_dim + 1u] = total;
     }
 }
 
@@ -1728,24 +1448,22 @@ mod tests {
     /// those cases pin is `banded_entry`, which is still the authority on which
     /// keys are live; what pins the bound to it is
     /// `the_bounded_loop_is_the_unbounded_one_bit_for_bit`.
-    fn unbounded(rows_a_block: usize) -> String {
-        let source = source(rows_a_block);
+    fn unbounded() -> String {
+        let source = source();
         let (head, tail) = source
             .split_once("    // BOUND:")
             .expect("the bound is marked");
-        // **The cut ends where `reach_and_last` answers, and everything after it
-        // is kept.** What this mutant exists to be is the same walk over every
-        // key of the span, which is the *bound* removed and not the block or the
-        // split — the block walks the union of its rows' ranges and the split
+        // **The cut ends where the split begins, and the split is kept.** What
+        // this mutant exists to be is the same walk over every key of the span,
+        // which is the *bound* removed and not the parallelism — and the split
         // partitions `[0, keys)` on tile boundaries either way, so a mutant that
-        // dropped either would compare two different accumulations and the
-        // bit-for-bit claim below would be about the wrong thing.
+        // dropped it would compare two different accumulations and the bit-for-
+        // bit claim below would be about the wrong thing.
         let (_, tail) = tail
-            .split_once("    // BOUNDED:")
-            .expect("the bound ends where the two are answered");
+            .split_once("\n    // SPLIT:")
+            .expect("the bound ends where the split begins");
         let whole = format!(
-            "{head}    const uint last = shape.keys;\n    const uint reach = 0u;\n\
-             \x20   // BOUNDED:{tail}"
+            "{head}    const uint last = shape.keys;\n    const uint reach = 0u;\n\n    // SPLIT:{tail}"
         );
         // What is asserted is that the bound is *gone*, not merely that the
         // string moved: cutting between two markers is only as good as the
@@ -1986,24 +1704,9 @@ mod tests {
         }
 
         fn on_the_device(&self, device: &Device, attention: &FusedAttention) -> Vec<f32> {
-            self.cut(device, attention, None)
-        }
-
-        /// The same with the split count pinned rather than left to
-        /// [`splits_for`], which is what lets a case that means to compare two
-        /// kernels compare only the two kernels: a cut accumulates each split's
-        /// softmax apart and folds them, so two calls that disagreed about how
-        /// many splits to take would disagree in the last ulps whatever the
-        /// kernels did.
-        fn cut(
-            &self,
-            device: &Device,
-            attention: &FusedAttention,
-            splits: Option<usize>,
-        ) -> Vec<f32> {
-            let layer = self.wrapped(device, attention);
-            layer.split_into(splits);
-            layer.forward(self.step()).expect("the dispatch completes")
+            self.wrapped(device, attention)
+                .forward(self.step())
+                .expect("the dispatch completes")
         }
 
         /// What the bandwidth column divides by, against what the kernel reads:
@@ -2034,32 +1737,22 @@ mod tests {
         }
 
         /// The keys this call's threadgroups walk, counted one key at a time
-        /// against the loop bounds written out rather than differenced the way
-        /// [`keys_a_call_walks`] differences them — so the two agree only where
+        /// against the loop bound written out rather than differenced the way
+        /// [`keys_a_call_walks`] differences it — so the two agree only where
         /// both are right, which is what `branch` is to the band.
-        ///
-        /// **A key a block reaches is counted once and not once a row**, which
-        /// is what a threadgroup carrying a block of rows reads: it stages each
-        /// tile of the union once and every row of the block scores against that
-        /// one staging.
         fn walked(&self) -> usize {
             let tile = tile_keys(self.config.head_dim);
-            let rows_a_block = rows_a_block(self.queries, QUERIES_A_BLOCK);
-            let reaches = |position: usize, key: usize| {
-                key <= position
-                    && match self.config.sliding {
-                        window if window > 0 && position >= window => {
-                            key >= (position - (window - 1)) / tile * tile
-                        }
-                        _ => true,
-                    }
-            };
             (0..self.queries)
-                .step_by(rows_a_block)
-                .map(|base| {
-                    let rows = rows_a_block.min(self.queries - base);
+                .map(|i| i + self.q_offset)
+                .map(|position| {
                     (0..self.keys)
-                        .filter(|&key| (base..base + rows).any(|i| reaches(i + self.q_offset, key)))
+                        .filter(|&key| key <= position)
+                        .filter(|&key| match self.config.sliding {
+                            window if window > 0 && position >= window => {
+                                key >= (position - (window - 1)) / tile * tile
+                            }
+                            _ => true,
+                        })
                         .count()
                 })
                 .sum()
@@ -2329,54 +2022,15 @@ mod tests {
         assert_eq!(keys_walked(768, 769, 512, tile), 769 - 256);
         assert_eq!(keys_walked(400, 769, 512, tile), 401);
 
-        assert_eq!(keys_a_call_walks(4, 0, 4, 0, tile, 1), 1 + 2 + 3 + 4);
+        assert_eq!(keys_a_call_walks(4, 0, 4, 0, tile), 1 + 2 + 3 + 4);
         assert_eq!(
-            keys_a_call_walks(2048, 0, 2048, 0, tile, 1),
+            keys_a_call_walks(2048, 0, 2048, 0, tile),
             2048 * 2049 / 2,
             "a global prefill walks the square"
         );
         // The same prompt through a window is linear in it instead, at the
         // window plus what the tile alignment leaves.
-        assert!(keys_a_call_walks(2048, 0, 2048, 512, tile, 1) < 2048 * 544);
-    }
-
-    /// **And what a block of rows walks is the union rather than the sum**,
-    /// which is the whole of what this milestone took off the quadratic term.
-    ///
-    /// Worked out by hand for the same reason the case above is: the figure
-    /// divides a bandwidth column, and it is now the column that says whether
-    /// the change reached the reads it was aimed at.
-    #[test]
-    fn a_block_of_query_rows_walks_the_union_of_the_keys_its_rows_leave_it() {
-        let tile = tile_keys(128);
-
-        // Four rows from nothing walk 1, 2, 3 and 4 keys apart and their union
-        // is the four — where a row at a time is ten.
-        assert_eq!(keys_a_call_walks(4, 0, 4, 0, tile, 4), 4);
-        assert_eq!(keys_a_call_walks(4, 0, 4, 0, tile, 2), 2 + 4);
-        // A short last block is charged its own rows and no more: nine rows in
-        // blocks of four is 4 + 8 + 9.
-        assert_eq!(keys_a_call_walks(9, 0, 9, 0, tile, 4), 4 + 8 + 9);
-
-        // A global prefill's square becomes a quarter of it plus the half-block
-        // each block reads past its first row — `n²/8 + n/2` against `n²/2`.
-        let square = keys_a_call_walks(2048, 0, 2048, 0, tile, 1);
-        let blocked = keys_a_call_walks(2048, 0, 2048, 0, tile, 4);
-        assert_eq!(blocked, 2048 * 2048 / 8 + 2048 / 2);
-        assert!(
-            (3.9..4.0).contains(&(square as f64 / blocked as f64)),
-            "{square} keys a row against {blocked} four to a block"
-        );
-
-        // A windowed layer was already linear in the prompt and the block
-        // divides its constant rather than its shape: the reads a row are the
-        // window and a tile, and the reads a block are that plus three.
-        let window = keys_a_call_walks(2048, 0, 2048, 512, tile, 1);
-        let blocks = keys_a_call_walks(2048, 0, 2048, 512, tile, 4);
-        assert!(
-            (3.7..4.0).contains(&(window as f64 / blocks as f64)),
-            "{window} keys a row against {blocks} four to a block"
-        );
+        assert!(keys_a_call_walks(2048, 0, 2048, 512, tile) < 2048 * 544);
     }
 
     /// What the bandwidth column divides by, against what the kernel reads.
@@ -2566,12 +2220,9 @@ mod tests {
     fn the_bounded_loop_is_the_unbounded_one_bit_for_bit() {
         let Some(device) = device() else { return };
         let bounded = FusedAttention::new(&device).expect("the kernel compiles");
-        assert_ne!(
-            unbounded(QUERIES_A_BLOCK),
-            source(QUERIES_A_BLOCK),
-            "the bound was not taken off"
-        );
-        let walking = FusedAttention::from_source(&device, unbounded).expect("the mutant compiles");
+        let whole = unbounded();
+        assert_ne!(whole, source(), "the bound was not taken off");
+        let walking = FusedAttention::from_source(&device, &whole).expect("the mutant compiles");
 
         let mut cases = Case::synthetic();
         cases.extend(
@@ -2609,190 +2260,6 @@ mod tests {
         assert!(skipped > 0, "no case here has a key the bound could skip");
     }
 
-    /// **The claim a query-blocked kernel had to be able to make, and the case
-    /// that was written before the kernel was.**
-    ///
-    /// A block of rows shares one staging of a tile of keys and values, which is
-    /// the whole of what it is for; what it must not share is an accumulation.
-    /// A softmax that rescales once a tile is not associative — the peak a tile
-    /// is shifted by decides the rounding of everything before it — so a row
-    /// that met its tiles in another order, or met one more of them, or met the
-    /// same ones with the block's `held` rather than its own, would answer a few
-    /// ulps away and a logit a few ulps away is a token.
-    ///
-    /// So the two heights are driven side by side out of one source string, over
-    /// cases wide enough to reach the block: **not within a tolerance, and not
-    /// on the floats — on the bits**, which is what separates this from every
-    /// other equivalence in this module. `-0.0` and `0.0` compare equal as
-    /// floats and are two different answers here.
-    ///
-    /// The cases are placed at what a block can get wrong and a row cannot:
-    ///
-    /// - a **short last block**, where the queries do not divide by the height
-    ///   and the dead rows must stage nothing, walk nothing and write nothing;
-    /// - a **windowed layer**, where the rows of one block do not share a
-    ///   `reach` — the block walks the union and each row must still take part
-    ///   only in the tiles its own bound gave it. Both ways a block's rows can
-    ///   disagree about it are placed: one whose rows straddle the position the
-    ///   window branch itself turns on, and one whose rows are all past it and
-    ///   land in two different 32-key buckets of the rounding;
-    /// - a **split span**, where the block is cut as well as blocked and the
-    ///   partials a fold reads are indexed by the query row rather than by the
-    ///   threadgroup that wrote them;
-    /// - a prompt **from nothing**, where the first block's rows are one, two,
-    ///   three and four keys long and three of the four end inside the first
-    ///   tile;
-    /// - and the trained captures, where the values are a checkpoint's rather
-    ///   than an index's.
-    #[test]
-    fn a_block_of_query_rows_is_a_row_at_a_time_bit_for_bit() {
-        let Some(device) = device() else { return };
-        let a_row_at_a_time =
-            FusedAttention::blocking(&device, source, 1).expect("a height of one compiles");
-
-        let mut cases = vec![
-            blocked(2048, 0, 64),
-            blocked(2048, SLIDING_WINDOW, 64),
-            blocked(600, SLIDING_WINDOW, 13),
-            blocked(600, 0, 13),
-            blocked(97, 0, 97),
-            blocked(97, SLIDING_WINDOW, 97),
-            blocked(129, SLIDING_WINDOW, 11),
-            blocked(520, SLIDING_WINDOW, 17),
-            blocked(560, SLIDING_WINDOW, 24),
-            blocked(1200, SLIDING_WINDOW, 12),
-            blocked(1200, 0, 12),
-        ];
-        cases.extend(
-            Case::all(ACTIVATIONS)
-                .expect("the committed capture")
-                .into_iter()
-                .map(|(case, _)| case),
-        );
-        cases.extend(
-            Case::all(LONG_ACTIVATIONS)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(case, _)| case),
-        );
-
-        let mut reached = [0; 5];
-        // **Every height the sweep compiles and not only the one that ships**,
-        // which at a shipped height of one is the whole of what this case can
-        // be about: a run of it against `QUERIES_A_BLOCK` alone would compare a
-        // kernel with itself and pass whatever the block did.
-        for height in HEIGHTS.into_iter().filter(|height| *height > 1) {
-            let Ok(in_blocks) = FusedAttention::blocking(&device, source, height) else {
-                continue;
-            };
-            for case in &cases {
-                let rows = rows_a_block(case.queries, height);
-                // **The split is pinned rather than left to the predicate**,
-                // both ways: unsplit is what a prefill runs and eight is the
-                // fold, and holding the number fixed is what leaves the block as
-                // the only thing that differs between the two arms.
-                for splits in [1, 8] {
-                    let want = case.cut(&device, &a_row_at_a_time, Some(splits));
-                    let got = case.cut(&device, &in_blocks, Some(splits));
-                    let apart = want
-                        .iter()
-                        .zip(&got)
-                        .position(|(want, got)| want.to_bits() != got.to_bits());
-                    assert_eq!(
-                        apart,
-                        None,
-                        "{} of {height} in {splits}: a block answered {:?} where a row at a \
-                         time answered {:?}",
-                        case.name,
-                        apart.map(|at| got[at]),
-                        apart.map(|at| want[at]),
-                    );
-                    reached[3] += usize::from(rows > 1 && splits > 1);
-                }
-                let tile = tile_keys(case.config.head_dim);
-                let disagrees = (0..case.queries).step_by(rows).any(|base| {
-                    let reaches =
-                        |i: usize| reach_of(base + i + case.q_offset, case.config.sliding, tile);
-                    (0..rows.min(case.queries - base)).any(|i| reaches(i) != reaches(0))
-                });
-                reached[0] += usize::from(rows > 1);
-                reached[1] += usize::from(rows > 1 && case.queries % rows != 0);
-                reached[2] += usize::from(rows > 1 && case.config.sliding > 0);
-                reached[4] += usize::from(rows > 1 && disagrees);
-            }
-        }
-
-        // **Without this the agreement is accidental**, which is the same thing
-        // `the_cases_that_pin_the_answer_are_driven_through_a_split_span` says
-        // about the split: a corpus every case of which fell under
-        // `LEAST_BLOCK` would agree bit for bit by running the same pipeline
-        // twice, and would go on passing whatever the block did.
-        let [blocked, ragged, windowed, split, disagreeing] = reached;
-        eprintln!(
-            "{} cases agree bit for bit at every height, {blocked} of them blocked — {ragged} \
-             with a short last block, {windowed} windowed of which {disagreeing} hold a block \
-             whose rows disagree about `reach`, {split} through a split span",
-            cases.len()
-        );
-        assert!(blocked > 0, "no case here reaches the block at all");
-        assert!(ragged > 0, "no case here has a short last block");
-        assert!(windowed > 0, "no blocked case here has a window");
-        assert!(split > 0, "no blocked case here cuts its span");
-        // **The one the prose above is easiest to be wrong about**: a windowed
-        // case whose blocks all agree about `reach` never asks whether a row
-        // takes part in the tiles its own bound gave it, because every row of
-        // every block took part in all of them.
-        assert!(
-            disagreeing > 0,
-            "no block here holds two rows that reach back to different keys"
-        );
-    }
-
-    /// **What keeps a decode step and the rounds it verifies out of the block**,
-    /// which is a shape rather than a measurement and is asserted as one.
-    ///
-    /// The block divides the threadgroups a call gives the machine, so a call
-    /// that has none to spare cannot afford one — and there is nothing for a
-    /// single query row to share a tile with anyway. What the boundary has to
-    /// clear is the widest block the eight MTP heads can propose, which is nine
-    /// rows: a `k = 8` round verifies nine in one pass, and the figures this
-    /// file pins that round to are taken against the kernel a row at a time.
-    #[test]
-    fn a_decode_step_and_the_rounds_it_verifies_take_no_block() {
-        for height in HEIGHTS {
-            for queries in 1..LEAST_BLOCK {
-                assert_eq!(
-                    rows_a_block(queries, height),
-                    1,
-                    "{queries} query rows took a block of {height}"
-                );
-            }
-            assert_eq!(rows_a_block(LEAST_BLOCK, height), height);
-            // And a prompt of any length worth the name is blocked, which is
-            // the other half of the boundary being in the right place.
-            for queries in [97, 385, 769, 2048] {
-                assert_eq!(rows_a_block(queries, height), height);
-            }
-        }
-        const {
-            assert!(
-                LEAST_BLOCK > 9,
-                "a k = 8 round's nine rows would be blocked"
-            )
-        };
-        // **And never more rows than the kernel was compiled to carry**, which
-        // is what says the grid this side lays out and the `blocks` the kernel
-        // divides its own position by are the same number. Dispatching fewer
-        // rows a block than the kernel carries only over-dispatches — the
-        // threadgroups past `heads * blocks` return on their first instruction —
-        // but dispatching more would silently drop the rows past the guard.
-        for height in HEIGHTS {
-            for queries in [1, 9, LEAST_BLOCK, 97, 2048] {
-                assert!(rows_a_block(queries, height) <= height);
-            }
-        }
-    }
-
     /// **And it is tight at both ends**, which the case above cannot say: a bound
     /// that skipped nothing would pass it, and so would a bound one tile too
     /// generous.
@@ -2827,14 +2294,10 @@ mod tests {
                 "((uint)position - (shape.sliding - 1u) + tile) / tile * tile",
             ),
         ] {
-            let tighter = |rows| source(rows).replace(from, to);
-            assert_ne!(
-                tighter(QUERIES_A_BLOCK),
-                source(QUERIES_A_BLOCK),
-                "{end}: the mutation changed nothing"
-            );
+            let tighter = source().replace(from, to);
+            assert_ne!(tighter, source(), "{end}: the mutation changed nothing");
             let mutant =
-                FusedAttention::from_source(&device, tighter).expect("the mutant compiles");
+                FusedAttention::from_source(&device, &tighter).expect("the mutant compiles");
             let deviation = deviation(&case.on_the_device(&device, &mutant), &want);
             eprintln!("{end} of the bound one tile tighter: deviation {deviation:e}");
             assert!(deviation > TOLERANCE, "{end}: deviation {deviation:e}");
@@ -2868,27 +2331,21 @@ mod tests {
             "the case's window is not narrower than its band"
         );
 
+        let source = unbounded();
         let want = case.through(case.mask.as_ref().expect("a recorded mask"));
-        let attention =
-            FusedAttention::from_source(&device, unbounded).expect("the kernel compiles");
+        let attention = FusedAttention::from_source(&device, &source).expect("the kernel compiles");
         let agreed = deviation(&case.on_the_device(&device, &attention), &want);
         assert!(agreed <= TOLERANCE, "deviation {agreed:e}");
 
-        let banded_first = |rows| {
-            unbounded(rows).replace(
-                "    if (shape.sliding > 0 && back >= shape.sliding) {\n        return MASKED;\n    }\n\
-                 \x20   if (back >= shape.rel_extent) {\n        return 0.0f;\n    }\n",
-                "    if (back >= shape.rel_extent) {\n        return 0.0f;\n    }\n\
-                 \x20   if (shape.sliding > 0 && back >= shape.sliding) {\n        return MASKED;\n    }\n",
-            )
-        };
-        assert_ne!(
-            banded_first(QUERIES_A_BLOCK),
-            unbounded(QUERIES_A_BLOCK),
-            "the mutation changed nothing"
+        let banded_first = source.replace(
+            "    if (shape.sliding > 0 && back >= shape.sliding) {\n        return MASKED;\n    }\n\
+             \x20   if (back >= shape.rel_extent) {\n        return 0.0f;\n    }\n",
+            "    if (back >= shape.rel_extent) {\n        return 0.0f;\n    }\n\
+             \x20   if (shape.sliding > 0 && back >= shape.sliding) {\n        return MASKED;\n    }\n",
         );
+        assert_ne!(banded_first, source, "the mutation changed nothing");
         let mutant =
-            FusedAttention::from_source(&device, banded_first).expect("the mutant compiles");
+            FusedAttention::from_source(&device, &banded_first).expect("the mutant compiles");
         let deviation = deviation(&case.on_the_device(&device, &mutant), &want);
         eprintln!("the band consulted before the window: deviation {deviation:e}");
         assert!(deviation > TOLERANCE, "deviation {deviation:e}");
@@ -2921,24 +2378,18 @@ mod tests {
             "a global case, whose window is zero"
         );
 
+        let source = unbounded();
         let want = case.through(case.mask.as_ref().expect("a recorded mask"));
-        let attention =
-            FusedAttention::from_source(&device, unbounded).expect("the kernel compiles");
+        let attention = FusedAttention::from_source(&device, &source).expect("the kernel compiles");
         let agreed = deviation(&case.on_the_device(&device, &attention), &want);
         assert!(agreed <= TOLERANCE, "deviation {agreed:e}");
 
-        let uncaused = |rows| {
-            unbounded(rows).replace(
-                "    if (dist < 0) {\n        return MASKED;\n    }\n",
-                "    if (dist < -1000000000) {\n        return MASKED;\n    }\n",
-            )
-        };
-        assert_ne!(
-            uncaused(QUERIES_A_BLOCK),
-            unbounded(QUERIES_A_BLOCK),
-            "the mutation changed nothing"
+        let uncaused = source.replace(
+            "    if (dist < 0) {\n        return MASKED;\n    }\n",
+            "    if (dist < -1000000000) {\n        return MASKED;\n    }\n",
         );
-        let mutant = FusedAttention::from_source(&device, uncaused).expect("the mutant compiles");
+        assert_ne!(uncaused, source, "the mutation changed nothing");
+        let mutant = FusedAttention::from_source(&device, &uncaused).expect("the mutant compiles");
         let deviation = deviation(&case.on_the_device(&device, &mutant), &want);
         eprintln!("the causal branch dropped: deviation {deviation:e}");
         assert!(deviation > TOLERANCE, "deviation {deviation:e}");
@@ -3020,30 +2471,23 @@ mod tests {
             "{masked} masked keys do not fill five of the widest tile a threadgroup can hold"
         );
 
-        let infinite = |written: fn(usize) -> String| {
-            move |rows| {
-                written(rows).replace(
-                    &format!("constant float MASKED = {MASKED:e}f;"),
-                    "constant float MASKED = -INFINITY;",
-                )
-            }
-        };
-        assert_ne!(
-            infinite(source)(QUERIES_A_BLOCK),
-            source(QUERIES_A_BLOCK),
-            "the mutation changed nothing"
-        );
-        let infinitely = |written| {
-            FusedAttention::from_source(&device, infinite(written)).expect("the mutant compiles")
+        let infinitely = |source: String| {
+            let infinite = source.replace(
+                &format!("constant float MASKED = {MASKED:e}f;"),
+                "constant float MASKED = -INFINITY;",
+            );
+            assert_ne!(infinite, source, "the mutation changed nothing");
+            FusedAttention::from_source(&device, &infinite).expect("the mutant compiles")
         };
 
-        let walking = FusedAttention::from_source(&device, unbounded).expect("the kernel compiles");
+        let walking =
+            FusedAttention::from_source(&device, &unbounded()).expect("the kernel compiles");
         assert!(
             case.on_the_device(&device, &walking)
                 .iter()
                 .all(|value| value.is_finite())
         );
-        let poisoned = case.on_the_device(&device, &infinitely(unbounded));
+        let poisoned = case.on_the_device(&device, &infinitely(unbounded()));
         assert!(
             poisoned.iter().any(|value| !value.is_finite()),
             "an infinite mask left the row finite, so this proves nothing"
@@ -3054,7 +2498,7 @@ mod tests {
         let bounded = FusedAttention::new(&device).expect("the kernel compiles");
         assert_eq!(
             case.on_the_device(&device, &bounded),
-            case.on_the_device(&device, &infinitely(source)),
+            case.on_the_device(&device, &infinitely(source())),
             "the bounded loop walked a masked key"
         );
     }
@@ -3377,7 +2821,8 @@ mod tests {
         // as a column rather than as a number in a commit message, because what
         // the bound is worth is the difference between two rows of one table and
         // a reader should not have to take that on trust.
-        let walking = FusedAttention::from_source(&device, unbounded).expect("the mutant compiles");
+        let walking =
+            FusedAttention::from_source(&device, &unbounded()).expect("the mutant compiles");
 
         let cost = |kernel: &FusedAttention, keys: usize, sliding: usize| -> Duration {
             let case = windowed(keys, sliding);
@@ -3794,24 +3239,6 @@ mod tests {
     /// four a coding turn opens somewhere inside.
     const PREFILL_CONTEXTS: [usize; 4] = [2048, 4096, 8192, 16384];
 
-    /// The block heights [`QUERIES_A_BLOCK`] is chosen from — swept for what
-    /// they cost and held to the shipped one's answer bit for bit, which are two
-    /// cases that have to visit the same set or the number rests on one of them
-    /// alone. Eight does not compile and the sweep says so rather than omitting
-    /// it.
-    const HEIGHTS: [usize; 4] = [1, 2, 4, 8];
-
-    /// And the shipped height is one of them, which is what makes the sweep a
-    /// sweep about this kernel.
-    #[test]
-    fn the_shipped_block_height_is_one_the_sweep_visits() {
-        assert!(HEIGHTS.contains(&QUERIES_A_BLOCK), "{QUERIES_A_BLOCK}");
-        assert_eq!(
-            HEIGHTS[0], 1,
-            "the sweep has no row a threadgroup to divide by"
-        );
-    }
-
     /// **What a prefill's attention costs on each kind of layer**, which is the
     /// same question the sweep above asks of a decode step and is a different
     /// shape entirely: there one query row walks a span, here `n` of them do.
@@ -3906,111 +3333,21 @@ mod tests {
         }
     }
 
-    /// **What a block of query rows is worth at each height it can be**, which
-    /// is what [`QUERIES_A_BLOCK`] is fitted on rather than reasoned about.
-    ///
-    /// A height of one is the kernel this repo ran for twelve milestones: a
-    /// threadgroup to a query of a head, each walking the whole span for itself.
-    /// Every column past it stages one tile of keys and values for that many
-    /// rows, so the reads fall by the height — and what the reads buy has to be
-    /// weighed against what carrying the rows costs, which is a running peak,
-    /// total and weighted sum a row and 3 KB of threadgroup memory a row.
-    ///
-    /// **Both kinds of layer, because they are not the same question.** A global
-    /// row's walk is its whole prefix, so a block of four saves three of every
-    /// four reads at the top of the prompt and much less at the bottom; a
-    /// windowed row's walk is its last 512 keys wherever it sits, and four
-    /// consecutive rows' windows overlap in all but four of them.
-    #[test]
-    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
-    fn what_a_prefills_attention_costs_at_each_height_a_block_carries() {
-        let Some(device) = device() else { return };
-        const ROUNDS: usize = 2;
-        const TOKENS: [usize; 2] = [2048, 8192];
-        eprintln!(
-            "{:>7}{:>10}{:>12}{:>10}{:>12}{:>10}{:>12}{:>10}",
-            "tokens",
-            "a block",
-            "global",
-            "against",
-            "window 512",
-            "against",
-            "the stack",
-            "widest"
-        );
-        for tokens in TOKENS {
-            let mut best: [Duration; 2] = [Duration::MAX; 2];
-            for height in HEIGHTS {
-                // A height the threadgroup memory cannot hold does not compile,
-                // which is a column of the sweep rather than a failure: the
-                // arrays a block carries are `QUERIES_A_BLOCK` rows of
-                // `MOST_CHANNELS` twice and `MOST_FEATURES` and `MOST_SCORES`
-                // once, against the 32 KB an Apple GPU allows.
-                let Ok(attention) = FusedAttention::blocking(&device, source, height) else {
-                    eprintln!("{tokens:>7}{height:>10}   does not compile at this height");
-                    continue;
-                };
-                let cost = |sliding: usize| -> Duration {
-                    let case = blocked(tokens, sliding, tokens);
-                    let layer = case.wrapped(&device, &attention);
-                    layer.hold(0, tokens).expect("the span reserves");
-                    layer.span().appended(tokens);
-                    let mut q = device.buffer(&case.q).expect("the queries upload");
-                    let mut rel = device.buffer(&case.rel).expect("the features upload");
-                    let mut span = layer.span();
-                    let mut held = None;
-                    let mut taken = Duration::MAX;
-                    // Warm once, for the reason the sweep above warms: the first
-                    // dispatch of a fresh pipeline pays for the driver's first
-                    // look at its buffers.
-                    for round in 0..=ROUNDS {
-                        let each = crate::testing::device_time(&device, 1, |batch| {
-                            held = Some(
-                                layer
-                                    .encode_over(batch, &mut span, &mut q, &mut rel, None, 0)
-                                    .expect("the prefill encodes"),
-                            );
-                        });
-                        taken = if round == 0 { taken } else { taken.min(each) };
-                    }
-                    taken
-                };
-
-                let (global, window) = (cost(0), cost(SLIDING_WINDOW));
-                if height == 1 {
-                    best = [global, window];
-                }
-                let against = |taken: Duration, one: Duration| {
-                    format!("×{:.2}", one.as_secs_f64() / taken.as_secs_f64())
-                };
-                let stack = SLIDING_LAYERS as u32 * window + GLOBAL_LAYERS as u32 * global;
-                eprintln!(
-                    "{tokens:>7}{height:>10}{:>12}{:>10}{:>12}{:>10}{:>12}{:>10}",
-                    format!("{global:.2?}"),
-                    against(global, best[0]),
-                    format!("{window:.2?}"),
-                    against(window, best[1]),
-                    format!("{stack:.2?}"),
-                    attention.global.max_threads_per_group(),
-                );
-            }
-        }
-    }
-
     /// **Whether a prefill's attention is waiting on the keys it reads**, which
-    /// is the premise under every version of this milestone and is the one thing
-    /// a bandwidth column computed from a *declared* byte count cannot say.
+    /// is the premise under every proposal to make this kernel read fewer of
+    /// them and is the one thing a bandwidth column computed from a *declared*
+    /// byte count cannot say.
     ///
-    /// The declared figure is the reads the walk issues: at 16384 tokens one
-    /// global layer issues 4.4 TB against a span of 134 MB, which over its
-    /// device time is 704 GB/s against this machine's 819. Read as a bandwidth
-    /// that says the kernel is at the memory and the only lever is reading less.
-    /// Read as an amplification it says nothing at all — 32 query heads and
-    /// their neighbouring rows walk almost the same keys at almost the same
-    /// time, so a tile fetched for one is in cache for the rest, and 704 GB/s of
-    /// *issued* reads can sit on far less traffic. **This is the same
-    /// distinction `PackedBank::moves` forced on the matmul rows**, met on the
-    /// other kernel.
+    /// The declared figure is the reads the walk issues: at 16384 tokens the
+    /// seven global layers issue 30.8 TB against a span of 134 MB apiece, which
+    /// over their device time is 699 GB/s against this machine's 819. Read as a
+    /// bandwidth that says the kernel is at the memory and the only lever left
+    /// is to read less. Read as an amplification it says nothing at all — 32
+    /// query heads and their neighbouring rows walk almost the same keys at
+    /// almost the same time, so a tile fetched for one is in cache for the rest,
+    /// and 699 GB/s of *issued* reads can sit on far less traffic. **This is the
+    /// same distinction [`crate::PackedBank::moves`] forced on the matmul rows**,
+    /// met on the other kernel.
     ///
     /// So it is settled by a mutation rather than by an argument: the same
     /// kernel with every key and every value read from slot zero. It walks the
@@ -4029,24 +3366,19 @@ mod tests {
         const ROUNDS: usize = 2;
         const TOKENS: [usize; 3] = [2048, 4096, 8192];
 
-        let from_one_slot = |rows| {
-            source(rows)
-                .replace(
-                    "values_of + (ulong)first * shape.head_dim",
-                    "values_of + (ulong)0 * shape.head_dim",
-                )
-                .replace(
-                    "keys_of + (ulong)j * shape.head_dim",
-                    "keys_of + (ulong)0 * shape.head_dim",
-                )
-        };
-        assert_ne!(
-            from_one_slot(QUERIES_A_BLOCK),
-            source(QUERIES_A_BLOCK),
-            "the mutation changed nothing"
-        );
+        let from_one_slot = source()
+            .replace(
+                "values_of + (ulong)first * shape.head_dim",
+                "values_of + (ulong)0 * shape.head_dim",
+            )
+            .replace(
+                "keys_of + (ulong)j * shape.head_dim",
+                "keys_of + (ulong)0 * shape.head_dim",
+            );
+        assert_ne!(from_one_slot, source(), "the mutation changed nothing");
         let walking = FusedAttention::new(&device).expect("the kernel compiles");
-        let cached = FusedAttention::from_source(&device, from_one_slot).expect("it compiles");
+        let cached =
+            FusedAttention::from_source(&device, &from_one_slot).expect("the mutant compiles");
         assert_ne!(
             blocked(97, 0, 97).on_the_device(&device, &walking),
             blocked(97, 0, 97).on_the_device(&device, &cached),
@@ -4063,6 +3395,9 @@ mod tests {
             let mut span = layer.span();
             let mut held = None;
             let mut taken = Duration::MAX;
+            // Warm once, for the reason the sweep above warms: the first
+            // dispatch of a fresh pipeline pays for the driver's first look at
+            // its buffers.
             for round in 0..=ROUNDS {
                 let each = crate::testing::device_time(&device, 1, |batch| {
                     held = Some(
