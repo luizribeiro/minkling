@@ -3408,6 +3408,282 @@ mod tests {
         assert!(RUNS.contains(&RUNS_A_GROUPING), "{RUNS_A_GROUPING}");
     }
 
+    /// **What separates the two tiled entries**, which is the largest
+    /// unexplained number this repo's prefill table has carried:
+    /// `packed_matmul_rows` reports 281 GB/s where `packed_matmul_grouped`
+    /// reports 556, at the same tile shape.
+    ///
+    /// **The two cannot differ in the walk.** They are one source string with
+    /// three expressions substituted — the binding the order arrives in, the row
+    /// of the input a tile reads and the row of the output it writes — and in
+    /// nothing else at all. So what is left is the call each of them is given,
+    /// and the two things that differ about those are crossed here rather than
+    /// argued about:
+    ///
+    /// - **the weight a dispatch walks.** `packed_matmul_rows` runs the
+    ///   projections and the shared banks, whose whole weight is 2 to 34 MB;
+    ///   `packed_matmul_grouped` runs the routed banks, whose weight is 256
+    ///   experts and 1.07 GB.
+    /// - **the indirection.** A grouped call reads its input through a
+    ///   permutation another dispatch wrote.
+    ///
+    /// One shape held fixed at a 769-token routed bank's, over banks of 1 to 256
+    /// experts, through both entries with the untiled kernel beside them. **The
+    /// rows are already sorted**, so the grouping is the identity and the tiles
+    /// the two entries see are the same tiles — which is what makes the pair of
+    /// columns the indirection on its own.
+    ///
+    /// **And the rate is the one the profile table prints**, which is
+    /// [`PackedBank::moves`] over device time — a whole weight charged per
+    /// *tile*. A bank of one expert declares 288 times the weight it has and a
+    /// bank of 256 declares 7.5 times, so the `distinct` column beside it is what
+    /// says whether a rate is a bandwidth or a cache.
+    ///
+    /// Nothing asserts a rate. What is asserted is that the three arms answer
+    /// the same thing, because a column that got faster by computing less would
+    /// explain nothing.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_separates_a_tiled_call_from_a_grouped_one() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const CALLS: usize = 4;
+        const ROUNDS: usize = 3;
+        const IN: usize = 4096;
+        const OUT: usize = 2048;
+        /// A 769-token prefill's routed bank: six rows a token.
+        const ROWS: usize = 769 * 6;
+        const BANKS: [usize; 5] = [1, 4, 16, 64, 256];
+
+        eprintln!(
+            "  {:<10}{:>10}{:>11}{:>11}{:>12}{:>12}{:>13}{:>13}",
+            "experts", "a run", "distinct", "untiled", "tiled", "grouped", "tiled", "grouped"
+        );
+        for experts in BANKS {
+            let case = Case::seeded(1, IN, experts * OUT, ROWS);
+            let bank = PackedBank::upload(
+                &device,
+                &matmul,
+                experts,
+                IN,
+                OUT,
+                &case.packed(),
+                &case.scales,
+            )
+            .expect("the bank's shapes pair");
+
+            // Sorted, so that the tiles are uniform and the grouping is the
+            // identity: what is being separated is the indirection from the
+            // weight, and a layout only one of the two entries can tile would
+            // confound them.
+            let chosen: Vec<u32> = (0..ROWS).map(|row| (row * experts / ROWS) as u32).collect();
+            let mut x = device.buffer(&case.x).expect("the rows upload");
+
+            let mut best = [Duration::MAX; 3];
+            for _ in 0..ROUNDS {
+                for (at, arm) in [Arm::Untiled, Arm::Tiled, Arm::Grouped]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let taken = crate::testing::device_time(&device, CALLS, |batch| {
+                        let mut picked = device.buffer(&chosen).expect("the selection uploads");
+                        match arm {
+                            Arm::Untiled => bank
+                                .encode_picked(batch, &mut picked, &mut x, 1)
+                                .expect("the dispatch encodes"),
+                            Arm::Tiled => bank
+                                .encode_over(batch, &chosen, &mut x)
+                                .expect("the dispatch encodes"),
+                            Arm::Grouped => {
+                                let mut sorted = grouping
+                                    .encode(batch, &mut picked, experts)
+                                    .expect("the grouping encodes");
+                                bank.encode_grouped(
+                                    batch,
+                                    &mut sorted,
+                                    &mut x,
+                                    1,
+                                    Through::Gathered,
+                                )
+                                .expect("the dispatch encodes")
+                            }
+                        };
+                    });
+                    best[at] = best[at].min(taken);
+                }
+            }
+
+            let tiles = ROWS.div_ceil(ROWS_A_TILE);
+            let rate = |read: usize, taken: Duration| {
+                let codes = read * OUT * IN;
+                let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+                format!(
+                    "{:.0} GB/s",
+                    moved / taken.as_secs_f64() * CALLS as f64 / 1e9
+                )
+            };
+            let held = experts * OUT * IN;
+            eprintln!(
+                "  {experts:<10}{:>10}{:>11}{:>11}{:>12}{:>12}{:>13}{:>13}",
+                format!("{}", ROWS / experts),
+                format!(
+                    "{:.0} MB",
+                    (held / CODES_PER_BYTE + held / GROUP_SIZE) as f64 / 1e6
+                ),
+                format!("{:.0}µs", 1e6 * best[0].as_secs_f64() / CALLS as f64),
+                format!("{:.0}µs", 1e6 * best[1].as_secs_f64() / CALLS as f64),
+                format!("{:.0}µs", 1e6 * best[2].as_secs_f64() / CALLS as f64),
+                rate(tiles, best[1]),
+                rate(
+                    ROWS.min(tiles + (ROWS_A_TILE - 1) * tiles.min(experts - 1)),
+                    best[2]
+                ),
+            );
+
+            // The three arms are three ways of cutting the same multiply up, so
+            // a difference between their answers would be a difference in what
+            // was measured rather than in how fast it ran.
+            let [untiled, tiled, grouped] = together(&device, |batch| {
+                let mut picked = device.buffer(&chosen)?;
+                let untiled = bank.encode_picked(batch, &mut picked, &mut x, 1)?;
+                let tiled = bank.encode_over(batch, &chosen, &mut x)?;
+                let mut sorted = grouping.encode(batch, &mut picked, experts)?;
+                let grouped =
+                    bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)?;
+                Ok([untiled, tiled, grouped])
+            })
+            .expect("the three dispatches run");
+            assert_eq!(tiled, untiled, "a bank of {experts} tiled");
+            assert_eq!(grouped, untiled, "a bank of {experts} grouped");
+        }
+    }
+
+    /// Which way one call of the sweep above cuts the multiply up.
+    #[derive(Debug, Clone, Copy)]
+    enum Arm {
+        Untiled,
+        Tiled,
+        Grouped,
+    }
+
+    /// **What each shape a prefill gives this kernel actually costs**, which is
+    /// what the two rows of the profile table are made of.
+    ///
+    /// `packed_matmul_rows` is 336 calls and `packed_matmul_grouped` is 120, and
+    /// neither is one shape: the first is five projections a layer, both halves
+    /// of a shared bank and the two dense feed-forward networks, and the second
+    /// is a routed bank's three. The sweep above says the two *entries* are
+    /// within 6% of each other at one shape, so whatever separates the two rows
+    /// is in here — and a row is only diagnosable once the shapes under it are
+    /// named.
+    ///
+    /// **The `a prefill` column is the check.** It is this shape's own device
+    /// time times how many of it a 769-token prefill dispatches, so the column
+    /// sums to the two rows of the profile table if the decomposition is right
+    /// and does not if it is not.
+    ///
+    /// One expert for a projection, two for a shared bank and 256 for a routed
+    /// one, because that is what each of them has — and the rows are sorted, so
+    /// each shape reaches the entry the engine would put it through.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_each_shape_of_a_prefills_packed_calls_costs() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const CALLS: usize = 4;
+        const ROUNDS: usize = 3;
+        const TOKENS: usize = 769;
+
+        // `(what, rows, in_dim, out_dim, experts, calls a prefill, grouped)`.
+        // The counts are the engine's: 42 layers of five projections, 40 MoE
+        // layers of a shared bank's three and a routed bank's three, and two
+        // dense ones. **Which entry is spelled out rather than asked of
+        // `PackedMatmul::groups`**, which answers about a routed bank's layout
+        // and says yes to a projection's 769 rows over one expert — a call the
+        // engine never puts through that entry at all.
+        let shapes = [
+            ("q_proj, o_proj", TOKENS, 4096, 4096, 1, 84, false),
+            ("k_proj, v_proj", TOKENS, 4096, 1024, 1, 84, false),
+            ("r_proj", TOKENS, 4096, 512, 1, 42, false),
+            ("shared gate, up", 2 * TOKENS, 4096, 2048, 2, 80, false),
+            ("shared down", 2 * TOKENS, 2048, 4096, 2, 40, false),
+            ("dense gate, up", TOKENS, 4096, 16384, 1, 4, false),
+            ("dense down", TOKENS, 16384, 4096, 1, 2, false),
+            ("routed gate, up", 6 * TOKENS, 4096, 2048, 256, 80, true),
+            ("routed down", 6 * TOKENS, 2048, 4096, 256, 40, true),
+        ];
+
+        eprintln!(
+            "  {:<18}{:>8}{:>10}{:>10}{:>8}{:>10}{:>12}{:>12}",
+            "shape", "rows", "distinct", "declared", "over", "a call", "achieved", "a prefill"
+        );
+        let mut totals = [Duration::ZERO; 2];
+        for (what, rows, in_dim, out_dim, experts, calls, groups) in shapes {
+            let case = Case::seeded(1, in_dim, experts * out_dim, rows);
+            let bank = PackedBank::upload(
+                &device,
+                &matmul,
+                experts,
+                in_dim,
+                out_dim,
+                &case.packed(),
+                &case.scales,
+            )
+            .expect("the bank's shapes pair");
+            let chosen: Vec<u32> = (0..rows).map(|row| (row * experts / rows) as u32).collect();
+            let mut x = device.buffer(&case.x).expect("the rows upload");
+
+            let mut best = Duration::MAX;
+            for _ in 0..ROUNDS {
+                best = best.min(crate::testing::device_time(&device, CALLS, |batch| {
+                    let mut picked = device.buffer(&chosen).expect("the selection uploads");
+                    match groups {
+                        false => bank
+                            .encode_over(batch, &chosen, &mut x)
+                            .expect("the dispatch encodes"),
+                        true => {
+                            let mut sorted = grouping
+                                .encode(batch, &mut picked, experts)
+                                .expect("the grouping encodes");
+                            bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)
+                                .expect("the dispatch encodes")
+                        }
+                    };
+                }));
+            }
+
+            let call = best / CALLS as u32;
+            let tiles = rows.div_ceil(ROWS_A_TILE);
+            let read = match groups {
+                false => tiles,
+                true => rows.min(tiles + (ROWS_A_TILE - 1) * tiles.min(experts - 1)),
+            };
+            let bytes = |codes: usize| (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+            let moved = bytes(read * out_dim * in_dim);
+            // What the call could read at most, which is the bank itself. The
+            // ratio between the two is how many times over a dispatch is charged
+            // for a weight it may still have in cache, and it is the column that
+            // says whether `achieved` is a bandwidth or an amplification.
+            let held = bytes(experts * out_dim * in_dim);
+            totals[usize::from(groups)] += call * calls as u32;
+            eprintln!(
+                "  {what:<18}{rows:>8}{:>10}{:>10}{:>8}{:>10}{:>12}{:>12}",
+                format!("{:.0} MB", held / 1e6),
+                format!("{:.0} MB", moved / 1e6),
+                format!("×{:.0}", moved / held),
+                format!("{:.0}µs", 1e6 * call.as_secs_f64()),
+                format!("{:.0} GB/s", moved / call.as_secs_f64() / 1e9),
+                format!("{:.2?}", call * calls as u32),
+            );
+        }
+        eprintln!(
+            "  the shapes on the tiled entry are {:.2?} of a prefill and the grouped ones {:.2?}",
+            totals[0], totals[1]
+        );
+    }
+
     /// The shipped kernel with a different tile shape written into its prelude,
     /// which is the one thing the two sweeps above vary.
     ///
