@@ -61,6 +61,11 @@ const ENTRY: &str = "fused_attention";
 /// The second dispatch, which folds one query's splits back into one row.
 const COMBINE: &str = "attention_combine";
 
+/// What a profile calls the entry on each kind of layer — see
+/// [`Kernel::under`], which is where one pipeline becomes two rows.
+const WINDOWED: &str = "windowed attention";
+const GLOBAL: &str = "global attention";
+
 /// Threads one threadgroup of a dispatch holds, all of them on one query of one
 /// head.
 ///
@@ -195,7 +200,13 @@ pub enum AttentionError {
 /// names no shape, so one of these serves all forty-two.
 #[derive(Debug)]
 pub struct FusedAttention {
-    kernel: Kernel,
+    /// The entry a global layer's call is charged to.
+    global: Kernel,
+    /// The same pipeline under the other name, for the 35 layers whose queries
+    /// stop at their window. **Two rows and one kernel**: a prefill's two terms
+    /// are shaped differently — linear in the prompt at a windowed layer and
+    /// quadratic at a global one — and a single row is a sum that says neither.
+    windowed: Kernel,
     /// The fold behind a split call, out of the same source string: the two
     /// entries share [`Shape`] and a mutation to one is a source a test has to
     /// be able to compile both out of.
@@ -211,10 +222,20 @@ impl FusedAttention {
     /// is how a test puts a deliberately wrong kernel through the same plumbing
     /// as the right one and measures the difference.
     pub(crate) fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
+        let global = device.compile(source, ENTRY)?;
         Ok(Self {
-            kernel: device.compile(source, ENTRY)?,
+            windowed: global.under(WINDOWED),
+            global: global.under(GLOBAL),
             combine: device.compile(source, COMBINE)?,
         })
+    }
+
+    /// The entry as a layer of this window is charged for it.
+    fn on(&self, sliding: usize) -> &Kernel {
+        match sliding {
+            0 => &self.global,
+            _ => &self.windowed,
+        }
     }
 }
 
@@ -825,7 +846,7 @@ impl<'a> LayerAttention<'a> {
                 + step.keys.min(self.rel_extent) * self.config.d_rel
                 + queries);
         batch.add(
-            &self.attention.kernel,
+            self.attention.on(self.config.sliding),
             &[
                 shape.arg(),
                 step.q.arg(),
@@ -2470,6 +2491,58 @@ mod tests {
             q_offset: keys - queries,
             mask: None,
         }
+    }
+
+    /// **A windowed layer's call and a global one's land in rows of their
+    /// own**, which is what makes a prefill's two terms readable at all: 35 of
+    /// the checkpoint's layers stop at a 512-key window and 7 reach every key
+    /// there is, and summed into one row the linear term and the quadratic one
+    /// are a number about neither.
+    ///
+    /// **The same pipeline behind both**, which the entry points say: two rows
+    /// that appeared because the kernel had been compiled twice would be the
+    /// same table and a slower engine. What [`Kernel::under`] gives is a name.
+    #[test]
+    fn a_windowed_layers_attention_is_charged_apart_from_a_global_ones() {
+        let Some(device) = device() else { return };
+        if !device.times_a_pass() {
+            eprintln!("skipping: this device does not sample at a stage boundary");
+            return;
+        }
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        assert_eq!(
+            attention.windowed.entry(),
+            attention.global.entry(),
+            "the two rows are two compiles rather than two names"
+        );
+
+        device
+            .time_each_dispatch(true)
+            .expect("the device times a dispatch");
+        profile::take();
+        for sliding in [SLIDING_WINDOW, 0] {
+            let case = windowed(64, sliding);
+            let layer = case.wrapped(&device, &attention);
+            layer.forward(case.step()).expect("the dispatch completes");
+        }
+        device.time_each_dispatch(false).expect("sampling stops");
+
+        let charged = profile::take();
+        let rows: Vec<(&str, u64)> = charged
+            .kernels()
+            .iter()
+            .map(|(kernel, each)| (*kernel, each.calls))
+            .collect();
+        assert_eq!(
+            rows.iter().find(|(kernel, _)| *kernel == WINDOWED),
+            Some(&(WINDOWED, 1)),
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.iter().find(|(kernel, _)| *kernel == GLOBAL),
+            Some(&(GLOBAL, 1)),
+            "{rows:?}"
+        );
     }
 
     /// What the attention step costs at the shape a decode step runs it at,

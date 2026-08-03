@@ -31,6 +31,10 @@ const ARGUMENT_SLOTS: usize = 31;
 #[derive(Debug)]
 pub struct Kernel {
     entry: String,
+    /// What the profile calls this, which is the entry point's own name unless
+    /// [`Kernel::under`] gave it another — see there for why one pipeline is
+    /// worth two rows.
+    label: String,
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
@@ -61,6 +65,7 @@ impl Device {
             })?;
 
         Ok(Kernel {
+            label: entry.to_owned(),
             entry: entry.to_owned(),
             pipeline,
         })
@@ -273,7 +278,7 @@ impl<'a> Batch<'a> {
                         .computeCommandEncoderWithDescriptor(&pass)
                         .ok_or(MetalError::NoCommandEncoder)?,
                 );
-                self.samples.as_mut().expect("sampling").ran(&kernel.entry);
+                self.samples.as_mut().expect("sampling").ran(&kernel.label);
             }
             None if self.encoder.is_none() => {
                 self.encoder = Some(
@@ -437,6 +442,27 @@ impl Drop for Batch<'_> {
 impl Kernel {
     pub fn entry(&self) -> &str {
         &self.entry
+    }
+
+    /// The same compiled pipeline, charged to a row of its own.
+    ///
+    /// **One kernel is not always one question.** The attention entry runs on
+    /// both kinds of layer this checkpoint has — 35 whose queries may reach 512
+    /// keys back and 7 whose queries may reach every key there is — and summed
+    /// into one row those two are a number about neither: at a prefill of 16384
+    /// tokens the second is quadratic in the prompt and the first is linear, and
+    /// a table that added them could not say so. Nothing about the dispatch
+    /// changes, only the name the profile files it under.
+    ///
+    /// The pipeline is shared rather than compiled again, so a second row costs
+    /// a retain and a string. The entry point stays what it is, because that is
+    /// what a failed dispatch has to name for anyone to find it in the source.
+    pub fn under(&self, label: &str) -> Self {
+        Self {
+            entry: self.entry.clone(),
+            label: label.to_owned(),
+            pipeline: self.pipeline.clone(),
+        }
     }
 
     /// The widest threadgroup this kernel can be dispatched in, which is a
