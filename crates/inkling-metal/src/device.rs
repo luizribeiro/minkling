@@ -51,6 +51,13 @@ pub enum MetalError {
         most: usize,
     },
 
+    #[error("{entry} runs {width} threads in lockstep where its layout is cut for {wanted}")]
+    UnexpectedSimdWidth {
+        entry: String,
+        width: usize,
+        wanted: usize,
+    },
+
     #[error("the Metal device would not open a command buffer")]
     NoCommandBuffer,
 

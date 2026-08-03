@@ -82,6 +82,18 @@ const TILED_ENTRY: &str = "packed_matmul_rows";
 /// rows that do name one weight.
 const GROUPED_ENTRY: &str = "packed_matmul_grouped";
 
+/// The two entries behind [`Numerics::Production`], which are the two above with
+/// the reduction carried by `simdgroup_matrix` instead of by a lane-strided walk.
+///
+/// **They stand in front of the two tiled entries and nowhere else.** An untiled
+/// call is a decode step's single row, which has nothing for a block of 32 to
+/// carry; a tiled or grouped one is a prefill's, which is where the 59.69 s the
+/// two matmul rows cost at 16384 tokens is. Compiled only where the flag asked
+/// for them — see [`PackedMatmul::compiled`] — so a reference run has neither in
+/// its pipeline cache.
+const MMA_TILED_ENTRY: &str = "mma_matmul_rows";
+const MMA_GROUPED_ENTRY: &str = "mma_matmul_grouped";
+
 /// Rows one simdgroup of [`TILED_ENTRY`] multiplies against one weight row.
 ///
 /// **What this is worth is the whole of the prefill gap and none of the decode
@@ -138,6 +150,139 @@ const ROWS_A_TILE: usize = 4;
 /// threadgroup the pipeline reports is the device's own 1024 at every width
 /// tried, eight included, which is the one place this side could have seen it.
 const COLS_A_TILE: usize = 4;
+
+/// The square the hardware matrix instruction multiplies.
+///
+/// **Not a tuning knob.** `simdgroup_multiply_accumulate` takes
+/// `simdgroup_matrix<float, 8, 8>` and the eight is the instruction's; every
+/// other constant behind [`Numerics::Production`] is a multiple of it because a
+/// block is laid out in these.
+const MMA_FRAGMENT: usize = 8;
+
+/// Rows of the call one threadgroup of the production entries carries.
+///
+/// **This is the arithmetic intensity the flag was opened for.** The reference
+/// tile reads a packed byte and multiplies its two codes against [`ROWS_A_TILE`]
+/// rows of input, which is 16 multiply-adds a weight byte. A block of this many
+/// rows decodes the same byte once into threadgroup memory and drives it through
+/// every row of the block, which is eight times that — and the decode, whose
+/// dependency chain "What each way of decoding a packed byte costs" measured at
+/// 30% of the reference kernel, is paid once for eight times the work.
+///
+/// **Thirty-two rather than more, because of what a block of rows costs when its
+/// rows disagree.** A weight block is one expert's, so a block whose rows name
+/// several runs the whole walk once per expert its rows name — see the pass loop
+/// in [`MMA`]. A routed bank's runs at 16384 tokens average 384 rows, so a block
+/// this tall straddles a boundary at most once per expert and is uniform
+/// otherwise; a taller one buys reuse the routing cannot feed it.
+const MMA_ROWS_A_BLOCK: usize = 32;
+
+/// Output columns one threadgroup of the production entries spans.
+///
+/// Twice the rows, which is what makes the two staged tiles the same shape as
+/// the eight simdgroups that read them: two down and four across, each holding
+/// `MMA_ROWS_A_BLOCK / (2 * MMA_FRAGMENT)` by
+/// `MMA_COLS_A_BLOCK / (4 * MMA_FRAGMENT)` fragments, which is two by two.
+const MMA_COLS_A_BLOCK: usize = 64;
+
+/// Simdgroups of a threadgroup laid down the rows, and across the columns.
+///
+/// Their product is the threadgroup, which is [`THREADS_PER_GROUP`] — so the
+/// production entries dispatch the same threadgroup the reference ones do and
+/// nothing about the submission changes.
+const MMA_SIMDS_DOWN: usize = 2;
+const MMA_SIMDS_ACROSS: usize = 4;
+
+/// Codes of the reduction one staging step brings in.
+///
+/// **[`GROUP_SIZE`] exactly, and that is what makes the staging free of a
+/// decision.** A weight row's codes share one scale byte per group of this many,
+/// so a step this wide reads exactly one scale byte per column of the block and
+/// the scale a code is decoded under is never in question at a step boundary.
+const MMA_CODES_A_STEP: usize = GROUP_SIZE;
+
+/// Floats between two staged rows.
+///
+/// **Padding, and it is load-bearing rather than defensive.** Threadgroup memory
+/// is 32 banks of four bytes, and a `simdgroup_load` of an 8×8 fragment reads
+/// eight rows at this stride: unpadded at 32 floats every one of the eight lands
+/// on the same bank and the load serialises eight ways. Four floats of padding
+/// puts them on banks 0, 4, 8 … 28, which are eight distinct ones.
+const MMA_STAGED_STRIDE: usize = MMA_CODES_A_STEP + 4;
+
+/// Floats between two rows of the block's answer, padded for the same reason and
+/// against the same 32 banks.
+const MMA_ANSWER_STRIDE: usize = MMA_COLS_A_BLOCK + 4;
+
+/// Fragments one simdgroup of a block holds down the rows and across the
+/// columns, which is what is left of the block once the eight simdgroups have
+/// taken their share of it.
+const MMA_FRAGMENTS_DOWN: usize = MMA_ROWS_A_BLOCK / (MMA_SIMDS_DOWN * MMA_FRAGMENT);
+const MMA_FRAGMENTS_ACROSS: usize = MMA_COLS_A_BLOCK / (MMA_SIMDS_ACROSS * MMA_FRAGMENT);
+
+/// Floats of the input one thread stages a step, and the threads a staged row
+/// takes.
+const MMA_FLOATS_A_THREAD: usize = MMA_ROWS_A_BLOCK * MMA_CODES_A_STEP / THREADS_PER_GROUP;
+const MMA_THREADS_A_STAGED_ROW: usize = MMA_CODES_A_STEP / MMA_FLOATS_A_THREAD;
+
+/// Packed bytes of the weight one thread decodes a step, and the threads a
+/// weight row takes.
+const MMA_BYTES_A_THREAD: usize =
+    MMA_COLS_A_BLOCK * (MMA_CODES_A_STEP / CODES_PER_BYTE) / THREADS_PER_GROUP;
+const MMA_THREADS_A_WEIGHT_ROW: usize = (MMA_CODES_A_STEP / CODES_PER_BYTE) / MMA_BYTES_A_THREAD;
+
+/// **Every division above has to be exact**, and a block whose staging left a
+/// remainder would leave part of a tile holding whatever the last step put
+/// there — a wrong answer rather than a failure, and one no shape check
+/// downstream could catch. Held here rather than asserted at compile time in
+/// the kernel, because these are the numbers the kernel's prelude is written
+/// from.
+const _: () = {
+    assert!(MMA_SIMDS_DOWN * MMA_SIMDS_ACROSS * NARROWEST_SIMD == THREADS_PER_GROUP);
+    assert!(MMA_FRAGMENTS_DOWN * MMA_SIMDS_DOWN * MMA_FRAGMENT == MMA_ROWS_A_BLOCK);
+    assert!(MMA_FRAGMENTS_ACROSS * MMA_SIMDS_ACROSS * MMA_FRAGMENT == MMA_COLS_A_BLOCK);
+    assert!(MMA_CODES_A_STEP % MMA_FRAGMENT == 0);
+    assert!(MMA_FLOATS_A_THREAD * THREADS_PER_GROUP == MMA_ROWS_A_BLOCK * MMA_CODES_A_STEP);
+    assert!(MMA_THREADS_A_STAGED_ROW * MMA_FLOATS_A_THREAD == MMA_CODES_A_STEP);
+    assert!(
+        MMA_BYTES_A_THREAD * THREADS_PER_GROUP
+            == MMA_COLS_A_BLOCK * (MMA_CODES_A_STEP / CODES_PER_BYTE)
+    );
+    assert!(MMA_THREADS_A_WEIGHT_ROW * MMA_BYTES_A_THREAD == MMA_CODES_A_STEP / CODES_PER_BYTE);
+    // A step is one scale byte a column, which is what lets the decode read the
+    // scale once outside the loop over the codes it covers.
+    assert!(MMA_CODES_A_STEP == GROUP_SIZE);
+    // And a staged row is at least as wide as the fragment reads across it.
+    assert!(MMA_STAGED_STRIDE >= MMA_CODES_A_STEP);
+    assert!(MMA_ANSWER_STRIDE >= MMA_COLS_A_BLOCK);
+};
+
+/// The narrowest simdgroup Metal reports, which is what the layout above
+/// divides the threadgroup into simdgroups by.
+///
+/// **A device that reported a wider one would put fewer simdgroups in a
+/// threadgroup than the block was laid out for**, which is why
+/// `a_block_is_the_simdgroups_this_device_gives_a_threadgroup` reads it back off
+/// the compiled pipeline rather than trusting this.
+const NARROWEST_SIMD: usize = 32;
+
+/// Rows an expert needs, on average, before a grouped call is dispatched through
+/// the production entries.
+///
+/// **A block of [`MMA_ROWS_A_BLOCK`] rows is correct however its rows are laid
+/// out and fast only where they agree**, so this is the line between the two.
+/// The kernel runs its whole walk once per distinct expert a block's rows name,
+/// which is one pass where a run covers the block and as many as the block is
+/// tall where the routing is spread thin — and a routed bank at 97 tokens
+/// averages 2.3 rows an expert, which would be a dozen passes a block.
+///
+/// A block's worth, so that the average run covers a block: six rows a token
+/// against 256 experts puts the line at about 1366 tokens, under which a grouped
+/// call stays on the reference tile whatever the flag says.
+/// [`RUNS_A_GROUPING`] is the same question asked of the sort rather than of the
+/// block, and is a much lower bar because a sort that saves nothing costs one
+/// dispatch where a block that straddles costs a whole extra walk.
+const MMA_RUNS_A_BLOCK: usize = MMA_ROWS_A_BLOCK;
 
 /// Rows an expert needs, on average, before sorting a call's rows by expert
 /// pays for the sort.
@@ -311,6 +456,11 @@ pub struct PackedMatmul {
     kernel: Kernel,
     tiled: Kernel,
     grouped: Kernel,
+    /// The two entries that stand in front of `tiled` and `grouped` where the
+    /// flag asked for them, and **nothing at all under the reference** — which
+    /// is what makes "nothing changes for a caller who does not ask" a fact
+    /// about the pipeline cache rather than about a branch nobody takes.
+    mma: Option<Mma>,
     /// Which arithmetic the innermost accumulation is allowed to use, which is
     /// [`Numerics::Reference`] unless a command line asked otherwise.
     numerics: Numerics,
@@ -334,7 +484,13 @@ impl PackedMatmul {
     /// below, so that "reference unless asked" is a fact about one line rather
     /// than a convention twenty-eight call sites keep.
     pub fn under(device: &Device, numerics: Numerics) -> Result<Self, MetalError> {
-        Self::compiled(device, &source(), ROWS_A_TILE, COLS_A_TILE, numerics)
+        Self::compiled(
+            device,
+            &source_under(numerics),
+            ROWS_A_TILE,
+            COLS_A_TILE,
+            numerics,
+        )
     }
 
     /// [`PackedMatmul::new`] out of a source string of the caller's own, which
@@ -390,10 +546,22 @@ impl PackedMatmul {
                  `{declares}`"
             );
         }
+        // Compiled only where the flag asked, which is what puts a reference run
+        // through the same three pipelines it went through before this flag
+        // existed — the sources are byte for byte the same string, and the two
+        // entries below are not in it to compile.
+        let mma = match numerics.is_production() {
+            false => None,
+            true => Some(Mma::of(
+                device.compile(source, MMA_TILED_ENTRY)?,
+                device.compile(source, MMA_GROUPED_ENTRY)?,
+            )?),
+        };
         Ok(Self {
             kernel: device.compile(source, ENTRY)?,
             tiled: device.compile(source, TILED_ENTRY)?,
             grouped: device.compile(source, GROUPED_ENTRY)?,
+            mma,
             numerics,
             rows_a_tile,
             cols_a_tile,
@@ -408,8 +576,7 @@ impl PackedMatmul {
         self.numerics
     }
 
-    /// The entry a call goes through and the simdgroups it takes to cover
-    /// `rows` rows of `out_dim` columns.
+    /// The entry a call goes through and the grid that covers it.
     ///
     /// **An untiled call stays on the untiled kernel rather than on a tile of
     /// one.** The two compute the same thing at that height, and the ordinary
@@ -417,12 +584,75 @@ impl PackedMatmul {
     /// — so the shape with nothing to win stays on the code that won what is
     /// already there, rather than carrying a tile's worth of registers to use
     /// one row of it.
-    fn entry(&self, layout: &Layout<'_>, rows: usize, out_dim: usize) -> (&Kernel, usize) {
+    ///
+    /// **The grid rather than a simdgroup count, because the two entries behind
+    /// the flag count in blocks where the three in front of it count in
+    /// simdgroups.** Both dispatch [`THREADS_PER_GROUP`] to a threadgroup and
+    /// neither changes anything else about the submission; what differs is only
+    /// how many threads cover a call, which is the one thing a caller cannot
+    /// work out from the kernel alone.
+    fn entry(
+        &self,
+        layout: &Layout<'_>,
+        rows: usize,
+        out_dim: usize,
+        experts: usize,
+    ) -> (&Kernel, Grid) {
+        let simdgroups = |kernel: &Kernel, elements: usize| {
+            Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP)
+        };
+        let blocks = || {
+            let over = rows.div_ceil(MMA_ROWS_A_BLOCK) * out_dim.div_ceil(MMA_COLS_A_BLOCK);
+            Grid::new(over * THREADS_PER_GROUP, THREADS_PER_GROUP)
+        };
         let tiles = rows.div_ceil(self.rows_a_tile) * out_dim.div_ceil(self.cols_a_tile);
-        match layout {
-            Layout::Each => (&self.kernel, rows * out_dim),
-            Layout::Tiled => (&self.tiled, tiles),
-            Layout::Grouped { .. } => (&self.grouped, tiles),
+        match (self.blocks(layout, rows, experts), layout) {
+            (_, Layout::Each) => (&self.kernel, simdgroups(&self.kernel, rows * out_dim)),
+            (None, Layout::Tiled) => (&self.tiled, simdgroups(&self.tiled, tiles)),
+            (None, Layout::Grouped { .. }) => (&self.grouped, simdgroups(&self.grouped, tiles)),
+            (Some(mma), Layout::Tiled) => (&mma.tiled, blocks()),
+            (Some(mma), Layout::Grouped { .. }) => (&mma.grouped, blocks()),
+        }
+    }
+
+    /// The production entries, where this call's shape is one they should run.
+    ///
+    /// **The production entries are correct for every shape and fast for some**,
+    /// so this is where the difference is drawn rather than in the kernel. A
+    /// block's weight is one expert's, so a block whose rows name several runs
+    /// the walk once per expert — which is nothing where the runs cover a block
+    /// and a dozen walks where the routing is spread thin.
+    ///
+    /// A tiled call's runs are as long as the call: a projection's rows all name
+    /// expert zero and a shared bank's are its input laid end to end once per
+    /// expert. A grouped call's are the routing's, and [`MMA_RUNS_A_BLOCK`] is
+    /// the line — under it the call stays on the reference tile whatever the
+    /// flag says, which is a rate and never an answer.
+    ///
+    /// **[`Layout::Each`] never reaches it**, and that is the decode path stated
+    /// where it is decided: a single-row projection, a two-row shared bank and a
+    /// six-row routed bank are what a decode step dispatches, and a block of 32
+    /// rows has nothing to carry for any of them.
+    fn blocks(&self, layout: &Layout<'_>, rows: usize, experts: usize) -> Option<&Mma> {
+        let worth = match layout {
+            Layout::Each => false,
+            Layout::Tiled => true,
+            Layout::Grouped { .. } => rows >= experts.saturating_mul(MMA_RUNS_A_BLOCK),
+        };
+        self.mma.as_ref().filter(|_| worth)
+    }
+
+    /// The rows one dispatch of this shape reads a weight once for, which is the
+    /// block where the production entries run it and the tile where they do not.
+    ///
+    /// **One predicate decides the entry and the accounting**, so that a
+    /// bandwidth column cannot describe a dispatch other than the one that ran —
+    /// see [`PackedBank::moves`], which charges a weight per tile of rows that
+    /// shares it.
+    fn rows_a_read(&self, layout: &Layout<'_>, rows: usize, experts: usize) -> usize {
+        match self.blocks(layout, rows, experts) {
+            Some(_) => MMA_ROWS_A_BLOCK,
+            None => self.rows_a_tile,
         }
     }
 
@@ -439,6 +669,49 @@ impl PackedMatmul {
     /// from.
     pub(crate) fn groups(&self, rows: usize, experts: usize) -> bool {
         self.rows_a_tile >= 2 && rows >= experts.saturating_mul(RUNS_A_GROUPING)
+    }
+}
+
+/// The two entries behind [`Numerics::Production`], held together because a
+/// dispatch reaches one or the other by the same predicate and neither is any
+/// use without the other.
+#[derive(Debug)]
+struct Mma {
+    tiled: Kernel,
+    grouped: Kernel,
+}
+
+impl Mma {
+    /// The pair, refused where this device's simdgroup is not the one the block
+    /// was cut for.
+    ///
+    /// **This is the one assumption in the layout that a wrong answer rather
+    /// than a failure would follow from.** Every fragment origin in the kernel
+    /// is `simdgroup_index_in_threadgroup` divided and taken modulo against
+    /// [`MMA_SIMDS_ACROSS`], and the eight simdgroups that share the work are
+    /// [`THREADS_PER_GROUP`] over [`NARROWEST_SIMD`]. A device that ran wider
+    /// simdgroups would put fewer of them in the threadgroup than the block was
+    /// cut into, and the rows no simdgroup reached would come back as the zeros
+    /// `out` was allocated with — plausible values, no error, nothing downstream
+    /// that could tell.
+    ///
+    /// **Asked of the compiled pipeline rather than assumed**, for the reason
+    /// [`Kernel::simd_width`](crate::Kernel::simd_width) exists to be asked:
+    /// every Apple GPU states 32 and Metal makes no promise that it always will.
+    /// Refused at compile time rather than at dispatch, so that a machine this
+    /// layout cannot serve says so once, before a token is decoded, instead of
+    /// answering wrongly on every prefill.
+    fn of(tiled: Kernel, grouped: Kernel) -> Result<Self, MetalError> {
+        for kernel in [&tiled, &grouped] {
+            if kernel.simd_width() != NARROWEST_SIMD {
+                return Err(MetalError::UnexpectedSimdWidth {
+                    entry: kernel.entry().to_string(),
+                    width: kernel.simd_width(),
+                    wanted: NARROWEST_SIMD,
+                });
+            }
+        }
+        Ok(Self { tiled, grouped })
     }
 }
 
@@ -1145,8 +1418,7 @@ impl<'a> PackedBank<'a> {
         let resident = &mut *resident;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
 
-        let (kernel, elements) = self.matmul.entry(&layout, rows, self.out_dim);
-        let grid = Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP);
+        let (kernel, grid) = self.matmul.entry(&layout, rows, self.out_dim, self.experts);
         let moves = self.moves(rows, x.len(), &layout);
         let bound = [
             shape.arg(),
@@ -1216,13 +1488,27 @@ impl<'a> PackedBank<'a> {
     /// a row is read through, which a bank's own dispatch leaves on the device
     /// and a projection's travels in the command buffer.
     fn moves(&self, rows: usize, values: usize, layout: &Layout<'_>) -> usize {
-        let tiles = rows.div_ceil(self.matmul.rows_a_tile);
+        let rows_a_read = self.matmul.rows_a_read(layout, rows, self.experts);
+        let tiles = rows.div_ceil(rows_a_read);
+        // The worst layout the shape allows, which is what a call whose runs
+        // this side cannot count has to be charged.
+        let straddling =
+            rows.min(tiles + (rows_a_read - 1) * tiles.min(self.experts.saturating_sub(1)));
         let read = match layout {
             Layout::Each => rows,
+            // **A tiled call is charged flat only while a tile is the height
+            // [`tiles`] gated it at.** That predicate keeps the shortest run at
+            // least [`ROWS_A_TILE`] long, which bounds a straddling tile to two
+            // experts and the whole call to one extra read a run. A block of
+            // [`MMA_ROWS_A_BLOCK`] rows is eight times that height against the
+            // same gate, so a block can span eight runs and read eight weights
+            // where this would charge one — and a bandwidth column that flattered
+            // the change by a factor of eight is exactly what this method exists
+            // not to print. Above the tile height it takes the same worst case
+            // the grouped arm takes.
+            Layout::Tiled if rows_a_read > self.matmul.rows_a_tile => straddling,
             Layout::Tiled => tiles,
-            Layout::Grouped { .. } => rows.min(
-                tiles + (self.matmul.rows_a_tile - 1) * tiles.min(self.experts.saturating_sub(1)),
-            ),
+            Layout::Grouped { .. } => straddling,
         };
         let elements = read * self.out_dim * self.in_dim;
         let weight = elements * BITS / u8::BITS as usize + elements / GROUP_SIZE;
@@ -1407,6 +1693,39 @@ constant float ELEMENTS[] = {{ {} }};
     )
 }
 
+/// The kernel under the numerics asked for, which is [`source`] and — where the
+/// flag says so — the two entries that carry the reduction the other way.
+///
+/// **Appended rather than substituted**, so that a reference run compiles the
+/// same string it compiled before this flag existed: every byte of `source`
+/// above is where it was, and what production adds is written after it.
+pub(crate) fn source_under(numerics: Numerics) -> String {
+    let mut written = source();
+    if numerics.is_production() {
+        written.push_str(&format!(
+            "
+constant uint MMA_FRAGMENT = {MMA_FRAGMENT};
+constant uint MMA_ROWS_A_BLOCK = {MMA_ROWS_A_BLOCK};
+constant uint MMA_COLS_A_BLOCK = {MMA_COLS_A_BLOCK};
+constant uint MMA_SIMDS_ACROSS = {MMA_SIMDS_ACROSS};
+constant uint MMA_CODES_A_STEP = {MMA_CODES_A_STEP};
+constant uint MMA_STAGED_STRIDE = {MMA_STAGED_STRIDE};
+constant uint MMA_ANSWER_STRIDE = {MMA_ANSWER_STRIDE};
+constant uint MMA_FRAGMENTS_DOWN = {MMA_FRAGMENTS_DOWN};
+constant uint MMA_FRAGMENTS_ACROSS = {MMA_FRAGMENTS_ACROSS};
+constant uint MMA_FLOATS_A_THREAD = {MMA_FLOATS_A_THREAD};
+constant uint MMA_THREADS_A_STAGED_ROW = {MMA_THREADS_A_STAGED_ROW};
+constant uint MMA_BYTES_A_THREAD = {MMA_BYTES_A_THREAD};
+constant uint MMA_THREADS_A_WEIGHT_ROW = {MMA_THREADS_A_WEIGHT_ROW};
+constant uint THREADS_PER_GROUP = {THREADS_PER_GROUP};
+"
+        ));
+        written.push_str(&mma_entry(MMA_TILED_ENTRY, false));
+        written.push_str(&mma_entry(MMA_GROUPED_ENTRY, true));
+    }
+    written
+}
+
 /// How many `uint`s the kernel's `Shape` struct declares.
 const SHAPE_FIELDS: usize = 10;
 
@@ -1584,6 +1903,19 @@ inline uint tile_source(constant Shape &shape, uint row) {
 /// straddles two runs is correct and saves nothing, exactly as it is for the
 /// ungrouped entry, so neither of the two assumes anything the other does not.
 fn tiled_entry(entry: &str, grouped: bool) -> String {
+    over_the_rows(TILE, entry, grouped)
+}
+
+/// The three expressions that separate a call over the rows as they lie from one
+/// over a permutation a dispatch wrote, written into whichever walk asked for
+/// them.
+///
+/// **One reading of the indirection for both walks**, because it is the same
+/// indirection: [`TILE`] and [`MMA`] differ in how they accumulate and in
+/// nothing about which row of the input a row reads or which row of the output
+/// it writes. A second copy of these three would be a second place for
+/// `shape.scatters` to be got backwards.
+fn over_the_rows(walk: &str, entry: &str, grouped: bool) -> String {
     let (order, reads, writes) = match grouped {
         false => ("", "row", "row"),
         true => (
@@ -1601,7 +1933,7 @@ fn tiled_entry(entry: &str, grouped: bool) -> String {
         !written.iter().any(|value| value.contains("__")),
         "a substitution that writes a placeholder would be substituted again"
     );
-    TILE.replace("__ENTRY__", entry)
+    walk.replace("__ENTRY__", entry)
         .replace("__ORDER__", order)
         .replace("__READS__", reads)
         .replace("__WRITES__", writes)
@@ -1788,6 +2120,259 @@ kernel void __ENTRY__(
 }
 "#;
 
+/// The production entries, written once and compiled twice the way [`TILE`] is
+/// and against the same three placeholders.
+///
+/// **What is behind [`Numerics::Production`] is this and nothing else.** It
+/// takes the same six bindings from the same encoder, reads the same `Shape`,
+/// answers the same `[rows, out_dim]`, and is chosen by the same predicates at
+/// the same shapes. The tiling above it, the grouping in front of it,
+/// `splits_for`, the occupancy declarations and every submission decision are
+/// shared. What differs is the accumulate, and the accumulate cannot be
+/// bit-compared — which is the whole reason the flag exists.
+fn mma_entry(entry: &str, grouped: bool) -> String {
+    over_the_rows(MMA, entry, grouped)
+}
+
+/// The block, the staging and the hardware multiply, with the three expressions
+/// [`mma_entry`] decides written as placeholders.
+const MMA: &str = r#"
+/// One threadgroup per MMA_ROWS_A_BLOCK rows of MMA_COLS_A_BLOCK columns, with
+/// the reduction carried by `simdgroup_multiply_accumulate` rather than by a
+/// lane-strided walk under a `simd_sum`.
+///
+/// **The weight is decoded once into threadgroup memory and multiplied against
+/// every row of the block.** That is the whole of what this buys and it is two
+/// things at once. A packed byte's two codes are gathered out of ELEMENTS once
+/// for MMA_ROWS_A_BLOCK rows where the reference tile gathers them once for
+/// ROWS_A_TILE, so the decode's dependency chain — 30% of that kernel by
+/// ablation — is amortised eight times as far; and the multiply that follows is
+/// an instruction carrying 512 multiply-adds where the reference carries one.
+///
+/// **The answer is not the reference kernel's bit for bit and cannot be.** A
+/// hardware 8x8x8 multiply-accumulate sums its `k` dimension in an order the
+/// instruction defines and this side does not choose. Every product either
+/// kernel forms is exact — a code is one of sixteen table values and a group
+/// scale is a power of two — so the two differ by summation order alone.
+///
+/// **And the order this one takes is the worse-conditioned of the two, which is
+/// measured rather than assumed.** A fragment accumulator is one running sum
+/// over the whole reduction: 4096 codes are 512 accumulate steps into the same
+/// register, one after another. The reference splits the same reduction 32 ways
+/// — a lane walks 128 products of it and a tree adds the 32 partials — so its
+/// longest chain is a quarter as long and its drift does not grow with the
+/// reduction at all. Measured against an f64 accumulation of the same products,
+/// this one drifts 1.6e-7 at a reduction of 32 and 4.1e-6 at 4096 where the
+/// reference holds 9.0e-8 to 1.4e-7 across the same range. See
+/// MMA_TOLERANCE and `a_block_answers_the_reference_tile_where_neither_extent
+/// _divides_it`, which is where those figures are taken.
+///
+/// **The scale is applied at the staging rather than at the accumulate**, which
+/// the reference kernel cannot do and this one can afford: a scale is a power of
+/// two, so a code times its scale is exact and no rounding is moved by folding
+/// it in early. What it buys is that the MMA sees plain floats and owes nothing
+/// per step.
+///
+/// **A block whose rows name several experts runs once per expert they name.** A
+/// staged weight block is one expert's, so there is no one block that serves
+/// rows disagreeing about which weight they read. Each pass zeroes the rows that
+/// named some other expert on the way in, and a zeroed row contributes exactly
+/// 0.0 to its own outputs — so what a row ends up holding is the pass that was
+/// its own, and the passes that were not its own added nothing to it. Correct
+/// for any expert list, exactly as the reference tile is, and fast only where
+/// the runs are at least a block — which is what MMA_RUNS_A_BLOCK is for and
+/// what keeps a grouped call off this entry until the routing can feed it.
+///
+/// **Every barrier below is reached by every thread of the threadgroup**, and
+/// what makes that true rather than hoped is that the pass loop and the step
+/// loop are both bounded by threadgroup-uniform values: `rows`, `opens` and
+/// `bytes` are the same for all 256 threads, so no thread takes a branch that
+/// skips a barrier another thread waits at.
+kernel void __ENTRY__(
+    constant Shape &shape [[buffer(0)]],
+    device const uint *experts [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device const uchar *codes [[buffer(3)]],
+    device const uchar *scales [[buffer(4)]],
+    device float *out [[buffer(5)]],__ORDER__
+    uint block [[threadgroup_position_in_grid]],
+    uint local [[thread_position_in_threadgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]
+) {
+    const uint across = (shape.out_dim + MMA_COLS_A_BLOCK - 1) / MMA_COLS_A_BLOCK;
+    const uint first = (block / across) * MMA_ROWS_A_BLOCK;
+    const uint leftmost = (block % across) * MMA_COLS_A_BLOCK;
+    // The grid covers exactly the blocks the two extents cut the call into, so
+    // this is the same guard the reference entries carry for the same reason:
+    // a dispatch whose shape and grid disagreed would be a wrong answer rather
+    // than a failure.
+    if (first >= shape.rows) {
+        return;
+    }
+
+    const uint rows = min((uint)MMA_ROWS_A_BLOCK, shape.rows - first);
+    const uint cols = min((uint)MMA_COLS_A_BLOCK, shape.out_dim - leftmost);
+    const uint bytes = shape.in_dim / CODES_PER_BYTE;
+    const uint scale_bytes = bytes / BYTES_PER_GROUP;
+    const uint step_bytes = MMA_CODES_A_STEP / CODES_PER_BYTE;
+
+    threadgroup float staged_x[MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE];
+    threadgroup float staged_w[MMA_COLS_A_BLOCK * MMA_STAGED_STRIDE];
+    threadgroup float answered[MMA_ROWS_A_BLOCK * MMA_ANSWER_STRIDE];
+    threadgroup uint held[MMA_ROWS_A_BLOCK];
+    threadgroup bool opens[MMA_ROWS_A_BLOCK];
+
+    // The block's expert list, read into threadgroup memory once. The pass loop
+    // below asks after it O(rows^2) times and a device load an ask would cost
+    // more than the uniform case it is there to serve.
+    //
+    // A slot past the block's own rows repeats the last of them, so that the
+    // read is inside the list whatever the call's shape leaves over; `opens`
+    // then refuses it, which is what keeps a repeat from being a pass.
+    if (local < MMA_ROWS_A_BLOCK) {
+        held[local] = experts[first + min(local, rows - 1)];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (local < MMA_ROWS_A_BLOCK) {
+        bool first_time = local < rows;
+        for (uint before = 0; before < local; ++before) {
+            first_time = first_time && (held[before] != held[local]);
+        }
+        opens[local] = first_time;
+    }
+
+    // Where this thread stages. The two tiles are filled cooperatively and the
+    // divisions are exact by construction — the prelude's static assertions are
+    // where that is held — so every thread reads the same count and no lane is
+    // idle in either fill.
+    const uint x_row = local / MMA_THREADS_A_STAGED_ROW;
+    const uint x_at = (local % MMA_THREADS_A_STAGED_ROW) * MMA_FLOATS_A_THREAD;
+    const uint w_col = local / MMA_THREADS_A_WEIGHT_ROW;
+    const uint w_at = (local % MMA_THREADS_A_WEIGHT_ROW) * MMA_BYTES_A_THREAD;
+
+    // The row of the input this thread's staged row reads, and the column of the
+    // weight its staged column is. Both clamp to the last live one so that every
+    // load below is inside the buffer it indexes; what a clamped slot produces
+    // is zeroed on the way in or never written out.
+    const uint row = first + min(x_row, rows - 1);
+    const uint source = tile_source(shape, __READS__);
+    const uint column = leftmost + min(w_col, cols - 1);
+
+    const uint down = simd / MMA_SIMDS_ACROSS;
+    const uint alongside = simd % MMA_SIMDS_ACROSS;
+
+    simdgroup_float8x8 sums[MMA_FRAGMENTS_DOWN][MMA_FRAGMENTS_ACROSS];
+    for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
+        for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
+            sums[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint pass = 0; pass < rows; ++pass) {
+        if (!opens[pass]) {
+            continue;
+        }
+        const uint expert = held[pass];
+        const bool live = (x_row < rows) && (held[x_row] == expert);
+        device const uchar *packed = codes + shape.code_base
+            + (ulong)expert * shape.code_stride + (ulong)column * bytes;
+        device const uchar *scale = scales + shape.scale_base
+            + (ulong)expert * shape.scale_stride + (ulong)column * scale_bytes;
+
+        for (uint b = 0; b < bytes; b += step_bytes) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // The input, as it lies. A row this pass is not for stages zeros,
+            // which is what makes a block of disagreeing rows several passes
+            // rather than several kernels: zeros multiply to zeros and a sum
+            // gains nothing from them.
+            device const float *values = x + source + b * CODES_PER_BYTE + x_at;
+            for (uint i = 0; i < MMA_FLOATS_A_THREAD; ++i) {
+                staged_x[x_row * MMA_STAGED_STRIDE + x_at + i] = live ? values[i] : 0.0f;
+            }
+
+            // The weight, decoded. One scale byte covers the whole step because
+            // a step is GROUP_SIZE codes wide — see MMA_CODES_A_STEP — so this
+            // is one load for the eight codes below it and the exponent is
+            // shifted into place exactly as the reference entries shift it.
+            const float by =
+                as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
+            for (uint i = 0; i < MMA_BYTES_A_THREAD; ++i) {
+                const uint code = packed[b + w_at + i];
+                const uint at = w_col * MMA_STAGED_STRIDE + (w_at + i) * CODES_PER_BYTE;
+                staged_w[at] = element(code & CODE_MASK) * by;
+                staged_w[at + 1] = element((code >> BITS) & CODE_MASK) * by;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint k = 0; k < MMA_CODES_A_STEP / MMA_FRAGMENT; ++k) {
+                simdgroup_float8x8 lhs[MMA_FRAGMENTS_DOWN];
+                simdgroup_float8x8 rhs[MMA_FRAGMENTS_ACROSS];
+                for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
+                    simdgroup_load(
+                        lhs[i],
+                        staged_x
+                            + (down * MMA_FRAGMENTS_DOWN + i) * MMA_FRAGMENT * MMA_STAGED_STRIDE
+                            + k * MMA_FRAGMENT,
+                        MMA_STAGED_STRIDE
+                    );
+                }
+                // Transposed on the way in, because the staged weight is
+                // [column, code] where the instruction wants [code, column] —
+                // which is the same transpose `out = x @ w^T` names and is free
+                // here rather than a second staging.
+                for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
+                    simdgroup_load(
+                        rhs[j],
+                        staged_w
+                            + (alongside * MMA_FRAGMENTS_ACROSS + j) * MMA_FRAGMENT
+                                * MMA_STAGED_STRIDE
+                            + k * MMA_FRAGMENT,
+                        MMA_STAGED_STRIDE,
+                        ulong2(0, 0),
+                        true
+                    );
+                }
+                for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
+                    for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
+                        simdgroup_multiply_accumulate(sums[i][j], lhs[i], rhs[j], sums[i][j]);
+                    }
+                }
+            }
+        }
+    }
+
+    for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
+        for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
+            simdgroup_store(
+                sums[i][j],
+                answered
+                    + (down * MMA_FRAGMENTS_DOWN + i) * MMA_FRAGMENT * MMA_ANSWER_STRIDE
+                    + (alongside * MMA_FRAGMENTS_ACROSS + j) * MMA_FRAGMENT,
+                MMA_ANSWER_STRIDE
+            );
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Written out here rather than by `simdgroup_store` straight to `out`,
+    // because a grouped call's rows are not consecutive in the output: the
+    // permutation names a row apiece, where a store to device memory takes one
+    // stride for the whole fragment. This is also where the block's ragged edges
+    // are refused, which a fragment store could not express either.
+    for (uint at = local; at < MMA_ROWS_A_BLOCK * MMA_COLS_A_BLOCK; at += THREADS_PER_GROUP) {
+        const uint r = at / MMA_COLS_A_BLOCK;
+        const uint c = at % MMA_COLS_A_BLOCK;
+        if (r < rows && c < cols) {
+            const uint row = first + r;
+            out[(__WRITES__) * shape.out_dim + leftmost + c] =
+                answered[r * MMA_ANSWER_STRIDE + c];
+        }
+    }
+}
+"#;
+
 /// The synthetic weights this module's tests are built from, reachable by
 /// [`crate::experts`]'s tests too: a bank is three of these, and a second copy
 /// of the packing would be a second reading of the format.
@@ -1940,6 +2525,23 @@ mod tests {
     /// to catch, a kernel reading each word's nibbles from the top down, lands
     /// at 8.1e-1, five decades above.
     const TOLERANCE: f32 = 6e-6;
+
+    /// How far the production path may land from the reference one, and from
+    /// exact, over the same reduction.
+    ///
+    /// **Wider than [`TOLERANCE`] because the order is worse-conditioned, and
+    /// this is the number that says by how much.** A fragment accumulator
+    /// carries the whole reduction as one running sum where the reference splits
+    /// it 32 ways across lanes, so its drift grows with the reduction where the
+    /// reference's does not: 1.6e-7, 4.8e-7, 7.4e-7, 1.4e-6 and 4.1e-6 at
+    /// reductions of 32, 128, 512, 2048 and 4096, against a reference that holds
+    /// 9.0e-8 to 1.4e-7 across all five.
+    ///
+    /// Twice the widest of those, which is what leaves the bound a claim about
+    /// this kernel rather than about this sitting — and the 4096 it is set from
+    /// is the reduction every projection and every expert in the checkpoint has,
+    /// so nothing in the model reaches past it.
+    const MMA_TOLERANCE: f32 = 1e-5;
 
     /// The eight E2M1 magnitudes, written out here rather than read off the
     /// table the kernel is built from, so that a case computed by hand is
@@ -2330,20 +2932,15 @@ kernel void decoded_elements(
     /// projection, which no flag touches, and a tiled call over a bank, which is
     /// where a kernel behind the flag would run.
     ///
-    /// **Bounded and not bit-for-bit, deliberately.** That is the whole content
-    /// of the flag: a production kernel accumulates in an order the instruction
-    /// picks, so equality of bits is exactly what cannot be asserted across it.
-    /// What can be asserted is that both are summing the same exact products —
-    /// nothing either path forms is rounded — so the two may only differ by what
-    /// summation order is worth, which is the bound [`TOLERANCE`] already holds
-    /// this module's kernel to against the CPU.
-    ///
-    /// **As this lands the two are the same three kernels and the deviation is
-    /// zero.** That is not what the case asserts and it is not what it is for:
-    /// what it pins is the plumbing — that `under` carries the word to the
-    /// struct, that the default constructor is the reference, and that a call
-    /// dispatched under either answers the same thing — and it is the commit
-    /// that puts a kernel behind the flag that makes it bite.
+    /// **The two arms are bounded differently and that is the finding rather
+    /// than an oversight.** The projection goes through [`Layout::Each`], which
+    /// no flag reaches, so the two paths run the same kernel and the deviation
+    /// there is a zero this asserts rather than tolerates. The tile goes through
+    /// the entry the flag selects, where equality of bits is exactly what cannot
+    /// be asserted: a production kernel accumulates in an order the instruction
+    /// picks. Both are summing the same exact products — nothing either path
+    /// forms is rounded — so the two may only differ by what summation order is
+    /// worth, which is [`MMA_TOLERANCE`].
     #[test]
     fn a_call_under_either_numerics_answers_what_the_other_answers() {
         let Some(device) = device() else { return };
@@ -2367,18 +2964,321 @@ kernel void decoded_elements(
                 .multiply(&case.x)
                 .expect("the dispatch completes")
         };
-        for (what, was, is) in [
-            ("a projection", untiled(&reference), untiled(&production)),
-            (
-                "a tile",
-                a_tiled_call_answers(&device, &reference),
-                a_tiled_call_answers(&device, &production),
-            ),
-        ] {
-            let deviation = deviation(&is, &was);
-            eprintln!("{what}: the two numerics deviate {deviation:e}");
-            assert!(deviation <= TOLERANCE, "{what}: deviation {deviation:e}");
+        // An untiled call is the same kernel either way, so the two answer the
+        // same bits — asserted rather than tolerated, which is what would catch
+        // a future predicate that let the decode path drift onto a block.
+        assert_eq!(
+            bit_patterns(&untiled(&production)),
+            bit_patterns(&untiled(&reference)),
+            "a projection is the same kernel under either word"
+        );
+
+        let (was, is) = (
+            a_tiled_call_answers(&device, &reference),
+            a_tiled_call_answers(&device, &production),
+        );
+        let deviation = deviation(&is, &was);
+        eprintln!("a tile: the two numerics deviate {deviation:e}");
+        assert!(deviation > 0.0, "a tile is not the same kernel either way");
+        assert!(deviation <= MMA_TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// **A reference run compiles the string it compiled before the flag
+    /// existed**, which is the cheapest reading there is of "nothing changes for
+    /// a caller who does not ask".
+    ///
+    /// Stated on the source rather than on the pipeline because that is where it
+    /// is decided: an entry point a source does not contain is one
+    /// `newLibraryWithSource:` never sees, so there is nothing to skip
+    /// dispatching later.
+    #[test]
+    fn the_reference_source_does_not_carry_the_production_entries() {
+        assert_eq!(source_under(Numerics::Reference), source());
+        for entry in [MMA_TILED_ENTRY, MMA_GROUPED_ENTRY] {
+            assert!(
+                !source().contains(entry),
+                "{entry} is in the reference source"
+            );
+            assert!(
+                source_under(Numerics::Production).contains(entry),
+                "{entry} is not in the production source"
+            );
         }
+        // And what production adds is added rather than substituted, so no byte
+        // of the reference source moved under it.
+        assert!(source_under(Numerics::Production).starts_with(&source()));
+    }
+
+    /// **The production entries against the reference ones over a shape that
+    /// leaves both of a block's extents ragged**, which is the one thing about
+    /// this kernel that a shape filling its blocks could not catch: a block that
+    /// ran its clamped rows or wrote its clamped columns would answer wrongly
+    /// where nothing else here would notice.
+    ///
+    /// **The bound is [`MMA_TOLERANCE`] and not [`TOLERANCE`], and the reason is
+    /// a finding rather than a slackening.** The production path is the
+    /// worse-conditioned of the two orders: a fragment accumulator carries the
+    /// whole reduction as one running sum where the reference splits it 32 ways
+    /// across lanes. Measured across reduction lengths against an f64
+    /// accumulation of the same products, the reference holds 9.0e-8, 9.5e-8,
+    /// 9.5e-8, 9.6e-8 and 1.4e-7 at reductions of 32, 128, 512, 2048 and 4096,
+    /// where this path reads 1.6e-7, 4.8e-7, 7.4e-7, 1.4e-6 and 4.1e-6.
+    ///
+    /// **That the drift is f32 noise at a reduction of 32 is what says the
+    /// arithmetic is right and only the chain is long.** Four accumulate steps
+    /// land within an ulp or two of exact; the growth after that is the chain
+    /// and nothing else, and a kernel that had the transpose or the staging
+    /// wrong would be decades out at every length rather than exact at the
+    /// short one.
+    ///
+    /// The assertion with teeth is therefore the *upper* bound on how much worse
+    /// it is, which is what a tolerance alone would hide: a drift that grew past
+    /// [`MMA_TOLERANCE`] would be a mistake and not a chain.
+    #[test]
+    fn a_block_answers_the_reference_tile_where_neither_extent_divides_it() {
+        let Some(device) = device() else { return };
+        // Two whole blocks of rows and thirteen left over, against four whole
+        // spans of columns and one left over.
+        const ROWS: usize = 77;
+        assert_ne!(ROWS % MMA_ROWS_A_BLOCK, 0, "rows that filled their blocks");
+        assert_ne!(
+            OUT_DIM % MMA_COLS_A_BLOCK,
+            0,
+            "columns that filled their blocks"
+        );
+
+        let case = Case::noisy(IN_DIM, OUT_DIM, ROWS);
+        let through = |matmul: &PackedMatmul| {
+            case.upload(&device, matmul)
+                .multiply(&case.x)
+                .expect("the dispatch completes")
+        };
+        let was = through(&matmul(&device));
+        let is = through(&PackedMatmul::under(&device, Numerics::Production).expect("compiles"));
+
+        let deviation = deviation(&is, &was);
+        let exact = case.exactly();
+        let (mine, theirs) = (drift(&is, &exact), drift(&was, &exact));
+        eprintln!(
+            "a ragged block: deviation {deviation:e}, drift from exact {mine:e} against the \
+             reference's {theirs:e}"
+        );
+        assert!(
+            deviation > 0.0,
+            "an exact match would mean the two are not summing independently"
+        );
+        assert!(deviation <= MMA_TOLERANCE, "deviation {deviation:e}");
+        assert!(
+            f64::from(MMA_TOLERANCE) >= mine,
+            "drift {mine:e} against the reference's {theirs:e}"
+        );
+
+        // The short reduction, where four accumulate steps put this path back
+        // inside the reference's own bound — which is what says the growth above
+        // is the chain rather than the arithmetic.
+        let short = Case::noisy(MMA_CODES_A_STEP, OUT_DIM, ROWS);
+        let brief = |matmul: &PackedMatmul| {
+            short
+                .upload(&device, matmul)
+                .multiply(&short.x)
+                .expect("the dispatch completes")
+        };
+        let close = drift(
+            &brief(&PackedMatmul::under(&device, Numerics::Production).expect("compiles")),
+            &short.exactly(),
+        );
+        eprintln!("a reduction of {MMA_CODES_A_STEP}: drift from exact {close:e}");
+        assert!(close <= f64::from(TOLERANCE), "drift {close:e}");
+    }
+
+    /// **A block whose rows name two experts answers each row its own expert's
+    /// weight**, which is the pass loop and is the one thing in this kernel with
+    /// no counterpart in the reference tile.
+    ///
+    /// A staged weight block is one expert's, so a block straddling a run cannot
+    /// serve both from one staging; it runs the whole walk once per expert its
+    /// rows name and zeroes the rows the pass is not for. **What would go wrong
+    /// without it is not a crash**: every row of the block would be multiplied
+    /// against whichever expert the pass happened to stage, which is a plausible
+    /// answer of the right magnitude — so the control below checks that the two
+    /// experts answer differently before the comparison checks that each row got
+    /// its own.
+    #[test]
+    fn a_block_whose_rows_name_two_experts_answers_each_row_the_weight_it_named() {
+        let Some(device) = device() else { return };
+        const EXPERTS: usize = 2;
+        const SOURCES: usize = 50;
+        assert_ne!(
+            SOURCES % MMA_ROWS_A_BLOCK,
+            0,
+            "a boundary falling on a block's own edge would never straddle one"
+        );
+
+        let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, SOURCES);
+        let chosen: Vec<u32> = (0..EXPERTS * SOURCES)
+            .map(|row| (row / SOURCES) as u32)
+            .collect();
+        let through = |matmul: &PackedMatmul| {
+            let bank = PackedBank::upload(
+                &device,
+                matmul,
+                EXPERTS,
+                IN_DIM,
+                OUT_DIM,
+                &case.packed(),
+                &case.scales,
+            )
+            .expect("the bank's shapes pair");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let mut input = device.buffer(&case.x).expect("the input uploads");
+            let got = bank
+                .encode_repeating(&mut batch, &chosen, &mut input)
+                .expect("the dispatch encodes");
+            batch.wait().expect("the dispatch completes");
+            got.take()
+        };
+        let was = through(&matmul(&device));
+        let is = through(&PackedMatmul::under(&device, Numerics::Production).expect("compiles"));
+
+        // The control: the same input row through the two experts is two
+        // different answers, so a block that staged one weight for all of its
+        // rows would be caught by the comparison below rather than agreeing.
+        fn row(rows: &[f32], at: usize) -> &[f32] {
+            &rows[at * OUT_DIM..][..OUT_DIM]
+        }
+        assert!(
+            deviation(row(&was, 0), row(&was, SOURCES)) > TOLERANCE,
+            "the two experts answer the same, so nothing here separates them"
+        );
+
+        for (at, expert) in chosen.iter().enumerate() {
+            let deviation = deviation(row(&is, at), row(&was, at));
+            assert!(
+                deviation <= MMA_TOLERANCE,
+                "row {at} of expert {expert}: deviation {deviation:e}"
+            );
+        }
+    }
+
+    /// **The grouped production entry against the grouped reference one**, over
+    /// a routing whose runs are the routing's rather than a tile's.
+    ///
+    /// The rows arrive through one permutation and leave through another, and a
+    /// block writes its answer a row at a time for exactly that reason — a
+    /// `simdgroup_store` straight to device memory takes one stride for a whole
+    /// fragment, and the rows of a scattered call are not at one. So this is the
+    /// case that would catch a block writing its answer where the *grouping* put
+    /// the row rather than where the router did.
+    #[test]
+    fn a_grouped_block_answers_the_grouped_tile_through_both_permutations() {
+        let Some(device) = device() else { return };
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const EXPERTS: usize = 3;
+        const TOKENS: usize = 64;
+        const SLOTS: usize = 2;
+        const ROWS: usize = TOKENS * SLOTS;
+        // A call under the line stays on the reference tile and would prove
+        // nothing here, so the shape is held above it where it is written.
+        const _: () = assert!(ROWS >= EXPERTS * MMA_RUNS_A_BLOCK);
+
+        let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, ROWS);
+        let chosen: Vec<u32> = (0..TOKENS)
+            .flat_map(|token| (0..SLOTS).map(move |slot| ((token + slot * 2) % EXPERTS) as u32))
+            .collect();
+        assert!(
+            !tiles(&chosen, ROWS_A_TILE),
+            "a routing a tile could already reach would prove nothing"
+        );
+
+        let through = |matmul: &PackedMatmul, through: Through| {
+            let bank = PackedBank::upload(
+                &device,
+                matmul,
+                EXPERTS,
+                IN_DIM,
+                OUT_DIM,
+                &case.packed(),
+                &case.scales,
+            )
+            .expect("the bank's shapes pair");
+            let mut selection = device.buffer(&chosen).expect("the selection uploads");
+            let mut x = device
+                .buffer(&case.x[..TOKENS * IN_DIM])
+                .expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let mut sorted = grouping
+                .encode(&mut batch, &mut selection, EXPERTS)
+                .expect("the grouping encodes");
+            let pending = bank
+                .encode_grouped(&mut batch, &mut sorted, &mut x, SLOTS, through)
+                .expect("the dispatch encodes");
+            batch.wait().expect("the dispatch completes");
+            pending.take()
+        };
+
+        let production = PackedMatmul::under(&device, Numerics::Production).expect("compiles");
+        for end in [Through::Gathered, Through::Scattered] {
+            let was = through(&matmul(&device), end);
+            let is = through(&production, end);
+            let deviation = deviation(&is, &was);
+            eprintln!("a grouped block, {end:?}: deviation {deviation:e}");
+            assert!(deviation > 0.0, "{end:?}: an exact match is not two orders");
+            assert!(
+                deviation <= MMA_TOLERANCE,
+                "{end:?}: deviation {deviation:e}"
+            );
+        }
+    }
+
+    /// **A block is the simdgroups this device gives a threadgroup**, and the
+    /// layout above is written from a width this side assumed.
+    ///
+    /// Every fragment origin in the kernel is `simdgroup_index_in_threadgroup`
+    /// divided and taken modulo against [`MMA_SIMDS_ACROSS`], so a device whose
+    /// simdgroup were wider would put fewer simdgroups in the threadgroup than
+    /// the block was cut into and leave whole fragments computed by nobody —
+    /// a wrong answer rather than a failure. Read off the compiled pipeline,
+    /// which is the only place this side can see it.
+    #[test]
+    fn a_block_is_the_simdgroups_this_device_gives_a_threadgroup() {
+        let Some(device) = device() else { return };
+        let matmul = PackedMatmul::under(&device, Numerics::Production).expect("compiles");
+        let mma = matmul
+            .mma
+            .as_ref()
+            .expect("the production entries compiled");
+        for kernel in [&mma.tiled, &mma.grouped] {
+            assert_eq!(kernel.simd_width(), NARROWEST_SIMD);
+            assert!(kernel.max_threads_per_group() >= THREADS_PER_GROUP);
+        }
+    }
+
+    /// **A decode step's shapes never reach the production entries**, which is
+    /// the same predicate `tiles` states for the reference tile and is checked
+    /// the same way: on the shapes rather than on a run.
+    #[test]
+    fn nothing_a_decode_step_dispatches_reaches_a_block() {
+        let Some(device) = device() else { return };
+        let matmul = PackedMatmul::under(&device, Numerics::Production).expect("compiles");
+        let grouped = Layout::Grouped {
+            order: Arg::Inline(&[]),
+            through: Through::Gathered,
+        };
+        // A single-row projection, a two-row shared bank naming two experts, and
+        // a six-row routed bank naming six of 256.
+        assert!(matmul.blocks(&Layout::Each, 1, 1).is_none());
+        assert!(matmul.blocks(&Layout::Each, 2, 2).is_none());
+        assert!(matmul.blocks(&Layout::Each, 6, 256).is_none());
+        assert!(matmul.blocks(&grouped, 6, 256).is_none());
+        // And the widest block the eight heads can propose, which is nine
+        // tokens of six rows apiece.
+        assert!(matmul.blocks(&grouped, 9 * 6, 256).is_none());
+
+        // The line a routed bank crosses, from either side. Six rows a token
+        // against 256 experts puts it at 1366 tokens.
+        let tokens = |tokens: usize| matmul.blocks(&grouped, tokens * 6, 256).is_some();
+        assert!(!tokens(1365) && tokens(1366), "the line is at 1366 tokens");
+        assert!(tokens(2048) && tokens(16384));
     }
 
     /// The kernel against the CPU it replaces, over the reduction length and the

@@ -50,13 +50,12 @@
 /// Which arithmetic the two dominant kernels accumulate with.
 ///
 /// **The default is [`Numerics::Reference`] and that is not a placeholder.**
-/// Nothing changes for a caller who does not ask: whatever entries stand behind
-/// this flag are to be compiled under [`Numerics::Production`] and nowhere else,
-/// so a reference run has them neither in its pipeline cache nor in its
-/// dispatches. **As this lands, nothing stands behind it at all** — the two
-/// answer the same bits because they are the same three kernels — and the
-/// commit that puts a kernel there is the one that makes the sentence above
-/// bite.
+/// Nothing changes for a caller who does not ask: the entries behind this flag
+/// are compiled under [`Numerics::Production`] and nowhere else, so a reference
+/// run has them neither in its pipeline cache nor in its dispatches — and the
+/// source string it hands the compiler is byte for byte the one it handed before
+/// the flag existed. `the_reference_source_does_not_carry_the_production_entries`
+/// is where that is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Numerics {
     /// Every product summed in an order this side picked and the CPU path
