@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **585 of the 623 tests, no
+`just test` is the one to run while iterating: **585 of the 627 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,7 +32,7 @@ a crate's tests in one process: opening a Metal device costs a second, so the 16
 kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 623 against a
+`just test-full` is what has to pass at the ends of a series: **all 627 against a
 real checkpoint, ten minutes.** The 52 gated tests — the 37 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the thirty-eight tests whose result *is* a number — a duration
+`just test-timing` is the forty-two tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -2045,6 +2045,67 @@ digit. `the_bounded_loop_is_the_unbounded_one_bit_for_bit`,
 `a_query_row_walks_the_keys_its_window_and_its_position_leave_it` and
 `a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` pass
 unrelaxed, and so do all 585 tests of the run against a real checkpoint.
+
+### What the diagnosis did not move, which is everything shipped
+
+**No source outside a `#[cfg(test)]` module changed, and that is checkable rather
+than asserted.** Every hunk in `attention.rs` and `matmul.rs` falls inside `mod
+tests`; `testing.rs` is `#[cfg(test)]` at its declaration; the two additions to
+`device.rs` and `kernel.rs` are read-only accessors on `MTLDevice` and
+`MTLComputePipelineState` that nothing in a forward pass calls. So the kernels a
+prefill and a decode step dispatch are byte for byte the ones `58d3ae7` left, and
+every mutant these tables price is a second pipeline compiled beside them and
+thrown away.
+
+**The arbiter is the in-model row and it is where it was.** One sampled
+16384-token prefill this sitting, against the two the file already records:
+
+    kernel                     here      A3      A2
+    global attention         43.78s  44.06s  43.74s
+    packed_matmul_grouped    38.15s  38.15s  38.15s
+    packed_matmul_rows       34.24s  34.16s  34.16s
+    windowed attention       13.99s  14.14s  13.99s
+    every pass              133.02s 133.47s 132.97s
+
+A 128.39 s wall in 1117 dispatches over 43 submissions, and the reads either side
+are the same reads — 30792198.52 MB issued by the 7 global layers at 703 GB/s.
+
+**The decode row, one sitting and unpaired, against what this file records:**
+19.63, 21.19, 21.84, 24.74, 25.93 and 28.53 ms at 97 to 8192 against 19.97,
+21.36, 22.08, 24.91, 26.06 and 29.02 — every figure inside the 1.7% this host
+drifts, and all six on the fast side of it, which is what a sitting rather than a
+change looks like. **585 gated tests pass and 42 are skipped where 38 were**: the
+four are this milestone's own measurements, which need a clock and no checkpoint.
+
+**The reference was not re-measured end to end.** `sdpa-probe` is one dispatch at
+our own shapes and makes no cross-engine claim; mlx-vlm's 34.31 s at 16384 and
+the ×3.89 beside it stand as A2 took them.
+
+### Which of the questions this could not settle
+
+**Four candidates were on the list and two of them are still open.**
+
+**Threadgroup-memory bank conflicts are not measured.** The occupancy sweep rules
+them out *of itself* — the ballast is declared last, so every address the walk
+uses is where it was and only the total size moves — but that is an argument
+about the instrument rather than about the kernel. What `scores` and `staged`
+cost in conflicts on their own is unasked here.
+
+**Serialisation on a dependency chain is measured only obliquely.** The barrier
+arm is 4% and the two-reduction arm is 23 to 29%, and the second of those removes
+a dependency and its instructions together; nothing here separates the two.
+
+**Launch and drain is ruled out by arithmetic rather than by a new
+measurement.** An empty dispatch of this kernel's grid is 1.4 to 1.9 µs by the
+table under "What is left was diagnosed rather than attacked", against a
+prefill-shaped dispatch of a second or more — so it is under a millionth of these
+rows and no arm was spent on it.
+
+**And the shape of the occupancy curve is a finding without a mechanism.** More
+threadgroups a core is better down to a count and worse below it, on both
+kernels, and whether the left arm of that U is a shared cache or a scheduler
+limit is not settled here — only that the shipped kernels are both on the same
+side of it.
 
 ## The tail of a step
 
