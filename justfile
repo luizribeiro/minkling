@@ -198,6 +198,14 @@ inspect config:
 smoke model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/smoke.py {{ model }}
 
+# What the reference's attention kernel costs at the shapes this engine's own
+# prefill gives its own — one dispatch, three loop bounds, both dtypes.
+#
+# Not a cross-engine claim and not paired: `bench-engines` is where those are
+# made. This is what lets the reference's Metal source be read beside a number.
+sdpa-probe *args:
+    reference/.venv/bin/python reference/scripts/sdpa_probe.py {{ args }}
+
 # Prefill wall time, throughput and peak memory across a prompt-length sweep
 prefill-bench model="models/Inkling-Small-mxfp4" *args:
     reference/.venv/bin/python reference/scripts/prefill_bench.py {{ model }} {{ args }}

@@ -1856,6 +1856,123 @@ the other side of a staging this file has now shown buys nothing at prefill shap
 and the matmul turn was reached here with dead memory rather than with anything a
 kernel would want. **Nothing was changed.**
 
+### What the reference's attention kernel does that ours does not
+
+**mlx-vlm's attention is readable Metal in the installed package and this is the
+first milestone to read it.** `steel/attn/kernels/steel_attention.h` and the
+`mma.h` beside it are what `mx.fast.scaled_dot_product_attention` compiles, and
+`mlx_vlm.models.inkling.language` reaches them through a materialised
+`[B, H, LQ, S]` additive mask that `banded_additive_mask` builds in a
+`mx.fast.metal_kernel` of its own. **This is for understanding and there is a
+hard constraint on acting on it — see the section after this one.**
+
+**Four structural differences, in the order they matter.**
+
+**A threadgroup is a block of `BQ` query rows and the multiply is a hardware
+matrix instruction.** Ours gives a threadgroup one query row and computes each
+score as a lane-strided dot with a `simd_sum` behind it — scalar multiply-adds,
+one channel at a time. Theirs holds `Q`, `K` and `V` blocks in threadgroup memory
+and drives them through `simdgroup_matrix` 8×8 fragments: `tile_matmad` for the
+scores and `MMAFrag_acc_t::mma` for the weighted values, so one instruction
+carries 512 multiply-adds where ours carries one. Everything below is small
+beside this.
+
+**The softmax lives in registers and takes no barrier.** Ours writes a tile's 32
+scores into threadgroup memory, barriers, has every one of 256 threads reduce all
+32 for the maximum, barriers, exponentiates, barriers, has every thread reduce
+all 32 again for the sum, and barriers. Theirs keeps `max_score` and `sum_score`
+as a per-thread register array and reduces a fragment's row with two
+`simd_shuffle_xor` steps — lanes 1 and 8 — and no threadgroup traffic at all.
+That is the term the table above measures at 23 to 29% of our kernel.
+
+**The exponential is `fast::exp2` with the base folded into the scale.** They
+multiply `scale` by `M_LOG2E_F` once, before the loop, so every rescale is a
+single hardware instruction; ours is `precise::exp`, deliberately, because every
+weight this kernel hands a value comes out of one. **The table above says that
+choice costs us nothing** — `fast::exp2` in our kernel reads 101% — so this is a
+difference that is not a deficit.
+
+**The mask is a tensor rather than a derivation, and the trade runs our way on
+memory and against us on time.** They read `mask[row, col]` and add it; we
+compute `banded_entry` on lane 0 of a simdgroup while the other 31 wait. Ours
+allocates nothing where theirs allocates 32 heads by the span squared — 34 GB of
+float32 at 16384 tokens, which is most of why the reference's peak is 200.8 GiB
+there against our 4.35. **And ours costs 28% of a windowed layer and 9 to 23% of
+a global one**, by the table above.
+
+**And with a mask given, their loop walks the whole rectangle.** `do_causal` and
+`has_mask` are separate function constants and the causal bound is only taken
+under the first, so a call carrying an additive mask runs `kb_lim = NK` — every
+key for every query, on all 42 layers, with the band's `-1e30` doing the masking.
+Ours bounds `[reach, last)` on both ends. **So the reference does about twice the
+attention arithmetic we do on a global layer and about thirty times it on a
+windowed one, and is still decades faster**, which is what the number below says
+and is the whole shape of this comparison.
+
+**One dispatch at our own shapes**, by `just sdpa-probe` — `[1, 32, n, 128]` over
+8 KV heads, float32 because that is what our kernel is in, against our own
+`what_a_prefills_attention_costs_as_the_prompt_grows` global column:
+
+    tokens        ours   mlx, causal   against   mlx, an additive mask   against
+      2048     92.62ms        2.49ms       ×37                  4.95ms       ×19
+      4096    334.95ms        8.47ms       ×40                 18.79ms       ×18
+      8192       1.25s       31.43ms       ×40                 75.35ms       ×17
+     16384       6.25s      122.36ms       ×51                       —
+
+**The middle column is the same work and the right-hand one is twice it.** A
+causal call walks the triangle our global layer walks — rounded up to a `BK`
+block the same way ours rounds `reach` down to a tile, so "half" is the shape
+rather than the exact count; a masked call walks the rectangle, which is what
+mlx-vlm's own layer does. The 16384-token mask is 34 GB
+and was not built. In bfloat16 the reference is faster again — 95.84 ms causal at
+16384 — and that column is not the comparison to make, since nothing here runs
+bfloat16 attention.
+
+**In arithmetic rather than in ratios: 17.97 TFLOP/s against our 0.352.** One
+global layer at 16384 tokens is 2.2 TFLOP either way. A2 measured ours doing it
+at 352 GFLOP/s and called that decades under the machine; this says what the
+machine actually gives a kernel of the same shape written the other way, on the
+same part, in the same dtype, in the same afternoon. **51× is not a tuning gap.**
+
+**What it would be worth, and it is arithmetic.** The two attention rows are
+58.2 s of a 133.47 s prefill at 16384. Seven global layers at the reference's
+causal figure are 0.86 s; what the 35 windowed ones would cost in that structure
+is not measured here, and even charging them their present 14.14 s the prefill
+would be about 90 s. Charging them nothing it would be about 76. **Neither
+reaches mlx-vlm's 34.31 s**, because the two matmul rows are 72.3 s and this
+changes none of them.
+
+### Whether the fast structure can keep the bits
+
+**It cannot, and the milestone stops here.** Every kernel change in this repo has
+preserved bit-identical output and the recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` has never moved. The structure
+that carries the 51× is `simdgroup_matrix`, and a hardware 8×8×8 matrix
+multiply-accumulate sums its `k` dimension in an order the instruction defines and
+this side does not choose. Our score is `simd_sum` over lanes walking the channels
+in a fixed stride; theirs is whatever the fragment does. **Those are different
+floats in the last bits, on every score of every key.** `fast::exp2` against
+`precise::exp` is a second one, on every weight.
+
+**The terms that keep the bits are measured and they do not compound to
+anything like it:**
+
+- **occupancy**, 23 to 27% of the attention rows and 12 to 16% of the matmul
+  rows, and bit-identical by construction — declaring different threadgroup
+  memory changes no arithmetic at all;
+- **the tile's two reductions**, 23 to 29%, and bit-identical if one thread
+  reduces in the same order and broadcasts, which costs a barrier;
+- **the band**, 9 to 28%, whose values are the same values however they arrive —
+  materialised or derived — at the memory cost the paragraph above prices;
+- **the dequantisation table**, 30% of both matmul rows, whose replacement would
+  have to produce the same sixteen floats and could.
+
+Taken together and generously those are about a factor of two on the attention
+rows and a quarter on the matmul rows. **The 51× is on the other side of the
+line**, and whether this project's core claim is worth crossing it for is a
+decision that belongs to whoever owns the claim. **Nothing here crossed it, and
+nothing here should be read as a recommendation to.**
+
 ### What this leaves for whoever caps the spans
 
 **A prefill writes every key of a layer before that layer's one attention
