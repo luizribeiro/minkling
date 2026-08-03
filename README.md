@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **585 of the 627 tests, no
+`just test` is the one to run while iterating: **590 of the 632 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,7 +32,7 @@ a crate's tests in one process: opening a Metal device costs a second, so the 16
 kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 627 against a
+`just test-full` is what has to pass at the ends of a series: **all 632 against a
 real checkpoint, ten minutes.** The 52 gated tests — the 37 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -64,9 +64,19 @@ three; the pre-commit hooks already skip clippy on those by config.
 ### Measuring two refs against each other
 
     just bench HEAD~1 HEAD decode
+    just bench HEAD~1 .    decode --context 8192
     just bench HEAD~1 .    prefill --tokens 769
     just bench v1 v2       sweep --depth 4
     just bench-engines                        # this engine against mlx-vlm
+
+**A decode step is the one measurement here with a context to be taken at**, and
+until the occupancy turn wanted one it was always taken at the structured
+prompt's own 34 keys — which is the one length nobody has, on the one row of this
+file that grows with the context. `--context` tiles the prompt to the length
+asked for first. The other three refuse the flag rather than drop it: a prefill's
+context is its prompt and `--tokens` already says how long that is, and a sweep
+and a cross-engine table fix their own prompts because acceptance is the
+workload's.
 
 Every timed claim in this file is paired and alternating — build A, build B, run
 them in one sitting with the order flipped each pair, and report whether the
@@ -1304,6 +1314,13 @@ Measured one length at a run by `bench prefill`, warm, against
      8192      54.25 s    151.0     13.05 s    627.9    ×4.16    155.7 GiB
     16384     133.63 s    122.6     34.31 s    477.6    ×3.89    200.8 GiB
 
+**Our column is a milestone behind and the one that supersedes it is under
+"What the two turns are worth"**: 11.32, 22.56, 46.77 and 109.51 s at the four
+lengths, which is 180.9 to 149.6 tokens a second and ×4.26 to ×3.19. It is kept
+here because everything the rest of this section diagnoses was diagnosed against
+it, and a table whose rows moved under the diagnosis that used them would be two
+sittings spliced.
+
 The 769 row is the cross-engine table's, kept for continuity; the four below it
 are new. Ours is time to first token and the reference's is its transformer
 stack alone, which is the same measurement to within the millisecond our own
@@ -1339,6 +1356,13 @@ the four lengths beside each other:
     moe_combine              17.15ms   34.67ms   69.50ms  139.30ms         ×2.00
     every pass                11.50 s   24.46 s   52.91 s  132.97 s         ×2.51
     the command buffers       10.67 s   22.64 s   49.30 s  125.73 s         ×2.55
+
+**The 16384 column is the one the occupancy turn moved**, and what it reads now
+is under "What the two turns are worth": 31.99 s of global attention, 33.19 and
+26.50 of the two matmul rows, 11.44 of windowed attention, and 106.63 s of
+passes. The shape of the table is what this section is about and the shape did
+not change — exactly one term is still superlinear, and it is still the global
+row.
 
 The last two rows are the two clocks and the gap between them is the pass span's
 own over-reporting, which is 7.24 s at 16384 and is what a boundary a dispatch
@@ -2122,6 +2146,252 @@ threadgroups a core is better down to a count and worse below it, on both
 kernels, and whether the left arm of that U is a shared cache or a scheduler
 limit is not settled here — only that the shipped kernels are both on the same
 side of it.
+
+### Taking the occupancy turn on the kernel that walks the keys
+
+**The turn A4 priced and left is taken, and what it cost to get is the staging.**
+A threadgroup of `fused_attention` is one query row of one head. Its four live
+arrays are 3 KiB and the tile of values it stages before weighting them is 16, so
+it declared 19 KiB; this part gives a core 80 KiB, so it held four threadgroups.
+The sweep is now the declaration rather than a ballast beside it —
+`how_many_threadgroups_of_a_prefills_attention_a_core_holds` compiles the walk
+staging a tile and the same walk staging none, at every size either can be given:
+
+    the values      a threadgroup   2048 global  2048 window   8192 global  8192 window
+    where they lie       4.00 KiB      114.72ms      52.82ms         1.62s     236.66ms
+    where they lie       7.00 KiB      114.80ms      52.86ms         1.61s     236.53ms
+    where they lie       9.00 KiB      114.94ms      53.30ms         1.61s     239.89ms
+    where they lie      11.00 KiB      114.65ms      52.72ms         1.61s     235.53ms
+    where they lie      11.25 KiB      114.68ms      52.70ms         1.57s     234.68ms
+    where they lie      11.50 KiB       71.65ms      34.66ms      924.40ms     152.83ms
+    where they lie      12.50 KiB       71.60ms      34.60ms      923.95ms     152.84ms
+    where they lie      13.00 KiB       71.64ms      34.66ms      923.92ms     152.85ms
+    where they lie      13.25 KiB       71.50ms      34.63ms      923.36ms     152.80ms
+    where they lie      13.50 KiB       77.14ms      36.95ms         1.03s     163.93ms
+    where they lie      15.00 KiB       77.10ms      36.93ms         1.03s     163.88ms
+    where they lie      19.00 KiB       92.51ms      43.88ms         1.26s     194.58ms
+    staged              19.00 KiB       92.65ms      44.45ms         1.25s     196.71ms
+    where they lie      23.00 KiB      120.88ms      57.79ms         1.65s     256.91ms
+    staged              23.00 KiB      120.25ms      57.75ms         1.63s     255.99ms
+    where they lie      31.00 KiB      177.69ms      84.76ms         2.45s     376.78ms
+    staged              31.00 KiB      176.42ms      84.33ms         2.41s     373.81ms
+
+**19 KiB against 19 KiB is the row the whole change rests on.** The two arms are
+0.15% apart on the global column at 2048 tokens and 1.3% apart at the widest of
+the four, on a walk whose values come from threadgroup memory in one and from
+device memory in the other — so at prefill shape the staging buys nothing worth
+16 KiB, and the whole of what it did to this row was declare them. The staged
+rows stop at 19 because a threadgroup that stages copies a whole tile whatever it
+declared: an arm below that is a walk writing past its own array rather than a
+smaller staging, which is what makes those three rows three and not twelve.
+
+**The turn is six threadgroups a core, and it is a plateau rather than an edge.**
+A core's 80 KiB divides into six of any declaration in (11.43, 13.33] KiB and
+seven of anything under, which is arithmetic; what the table measures is that the
+row turns exactly there. 11.25 KiB is 114.68 ms where 11.50 is 71.65, and 13.25
+is 71.50 where 13.50 is 77.14. The shipped figure is 12.5 KiB, about a kibibyte
+inside each edge, so a compiler that rounds a declaration differently lands on
+the same six. Against the 19 KiB the kernel declared, that is **22.6% at 2048
+tokens and 26.1% at 8192** on a global layer.
+
+**So the memory nothing reads is load-bearing, and it has to be memory nothing
+reads.** A first attempt kept part of the staging — as many keys of a tile as the
+turn left room for, which is real work rather than dead weight — and it does not
+reach the turn: a walk that brings *any* of a tile in early reads 116 ms at this
+declaration where one that brings none reads 71, and two staged keys cost as much
+as nineteen. At the five-threadgroup declaration above it the two agree to 2%. So
+what the left arm of A4's U punishes is the staging and not the memory, and why
+is no more settled here than it was there. It is the mechanism A4 said to name
+rather than tune around, met head on.
+
+**Bit-safety comes before the number and is proven after it.** A value is the
+same float whichever memory it was read out of, and each thread meets its tile's
+values in the order it always met them; the tile itself cannot move, because
+`TILED_VALUES` bounds it in both entries out of one Rust constant.
+`a_value_weighted_where_it_lies_is_a_staged_one_bit_for_bit` is that on the bits
+rather than on a tolerance — sixteen cases and 55.7 million elements, synthetic
+and captured, driven unsplit and through an eight-way fold, `-0.0` and `0.0` two
+different answers.
+
+**And the decode path keeps the kernel it had, which is a predicate and not a
+hope.** The turn was measured on both regimes before the line was drawn: with it
+taken everywhere, a decode step's device clock falls 2.1% at 385 keys, 1.4% at
+2048 and 1.3% at 4096 — and **rises 1.9% at 8192**, every pair the same way and
+no ranges overlapping at any of the four. A prefill's gain is not worth a decode
+step's long context, so the kernel is compiled twice out of one string and
+`splits_for` picks: a call the span was not cut for reads its values where they
+lie, a cut one stages its tile whole. The two answer the same bits, so what the
+predicate decides is a rate and never an answer.
+
+### The same turn on the two matmul rows
+
+**A tile of the packed matmul is one simdgroup, shares nothing with the other
+seven of its threadgroup, and declared no threadgroup memory at all** — so it ran
+at whatever residency this part gives a kernel that asks for nothing, and A4
+found that to be the wrong side of the same turn. There is nothing here a
+declaration could hold: the working set is registers, no load is cooperative, and
+the memory is dead by construction rather than by choice.
+`how_many_threadgroups_of_a_prefills_packed_matmul_a_core_holds` now runs past
+where the row stops improving:
+
+    a threadgroup     q_proj, tiled   a routed bank, grouped
+     0 KiB                   5.90ms                  19.53ms
+     1 KiB                   6.01ms                  20.37ms
+     4 KiB                   6.01ms                  20.37ms
+     8 KiB                   5.52ms                  18.27ms
+    12 KiB                   5.27ms                  17.13ms
+    16 KiB                   5.23ms                  16.84ms
+    20 KiB                   5.20ms                  16.63ms
+    24 KiB                   5.18ms                  16.49ms
+    26 KiB                   5.18ms                  16.50ms
+    28 KiB                   6.00ms                  18.63ms
+    32 KiB                   6.00ms                  18.65ms
+
+**Monotone to three threadgroups a core and 13 to 16% worse at two**, which is
+where A4's sweep stopped and could not have seen the far edge. Three of them is every
+declaration in (20, 26.67] KiB; the shipped figure is 24. That is **12.2% and
+15.6%** against declaring nothing, bought with memory nobody reads.
+
+**`volatile` is load-bearing here and was measured rather than assumed.** A
+thread stores a zero to its own slot and loads it back on the next line, which is
+exactly the shape a forwarding pass removes: without `volatile` the pipeline
+reports *no threadgroup memory at all* whatever the source declares, and the
+change is silently undone. `fused_attention` declares memory the same way and
+needs no `volatile` for it — there the fill is a strided loop over one array and
+the read is a different loop over another, with a runtime bound between them.
+Neither kernel argues the point: each has a case that reads the bytes its own
+pipeline reports, so a compiler that started or stopped folding either fails a
+test rather than quietly giving the memory back.
+
+**It is bit-safe because the zero is the zero.** A tile's running sums start from
+the entry that was filled with `0.0f` where they started from the literal, and
+nothing else about the walk moved — same operands, same order.
+`a_tiled_dispatch_answers_row_for_row_what_the_untiled_one_answers` is unchanged
+and unrelaxed, and every arm of the sweep asserts the shipped answer as it goes.
+
+**And it reaches no dispatch a decode step makes.** Only the two tiled entries
+declare it, and `tiles` is false for every shape a decode step has — a single-row
+projection, a two-row shared bank naming two experts, a six-row routed bank
+naming six.
+
+### What the two turns are worth, measured rather than projected
+
+**A4's arithmetic was 24 s of a 133 s prefill and the two changes are 26.4 s of
+it**, which is the first thing to say because the projection was labelled as one.
+The arbiter is the in-model per-kernel row at 16384 tokens, one sampled prefill a
+column:
+
+    kernel                       A4   the keys   the matmul
+    global attention         43.78s     31.83s       31.99s
+    packed_matmul_grouped    38.15s     38.10s       33.19s
+    packed_matmul_rows       34.24s     34.39s       26.50s
+    windowed attention       13.99s     11.29s       11.44s
+    every pass              133.02s    118.46s      106.63s
+
+The two attention rows are 57.77 s and are 43.43; the two matmul rows are 72.39 s
+and are 59.69. **Neither change moved the other's rows** — the matmul pair is
+within 0.4% across the first column and the attention pair within 1.3% across the
+second, on a host that drifts 1.7% — which is what says the two are independent
+and that neither figure is carrying the other.
+
+**Paired and alternating, with the order flipped each pair**, each change against
+the commit before it:
+
+    prefill        2048 before   2048 after   8192 before   8192 after
+    the keys          12715ms      12239ms       54230ms      50813ms
+    the matmul        12291ms      11245ms       50894ms      45915ms
+
+Every pair moved the same way at every length and no two ranges overlapped; the
+device's own clock moved with each — 10671 ms to 10277 and 10275 to 9126 at 2048,
+49153 to 45697 and 45685 to 40756 at 8192.
+
+**The wall a user waits, one sitting a length, against the four this file
+records:**
+
+    tokens        before        after     tok/s     mlx-vlm       gap
+     2048        12.66 s      11.32 s     180.9      2.66 s     ×4.26
+     4096        25.36 s      22.56 s     181.6      5.61 s     ×4.02
+     8192        54.25 s      46.77 s     175.2     13.05 s     ×3.58
+    16384       133.63 s     109.51 s     149.6     34.31 s     ×3.19
+
+**The reference was not re-measured and its column is A2's**, for the reason A4
+gave: nothing here changes what mlx-vlm does, and a paired cross-engine sitting
+is not spent to re-prove an arm that did not move. The gap is ×4.76 to ×4.26 at
+2048 and ×3.89 to ×3.19 at 16384 — **the first sitting in this file where the
+long end is under three and a half**, and the curvature that arrives at the top
+is smaller than it was: 8192 to 16384 is ×2.34 where it was ×2.46.
+
+### What did not move, which is the whole decode path
+
+**Every context, paired against the commit this milestone opened at**, on the
+device's own clock, which is the arbiter for whether a change is the work:
+
+    context   before    after                       claim
+       97     18.469   18.407   ranges across, 1 of 3   no claim
+      385     20.065   20.104   ranges across, 3 of 5   no claim
+      769     20.772   20.689   ranges across, 2 of 3   no claim
+     2048     23.445   23.477   ranges across, 2 of 3   no claim
+     4096     24.868   24.832   ranges across, 3 of 3   no claim
+     8192     27.443   27.474   ranges across, 1 of 2   no claim
+
+That is what a predicate holding the line looks like from the outside, and it is
+what the same table read *without* one that says the predicate was needed. **A
+paired decode step could not be taken at a context before this milestone** — the
+harness timed every one of them over the structured prompt's own 34 keys, which
+is the one length nobody has — so `bench decode` takes a `--context` now and the
+row above is what it is for. The unpaired table the timing tier prints reads
+20.71, 20.99, 21.62, 24.56, 25.74 and 28.70 ms a token against A4's 19.63 to
+28.53, one sitting each and inside this host's drift but for the 97-token row,
+which the paired column above calls no claim.
+
+**The eight-token figures, acceptance and the tokens a round did not move
+either**, over five alternating pairs on the packed heads: 19.47 ms at `k = 0`
+and 16.08 at `k = 2`, no claim at any depth on either clock, and 85% / 87-78% /
+85-65-55% / 82-65-53-47% digit for digit with 1.829, 2.560, 2.909 and 3.368
+tokens a round. **`k = 4` has stopped paying**, which the brief asked to be said
+plainly: it reads 0.997× and 1.000× across the two sittings where A4 read 1.011×
+and the milestone before it 1.002×, so it is a round that costs what it banks.
+
+**No token changed.** The recorded continuation is `[656, 13, 623, 180069, 86333,
+60500, 220, 23]`; all **590** gated cases pass and 42 are skipped, which includes
+the cases asserting that 48 tokens of a longer prompt are byte for byte what they
+are at `k` of 0, 1, 2 and 4 and that `--backend cpu` answers what it answered.
+`the_bounded_loop_is_the_unbounded_one_bit_for_bit`,
+`a_query_row_walks_the_keys_its_window_and_its_position_leave_it` and
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` pass
+unrelaxed. The peak resident set is where it was and the span table under "The
+keys a sequence keeps" is unchanged to the mebibyte: neither change allocates
+anything, and threadgroup memory is not resident memory.
+
+### What this milestone did not reach
+
+**The occupancy turn was the largest bit-safe item A4 found and it is the only
+one taken.** What is left is A4's list, with every share it quotes now a share of
+a smaller row — the attention pair is 43.43 s where A4 measured these terms
+against 57.77, and the matmul pair 59.69 s against 72.39. **So the shares below
+are A4's, of A4's rows, and each is worth about a fifth more of the prefill that
+is left than the number says.** Nothing was re-swept to say by exactly how much:
+that would be a second run of A4's instrument rather than a change, and the
+ranking it produced is what the list is for.
+
+- **The dequantisation table**, 30% of both matmul rows then and about 36% of
+  them now — 21.7 s of the 59.69 by that arithmetic, and the largest term nobody
+  has attacked. Two gathers into a 16-entry constant array per packed byte, whose
+  replacement would have to produce the same sixteen floats and could.
+- **The tile's two serial reductions**, 23 to 29% of the attention rows. Every
+  one of 256 threads walks a tile's 32 scores twice for two scalars. Bit-safety
+  is available — one thread reducing in the same order and broadcasting is the
+  same two floats — but it costs a barrier and trades 255 threads' issue slots
+  for one thread's serial chain at the *same* latency, so whether it pays at all
+  is a measurement rather than an inference and none was taken here.
+- **The band it derives**, 9 to 28%, and **the keys and values**, 15 to 19%.
+- **`exp` and `simd_sum` are still nothing** and still not worth a milestone.
+
+**And the two questions A4 could not settle are still open.** Threadgroup-memory
+bank conflicts are unmeasured. The U is still a finding without a mechanism — and
+this milestone added a row to it rather than explaining it: at six threadgroups a
+core a walk that stages any part of a tile is 63% slower than one that stages
+none, at the same declaration, and nothing here says why.
 
 ## The tail of a step
 

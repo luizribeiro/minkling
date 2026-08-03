@@ -4038,8 +4038,8 @@ mod tests {
         let Some(device) = device() else { return };
         /// Floats a threadgroup declares beside its four live arrays: finely
         /// across the turn, and past it at either end.
-        const DECLARED: [usize; 12] = [
-            256, 1024, 1536, 2048, 2176, 2432, 2560, 2688, 3072, 4096, 5120, 7168,
+        const DECLARED: [usize; 14] = [
+            256, 1024, 1536, 2048, 2112, 2176, 2432, 2560, 2624, 2688, 3072, 4096, 5120, 7168,
         ];
 
         let most = device.most_threadgroup_bytes();
