@@ -215,8 +215,8 @@ impl GreedyArgmax {
     ///
     /// The output is a buffer of ids and not of logits, and that is the whole
     /// point: what crosses back is four bytes a row where the row itself is
-    /// 800 KB, and the argmax that used to read those 800 KB on this side is a
-    /// dispatch in the command buffer that wrote them.
+    /// 800 KB, and the pass that ranks those 800 KB is a dispatch in the command
+    /// buffer that wrote them.
     pub fn encode(
         &self,
         batch: &mut Batch<'_>,
