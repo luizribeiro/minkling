@@ -42,7 +42,7 @@ use inkling_cli::args::Backend;
 use inkling_cli::{backend, config};
 use inkling_core::generate::{Proposer, Round};
 use inkling_core::mtp::{CheckpointHeads, MtpProposer};
-use inkling_core::workload::{DECODED, STRUCTURED_PROMPT, SWEPT, tiled};
+use inkling_core::workload::{BEST, DECODED, REALISTIC, STRUCTURED_PROMPT, SWEPT, tiled};
 use inkling_core::{
     Checkpoint, CheckpointWeights, Ending, ModelCache, TextConfig, Tokenizer, profile,
 };
@@ -59,6 +59,7 @@ const USAGE: &str = "usage:\n  \
     bench decode  <checkpoint> [--tokens <n>]\n  \
     bench prefill <checkpoint> [--tokens <n>]\n  \
     bench sweep   <checkpoint> [--tokens <n>] [--depth <k>]\n  \
+    bench engines <checkpoint> [--depth <k>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
 
@@ -134,6 +135,10 @@ enum What {
     Decode,
     Prefill,
     Sweep,
+    /// Everything a cross-engine table quotes, from one generation per
+    /// (prompt, generated) pair. The one measurement here another engine can
+    /// also report, which is what makes it the one taken against one.
+    Engines,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -173,17 +178,24 @@ impl Job {
             Some("decode") => Some(What::Decode),
             Some("prefill") => Some(What::Prefill),
             Some("sweep") => Some(What::Sweep),
+            Some("engines") => Some(What::Engines),
             Some("alternate") => return Self::alternating(args),
             Some("guesses") => None,
             Some(word) => {
-                bail!("{word} is not one of decode, prefill, sweep, guesses or alternate")
+                bail!("{word} is not one of decode, prefill, sweep, engines, guesses or alternate")
             }
             None => bail!("no measurement given"),
         };
 
         let mut checkpoints = Vec::new();
         let mut tokens = None;
-        let mut depth = SWEPT;
+        // A sweep runs every depth up to its own, where a cross-engine table
+        // quotes one beside `k = 0` — so the default depth is what the flag
+        // means to the measurement asking for it.
+        let mut depth = match what {
+            Some(What::Engines) => BEST,
+            _ => SWEPT,
+        };
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--tokens" | "-n" => tokens = Some(count(&arg, &mut args)?),
@@ -209,6 +221,17 @@ impl Job {
                     given.len()
                 )
             })?;
+        // **A cross-engine table's lengths are the table's own.** It runs
+        // [`REALISTIC`], which is four (prompt, generated) pairs rather than one
+        // length — so a `--tokens` handed to it could only be dropped, and a
+        // measurement that silently ignores the number it was given is one whose
+        // rows say something other than what was asked for.
+        if what == What::Engines && tokens.is_some() {
+            bail!(
+                "engines takes no --tokens: it runs {} pairs",
+                REALISTIC.len()
+            );
+        }
         Ok(Self::Measure {
             what,
             checkpoint,
@@ -291,6 +314,10 @@ fn count(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize> {
     }
 }
 
+/// How many of a generation's own tokens [`Generated`] keeps, so that a run can
+/// be said to have generated what another run generated.
+const OPENING: usize = 8;
+
 /// One generation, and what it cost.
 struct Generated {
     /// Every step, the prompt's prefill first.
@@ -300,6 +327,14 @@ struct Generated {
     tokens: usize,
     rounds: usize,
     rates: Vec<f64>,
+    /// The first [`OPENING`] tokens it produced.
+    ///
+    /// **What makes a cross-engine figure a comparison of engines rather than
+    /// of workloads.** Two engines given the same prompt and asked for the same
+    /// number of tokens are comparable whatever they answer, but two that answer
+    /// the same thing are comparable without an argument — so the answer is
+    /// carried beside the duration rather than assumed to be the same one.
+    opening: Vec<usize>,
 }
 
 impl Generated {
@@ -317,10 +352,56 @@ impl Generated {
         }
     }
 
+    /// The first token, which is the prompt's prefill and whatever the engine
+    /// does behind it to name a token.
+    fn first(&self) -> Duration {
+        self.steps.first().copied().unwrap_or_default()
+    }
+
+    /// Prompt and answer together — **the wall a user actually waits**, and the
+    /// only figure here in which prefill and decode are weighed against each
+    /// other rather than quoted apart.
+    fn wall(&self) -> Duration {
+        self.steps.iter().sum()
+    }
+
     /// Tokens a round banked, which is what acceptance buys before the cost of
     /// having guessed comes off it.
     fn per_round(&self) -> f64 {
         self.tokens as f64 / self.rounds.max(1) as f64
+    }
+
+    /// The median of the steps after the prefill.
+    ///
+    /// **A mean that is not the median is a reading of something else**, and
+    /// [`Generated::step`] is a mean. A decode step at a fixed context is flat
+    /// here to a few tenths, so a pair whose mean sits well above its own median
+    /// has a step in it that is not a decode step — which a table printing only
+    /// the mean could not tell from an engine that is uniformly slower.
+    fn median(&self) -> Duration {
+        let mut after: Vec<Duration> = self.steps.iter().skip(1).copied().collect();
+        after.sort_unstable();
+        after.get(after.len() / 2).copied().unwrap_or_default()
+    }
+
+    /// The longest step after the prefill, and which one it was.
+    ///
+    /// Which one matters as much as how long: a generation's own first step is
+    /// where anything the prefill deferred lands, and one anywhere else is this
+    /// machine rather than this engine.
+    ///
+    /// Step zero is the prefill and is never the answer, so a generation with no
+    /// step after it answers `(0, 0)` — a position this cannot otherwise return,
+    /// which is what makes the sentinel readable rather than a duration of zero
+    /// standing in for one nobody measured.
+    fn worst(&self) -> (usize, Duration) {
+        self.steps
+            .iter()
+            .enumerate()
+            .skip(1)
+            .max_by_key(|(_, step)| **step)
+            .map(|(at, step)| (at, *step))
+            .unwrap_or_default()
     }
 }
 
@@ -343,57 +424,111 @@ fn measure(what: What, dir: &Path, tokens: usize, depth: usize) -> Result<Vec<Re
     let gpu = backend::open(Backend::Metal)?;
     let ckpt = Checkpoint::open(dir)?;
 
-    // A prefill is one step and its prompt is the measurement, so the prompt is
-    // tiled to the length asked for.
-    let (ids, budget) = match what {
-        What::Prefill => (tiled(&prompt, tokens), 1),
-        _ => (prompt, tokens),
+    // Which depths this wants weights wrapped at: a sweep every one up to its
+    // own, a cross-engine table `k = 0` and the depth that pays best beside it,
+    // and everything else nothing but zero.
+    let depths: Vec<usize> = match what {
+        What::Sweep => (0..=depth).collect(),
+        What::Engines if depth > 0 => vec![0, depth],
+        _ => vec![0],
     };
-    let deepest = match what {
-        What::Sweep => depth,
-        _ => 0,
-    };
+    // Thrown away, because the first generation of a process faults in the
+    // pages the rest of them read — 4.2 GiB of it once heads are mapped — and
+    // that belongs to a run's first token rather than to whichever arm ran
+    // first.
+    let warm = prompt[..prompt.len().min(8)].to_vec();
 
     let mut taken = Vec::new();
     let mut unspeculated = None;
-    for depth in 0..=deepest {
+    for depth in depths {
         // Wrapped at the depth being measured rather than at the deepest one:
         // the windows a rejected token is taken back out of are wider by the
         // depth, so this is the configuration a run of that depth actually has.
         let weights = backend::weights(gpu.as_ref(), &ckpt, text, depth)?;
         let tail = backend::tail_weights(&weights, text);
         let heads = backend::heads(gpu.as_ref(), &ckpt, &config, depth, &tail)?;
+        let timed =
+            |ids: &[usize], budget| generate(&weights, heads.as_ref(), text, ids, budget, depth);
 
-        // Thrown away, because the first generation of a process faults in the
-        // pages the rest of them read — 4.2 GiB of it once heads are mapped —
-        // and that belongs to a run's first token rather than to whichever arm
-        // ran first.
-        generate(
-            &weights,
-            heads.as_ref(),
-            text,
-            &ids[..ids.len().min(8)],
-            2,
-            depth,
-        );
-        let run = generate(&weights, heads.as_ref(), text, &ids, budget, depth);
+        timed(&warm, 2);
 
         match what {
+            // **Three readings off one generation and not three runs of it.**
+            // The first step is the prefill, the mean of the ones after it is a
+            // decode step, and the sum is the wall a user waits — so a table
+            // that quotes all three quotes them about the same generation
+            // rather than about three sittings of one.
+            //
+            // **And the whole pass is run twice, with the first thrown away**,
+            // because what a pair costs depends on what ran before it: the same
+            // 97-token prefill is 1.17 s where a 769-token generation preceded
+            // it and 0.59 s where a shorter one did. Warming at one length
+            // cannot settle a table of four lengths; two passes give every pair
+            // the same predecessor in the pass that counts.
+            What::Engines => {
+                for measured in [false, true] {
+                    for (prompted, generated) in REALISTIC {
+                        let felt = timed(&tiled(&prompt, prompted), generated);
+                        if !measured {
+                            continue;
+                        }
+                        let pair = format!("{prompted}x{generated}.k{depth}");
+                        // The spread only where a step is a step. A round of
+                        // depth `k` banks what it accepted all at once, so most
+                        // of a speculating run's steps are nothing and the
+                        // round's whole cost lands on one of them — a median of
+                        // 42 nanoseconds, which is a reading about the sink and
+                        // not about the engine. The mean over them is still
+                        // milliseconds a token, which is what the table quotes.
+                        let (worst, longest) = felt.worst();
+                        eprintln!(
+                            "{pair}: {} tokens, {}first eight {:?}",
+                            felt.tokens,
+                            match depth {
+                                0 => format!(
+                                    "steps p50 {:.2?}, longest {:.2?} at step {worst}, ",
+                                    felt.median(),
+                                    longest
+                                ),
+                                _ => String::new(),
+                            },
+                            felt.opening,
+                        );
+                        for (name, taken_by) in [
+                            ("wall", felt.wall()),
+                            ("first", felt.first()),
+                            ("token", felt.step()),
+                        ] {
+                            taken.push(Reading::new(
+                                format!("{pair}.{name}"),
+                                millis(taken_by),
+                                "ms",
+                            ));
+                        }
+                    }
+                }
+            }
             What::Decode => {
+                let run = timed(&prompt, tokens);
                 taken.push(Reading::new("decode", millis(run.step()), "ms"));
                 taken.push(Reading::new("device", millis(run.gpu), "ms"));
             }
             What::Prefill => {
+                // A prefill is one step and its prompt is the measurement, so
+                // the prompt is tiled to the length asked for.
+                let ids = tiled(&prompt, tokens);
+                let run = timed(&ids, 1);
                 // The second of two, for the reason the timing tier prints both:
                 // the first prefill of a length is the one that faults its pages
                 // in, and what a prefill costs warm is the figure every other
                 // one here is comparable to.
-                let again = generate(&weights, heads.as_ref(), text, &ids, budget, depth);
+                let again = timed(&ids, 1);
                 taken.push(Reading::new("prefill", millis(again.step()), "ms"));
                 taken.push(Reading::new("device", millis(again.gpu), "ms"));
                 taken.push(Reading::new("cold", millis(run.step()), "ms"));
             }
             What::Sweep => {
+                let run = timed(&prompt, tokens);
                 let step = run.step();
                 let unspeculated = *unspeculated.get_or_insert(step);
                 taken.push(Reading::new(format!("k{depth}"), millis(step), "ms"));
@@ -500,6 +635,7 @@ fn generate(
         .map(|heads| MtpProposer::new(heads, generator, weights, depth));
 
     let mut steps = Vec::new();
+    let mut opening = Vec::new();
     let mut tokens = 0;
     // Cleared here so that what comes back is this generation's: wrapping the
     // model charges the same accounts, and on a prefill there is no later step
@@ -507,8 +643,11 @@ fn generate(
     profile::take();
     let mut step = Instant::now();
     {
-        let mut sink = |_: usize| {
+        let mut sink = |token: usize| {
             steps.push(step.elapsed());
+            if opening.len() < OPENING {
+                opening.push(token);
+            }
             // The prefill's accounts, dropped where the prefill's duration is:
             // a decode figure is about the steps after it.
             if steps.len() == 1 && budget > 1 {
@@ -533,6 +672,7 @@ fn generate(
             .unwrap_or_default(),
         steps,
         tokens,
+        opening,
     }
 }
 
@@ -838,6 +978,47 @@ mod tests {
             tokens,
             rounds,
             rates: Vec::new(),
+            opening: Vec::new(),
+        }
+    }
+
+    /// **The wall a user waits is the whole call and the prefill is inside it**,
+    /// where the decode figure beside it deliberately leaves that first step out
+    /// — so the three readings a cross-engine table takes off one generation are
+    /// three different cuts of the same list rather than three runs of it.
+    #[test]
+    fn a_generations_three_readings_are_three_cuts_of_the_same_steps() {
+        let run = generated(&[1000, 20, 22, 24], 4, 4);
+        assert_eq!(run.first(), Duration::from_millis(1000));
+        assert_eq!(run.step(), Duration::from_millis(22));
+        assert_eq!(run.wall(), Duration::from_millis(1066));
+        // Neither of the two the mean is read against carries the prefill: one
+        // that did would report the first step as the longest at every length
+        // and say nothing at any of them.
+        assert_eq!(run.median(), Duration::from_millis(22));
+        assert_eq!(run.worst(), (3, Duration::from_millis(24)));
+    }
+
+    /// A generation whose longest step is its *first* is the case this column
+    /// exists for — what a prefill deferred, arriving on the step after it —
+    /// and it has to be told from the same duration landing anywhere else.
+    #[test]
+    fn the_longest_step_is_reported_with_where_it_fell() {
+        assert_eq!(
+            generated(&[1000, 800, 22, 24], 4, 4).worst(),
+            (1, Duration::from_millis(800))
+        );
+    }
+
+    /// A prefill has no step after it, and both readings taken over those steps
+    /// have to say so rather than report a zero that reads like a measurement.
+    /// Step zero is the prefill, so it is a position `worst` cannot otherwise
+    /// answer with.
+    #[test]
+    fn a_run_with_no_step_after_its_prefill_reports_no_spread() {
+        for run in [generated(&[1000], 1, 1), generated(&[], 0, 0)] {
+            assert_eq!(run.median(), Duration::ZERO);
+            assert_eq!(run.worst(), (0, Duration::ZERO));
         }
     }
 
@@ -887,6 +1068,28 @@ mod tests {
                 tokens: PREFILLED,
                 depth: SWEPT,
             }
+        );
+    }
+
+    /// **A cross-engine table's default depth is not a sweep's**, because the
+    /// flag does not mean the same thing to the two: a sweep runs every depth up
+    /// to the one it is given and a table quotes the one that pays best beside
+    /// `k = 0`.
+    #[test]
+    fn a_cross_engine_table_defaults_to_the_depth_that_pays_rather_than_the_deepest() {
+        assert_eq!(
+            Job::parse(["engines".to_string(), "models/small".to_string()]).expect("parses"),
+            Job::Measure {
+                what: What::Engines,
+                checkpoint: PathBuf::from("models/small"),
+                tokens: DECODED,
+                depth: BEST,
+            }
+        );
+        assert_ne!(BEST, SWEPT);
+        // And it takes no length, because it runs four of them.
+        assert!(
+            Job::parse(["engines", "models/small", "--tokens", "769"].map(str::to_string)).is_err()
         );
     }
 
