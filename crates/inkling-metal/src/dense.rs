@@ -71,19 +71,40 @@ const MOST_SIMDGROUPS: usize = 32;
 /// lane walking 128 strides of two bytes.** That is `rms_norm`'s finding at a
 /// different width: nothing here is waiting on bandwidth, it is waiting on the
 /// requests one thread has outstanding, and the fix is to give the reduction
-/// more threads rather than the machine more bytes. Eight simdgroups to an
-/// element takes a decode-shaped gate from 39 microseconds to 10.
+/// more threads rather than the machine more bytes.
 ///
 /// **And it has to be the dispatch that decides.** The same widening at prefill
 /// makes the kernel twice as slow — 385 rows are 99330 elements, which fill the
 /// machine at one simdgroup apiece, and eight of them is eight times the
 /// reduction overhead for work that was never idle. So the count comes from how
 /// many elements there are: this many simdgroups between them, and each element
-/// takes what is left over. Measured across rows 1 to 385 and one to eight
-/// simdgroups, it picks the best run at a decode step's one row and at a
-/// prefill's hundreds, and lands within a sixth of the best at every row count
-/// between — `what_a_gate_costs_the_device_at_each_reduction_width` is the
-/// sweep, and the row counts in between are not shapes this engine dispatches.
+/// takes what is left over.
+///
+/// **The rule picks the best run at both ends and not in between**, which is
+/// what `what_a_gate_costs_the_device_at_each_reduction_width` says over runs of
+/// 1, 2, 4 and 8 — the row counts between the two ends being the shapes a
+/// speculative round dispatches and nothing else does:
+///
+/// ```text
+/// rows       1        2        4        8   the rule
+///    1  14.49µs   9.32µs   6.76µs   7.24µs   8, +7%
+///    2  14.82µs   9.96µs   8.32µs   9.49µs   8, +14%
+///    4  14.93µs  10.85µs  10.70µs  13.82µs   8, +29%
+///    8  16.67µs  14.91µs  16.27µs  23.32µs   8, +56%
+///   16  27.22µs  22.63µs  27.12µs  42.32µs   4, +20%
+///   32  39.19µs  37.04µs  50.84µs  79.76µs   2, best
+///   97  92.40µs  96.07µs 141.63µs 230.62µs   1, best
+///  385 327.52µs 360.05µs 551.63µs 902.26µs   1, best
+/// ```
+///
+/// The surface is not a function of the element count any more: one row and two
+/// both want a run of 4, which no rule of the form `elements × run` can give
+/// them both. What that is worth is 40 gates a call — 19 microseconds of a
+/// decode step, and up to 0.34 ms of a round whose block is nine rows — against
+/// a kernel that is 2.2% of a decode step's device time and absent from a chain
+/// of heads since the MTP shard was packed. **Not taken here**: it is a change
+/// to a different kernel from the one this milestone is about, and moving it
+/// needs its own alternating pairs.
 const SIMDGROUPS_IN_FLIGHT: usize = 16512;
 
 /// Values of a weight row one lane reads before the next lane's, which is how
@@ -929,6 +950,18 @@ mod tests {
     /// Read off the device's own clock over a command buffer of `CALLS`
     /// dispatches, for `norm`'s reason: a submission is 225 microseconds and
     /// most of these are under a hundred.
+    ///
+    /// **It costs 2.8 seconds.** Eight briefs carried this case as one that had
+    /// never finished inside eleven minutes, and the last of them excluded it to
+    /// run the timing tier at all. Run on its own and run inside the tier, it
+    /// completes in 2.8 seconds, and the shape says why it would: four rounds of
+    /// eight row counts and four runs are 32 command buffers of 64 dispatches
+    /// against a weight of 2.1 MB, which stays in cache. **What made it look
+    /// unbounded is not attributed here** and is not the sweep; what can be said
+    /// is that the failure does not reproduce, that nothing about the case
+    /// bounds its own runtime, and that a process which cannot reach the GPU
+    /// reads from the outside exactly like one whose dispatch never returns.
+    /// What the numbers say is under [`SIMDGROUPS_IN_FLIGHT`].
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn what_a_gate_costs_the_device_at_each_reduction_width() {
