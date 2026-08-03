@@ -1918,8 +1918,8 @@ const LONG_PREFILLS: [usize; 4] = [2048, 4096, 8192, 16384];
 ///
 /// **One sampled run a length and no unsampled one beside it**, which is a
 /// departure from the two-length table above and is a wall-clock judgement
-/// rather than a claim: these four prefills are 3.8 minutes of device time
-/// between them and the pair would be 7.6. What the pair buys there is telling
+/// rather than a claim: these four prefills are 3.5 minutes of device time
+/// between them and the pair would be 7. What the pair buys there is telling
 /// an effect of sampling from this machine's own state, and what stands in for
 /// it is `bench prefill` at the same four lengths — quoted in the README beside
 /// these rows rather than run inside this process, so a reader can see both.

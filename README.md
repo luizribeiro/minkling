@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **583 of the 617 tests, no
+`just test` is the one to run while iterating: **585 of the 621 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,8 +32,8 @@ a crate's tests in one process: opening a Metal device costs a second, so the 16
 kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 617 against a
-real checkpoint, ten minutes.** The 51 gated tests — the 37 above and fourteen
+`just test-full` is what has to pass at the ends of a series: **all 621 against a
+real checkpoint, ten minutes.** The 52 gated tests — the 37 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the thirty-four tests whose result *is* a number — a duration
+`just test-timing` is the thirty-six tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -1251,6 +1251,12 @@ measured at 91 ms at 32768. **Those two are arithmetic and are labelled as such*
 what is measured stops at 8192, and what stopped it is that a prefill to 16384
 costs five minutes here and to 32768 fourteen.
 
+**That last sentence is wrong and "Where a prefill's time goes as the prompt
+grows" below is where it is measured.** A prefill of 16384 tokens costs 133.63
+seconds on this engine and 32768 is about six minutes by arithmetic. Nothing
+between that reading and this one changed the prefill path; what the two figures
+are is a measurement and an estimate that was never taken.
+
 ### The keys a sequence keeps, which the window does not bound
 
 **35 of the 42 layers can never read past their own last 512 keys and all 42
@@ -1281,6 +1287,224 @@ our 0.23 to 4.35. **Nothing here was changed.** Capping a windowed layer means a
 ring buffer — the kernel's key addressing, `rewind`'s interaction with a
 speculative round, and what a prefill writes — and the size of the prize is the
 column above rather than a paragraph.
+
+## Where a prefill's time goes as the prompt grows
+
+**The milestone this section was taken for began from a figure that is not
+true of this engine.** The decode sweep above closes by saying that what stopped
+it at 8192 is "that a prefill to 16384 costs five minutes here and to 32768
+fourteen", and a prefill of 16384 tokens at that commit costs **133.63 seconds**.
+Measured one length at a run by `bench prefill`, warm, against
+`models/Inkling-Small-mxfp4`:
+
+    tokens        ours    tok/s     mlx-vlm    tok/s      gap    mlx-vlm peak
+      769       5.40 s      142     1.171 s      657    ×4.61        —
+     2048      12.66 s    161.7      2.66 s    769.7    ×4.76    135.6 GiB
+     4096      25.36 s    161.5      5.61 s    730.7    ×4.52    141.2 GiB
+     8192      54.25 s    151.0     13.05 s    627.9    ×4.16    155.7 GiB
+    16384     133.63 s    122.6     34.31 s    477.6    ×3.89    200.8 GiB
+
+The 769 row is the cross-engine table's, kept for continuity; the four below it
+are new. Ours is time to first token and the reference's is its transformer
+stack alone, which is the same measurement to within the millisecond our own
+head and argmax cost at these lengths. Each column is one sitting a length and neither is
+paired — the effects are decades and this host drifts 1.7%, which is the same
+standard the decode sweep above is taken to and no better.
+
+**Prefill is very nearly linear, and 122.6 tokens a second at 16384 is not the
+shape "getting worse with length" describes.** 2048 to 4096 is ×2.003 across a
+doubling. What curvature there is arrives at the top — ×2.14 then ×2.46 — and
+where it comes from is one row of the table below. **The reference falls
+faster over the same range**: 769.7 to 477.6 tokens a second against our 161.7 to
+122.6, so the ×4.76 at 2048 is ×3.89 at 16384. That is a comparison and not an
+explanation; nothing here diagnoses mlx-vlm.
+
+### Which of a prefill's kernels grow with the prompt and which grow faster
+
+`where_a_long_prefill_spends_its_time` divides one sampled prefill a length up
+by kernel, with **the 35 windowed layers charged apart from the 7 global ones** —
+`Kernel::under` is what makes that a row rather than an argument, and it splits
+them in every table this repo takes rather than only here. What the device timed,
+the four lengths beside each other:
+
+    kernel                     2048      4096      8192     16384    8192→16384
+    global attention        647.80ms    2.35 s    8.75 s   43.74 s         ×5.00
+    packed_matmul_grouped     4.78 s    9.54 s   18.87 s   38.15 s         ×2.02
+    packed_matmul_rows        4.18 s    8.51 s   16.93 s   34.16 s         ×2.02
+    windowed attention        1.55 s    3.34 s    6.88 s   13.99 s         ×2.03
+    short_conv               49.64ms  225.39ms  481.66ms  900.39ms         ×1.87
+    dense_matmul             89.48ms  183.74ms  374.38ms  756.67ms         ×2.02
+    group_by_expert          67.48ms  139.25ms  282.31ms  567.00ms         ×2.01
+    swiglu                   49.96ms  100.33ms  201.40ms  403.15ms         ×2.00
+    moe_combine              17.15ms   34.67ms   69.50ms  139.30ms         ×2.00
+    every pass                11.50 s   24.46 s   52.91 s  132.97 s         ×2.51
+    the command buffers       10.67 s   22.64 s   49.30 s  125.73 s         ×2.55
+
+The last two rows are the two clocks and the gap between them is the pass span's
+own over-reporting, which is 7.24 s at 16384 and is what a boundary a dispatch
+costs. **Everything divided below divides by the passes**, because the rows are
+passes; the wall times in the table above it are what the wall claims are made
+in.
+
+**Exactly one term is superlinear.** Every other row lands between ×1.87 and
+×2.03 when the prompt doubles, where the global row is ×5.00. The growth column
+is the last doubling rather than a fit over all four, because the 2048 column is
+the first prefill this process ran and its short rows carry that: `short_conv`
+reads 49.64 ms there against 225.39 at twice the prompt, and `rms_norm` 65.59
+against 30.65. The rows that dominate do not, and the two matmul rows are 54% of
+the passes at 16384.
+
+Taken apart the other way: everything that is not attention costs **4.54, 4.58,
+4.55 and 4.59 ms a token** across the four lengths, and the 35 windowed layers
+cost **21.6, 23.3, 24.0 and 24.4 µs a token each**. So a prefill is about 5.4 ms
+a token whatever the prompt, plus a global term that is not.
+
+That term is quadratic and a little worse than quadratic in the measured range:
+per token squared it reads 154, 140, 130 and **163 nanoseconds**, so the last
+doubling costs ×5.00 where a square costs ×4. Per token it is 45.2, 81.9, 152.6
+and 381.4 µs against a windowed layer's flat 24.
+
+**`what_a_prefills_attention_costs_as_the_prompt_grows` says the same thing off
+one dispatch**, at n query rows over n keys with no model around it, and the two
+agree to within 1% at every length — 95.21 ms against 95.4 for a windowed layer
+at 4096, 6.25 s against 6.25 for a global one at 16384. That is worth having,
+because the standalone sweep is thirty seconds where the table above is 3.5
+minutes of device time.
+
+### Whether the 6× was there
+
+**It was not, and the windowed bound is why.** The hypothesis this milestone
+opened with was that a prefill walks full spans on all 42 layers where 35 of them
+should stop at 512 keys — `42 × n²/2` where `35 × n × 512 + 7 × n²/2` is the
+work. That is **×4.6 at 16384** and six times in the limit where the linear term
+stops mattering, and it was the second of those the milestone was sized against.
+A1 had left prefill untouched and flagged the bound as a decode-time fix.
+
+But the bound is in the kernel and not in the split: `reach` is computed from
+each query row's own position, so it holds for a call of one query row and a call
+of 16384 of them alike. What that costs, priced rather than reasoned about: the
+35 windowed layers are 13.99 s at 16384 and the 7 global ones are 43.74, so a
+windowed layer costs `13.99/35 ÷ 43.74/7` — **one sixteenth** of a global one at
+the same prompt. Walking full spans they would each cost what a global one does,
+so the 35 of them would be 218.7 s of passes where they are 13.99: 337.7 s of
+passes against 132.97, which is **×2.54** and puts the prefill at about 339
+seconds rather than 133.63. Those last two are arithmetic and are labelled as
+such — nothing here ran a prefill with the bound taken off.
+
+### What the bandwidth column says now that it divides by the right number
+
+**The declared byte count was wrong at prefill shape and the row that mattered
+most read `2 GB/s` because of it.** An attention dispatch charged its keys and
+values once — `2 × kv_heads × keys × head_dim` — where a call of `n` query rows
+walks them once a row and each of the 32 query heads walks its KV head's span for
+itself. Corrected to the reads the dispatch issues, which is the contract a bank
+binding 256 experts and reading six already states:
+
+    kernel                    2048     4096     8192    16384
+    global attention      744 GB/s 819 GB/s 880 GB/s 704 GB/s
+    windowed attention    697 GB/s 696 GB/s 698 GB/s 698 GB/s
+
+**Both are at this machine and have been all along.** 819 GB/s is the part's
+stated figure, and a windowed layer sits at 85% of it at all four lengths. The
+global row reads 744, 819, 880 and 704, and the 880 is a rate this part does not
+have: either some of those reads are served without reaching memory — 32 query
+rows next to each other walk almost the same keys — or the declared figure is
+still counting reads the walk does not make. **Which of the two is not decided
+here**, and it does not have to be for the row to be read: at every length the
+kernel is within a factor of 1.2 of the machine, where a kernel with arithmetic
+to do would be decades off it.
+
+**So the global row is not a slow kernel, it is a kernel reading the same keys
+32768 times.** At 16384 tokens one global layer issues 4.4 TB of key and value
+reads against a distinct span of 134 MB, and does the 2.2 TFLOP underneath them
+at 352 GFLOP/s — decades under this machine's arithmetic and 86% of its memory.
+What makes it faster is reading less.
+
+**The two matmul rows' 360 and 277 GB/s are not read the same way**, for the
+reason "Why the two tiled rows report bandwidths a factor of two apart" gives at
+length: `PackedBank::moves` charges a whole weight per tile, so those are
+amplification factors and the distinct bytes are decades below. Nothing about
+them moved here.
+
+### What is left, sized and not taken
+
+A threadgroup that carried `R` query rows through one tile of keys would divide
+the global row's reads by `R`, and the per-row arithmetic need not move at all:
+tiles outer and rows inner keeps each row's walk over the same tiles in the same
+order, which is what `the_bounded_loop_is_the_unbounded_one_bit_for_bit` rests
+on. What has to go somewhere is each row's running peak, total and weighted sum
+for the length of the walk, and the staging already holds 19 KB of the 32 an
+Apple GPU allows. **Three of every four reads are redundant before any of that**:
+four query heads share one KV head under this checkpoint's grouping and each of
+the four walks that one span for itself.
+
+**That is the next milestone and it is not this one.** What this one found is
+that the defect it was called to fix is not present, that the one superlinear
+term is inherent to full attention rather than a missing bound, and that the
+term is 33% of a 16384-token prefill against the two matmul rows' 54%.
+
+**Carried out, 32768 tokens is about 5.9 minutes, and that figure is
+arithmetic.** Split the 133.63 s wall at 16384 by the passes' own shares — which
+assumes the over-reporting falls evenly across the kernels, and is a splice of
+two runs: 43.96 s is the global row and 89.67 s is everything else, which is
+163.8 ns a token squared and 5.47 ms a token. At 32768 those are 175.9 s and
+179.3 s, so **355 seconds**. It is not fourteen minutes. The quadratic constant taken is the worst
+of the four lengths, and nothing past 16384 was run: a paired sitting of
+32768-token prefills is hours and the sweep above already answers which term
+grows.
+
+### What this leaves for whoever caps the spans
+
+**A prefill writes every key of a layer before that layer's one attention
+dispatch reads any of them.** `hold(0, n)` reserves the whole span, the
+projections fill all `n` slots, and then a single `encode_over` runs `n` query
+rows over `n` keys. A windowed layer held in a ring of its window would therefore
+have its early keys overwritten by its late ones *before* the dispatch that needs
+them — so **capping a windowed layer means chunking its prefill**, which is a
+second change beside the ring addressing and the rewind that "The keys a sequence
+keeps" already names.
+
+**And the ring cannot be 512.** `reach` rounds the window down to a 32-key tile
+so that the bounded loop stays the unbounded one bit for bit, so a windowed row
+reads up to `window + tile - 1` keys back — 536 of them for a row at position
+599, which `a_query_row_walks_the_keys_its_window_and_its_position_leave_it`
+pins. The cap is the window rounded up to a tile, and the ring's size has to be a
+multiple of the tile for `from` and `to` to keep landing where they land now.
+
+**The prize is unchanged and it is memory rather than time.** A windowed layer
+already reads only its window: 698 GB/s and 24 µs a token at every length here.
+Capping the span saves the bytes the table under "The keys a sequence keeps"
+counts and buys no microsecond of this section's.
+
+### What did not move, which is everything
+
+Nothing here touches a dispatch. `Kernel::under` renames a row, the byte count is
+an integer computed while encoding and only reaches the profile when the device
+is sampling, and the two new tables are tables. So the list below is a check on
+that claim rather than a comparison, and it is what says so:
+
+    context     e7168ce      here
+       97         19.99     19.98
+      385         21.34     22.21
+      769         21.91     22.08
+     2048         24.85     24.81
+     4096         26.09     26.09
+     8192         28.65     28.92
+
+One sitting each and unpaired, which is the standard the column beside it was
+taken to. The eight-token figures on the packed heads are **19.44 ms at k = 0
+against 19.414 and 15.96 at k = 2 against 16.078**, and `k = 4` is 1.002× where
+A1 left it at 1.003 — still not comfortably worth running, and no further from it.
+
+**No token changed.** The recorded continuation is `[656, 13, 623, 180069,
+86333, 60500, 220, 23]` and is what the device generates; the speculating cases
+write the text one-at-a-time decoding writes at every depth they drive; and
+acceptance is unmoved to the digit — **85% at k = 1, 87/78% at k = 2**, 85/65/55%
+and 82/65/53/47% below that — the packed heads' own recorded row, digit for
+digit. The bfloat16 heads reproduce theirs in the same way: 85%, 91/74%,
+84/74/63%, 82/65/53/47%. `the_bounded_loop_is_the_unbounded_one_bit_for_bit`
+and `a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` pass
+unrelaxed, and so do all 585 tests of the run against a real checkpoint.
 
 ## The tail of a step
 
