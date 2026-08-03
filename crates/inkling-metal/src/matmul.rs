@@ -284,6 +284,16 @@ const NARROWEST_SIMD: usize = 32;
 /// dispatch where a block that straddles costs a whole extra walk.
 const MMA_RUNS_A_BLOCK: usize = MMA_ROWS_A_BLOCK;
 
+/// Blocks a call has to bring rows enough for before it is dispatched through
+/// one at all.
+///
+/// **Two, and the sweep either side of it is in [`PackedMatmul::blocks`].** A
+/// block computes its full height whatever the call brought, and a call of one
+/// or two blocks does not put threadgroups enough on this part to fill it — so
+/// the block is behind the reference tile at 40 and 48 rows and ahead from 64,
+/// which is where this is set.
+const MMA_BLOCKS_A_CALL: usize = 2;
+
 /// Rows an expert needs, on average, before sorting a call's rows by expert
 /// pays for the sort.
 ///
@@ -568,6 +578,16 @@ impl PackedMatmul {
         })
     }
 
+    /// The shortest call the entries behind [`Numerics::Production`] are given,
+    /// in rows.
+    ///
+    /// **Public because a differential run is worthless without it.** A call
+    /// under this height runs the same kernel under both words, so a corpus of
+    /// prompts shorter than this would report perfect agreement between a thing
+    /// and itself — and would keep reporting it after the arithmetic behind the
+    /// flag had changed. Whoever assembles a corpus has to be able to ask.
+    pub const SHORTEST_BLOCKED_CALL: usize = MMA_BLOCKS_A_CALL * MMA_ROWS_A_BLOCK;
+
     /// Which arithmetic this one accumulates with.
     ///
     /// Read back rather than only obeyed, because the first thing a report about
@@ -633,12 +653,51 @@ impl PackedMatmul {
     /// where it is decided: a single-row projection, a two-row shared bank and a
     /// six-row routed bank are what a decode step dispatches, and a block of 32
     /// rows has nothing to carry for any of them.
+    ///
+    /// **And a call has to bring [`MMA_BLOCKS_A_CALL`] blocks' worth of rows
+    /// before it is given a block, which a measurement rather than an argument
+    /// put here.** A block computes [`MMA_ROWS_A_BLOCK`] rows whether the call
+    /// has that many or not — the rows past its own stage zeros and are walked
+    /// with the rest — and a call of a few blocks does not put threadgroups
+    /// enough on the machine to fill it either way. A prefill at each length,
+    /// one sitting apiece, on the device's own clock:
+    ///
+    /// ```text
+    /// rows   reference   production
+    ///   40    264.6ms      278.8ms
+    ///   48    315.0ms      320.7ms
+    ///   64    415.1ms      390.1ms
+    ///   80    518.2ms      487.3ms
+    ///   97    502.8ms      456.8ms
+    /// ```
+    ///
+    /// So the block is behind at 40 and 48 rows and ahead from 64, and the line
+    /// is drawn where the measurement turns. **Padding alone does not explain
+    /// it** — 48 rows waste a third of two blocks and 97 waste a third of four,
+    /// and only the second wins — so what the shorter calls are also short of is
+    /// threadgroups: a 48-row call of `q_proj` is 128 of them against 240 slots
+    /// on this part's 80 cores, where 97 rows are 256 and fill it.
+    ///
+    /// **What a floor here is worth is a speculative round, and that was
+    /// measured before the line existed.** A verify block is the depth plus one
+    /// rows through every projection, so at a depth of three or four it clears
+    /// [`tiles`]'s four-row bar and lands on a block eight times too tall:
+    /// `k = 3` read **37.33 ms a token against the reference's 17.08** and
+    /// `k = 4` 36.30 against 19.98, where `k` of 0, 1 and 2 were untouched
+    /// because their blocks are under four rows and never left [`Layout::Each`].
+    /// **Speculation is a decode-time path and this flag was never meant to
+    /// reach it.**
+    ///
+    /// The floor binds on [`Layout::Tiled`] alone in practice: a grouped call
+    /// already needs a block's worth of runs an expert, which for the 256-expert
+    /// routed bank is 8192 rows and past this many times over.
     fn blocks(&self, layout: &Layout<'_>, rows: usize, experts: usize) -> Option<&Mma> {
-        let worth = match layout {
-            Layout::Each => false,
-            Layout::Tiled => true,
-            Layout::Grouped { .. } => rows >= experts.saturating_mul(MMA_RUNS_A_BLOCK),
-        };
+        let worth = rows >= MMA_BLOCKS_A_CALL * MMA_ROWS_A_BLOCK
+            && match layout {
+                Layout::Each => false,
+                Layout::Tiled => true,
+                Layout::Grouped { .. } => rows >= experts.saturating_mul(MMA_RUNS_A_BLOCK),
+            };
         self.mma.as_ref().filter(|_| worth)
     }
 
@@ -2487,7 +2546,7 @@ mod tests {
     use inkling_core::ops::DenseProjection;
     use inkling_core::quant::dequantize_blocks;
     use inkling_core::weights::PackedRows;
-    use inkling_core::workload::BEST;
+    use inkling_core::workload::{BEST, SWEPT};
 
     use crate::grouping::ExpertGrouping;
     use crate::testing::{device, drift};
@@ -3253,11 +3312,20 @@ kernel void decoded_elements(
         }
     }
 
-    /// **A decode step's shapes never reach the production entries**, which is
-    /// the same predicate `tiles` states for the reference tile and is checked
-    /// the same way: on the shapes rather than on a run.
+    /// **Neither a decode step nor a speculative round reaches the production
+    /// entries**, which is the same predicate `tiles` states for the reference
+    /// tile and is checked the same way: on the shapes rather than on a run.
+    ///
+    /// **The speculative rows are here because they were measured before they
+    /// were refused.** A verify block is the depth plus one rows through every
+    /// projection, which at a depth of three clears [`tiles`]'s four-row bar and
+    /// would land on a block eight times too tall — and read 37.33 ms a token
+    /// against the reference's 17.08. A block computes its full height whether
+    /// the call has the rows or not, so the shapes below are the ones this flag
+    /// was never meant to reach and the ones a future edit to [`blocks`] would
+    /// most easily let back in.
     #[test]
-    fn nothing_a_decode_step_dispatches_reaches_a_block() {
+    fn neither_a_decode_step_nor_a_speculative_round_reaches_a_block() {
         let Some(device) = device() else { return };
         let matmul = PackedMatmul::under(&device, Numerics::Production).expect("compiles");
         let grouped = Layout::Grouped {
@@ -3270,9 +3338,45 @@ kernel void decoded_elements(
         assert!(matmul.blocks(&Layout::Each, 2, 2).is_none());
         assert!(matmul.blocks(&Layout::Each, 6, 256).is_none());
         assert!(matmul.blocks(&grouped, 6, 256).is_none());
+
+        // A verify block at every depth the sweep runs, through the two shapes
+        // that reached [`Layout::Tiled`] and so were the ones that regressed:
+        // the projections at a row a token, and the shared bank at two.
+        //
+        // **A round's routed bank is not among them and never could be.** Its
+        // rows sort into runs of one, so `ExpertBanks::groups` is false for
+        // every shape a round has and the call goes through
+        // [`PackedBank::encode_picked`], which is [`Layout::Each`] by
+        // construction. The grouped rows below are here to hold [`blocks`]
+        // itself rather than because a round ever dispatched one.
+        for depth in 0..=SWEPT {
+            let rows = depth + 1;
+            assert!(
+                matmul.blocks(&Layout::Tiled, rows, 1).is_none(),
+                "a projection verifying {rows} rows"
+            );
+            assert!(
+                matmul.blocks(&Layout::Tiled, rows * 2, 2).is_none(),
+                "a shared bank verifying {rows} rows"
+            );
+            assert!(
+                matmul.blocks(&grouped, rows * 6, 256).is_none(),
+                "a routed bank of {rows} tokens, which no round dispatches grouped"
+            );
+        }
         // And the widest block the eight heads can propose, which is nine
-        // tokens of six rows apiece.
+        // tokens.
+        assert!(matmul.blocks(&Layout::Tiled, 9, 1).is_none());
         assert!(matmul.blocks(&grouped, 9 * 6, 256).is_none());
+
+        // The line a tiled call crosses, from either side, and the two prefill
+        // lengths the sweep behind `blocks` reads either side of — so a line
+        // moved without re-measuring fails here rather than quietly.
+        let shortest = PackedMatmul::SHORTEST_BLOCKED_CALL;
+        assert!(matmul.blocks(&Layout::Tiled, shortest - 1, 1).is_none());
+        assert!(matmul.blocks(&Layout::Tiled, shortest, 1).is_some());
+        assert!(matmul.blocks(&Layout::Tiled, 48, 1).is_none());
+        assert!(matmul.blocks(&Layout::Tiled, 64, 1).is_some());
 
         // The line a routed bank crosses, from either side. Six rows a token
         // against 256 experts puts it at 1366 tokens.
@@ -5607,13 +5711,20 @@ kernel void decoded_elements(
     /// What one small tiled call answers, which is how an arm of the table above
     /// is held to having changed the kernel rather than only its source.
     ///
-    /// Two experts and eleven rows apiece, which is the shape
+    /// Two experts and thirty-seven rows apiece, which is the shape
     /// `a_tiled_dispatch_answers_row_for_row_what_the_untiled_one_answers`
-    /// establishes the tiled entry over: a partial last tile, a run that
-    /// straddles one, and columns that do not fill theirs.
+    /// establishes the tiled entry over — a partial last tile, a run that
+    /// straddles one, and columns that do not fill theirs — at a height that
+    /// also reaches the entries behind [`Numerics::Production`].
+    ///
+    /// **The height is the flag's own line and not a spare row.** A call under
+    /// [`MMA_ROWS_A_BLOCK`] rows stays on the reference tile whichever numerics
+    /// asked, so a helper eleven rows tall would run the same kernel under both
+    /// words and `a_call_under_either_numerics_answers_what_the_other_answers`
+    /// would pass by comparing a thing to itself.
     fn a_tiled_call_answers(device: &Device, matmul: &PackedMatmul) -> Vec<f32> {
         const EXPERTS: usize = 2;
-        const SOURCES: usize = 11;
+        const SOURCES: usize = 37;
         let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, SOURCES);
         let bank = PackedBank::upload(
             device,

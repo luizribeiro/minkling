@@ -70,21 +70,36 @@ pub const SWEPT: usize = 4;
 /// code, a chat turn written out the way [`STRUCTURED_PROMPT`] is, a list of
 /// numerals, and a factual question with one likely answer.
 ///
-/// **Length is a second axis and it is deliberate here too.** The two entries
-/// this flag reaches are the tiled ones, and which of them a call goes through
-/// is decided by how many rows it has: every prompt below reaches the tiled
-/// projections, and only one long enough for a routed bank's rows to outnumber
-/// its experts reaches the grouped entry. The list of primes is that one, and
-/// `a_corpus_reaches_both_of_the_entries_this_flag_selects` is what holds it to
-/// a length rather than leaving it to whoever next edits the text.
+/// **Length is a second axis and it is what decides whether a prompt reaches the
+/// flag at all.** The two entries this flag selects are the tiled ones, and a
+/// call is given one only where its rows are two blocks' worth — 64 of them —
+/// so a prompt shorter than that runs the same kernels under both words and its
+/// agreement would be a check on this harness rather than on any arithmetic.
+/// Every prompt below clears that bar on the projections, and the one long
+/// enough for a routed bank's rows to outnumber its 256 experts by a block's
+/// worth of runs — about 1366 tokens — reaches the grouped entry as well. The
+/// list of primes is that one, and
+/// `a_corpus_reaches_both_of_the_entries_this_flag_selects` is what holds the
+/// two lengths rather than leaving them to whoever next edits the text.
 pub const CORPUS: [&str; 6] = [
-    "<|message_user|><|content_text|>Count from 1 to 30. Separate them with commas. No \
-     commentary.<|end_message|><|message_model|>",
+    "<|message_user|><|content_text|>Count from 1 to 30. Separate them with commas, with no \
+     commentary before or after them, and stop as soon as you reach thirty rather than carrying \
+     on into the thirties. Do not number the lines, do not explain what you are about to do, and \
+     do not add a closing remark once you have finished \
+     counting.<|end_message|><|message_model|>",
     "The lighthouse keeper had not spoken to another person in nine weeks, and when the supply \
-     boat finally rounded the headland he found that he",
-    "fn merge(left: &[u32], right: &[u32]) -> Vec<u32> {\n    let mut out = Vec::with_capacity(",
-    "<|message_user|><|content_text|>Explain why a hash map's worst case is linear, in two \
-     sentences.<|end_message|><|message_model|>",
+     boat finally rounded the headland he found that he had forgotten which of the several things \
+     he had been saving up to say was the one that had seemed urgent, so he stood on the jetty \
+     with his hands in his pockets and said nothing at all until",
+    "fn merge(left: &[u32], right: &[u32]) -> Vec<u32> {\n    let mut out = \
+     Vec::with_capacity(left.len() + right.len());\n    let (mut i, mut j) = (0, 0);\n    while i \
+     < left.len() && j < right.len() {\n        if left[i] <= right[j] {\n            ",
+    "<|message_user|><|content_text|>Explain why a hash map's worst case is linear rather than \
+     constant, why that almost never happens with a good hash function, what an attacker who \
+     controls the keys can do about it, and which of the usual mitigations — a randomised seed, a \
+     tree fallback for long chains, or a keyed hash — actually removes the problem rather than \
+     making it less likely. Four sentences, no \
+     bullets.<|end_message|><|message_model|>",
     "2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, \
      97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, \
      191, 193, 197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, \
@@ -121,8 +136,11 @@ pub const CORPUS: [&str; 6] = [
      3803, 3821, 3823, 3833, 3847, 3851, 3853, 3863, 3877, 3881, 3889, 3907, 3911, 3917, 3919, \
      3923, 3929, 3931, 3943, 3947, 3967, 3989, 4001, 4003, 4007, 4013, 4019, 4021, 4027, 4049, \
      4051, 4057, 4073, 4079, 4091, 4093, 4099, 4111, 4127, 4129, 4133, 4139, 4153, 4157, 4159,",
-    "<|message_user|><|content_text|>What is the capital of \
-     France?<|end_message|><|message_model|>",
+    "<|message_user|><|content_text|>What is the capital of France, what river runs through it, \
+     roughly how many people live in the city proper as against the wider metropolitan area, and \
+     which of its railway termini would you leave from for Brussels, for Bordeaux and for \
+     Marseille? Answer in one sentence each and do not pad them \
+     out.<|end_message|><|message_model|>",
 ];
 
 /// How many tokens a differential run generates from each of [`CORPUS`]'s
@@ -186,23 +204,33 @@ mod tests {
         );
     }
 
-    /// **A differential corpus of one length is a corpus that reaches one
+    /// **A differential corpus of short prompts is a corpus that reaches neither
     /// entry.** Which of the packed matmul's entries a call is dispatched
-    /// through is decided by its rows: every prompt here reaches the tiled
-    /// projections, and only a prompt whose routed-bank rows outnumber the
-    /// bank's 256 experts reaches the grouped one — six rows a token against a
-    /// threshold of two runs an expert, which is 86 tokens. A corpus of six
-    /// short prompts would report the agreement of one entry and say nothing
-    /// about the other.
+    /// through is decided by its rows, and the entries behind `--numerics
+    /// production` are given a call only where its rows are two 32-row blocks'
+    /// worth — so a prompt under 64 tokens runs the same kernels under both
+    /// words and reports nothing at all. Above that the projections reach the
+    /// tiled entry, and a prompt whose routed-bank rows outnumber the bank's 256
+    /// experts by a block's worth of runs — six rows a token against 32 runs an
+    /// expert, which is about 1366 tokens — reaches the grouped one.
     ///
-    /// Bytes rather than tokens, because a tokenizer is a checkpoint away from
-    /// here and the margin does not need one: 1500 bytes of comma-separated
-    /// numerals is several hundred tokens however they are split, where 86 is
-    /// the line.
+    /// **A coarse guard and not a derivation**, and saying which is the point.
+    /// A tokenizer is a checkpoint away from here, so this can only bound the
+    /// bytes — and bytes do not give tokens: the code member below is 3.1 bytes
+    /// a token and the chat-tagged one 5.7, which is nearly a factor of two.
+    /// What this catches is a member deleted down to a line; what it cannot
+    /// catch is one that stays long in bytes and short in tokens.
+    ///
+    /// **The check with teeth is in `bench diverge`**, which holds every
+    /// prompt's *token* count against `PackedMatmul::SHORTEST_BLOCKED_CALL`
+    /// before it runs anything — the tokenizer is open by then, and a length in
+    /// tokens is the only length that decides which entry a call reaches.
     #[test]
-    fn a_corpus_reaches_both_of_the_entries_this_flag_selects() {
+    fn no_prompt_of_the_corpus_has_been_cut_down_to_a_line() {
+        let shortest = CORPUS.iter().map(|prompt| prompt.len()).min();
+        assert!(shortest > Some(200), "{shortest:?} bytes is the shortest");
         let longest = CORPUS.iter().map(|prompt| prompt.len()).max();
-        assert!(longest > Some(1500), "{longest:?} bytes is the longest");
+        assert!(longest > Some(2200), "{longest:?} bytes is the longest");
     }
 
     /// Two copies of one prompt are one prompt measured twice, and the whole

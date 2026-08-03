@@ -48,7 +48,7 @@ use inkling_core::workload::{
 use inkling_core::{
     Checkpoint, CheckpointWeights, Ending, ModelCache, TextConfig, Tokenizer, profile,
 };
-use inkling_metal::Numerics;
+use inkling_metal::{Numerics, PackedMatmul};
 
 /// How long a prefill's prompt is, when nobody says. The middle of the three
 /// lengths this repo quotes.
@@ -904,6 +904,25 @@ fn diverge(dir: &Path, tokens: usize) -> Result<Vec<Reading>> {
                 .collect::<Vec<usize>>())
         })
         .collect::<Result<Vec<_>>>()?;
+
+    // **A prompt shorter than this reaches no entry the flag selects**, so its
+    // two continuations are one kernel compared to itself — perfect agreement
+    // that would stay perfect however the arithmetic behind the flag changed.
+    // Checked here rather than beside the corpus because this is where the
+    // tokenizer is: a prompt's length in tokens is the only length that decides
+    // it, and a byte count beside the text is a proxy that has already been
+    // wrong once.
+    for (at, ids) in prompts.iter().enumerate() {
+        if ids.len() < PackedMatmul::SHORTEST_BLOCKED_CALL {
+            bail!(
+                "prompt {} is {} tokens, under the {} a call needs to reach the entries this \
+                 measurement exists to compare",
+                at + 1,
+                ids.len(),
+                PackedMatmul::SHORTEST_BLOCKED_CALL
+            );
+        }
+    }
 
     let mut answers = Vec::new();
     for numerics in [Numerics::Reference, Numerics::Production] {
