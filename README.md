@@ -2797,12 +2797,26 @@ read. `k = 4` reads 0.983× under the reference and 1.031× under the production
 path in this sitting, one unpaired reading each, against A6's 0.972: **it has not
 fallen further.**
 
-**Two of those acceptance figures no longer reproduce, and A8 is where that is
-taken up.** The same sweep run against a commit after this one reads
-91.3-73.9% at `k = 2` and 84.2-73.7-63.2% at `k = 3`, with 3.048 tokens a round
-where this line says 2.909 — under both words and on the commit before A8's
-block, so nothing either milestone did moved them. See "What did not move, which
-is the whole decode path", which is the run that says so.
+**These are the packed heads' figures and the checkpoint is what has to be said
+beside them.** A8 read 91.3-73.9% at `k = 2` and 84.2-73.7-63.2% at `k = 3` with
+3.048 tokens a round, took the line above for stale, and the two runs are two
+checkpoints: this one is `models/Inkling-Small-mxfp4-mtp4` and that one is the
+default `models/Inkling-Small-mxfp4`, whose heads are the bfloat16 originals.
+Both were re-run at `42effa1` on a host checked settled first, and **each
+reproduces its own recorded row to the digit**:
+
+    heads       k = 1     k = 2          k = 3            tokens a round
+    packed      84.8%   86.96-78.26%   85-65-55%    1.829 2.560 2.909 3.368
+    bfloat16    84.8%   91.30-73.91%   84.21-73.68-63.16%
+                                                    1.829 2.560 3.048 3.368
+
+`k = 4` is 82.35-64.71-52.94-47.06% on both. **Nothing moved.** `k = 1` and
+`k = 4` are the two depths the format leaves alone and `k = 2` banks the same
+2.560 either way — see "The gate is acceptance" below, which records both rows
+side by side — so a run on the wrong checkpoint disagrees at exactly the two
+depths that disagree and nowhere else. **Two figures parting and two agreeing is
+the signature of a swapped checkpoint**, and it is the one shape that reads from
+the outside like a line that drifted.
 
 **With the flag at its default nothing moved at all.** A paired decode step is
 19.765 against 19.946 ms at 385 keys and 27.420 against 27.384 at 8192, ranges
@@ -3262,18 +3276,38 @@ block, because nine rows is under both floors.
 `k = 4`, with 1.829, 2.560, 3.048 and 3.368 tokens a round.
 
 **Two of those figures disagree with the line this file records above, and the
-disagreement predates this milestone.** The same sweep run against the commit
-before the block reads the same nine acceptance figures, so nothing here moved
-them; what moved is that the recorded line was last taken when `k = 2` read
-87.0-78.3% and `k = 3` read 85-65-55%. **The line above is stale and this is the
-run that says so** — which is the second time in this milestone a figure nobody
-re-ran turned out to have drifted, and the reason the debt paragraph below
-exists.
+reason is the checkpoint rather than the calendar.** This sitting ran the default
+`models/Inkling-Small-mxfp4`, whose heads are the bfloat16 originals; the line
+above was taken on `models/Inkling-Small-mxfp4-mtp4`, whose heads are packed. So
+the nine figures here are the bfloat16 row and the nine above are the packed one,
+and **both reproduce**: re-run at `42effa1` on a host checked settled first, each
+checkpoint returns its own recorded row to the digit. A8 read this as the
+recorded line having drifted and it had not.
+
+**The two rows agree at `k = 1` and at `k = 4` and part only at `k = 2` and
+`k = 3`, which is exactly what "The gate is acceptance" records the format
+costing** — so two figures disagreeing and two agreeing is the signature of the
+wrong checkpoint. It is worth naming because it is the failure this file's own
+discipline does not catch: every number here was paired, alternating and
+same-sitting, and none of that says which weights the sitting opened.
 
 **`k = 4` reads 0.843× under the reference and 0.844 under the production path**,
 against the 0.972 this file records. The commit before the block reads 0.858 in
-the same sitting, so this is the host and not the change — see the paragraph
-below on what this sitting's absolute figures are worth.
+the same sitting, so this is not the change — and **it is the same swapped
+checkpoint and not the host**, which is what this paragraph originally said and
+had wrong. Re-measured at `42effa1` on a settled host, the bfloat16 heads read
+0.848× and the packed ones 0.960× at `k = 4`. The 0.848 is the figure these three
+readings are of: it is 0.6% and 0.5% off the two taken across the block and 1.2%
+off the 0.858 before it, where the 0.972 they were all held against is a seventh
+away. That 0.972 is A6's and is a packed figure.
+
+**The one loose end is that 0.848 is not the 0.832 "What the heads' format is
+worth" records for the same checkpoint**, and 1.9% is above what this host
+drifts. Neither figure is paired — that section's 0.832 is five alternating pairs
+and this is one reading — so what the gap is of is not settled here. It does not
+reach the argument: 0.848 against 0.843 and 0.844 is the comparison that decides
+which checkpoint these readings came from, and it is tight where the comparison
+against 0.972 is a seventh.
 
 ### What this sitting's absolute figures are worth, which is less than its ratios
 
