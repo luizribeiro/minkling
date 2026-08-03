@@ -1851,29 +1851,8 @@ fn where_a_prefill_spends_its_time() {
             round_trip_table(&run.measured()),
         );
 
-        let (timed, _) = what_was_sampled(&run.profile);
-        // The same two bounds a decode step's table is held to: the rows are
-        // self time inside the wall time they were measured in, and the device
-        // cannot have executed for longer than the step that waited for it.
-        let (step, accounted) = (run.each_charged_step(), run.profile.total());
-        assert!(
-            accounted <= step,
-            "the rows sum to {accounted:.2?} inside a {step:.2?} prefill"
-        );
-        assert!(
-            run.profile.gpu() < step,
-            "the device reported executing for {:.2?} of a {step:.2?} prefill",
-            run.profile.gpu()
-        );
-        // Every dispatch the prefill encoded came back with a pair of
-        // timestamps. A device that dropped one writes `MTLCounterErrorValue`
-        // and this side charges it nothing, which would be a row quietly short
-        // rather than a failure.
-        let (dispatches, submissions, ..) = run.per_charged_step();
-        assert_eq!(
-            timed, dispatches,
-            "a prefill's dispatches were not all timed"
-        );
+        a_sampled_prefills_accounting_adds_up(&run, tokens);
+        let (_, submissions, ..) = run.per_charged_step();
         // **A prefill of hundreds of tokens merges nothing**, because one of
         // its layers alone passes the bytes a run may hold — so it is a
         // submission a layer where a decode step is two for the whole stack,
@@ -1887,6 +1866,82 @@ fn where_a_prefill_spends_its_time() {
             "a prefill of {tokens} tokens went in {submissions} submissions, which is fewer than \
              its {layers} layers and so is a merged run rather than a layer at a time"
         );
+    }
+}
+
+/// What a sampled prefill's rows have to be true of for the table above them to
+/// describe the prefill rather than a fraction of it: the rows are self time
+/// inside the wall time they were measured in, the device cannot have executed
+/// for longer than the prefill that waited for it, and every dispatch came back
+/// with a pair of timestamps.
+///
+/// The last is the one that fails quietly on its own. A device that dropped a
+/// timestamp writes `MTLCounterErrorValue` and this side charges it nothing,
+/// which is a row short rather than a failure.
+fn a_sampled_prefills_accounting_adds_up(run: &OnTheDevice, tokens: usize) {
+    let (timed, _) = what_was_sampled(&run.profile);
+    let (step, accounted) = (run.each_charged_step(), run.profile.total());
+    assert!(
+        accounted <= step,
+        "the rows sum to {accounted:.2?} inside a {step:.2?} prefill of {tokens} tokens"
+    );
+    assert!(
+        run.profile.gpu() < step,
+        "the device reported executing for {:.2?} of a {step:.2?} prefill of {tokens} tokens",
+        run.profile.gpu()
+    );
+    let (dispatches, ..) = run.per_charged_step();
+    assert_eq!(
+        timed, dispatches,
+        "a prefill of {tokens} tokens did not have all its dispatches timed"
+    );
+}
+
+/// The prompts a prefill is diagnosed at once the workload is a coding one.
+///
+/// The four `what_a_decode_step_costs_as_the_context_grows` stops inside and
+/// past, and its own list stops where this one does for a reason of its own —
+/// a decode step at 65536 keys is a dispatch and a prefill to it is half an
+/// hour, so the two lists are the same question asked at different prices.
+const LONG_PREFILLS: [usize; 4] = [2048, 4096, 8192, 16384];
+
+/// **Where a prefill's time goes at a prompt a coding turn opens with**, which
+/// is the same table as `where_a_prefill_spends_its_time` at 385 and 769 tokens
+/// and is the only one that can say which of its terms grow faster than the
+/// prompt.
+///
+/// **The attention rows are two here and one there.** 35 of this checkpoint's
+/// layers stop at a 512-key window and 7 reach every key the sequence has, so
+/// the arithmetic says one term should be `n × 512` and the other `n²/2` — and
+/// summed into a single row the two are a number about neither. `Kernel::under`
+/// is what splits them, and it splits them everywhere rather than here.
+///
+/// **One sampled run a length and no unsampled one beside it**, which is a
+/// departure from the two-length table above and is a wall-clock judgement
+/// rather than a claim: these four prefills are 3.8 minutes of device time
+/// between them and the pair would be 7.6. What the pair buys there is telling
+/// an effect of sampling from this machine's own state, and what stands in for
+/// it is `bench prefill` at the same four lengths — quoted in the README beside
+/// these rows rather than run inside this process, so a reader can see both.
+/// The row that says whether that substitution held is the sampled wall time
+/// printed here against the unsampled one printed there.
+///
+/// Nothing asserts a share or a slope. What is asserted is what the shorter
+/// table asserts: the rows are self time inside the wall time they were
+/// measured in, the device cannot have executed for longer than the prefill that
+/// waited for it, and every dispatch came back with a pair of timestamps — so a
+/// row is not quietly short.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn where_a_long_prefill_spends_its_time() {
+    let Some((dir, device)) = sampling_device() else {
+        return;
+    };
+
+    for &tokens in &LONG_PREFILLS {
+        let run = OnTheDevice::prefilling(&dir, &device, tokens, true);
+        eprintln!("{}", step_table(&run.measured()));
+        a_sampled_prefills_accounting_adds_up(&run, tokens);
     }
 }
 
