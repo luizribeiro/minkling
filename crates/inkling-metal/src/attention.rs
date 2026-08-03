@@ -3871,15 +3871,24 @@ mod tests {
         // The weighting, which is the tile's values against the tile's weights:
         // 32 threadgroup reads and 32 multiply-adds on each of the 128 threads a
         // 128-channel head leaves busy.
-        arm(
-            "the weighting",
-            crate::testing::instead_of(
-                &shipped,
-                "for (uint s = 0; s < held; ++s) {\n                acc += scores[s]",
-                "for (uint s = 0; s < 1u; ++s) {\n                acc += scores[s]",
-            ),
-            true,
+        //
+        // **Both writings of it, which is what the two memories cost this arm.**
+        // The walk is spelled once against `staged` and once against `tiled`
+        // because a threadgroup pointer and a device pointer are different types
+        // and nothing can name both — so an anchor that reached one of them would
+        // hold the term out of one entry and leave it in the other, and this
+        // table is read across a shape that runs each.
+        const WEIGHTS: &str =
+            "for (uint s = 0; s < held; ++s) {\n                    acc += scores[s]";
+        const ONE_WEIGHT: &str =
+            "for (uint s = 0; s < 1u; ++s) {\n                    acc += scores[s]";
+        let weighting = crate::testing::instead_of(&shipped, WEIGHTS, ONE_WEIGHT);
+        assert_eq!(
+            weighting.matches(ONE_WEIGHT).count(),
+            2,
+            "the weighting is cut out of one memory and left in the other"
         );
+        arm("the weighting", weighting, true);
 
         // The scoring dot, which is four multiply-adds a lane and the four key
         // reads under them — so this arm takes three quarters of the key traffic
