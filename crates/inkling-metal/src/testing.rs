@@ -176,6 +176,45 @@ pub fn device_time(
     profile::take().gpu() / calls as u32
 }
 
+/// Work the device until it has been busy this long, so that the pass which
+/// counts opens on a GPU already at its clock rather than climbing to it.
+///
+/// **A clock that ramps over a sweep manufactures a monotone row**, and this is
+/// not hypothetical: external work reproducing the threadgroup-memory
+/// experiment in `matmul.rs` reported a 1.7× win that vanished entirely once
+/// thirty warm-up dispatches were added — larger than the effect either sweep in
+/// this crate reports.
+///
+/// A budget rather than a count of dispatches, because the two sweeps' arms
+/// differ by two decades in what one costs and what a clock answers to is
+/// elapsed load rather than dispatches. Two seconds is past where this part's
+/// boost window closes, so what a sweep reports after it is the sustained clock
+/// — which is the one a prefill of any length runs at.
+pub fn warmed(mut work: impl FnMut()) {
+    const BUSY: std::time::Duration = std::time::Duration::from_secs(2);
+    let opened = std::time::Instant::now();
+    while opened.elapsed() < BUSY {
+        work();
+    }
+}
+
+/// Every arm of a sweep, measured up the list and then down it.
+///
+/// **One order cannot separate a turn the kernel has from one the clock drew.**
+/// A ramp flatters whichever arm ran last, and the arms of an occupancy sweep
+/// are listed by what they declare — so a ramp and a real turn read the same way
+/// in a single pass. Run both ways they do not: a turn sits at the same arm
+/// whichever end the sweep opened from, and a ramp follows the order instead.
+///
+/// The second vector is returned in the arms' own order rather than the order it
+/// was taken in, so that the two read down the page against each other.
+pub fn both_ways<T: Copy, R>(arms: &[T], mut measure: impl FnMut(T) -> R) -> (Vec<R>, Vec<R>) {
+    let up: Vec<R> = arms.iter().map(|&arm| measure(arm)).collect();
+    let mut down: Vec<R> = arms.iter().rev().map(|&arm| measure(arm)).collect();
+    down.reverse();
+    (up, down)
+}
+
 /// A dispatch of the caller's grid with nothing in it, which is the floor under
 /// every figure a sweep here reports.
 ///
@@ -246,4 +285,48 @@ impl EmptyDispatch {
 /// answer is the same wherever it is asked.
 pub fn saxpy_moves(len: usize) -> usize {
     3 * size_of::<f32>() * len
+}
+
+#[cfg(test)]
+mod tests {
+    /// **The second pass runs backwards and reports forwards**, which is the
+    /// whole of what [`super::both_ways`] promises and the one thing a stray
+    /// edit could undo silently: the sweeps that read it are `#[ignore]`d, so a
+    /// dropped `reverse` would surface as a table nobody could line up rather
+    /// than as a failure.
+    #[test]
+    fn a_sweep_taken_both_ways_reports_the_second_pass_in_the_arms_own_order() {
+        let mut order = Vec::new();
+        let (up, down) = super::both_ways(&[10, 20, 30], |arm| {
+            order.push(arm);
+            arm
+        });
+
+        assert_eq!(up, [10, 20, 30]);
+        assert_eq!(down, [10, 20, 30], "the second pass is reported forwards");
+        assert_eq!(
+            order,
+            [10, 20, 30, 30, 20, 10],
+            "the second pass is taken backwards"
+        );
+    }
+
+    /// An arm list of one is the degenerate case both passes have to agree on,
+    /// and an empty one is the case a `reverse` of nothing must not panic over.
+    #[test]
+    fn a_sweep_of_one_arm_and_a_sweep_of_none_are_both_taken_twice_and_never() {
+        let mut calls = 0;
+        let (up, down) = super::both_ways(&[7], |arm| {
+            calls += 1;
+            arm
+        });
+        assert_eq!((up, down, calls), (vec![7], vec![7], 2));
+
+        let mut never = 0;
+        let (up, down) = super::both_ways(&[] as &[usize], |arm| {
+            never += 1;
+            arm
+        });
+        assert_eq!((up, down, never), (Vec::new(), Vec::new(), 0));
+    }
 }

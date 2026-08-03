@@ -5665,6 +5665,18 @@ kernel void decoded_elements(
     /// asserted rather than argued**: the declaration reaches no operand and no
     /// order, so a row that moved the answer would be a row about something
     /// other than residency.
+    ///
+    /// **Warm and swept both ways**, for the reasons [`crate::testing::warmed`]
+    /// and [`crate::testing::both_ways`] give. Here the two passes agree to a
+    /// tenth of a percent at every arm, so the row is the kernel's.
+    ///
+    /// **The warm-up is what decides which clock this table is about, and this
+    /// is the sweep it reaches.** An arm here is about 300 ms and there are
+    /// eleven of them, which is short enough to sit inside this part's boost
+    /// window end to end; two seconds of load first puts every arm on the
+    /// sustained clock, which is the one a prefill of any length runs at. The
+    /// turn, its declaration and its far edge are the same on either clock and
+    /// only the size of the win moves.
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn how_many_threadgroups_of_a_prefills_packed_matmul_a_core_holds() {
@@ -5680,9 +5692,11 @@ kernel void decoded_elements(
             "  a threadgroup may declare {} KiB of a core's own memory",
             device.most_threadgroup_bytes() / 1024
         );
-        eprintln!("  {:<32}{}", "a threadgroup", bound_header());
+        crate::testing::warmed(|| {
+            a_prefills_shapes_cost(&device, &shipped);
+        });
 
-        for floats in DECLARED {
+        let (up, down) = crate::testing::both_ways(&DECLARED, |floats| {
             // A tile that declares nothing is the entry a decode step
             // dispatches, reached by taking the residency out of the walk
             // rather than by shrinking it: an array of no floats is not a
@@ -5705,17 +5719,25 @@ kernel void decoded_elements(
                 want,
                 "{floats} floats of residency moved the answer"
             );
-            let cells: String = a_prefills_shapes_cost(&device, &matmul)
-                .iter()
-                .map(|each| format!("{:>26}", format!("{:.2}ms", 1e3 * each.as_secs_f64())))
-                .collect();
-            eprintln!(
-                "  {:<32}{cells}",
-                format!(
-                    "{:.0} KiB",
-                    matmul.tiled.threadgroup_memory() as f64 / 1024.0
-                ),
-            );
+            (
+                matmul.tiled.threadgroup_memory(),
+                a_prefills_shapes_cost(&device, &matmul),
+            )
+        });
+
+        for (opened, rows) in [("up the list", &up), ("down it", &down)] {
+            eprintln!("  swept {opened}");
+            eprintln!("  {:<32}{}", "a threadgroup", bound_header());
+            for (held, taken) in rows {
+                let cells: String = taken
+                    .iter()
+                    .map(|each| format!("{:>26}", format!("{:.2}ms", 1e3 * each.as_secs_f64())))
+                    .collect();
+                eprintln!(
+                    "  {:<32}{cells}",
+                    format!("{:.0} KiB", *held as f64 / 1024.0)
+                );
+            }
         }
     }
 

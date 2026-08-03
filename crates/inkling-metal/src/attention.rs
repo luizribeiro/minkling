@@ -4637,6 +4637,13 @@ mod tests {
     /// multiply's right operand wants and which a copy makes free — so this is
     /// the one place the guidance could have been wrong for this kernel, and it
     /// is measured rather than taken.
+    ///
+    /// **Warm, and the arms run both ways at every cell**, for the reason
+    /// [`crate::testing::both_ways`] gives: this table reports the guidance's own
+    /// case coming out backwards, and a reading that disagrees with published
+    /// guidance is the one that has to rule out its own ordering first. A ramp
+    /// across four arms taken in one fixed order would flatter whichever ran
+    /// last.
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn what_staging_a_blocks_keys_and_values_is_worth() {
@@ -4674,25 +4681,35 @@ mod tests {
             }
         }
 
+        crate::testing::warmed(|| {
+            let opening = blocked(BOUND_TOKENS[0], 0, BOUND_TOKENS[0]);
+            a_call_costs(&device, &arms[0].1, &opening, None);
+        });
+
         let header: String = arms.iter().map(|(what, _)| format!("{what:>22}")).collect();
-        eprintln!("  {:<26}{header}", "a call, staging");
+        eprintln!("  {:<30}{header}", "a call, staging");
+        let order: Vec<usize> = (0..arms.len()).collect();
         for (tokens, sliding, what) in bound_cells() {
             let case = blocked(tokens, sliding, tokens);
-            let taken: Vec<Duration> = arms
-                .iter()
-                .map(|(_, arm)| a_call_costs(&device, arm, &case, None))
-                .collect();
-            let cells: String = taken
-                .iter()
-                .map(|each| {
-                    format!(
-                        "{:>13}{:>9}",
-                        format!("{each:.2?}"),
-                        format!("{:.2}x", taken[0].as_secs_f64() / each.as_secs_f64()),
-                    )
-                })
-                .collect();
-            eprintln!("  {:<26}{cells}", format!("{tokens} tokens, {what}"));
+            let (up, down) = crate::testing::both_ways(&order, |at| {
+                a_call_costs(&device, &arms[at].1, &case, None)
+            });
+            for (opened, taken) in [("arms up", &up), ("arms down", &down)] {
+                let cells: String = taken
+                    .iter()
+                    .map(|each| {
+                        format!(
+                            "{:>13}{:>9}",
+                            format!("{each:.2?}"),
+                            format!("{:.2}x", taken[0].as_secs_f64() / each.as_secs_f64()),
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "  {:<30}{cells}",
+                    format!("{tokens} tokens, {what}, {opened}")
+                );
+            }
         }
     }
 
@@ -5372,6 +5389,13 @@ mod tests {
     ///
     /// **The two shipped entries are rows of this table**, at 12.5 KiB staging
     /// nothing and 19 KiB staging a tile.
+    ///
+    /// **Warm and swept both ways**, for the reasons [`crate::testing::warmed`]
+    /// and [`crate::testing::both_ways`] give. What separates this sweep from
+    /// the matmul's is that a single row of it is seconds of device work, so it
+    /// is on the sustained clock by its second arm whatever it opened on — and
+    /// the two passes agree to a tenth of a percent, which is what says the step
+    /// at the sixth threadgroup is the declaration and not the order.
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn how_many_threadgroups_of_a_prefills_attention_a_core_holds() {
@@ -5392,35 +5416,48 @@ mod tests {
             "  a threadgroup may declare {} KiB of a core's own memory",
             most / 1024
         );
-        eprintln!("  {:<15}{:>14}{header}", "the values", "a threadgroup");
 
-        for floats in DECLARED {
-            for (what, arm) in [
-                (
-                    "where they lie",
-                    super::source(STAGED_BY_AN_UNSPLIT_CALL, floats, Numerics::Reference),
-                ),
-                (
-                    "staged",
-                    super::source(floats, NO_RESIDENCY, Numerics::Reference),
-                ),
-            ] {
-                if what == "staged" && floats < TILED_VALUES {
-                    continue;
-                }
-                let attention =
-                    FusedAttention::from_source(&device, &arm).expect("the arm compiles");
-                let held = attention.global.threadgroup_memory();
-                let taken: String = cells
+        // The staged arms stop where a tile stops fitting, which is what makes
+        // them three rather than fourteen — see this case's own paragraph.
+        let arms: Vec<(&'static str, usize)> = DECLARED
+            .iter()
+            .flat_map(|&floats| [("where they lie", floats), ("staged", floats)])
+            .filter(|&(what, floats)| what != "staged" || floats >= TILED_VALUES)
+            .collect();
+
+        let shipped = FusedAttention::from_source(
+            &device,
+            &super::source(STAGED_BY_AN_UNSPLIT_CALL, RESIDENCY, Numerics::Reference),
+        )
+        .expect("the shipped arm compiles");
+        crate::testing::warmed(|| {
+            a_prefill_costs(&device, &shipped, BOUND_TOKENS[0], 0);
+        });
+
+        let (up, down) = crate::testing::both_ways(&arms, |(what, floats)| {
+            let arm = match what {
+                "staged" => super::source(floats, NO_RESIDENCY, Numerics::Reference),
+                _ => super::source(STAGED_BY_AN_UNSPLIT_CALL, floats, Numerics::Reference),
+            };
+            let attention = FusedAttention::from_source(&device, &arm).expect("the arm compiles");
+            let taken: Vec<Duration> = cells
+                .iter()
+                .map(|&(tokens, sliding, _)| a_prefill_costs(&device, &attention, tokens, sliding))
+                .collect();
+            (what, attention.global.threadgroup_memory(), taken)
+        });
+
+        for (opened, rows) in [("up the list", &up), ("down it", &down)] {
+            eprintln!("  swept {opened}");
+            eprintln!("  {:<15}{:>14}{header}", "the values", "a threadgroup");
+            for (what, held, taken) in rows {
+                let cells: String = taken
                     .iter()
-                    .map(|&(tokens, sliding, _)| {
-                        let each = a_prefill_costs(&device, &attention, tokens, sliding);
-                        format!("{:>17}", format!("{each:.2?}"))
-                    })
+                    .map(|each| format!("{:>17}", format!("{each:.2?}")))
                     .collect();
                 eprintln!(
-                    "  {what:<15}{:>14}{taken}",
-                    format!("{:.2} KiB", held as f64 / 1024.0),
+                    "  {what:<15}{:>14}{cells}",
+                    format!("{:.2} KiB", *held as f64 / 1024.0),
                 );
             }
         }
