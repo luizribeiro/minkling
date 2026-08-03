@@ -170,7 +170,7 @@ impl<'a> ModelTail<'a> {
         let picks = self.argmax.encode(batch, &mut logits, self.vocab)?;
         Ok(Landed {
             chained,
-            logits,
+            logits: want.logits.then_some(logits),
             picks,
         })
     }
@@ -184,7 +184,13 @@ impl<'a> ModelTail<'a> {
 pub(crate) struct Landed {
     /// The undivided normed rows, where [`Tail::chained`] asked for them.
     chained: Option<Buffer<f32>>,
-    logits: Buffer<f32>,
+    /// The block's own logits, where [`Tail::logits`] asked for them — which a
+    /// generation never does, the ids being what it takes from a row.
+    ///
+    /// The buffer is dropped rather than never allocated, because the argmax is
+    /// what reads it: the flag decides whether it crosses back and not whether
+    /// it exists.
+    logits: Option<Buffer<f32>>,
     /// The id each row of the block names, taken where the row was written.
     picks: Buffer<u32>,
 }
@@ -199,7 +205,7 @@ impl Landed {
                 .as_ref()
                 .map(Buffer::to_vec)
                 .unwrap_or_default(),
-            logits: self.logits.to_vec(),
+            logits: self.logits.as_ref().map(Buffer::to_vec).unwrap_or_default(),
             picks: widened(&self.picks),
         })
     }

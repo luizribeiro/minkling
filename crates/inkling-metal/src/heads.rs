@@ -264,6 +264,7 @@ impl WrappedHead<'_> {
                     Tail {
                         block: 1,
                         chained: false,
+                        logits: false,
                     },
                 )
             })

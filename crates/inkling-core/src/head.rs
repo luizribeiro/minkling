@@ -76,6 +76,16 @@ pub struct Tail {
     /// norm behind it is never dispatched. See
     /// [`Round::hidden`](crate::generate::Round::hidden).
     pub chained: bool,
+    /// Whether the `[block, vocab]` logits are wanted beside the ids taken from
+    /// them.
+    ///
+    /// **The ids are not optional and these are**, which is the shape a
+    /// generation actually has: what a loop does with a row of logits is take
+    /// its argmax, and both backends answer with the argmax. So a run that only
+    /// decodes asks for none of them and 800 KB a row stays where it was
+    /// written — where a caller comparing this port against the reference wants
+    /// the distribution itself and says so.
+    pub logits: bool,
 }
 
 /// What the back of the model answers with, wherever it ran.

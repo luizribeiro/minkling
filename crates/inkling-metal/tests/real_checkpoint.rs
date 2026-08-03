@@ -1033,6 +1033,7 @@ fn the_device_tail_takes_the_token_the_host_tail_takes() {
     let want = Tail {
         block: 1,
         chained: true,
+        logits: true,
     };
 
     // The prompt, and then a decode step at a time — because the two regimes
@@ -2822,6 +2823,7 @@ fn a_heads_own_argmax_takes_the_token_the_host_takes() {
             Tail {
                 block: 1,
                 chained: true,
+                logits: false,
             },
             &held,
         )
@@ -2881,6 +2883,7 @@ fn time_chain(
             Tail {
                 block: 1,
                 chained: true,
+                logits: false,
             },
             weights,
         )

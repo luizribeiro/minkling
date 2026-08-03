@@ -247,6 +247,7 @@ impl<'a> Generator<'a> {
             Tail {
                 block: 1,
                 chained: false,
+                logits: true,
             },
             weights,
         )
@@ -287,6 +288,12 @@ impl<'a> Generator<'a> {
     /// is what a proposer is chained from and a row costs a pass over its own
     /// 4096 values. What the head is then given is the block, which is where
     /// the 200058-row projection is worth not running.
+    ///
+    /// **The logits are formed whatever [`Tail::logits`] says**, because the ids
+    /// come out of them and there is nowhere else on this side for them to come
+    /// from. What the flag decides here is whether they are handed on, which is
+    /// a `Vec` moved against a `Vec` dropped — where on a device it is 800 KB a
+    /// row not crossing a seam.
     fn on_this_side(&self, h: &[f32], want: Tail) -> Tailed {
         let hidden = self.model.hidden();
         let normed = self.model.final_norm(h);
@@ -298,7 +305,10 @@ impl<'a> Generator<'a> {
                 false => Vec::new(),
             },
             picks: Self::picks(&logits, want.block),
-            logits,
+            logits: match want.logits {
+                true => logits,
+                false => Vec::new(),
+            },
         }
     }
 
@@ -441,6 +451,7 @@ impl<'a> Generator<'a> {
                 Tail {
                     block,
                     chained: proposer.depth() > 0,
+                    logits: false,
                 },
                 weights,
             );
