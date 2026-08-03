@@ -46,7 +46,7 @@
 //! is formed.
 
 use std::borrow::Cow;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 
 use inkling_core::attention::AttentionConfig;
 use inkling_core::mask::MASKED;
@@ -57,6 +57,9 @@ use crate::device::{Device, MetalError};
 use crate::kernel::{Batch, Grid, Kernel, extent};
 
 const ENTRY: &str = "fused_attention";
+
+/// The second dispatch, which folds one query's splits back into one row.
+const COMBINE: &str = "attention_combine";
 
 /// Threads one threadgroup of a dispatch holds, all of them on one query of one
 /// head.
@@ -107,6 +110,62 @@ const STAGED_VALUES: usize = 4096;
 /// Inkling's `d_rel` is 16.
 const MOST_FEATURES: usize = 128;
 
+/// The narrowest simdgroup any Apple GPU reports, which is what the tile a
+/// dispatch will walk in has to be worked out from on this side.
+///
+/// The kernel takes its own width from `threads_per_simdgroup` and this side
+/// cannot ask before dispatching, so the two agree by this being a floor — and
+/// the direction is worth working out rather than asserting. A threadgroup is a
+/// fixed 256 threads, so a *wider* simdgroup is *fewer* of them and a *smaller*
+/// tile, which is *more* tiles in a span than this side counted. A split count
+/// bounded by the count from 32 is therefore at or under the tiles that exist,
+/// which is what it has to be: the partition itself is the kernel's own
+/// arithmetic over the kernel's own tile, and all this bound decides is that no
+/// split is asked for that has no tile to hold it.
+const NARROWEST_SIMD: usize = 32;
+
+/// Splits a call may cut its key span into, which bounds the combine's own
+/// threadgroup array.
+///
+/// Above where [`WANTED_GROUPS`] turns, so that the constant below is fitted at
+/// its own sweep's turn rather than pinned against this one.
+const MOST_SPLITS: usize = 128;
+
+/// Threadgroups a call aims to give the machine, which is what decides how many
+/// splits it cuts.
+///
+/// **A decode step is 32 threadgroups on an 80-core machine and that is the
+/// whole of what this fixes.** One threadgroup to each query head is 32 of them
+/// at one query, so 48 cores have no work at all and the 32 that do have one
+/// apiece — nothing to interleave against, on a kernel whose every tile is four
+/// barriers and a dependent read. Measured, the step reaches 9 to 16 GB/s
+/// against a machine that does 819, and it holds that rate from 97 keys to
+/// 65536: the kernel is not waiting on memory, it is waiting on itself.
+///
+/// So the span is cut instead, which is the lever the argmax took for the same
+/// reason — see "Sampling on the device": one threadgroup over a row of the
+/// vocabulary was this process's own argmax to within its spread, and the whole
+/// of what a device argmax was worth turned out to be the cut. The norm's
+/// arithmetic went the other way and is the reason this is a number rather than
+/// a rule: a split costs a dispatch, so it has to buy more than one.
+///
+/// Splits below which a call takes none, unless the span had no more tiles to
+/// give — see [`splits_for`], where the sweep that puts it here is quoted.
+const LEAST_SPLIT: usize = 16;
+
+/// **Swept rather than reasoned about**, by
+/// `what_the_split_over_the_key_span_is_worth` — and the sweep says the turn is
+/// not in the same place at two contexts. Summed over the stack's 35 windowed
+/// layers and 7 global ones, a 769-key step is best cut 16 ways and an 8192-key
+/// one 64 ways, and each is half again as expensive at the other's figure.
+///
+/// So this is deliberately past the shorter turn and the *tile clamp* is what
+/// brings a short context back down: a span has only so many tiles to give, and
+/// 97, 385 and 769 keys have 4, 13 and 25 of them where 2048 and up have 64 or
+/// more. One number and a clamp lands within a few percent of the swept best at
+/// every length, which two numbers and a length threshold would have to earn.
+const WANTED_GROUPS: usize = 2048;
+
 /// What wrapping one layer's step can fail with.
 ///
 /// Wrapping and not calling: everything here is a shape, settled once against
@@ -137,6 +196,10 @@ pub enum AttentionError {
 #[derive(Debug)]
 pub struct FusedAttention {
     kernel: Kernel,
+    /// The fold behind a split call, out of the same source string: the two
+    /// entries share [`Shape`] and a mutation to one is a source a test has to
+    /// be able to compile both out of.
+    combine: Kernel,
 }
 
 impl FusedAttention {
@@ -150,8 +213,53 @@ impl FusedAttention {
     pub(crate) fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
         Ok(Self {
             kernel: device.compile(source, ENTRY)?,
+            combine: device.compile(source, COMBINE)?,
         })
     }
+}
+
+/// Keys one tile of the walk holds, as this side has to work it out.
+///
+/// The kernel takes the same minimum of what its simdgroups can score and what
+/// its threadgroup memory can stage; here the first half is a floor rather than
+/// the device's own width, for the reason [`NARROWEST_SIMD`] gives.
+fn tile_keys(head_dim: usize) -> usize {
+    (THREADS_PER_GROUP / NARROWEST_SIMD * KEYS_PER_SIMD).min(STAGED_VALUES / head_dim)
+}
+
+/// How many splits a call of `pairs` query-head threadgroups over `keys` keys
+/// cuts its span into.
+///
+/// **One where the grid already fills the machine**, which is every prefill and
+/// every speculative round wide enough — 769 queries over 32 heads is 24608
+/// threadgroups and nothing about them is short of work. A split there would buy
+/// no parallelism and cost a dispatch, a buffer and a fold, which is what
+/// `RUNS_A_GROUPING` cost the matmul for existing.
+///
+/// And never more splits than there are tiles to give them: a split with no tile
+/// in it is a threadgroup that returns on its first instruction, and past that
+/// point the fold grows while the walk does not.
+fn splits_for(pairs: usize, keys: usize, head_dim: usize) -> usize {
+    let tiles = keys.div_ceil(tile_keys(head_dim)).max(1);
+    let splits = WANTED_GROUPS
+        .div_ceil(pairs.max(1))
+        .clamp(1, tiles.min(MOST_SPLITS));
+    // **Either a cut that spreads the live keys or no cut at all**, which is
+    // what the sweep found on a nine-row block: at 8192 keys the predicate's own
+    // eight splits are 565 µs on a windowed layer against 326 unsplit, because
+    // a windowed layer's live 512 keys fall inside one or two of eight splits
+    // while the fold is charged all eight of every one of the block's 288 rows.
+    // The fold grows with `pairs * splits` and the walk only shrinks where a
+    // split has live keys in it, so a small cut over a wide grid pays for the
+    // first and gets none of the second.
+    //
+    // A span with fewer tiles than that is a different case and keeps its cut:
+    // there the clamp is what chose the number, every split has a tile in it,
+    // and 97 and 385 keys are 4 and 13 tiles.
+    if splits < LEAST_SPLIT && splits < tiles {
+        return 1;
+    }
+    splits
 }
 
 /// What one call of the attention step reads, in the layouts the pieces around
@@ -432,6 +540,16 @@ pub struct LayerAttention<'a> {
     span: RefCell<KeyValues>,
     config: AttentionConfig,
     rel_extent: usize,
+    /// Splits a call cuts its span into, where a caller has pinned it rather
+    /// than left it to [`splits_for`].
+    ///
+    /// A seam for the same reason [`FusedAttention::from_source`] is one: what
+    /// fits [`WANTED_GROUPS`] is a sweep across split counts on one shape, and
+    /// the alternative to pinning it here is a sweep that re-derives the
+    /// predicate it is meant to be fitting. Nothing outside this crate can set
+    /// it and nothing inside it does but
+    /// `what_the_split_over_the_key_span_is_worth`.
+    pinned: Cell<Option<usize>>,
 }
 
 impl<'a> LayerAttention<'a> {
@@ -481,6 +599,7 @@ impl<'a> LayerAttention<'a> {
             proj: RefCell::new(device.buffer(&by_distance(proj, config.d_rel, rel_extent))?),
             span: RefCell::new(KeyValues::new(device, config.kv_heads, config.head_dim)?),
             rel_extent,
+            pinned: Cell::new(None),
             device,
             attention,
             config,
@@ -646,6 +765,11 @@ impl<'a> LayerAttention<'a> {
             step.keys
         );
 
+        let pairs = heads * queries;
+        let splits = self
+            .pinned
+            .get()
+            .unwrap_or_else(|| splits_for(pairs, step.keys, head_dim));
         let fields = [
             extent(heads, "the heads of a layer"),
             extent(kv_heads, "the KV heads of a layer"),
@@ -657,18 +781,29 @@ impl<'a> LayerAttention<'a> {
             extent(self.config.d_rel, "the relative features of a layer"),
             extent(self.rel_extent, "the band of a layer"),
             extent(self.config.sliding, "the window of a layer"),
+            extent(splits, "the splits of a call"),
             (1.0 / head_dim as f32).to_bits(),
         ];
         let mut shape = self.device.inline(&fields)?;
         let mut scaled = self.device.inline(&taus)?;
         let mut proj = self.proj.borrow_mut();
         let mut out = self.device.zeroed::<f32>(queries * heads * head_dim)?;
+        // What each split leaves for the fold: its weighted sum, its peak and
+        // its total. An unsplit call writes its row straight out and this is the
+        // smallest allocation the device will make rather than the buffer it
+        // does not need — so a prefill allocates what it always did to within a
+        // float.
+        let partial = head_dim + 2;
+        let mut partials = self.device.zeroed::<f32>(match splits {
+            1 => 1,
+            splits => pairs * splits * partial,
+        })?;
 
-        // A threadgroup to each query of each head, which is what makes the pair
-        // the threadgroup's own position and so what makes the barriers below
-        // uniform: a threadgroup either runs a query or returns from one, and
-        // never splits over the question.
-        let grid = Grid::new(heads * queries * THREADS_PER_GROUP, THREADS_PER_GROUP);
+        // A threadgroup to each split of each query of each head, which is what
+        // makes the pair the threadgroup's own position and so what makes the
+        // barriers below uniform: a threadgroup either runs a split or returns
+        // from one, and never splits over the question.
+        let grid = Grid::new(pairs * splits * THREADS_PER_GROUP, THREADS_PER_GROUP);
         // **The spans are bound whole and read to `step.keys`**, which is the
         // difference between what this dispatch binds and what it moves: a
         // layer's keys and values have room for a thousand and an eight-token
@@ -676,8 +811,15 @@ impl<'a> LayerAttention<'a> {
         // projection is `[rel_extent, d_rel]` and a call reaches the distances
         // its keys span. Beside them the queries in and the same shape out, the
         // relative features, and a scale for each query.
+        //
+        // A split call writes partials where an unsplit one writes the row, and
+        // the fold below is charged reading them — so the pair of dispatches is
+        // charged the row once between them however many splits made it.
+        let row = out.len();
+        let staged = pairs * splits * partial;
         let moves = size_of::<f32>()
-            * (2 * step.q.len()
+            * (step.q.len()
+                + if splits == 1 { row } else { staged }
                 + 2 * kv_heads * step.keys * head_dim
                 + step.rel.len()
                 + step.keys.min(self.rel_extent) * self.config.d_rel
@@ -693,10 +835,22 @@ impl<'a> LayerAttention<'a> {
                 proj.arg(),
                 scaled.arg(),
                 out.arg(),
+                partials.arg(),
             ],
             grid,
             moves,
         )?;
+        if splits > 1 {
+            // A thread to a channel, which is the width the fold's own loop
+            // wants and is what the weighting phase above gives each thread.
+            let width = head_dim.next_multiple_of(NARROWEST_SIMD);
+            batch.add(
+                &self.attention.combine,
+                &[shape.arg(), partials.arg(), out.arg()],
+                Grid::new(pairs * width, width),
+                size_of::<f32>() * (staged + row),
+            )?;
+        }
         Ok(out)
     }
 
@@ -704,6 +858,18 @@ impl<'a> LayerAttention<'a> {
     /// are.
     pub fn held(&self) -> usize {
         self.span.borrow().held
+    }
+
+    /// Cut every call's span into `splits`, or `None` to leave it to
+    /// [`splits_for`] — see [`LayerAttention::pinned`].
+    ///
+    /// Only the sweep sets it, so only the sweep's build has it: what a release
+    /// build reads is the `None` the constructor put there, and a caller that
+    /// could pin a split count is a caller that could take the predicate off the
+    /// one path this measures.
+    #[cfg(test)]
+    pub(crate) fn split_into(&self, splits: Option<usize>) {
+        self.pinned.set(splits);
     }
 
     /// What this layer's keys and values occupy on the device.
@@ -789,6 +955,7 @@ fn source() -> String {
         "constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n\
          constant uint MOST_CHANNELS = {MOST_CHANNELS};\n\
          constant uint MOST_FEATURES = {MOST_FEATURES};\n\
+         constant uint MOST_SPLITS = {MOST_SPLITS};\n\
          constant uint KEYS_PER_SIMD = {KEYS_PER_SIMD};\n\
          constant uint STAGED_VALUES = {STAGED_VALUES};\n\
          constant float MASKED = {MASKED:e}f;\n{BODY}"
@@ -816,6 +983,7 @@ struct Shape {
     uint d_rel;
     uint rel_extent;
     uint sliding;
+    uint splits;
     uint scale_bits;
 };
 
@@ -894,6 +1062,7 @@ kernel void fused_attention(
     device const float *proj [[buffer(5)]],
     device const float *taus [[buffer(6)]],
     device float *out [[buffer(7)]],
+    device float *partials [[buffer(8)]],
     uint slot [[threadgroup_position_in_grid]],
     uint local [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -908,18 +1077,25 @@ kernel void fused_attention(
     threadgroup float scores[MOST_SIMDGROUPS * KEYS_PER_SIMD];
     threadgroup float staged[STAGED_VALUES];
 
+    // A threadgroup is one split of one query of one head, split-minor — so the
+    // splits of a pair are consecutive threadgroups, which is the order they are
+    // written in and the order the combine reads them in.
+    const uint pair = slot / shape.splits;
+    const uint split = slot % shape.splits;
+
     // Unreachable under the grid this is dispatched over, which gives exactly
-    // one threadgroup to each query of each head. It is here for what it would
-    // have to be if that ever stopped being true: the pair is the threadgroup's
-    // own position, so this turns away a whole group and never splits one — and
-    // a bounds check on `local` instead would leave some threads at the barriers
-    // below and others past them, which is undefined rather than slow.
-    if (slot >= shape.heads * shape.queries) {
+    // one threadgroup to each split of each query of each head. It is here for
+    // what it would have to be if that ever stopped being true: the pair is the
+    // threadgroup's own position, so this turns away a whole group and never
+    // splits one — and a bounds check on `local` instead would leave some
+    // threads at the barriers below and others past them, which is undefined
+    // rather than slow.
+    if (pair >= shape.heads * shape.queries) {
         return;
     }
 
-    const uint head = slot / shape.queries;
-    const uint i = slot % shape.queries;
+    const uint head = pair / shape.queries;
+    const uint i = pair % shape.queries;
     // Each KV head serves a contiguous block of query heads: with 32 query heads
     // over 8 KV heads, query heads 0..4 all read KV head 0. Striding instead —
     // `head % kv_heads` — pairs every query head with keys of the right shape.
@@ -931,7 +1107,7 @@ kernel void fused_attention(
     // room for more keys than the sequence has put in it, so what separates one
     // KV head's keys from the next is the slots allocated and not the slots
     // filled. A call handed the span whole passes the same number twice.
-    device const float *q_row = q + (ulong)slot * shape.head_dim;
+    device const float *q_row = q + (ulong)pair * shape.head_dim;
     device const float *keys_of = k + (ulong)kv * shape.key_stride * shape.head_dim;
     device const float *values_of = v + (ulong)kv * shape.key_stride * shape.head_dim;
     device const float *rel_row = rel + ((ulong)i * shape.heads + head) * shape.d_rel;
@@ -977,8 +1153,27 @@ kernel void fused_attention(
         ? ((uint)position - (shape.sliding - 1u)) / tile * tile
         : 0u;
 
-    for (uint first = reach; first < last; first += tile) {
-        const uint held = min(tile, last - first);
+    // SPLIT: this threadgroup's share of the walk, in whole tiles.
+    //
+    // **Cut out of the whole span rather than out of the live range, and that
+    // is what keeps the bound above bit-exact.** A split of `[reach, last)`
+    // would put its boundaries somewhere else the moment the bound moved them,
+    // so a kernel with the bound taken off would accumulate over different
+    // tiles and the claim that walking a masked key is the same as not walking
+    // it could no longer be made on the bits. Cut out of `[0, keys)` the
+    // boundaries are the same either way: every split walks the tiles it would
+    // have walked, and a split with no live key in it contributes a peak of
+    // `-1e30` or `-INFINITY` that the combine rescales by an exact zero.
+    //
+    // A split is at least one tile, so `per_split * tile` never cuts a tile in
+    // half and `from` stays on the alignment `reach` already has.
+    const uint spans = (shape.keys + tile - 1u) / tile;
+    const uint per_split = (spans + shape.splits - 1u) / shape.splits;
+    const uint from = max(reach, split * per_split * tile);
+    const uint to = min(last, min(shape.keys, (split + 1u) * per_split * tile));
+
+    for (uint first = from; first < to; first += tile) {
+        const uint held = min(tile, to - first);
 
         // The tile's values, brought in by the whole threadgroup in the order
         // they lie rather than by each thread down its own channel.
@@ -1044,16 +1239,108 @@ kernel void fused_attention(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    // **One split is the whole walk, and it answers where it always did.** The
+    // partials and the dispatch that folds them are what a split call needs and
+    // what an unsplit one would only pay for, so the branch is here rather than
+    // in a second kernel: at one split this is the same arithmetic over the same
+    // tiles writing the same row, which is what lets a prefill go on being the
+    // dispatch it was.
+    //
     // `[queries, heads * head_dim]` rather than the `[heads, queries, head_dim]`
     // read above: the merge `o_proj` needs is an output index here rather than a
     // pass over a tensor.
     //
     // A call over no keys leaves a total of zero, which is a forward pass over
     // no tokens rather than a row to divide by it.
-    device float *result = out + ((ulong)i * shape.heads + head) * shape.head_dim;
-    const float norm = total > 0.0f ? 1.0f / total : 0.0f;
+    if (shape.splits == 1u) {
+        device float *result = out + ((ulong)i * shape.heads + head) * shape.head_dim;
+        const float norm = total > 0.0f ? 1.0f / total : 0.0f;
+        for (uint d = local; d < shape.head_dim; d += threads) {
+            result[d] = weighted[d] * norm;
+        }
+        return;
+    }
+
+    // What this split reached, unnormalised and beside the peak it is relative
+    // to — which is what the combine needs and what a normalised row could not
+    // give it, since two splits' totals are not comparable until they have been
+    // shifted onto one peak.
+    device float *part = partials + (ulong)slot * (shape.head_dim + 2u);
     for (uint d = local; d < shape.head_dim; d += threads) {
-        result[d] = weighted[d] * norm;
+        part[d] = weighted[d];
+    }
+    if (local == 0) {
+        part[shape.head_dim] = peak;
+        part[shape.head_dim + 1u] = total;
+    }
+}
+
+/// One query's splits folded back into the row the unsplit kernel would have
+/// written.
+///
+/// A threadgroup to a query of a head, reading the `splits` partials that pair
+/// left. The fold is the same streaming softmax the tile loop above runs, at the
+/// grain of a split rather than of a tile: take the largest peak, rescale every
+/// split's total and weighted sum onto it, and normalise by what they come to.
+///
+/// **A split with no live key in it is rescaled to nothing rather than branched
+/// around.** Its peak is `-INFINITY` where the loop above never entered, or
+/// `-1e30` where it walked masked tiles only, and `exp` of either against a real
+/// peak underflows to a zero that is exact — which is what lets the bound above
+/// stay bit-exact against a kernel that walks keys this one skips.
+kernel void attention_combine(
+    constant Shape &shape [[buffer(0)]],
+    device const float *partials [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint pair [[threadgroup_position_in_grid]],
+    uint local [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    threadgroup float rescale[MOST_SPLITS];
+
+    if (pair >= shape.heads * shape.queries) {
+        return;
+    }
+    const uint head = pair / shape.queries;
+    const uint i = pair % shape.queries;
+    const uint stride = shape.head_dim + 2u;
+    device const float *base = partials + (ulong)pair * shape.splits * stride;
+    device float *result = out + ((ulong)i * shape.heads + head) * shape.head_dim;
+
+    // Every thread reduces the same handful of entries rather than one reducing
+    // and broadcasting, which is what the tile loop above does with its scores
+    // and for the same reason: at this many entries that costs less than the
+    // barrier a broadcast needs.
+    float peak = -INFINITY;
+    for (uint s = 0; s < shape.splits; ++s) {
+        peak = fmax(peak, base[s * stride + shape.head_dim]);
+    }
+    // A row no split reached at all, which the grid cannot produce — every query
+    // can see its own key — and which would otherwise be `exp(-inf - -inf)`.
+    if (!(peak > -INFINITY)) {
+        for (uint d = local; d < shape.head_dim; d += threads) {
+            result[d] = 0.0f;
+        }
+        return;
+    }
+
+    for (uint s = local; s < shape.splits; s += threads) {
+        rescale[s] = precise::exp(base[s * stride + shape.head_dim] - peak);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total = 0.0f;
+    for (uint s = 0; s < shape.splits; ++s) {
+        total += base[s * stride + shape.head_dim + 1u] * rescale[s];
+    }
+    const float norm = total > 0.0f ? 1.0f / total : 0.0f;
+
+    for (uint d = local; d < shape.head_dim; d += threads) {
+        float acc = 0.0f;
+        for (uint s = 0; s < shape.splits; ++s) {
+            acc += base[s * stride + d] * rescale[s];
+        }
+        result[d] = acc * norm;
     }
 }
 "#;
@@ -1092,11 +1379,17 @@ mod tests {
         let (head, tail) = source
             .split_once("    // BOUND:")
             .expect("the bound is marked");
+        // **The cut ends where the split begins, and the split is kept.** What
+        // this mutant exists to be is the same walk over every key of the span,
+        // which is the *bound* removed and not the parallelism — and the split
+        // partitions `[0, keys)` on tile boundaries either way, so a mutant that
+        // dropped it would compare two different accumulations and the bit-for-
+        // bit claim below would be about the wrong thing.
         let (_, tail) = tail
-            .split_once("\n    for (uint first = reach;")
-            .expect("the bound ends at its loop");
+            .split_once("\n    // SPLIT:")
+            .expect("the bound ends where the split begins");
         let whole = format!(
-            "{head}    const uint last = shape.keys;\n    const uint reach = 0u;\n\n    for (uint first = reach;{tail}"
+            "{head}    const uint last = shape.keys;\n    const uint reach = 0u;\n\n    // SPLIT:{tail}"
         );
         // What is asserted is that the bound is *gone*, not merely that the
         // string moved: cutting between two markers is only as good as the
@@ -1112,6 +1405,96 @@ mod tests {
             "the loop was not put back over the whole span"
         );
         whole
+    }
+
+    /// **A call cuts its span only where the grid is short of the machine**,
+    /// which is the whole of the predicate and the thing a table of timings
+    /// cannot say. A decode step is 32 threadgroups on 80 cores and splits; a
+    /// prefill is tens of thousands and does not, so it goes on being the one
+    /// dispatch it was and pays for no fold.
+    ///
+    /// Here rather than left to the timings because a predicate that quietly
+    /// stopped splitting a decode step would read as a regression in a number
+    /// nobody was measuring that week, and one that started splitting a prefill
+    /// would cost a dispatch and a buffer a layer at every length.
+    #[test]
+    fn a_call_splits_its_span_only_where_the_grid_is_short_of_the_machine() {
+        let (heads, head_dim) = (32, 128);
+        // A decode step: one query, 32 heads, and a context somebody has. Each
+        // either reaches the threadgroups it wanted or ran out of tiles to cut,
+        // which is the whole of the predicate — and the second case is not a
+        // shortfall but where a short context is meant to land, see
+        // `WANTED_GROUPS`.
+        for keys in [97, 385, 769, 4096, 65536] {
+            let splits = splits_for(heads, keys, head_dim);
+            let tiles = keys.div_ceil(tile_keys(head_dim));
+            assert!(
+                splits * heads >= WANTED_GROUPS || splits == tiles.min(MOST_SPLITS),
+                "{keys} keys split {splits} ways is {} threadgroups against {tiles} tiles",
+                splits * heads
+            );
+            assert!(
+                splits <= tiles,
+                "{keys} keys split {splits} ways is more splits than the {tiles} tiles it has"
+            );
+        }
+        // And a span with too few tiles to cut takes the tiles it has rather
+        // than threadgroups that return on their first instruction.
+        assert_eq!(splits_for(heads, 8, head_dim), 1);
+        assert_eq!(splits_for(heads, 3 * tile_keys(head_dim), head_dim), 3);
+
+        // A prefill takes no cut at any length, which is what keeps it the one
+        // dispatch it was.
+        for queries in [97, 385, 769] {
+            assert_eq!(
+                splits_for(heads * queries, 8192, head_dim),
+                1,
+                "{queries} queries split a span the grid already fills"
+            );
+        }
+        // And the widest block a round can propose takes none either — not
+        // because its grid fills the machine but because the cut it would get is
+        // too small to spread a windowed layer's live keys, which is the floor
+        // `splits_for` states and the sweep measured.
+        assert_eq!(splits_for(heads * 9, 8192, head_dim), 1);
+        assert!(splits_for(heads * 3, 8192, head_dim) >= LEAST_SPLIT);
+    }
+
+    /// The shape the cases below are driven at does reach the split, so that
+    /// what they assert is asserted of a call that cuts its span.
+    ///
+    /// **Without this the coverage is accidental.** Every equivalence claim in
+    /// this module — against mlx-vlm's own mask, against the CPU over the same
+    /// band, and the bit-for-bit one against the unbounded loop — is made over
+    /// cases whose split count is decided by a predicate none of them mentions,
+    /// and a fixture retuned until they stopped splitting would leave all three
+    /// passing about the unsplit kernel alone.
+    #[test]
+    fn the_cases_that_pin_the_answer_are_driven_through_a_split_span() {
+        let decode = synthetic("decode");
+        let splits = splits_for(
+            decode.config.heads * decode.queries,
+            decode.keys,
+            decode.config.head_dim,
+        );
+        assert!(
+            splits > 1,
+            "the decode case is one split, so nothing here pins the fold"
+        );
+        // And the long capture is the other side of the predicate, which is what
+        // says both paths are exercised rather than one of them twice.
+        for (case, _) in Case::all(LONG_ACTIVATIONS).unwrap_or_default() {
+            assert_eq!(
+                splits_for(
+                    case.config.heads * case.queries,
+                    case.keys,
+                    case.config.head_dim
+                ),
+                1,
+                "{}: a 1280-query capture split a grid that already fills the machine",
+                case.name
+            );
+        }
     }
 
     /// The synthetic cases, and the branches each was placed to reach — named
@@ -2056,9 +2439,16 @@ mod tests {
     /// The same, on a layer whose window is `sliding` — which is 35 of the
     /// checkpoint's 42 at 512, against 7 global ones this passes 0 for.
     fn windowed(keys: usize, sliding: usize) -> Case {
+        blocked(keys, sliding, 1)
+    }
+
+    /// The same over a block of `queries` rows, which is what a speculative
+    /// round of depth `k` verifies `k + 1` of in one pass — and is the other
+    /// shape a decode-time call comes in.
+    fn blocked(keys: usize, sliding: usize, queries: usize) -> Case {
         let (heads, kv_heads, head_dim, d_rel, extent) = (32, 8, 128, 16, 1024);
         Case {
-            name: format!("a decode step over {keys} keys through a window of {sliding}"),
+            name: format!("{queries} queries over {keys} keys through a window of {sliding}"),
             config: AttentionConfig {
                 hidden: heads * head_dim,
                 heads,
@@ -2070,14 +2460,14 @@ mod tests {
                 log_scaling: None,
             },
             proj: values(d_rel * extent, 4),
-            q: values(heads * head_dim, 1),
+            q: values(queries * heads * head_dim, 1),
             k: values(kv_heads * keys * head_dim, 2),
             v: values(kv_heads * keys * head_dim, 3),
-            rel: values(heads * d_rel, 5),
+            rel: values(queries * heads * d_rel, 5),
             taus: None,
-            queries: 1,
+            queries,
             keys,
-            q_offset: keys - 1,
+            q_offset: keys - queries,
             mask: None,
         }
     }
@@ -2422,6 +2812,119 @@ mod tests {
     fn span_bytes_for(config: AttentionConfig, keys: usize) -> u64 {
         let slots = KeyValues::capacity_for(keys);
         2 * (config.kv_heads * slots * config.head_dim) as u64 * size_of::<f32>() as u64
+    }
+
+    /// **What cutting the key span across threadgroups is worth, and where it
+    /// turns** — which is what [`WANTED_GROUPS`] is fitted on rather than
+    /// reasoned about.
+    ///
+    /// One split is the kernel this repo ran for eleven milestones: 32
+    /// threadgroups at a decode step's one query, on a machine with 80 cores.
+    /// Every column past it is the same walk over the same tiles cut more ways,
+    /// and each pays a second dispatch to fold what the splits left — so the
+    /// turn is where the fold starts costing more than the parallelism buys,
+    /// which is the shape of finding `ROWS_A_TILE` and `COLUMNS_A_TILE` both
+    /// are.
+    ///
+    /// **The fold is inside the figure**, because a batch holds both dispatches
+    /// and the device's clock is read across it. A column that timed the walk
+    /// alone would rank the widest cut first at every shape and be wrong about
+    /// all of them.
+    ///
+    /// Both kinds of layer, because they are not the same question. A global
+    /// layer's live range is the whole span and every split gets a share of it;
+    /// a windowed layer's is its last 512 keys, and the splits are cut over the
+    /// span rather than over the live range — see SPLIT in the kernel, where
+    /// that is what keeps the loop bound exact — so past a context of about four
+    /// windows its live keys land in one split and the rest return. That is
+    /// visible here as a windowed row that stops improving, and it is the next
+    /// thing to take.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_the_split_over_the_key_span_is_worth() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        const ROUNDS: usize = 3;
+        const CUTS: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+        let cost = |keys: usize, sliding: usize, queries: usize, splits: usize| -> Duration {
+            let case = blocked(keys, sliding, queries);
+            let layer = case.wrapped(&device, &attention);
+            layer.hold(0, keys).expect("the span reserves");
+            layer.span().appended(keys);
+            layer.split_into(Some(splits));
+
+            let mut q = device.buffer(&case.q).expect("the queries upload");
+            let mut rel = device.buffer(&case.rel).expect("the features upload");
+            let mut span = layer.span();
+            let calls = readings_of(keys);
+            let mut held = Vec::with_capacity(calls);
+            crate::testing::device_time(&device, calls, |batch| {
+                held.push(
+                    layer
+                        .encode_over(batch, &mut span, &mut q, &mut rel, None, keys - queries)
+                        .expect("the step encodes"),
+                );
+            })
+        };
+
+        // A decode step at both kinds of layer and two contexts, and the two
+        // block widths a speculative round proposes — `k = 2` verifies three
+        // rows and the deepest chain nine, which are 96 and 288 threadgroups
+        // where a decode step is 32. **A block is where the predicate could
+        // most easily be wrong**: its grid is already wide, so a split there
+        // buys less parallelism and costs the same fold.
+        let shapes = [
+            (769, 0, 1),
+            (769, SLIDING_WINDOW, 1),
+            (8192, 0, 1),
+            (8192, SLIDING_WINDOW, 1),
+            (8192, 0, 3),
+            (8192, SLIDING_WINDOW, 3),
+            (8192, 0, 9),
+            (8192, SLIDING_WINDOW, 9),
+        ];
+        let mut taken = shapes.map(|(keys, sliding, queries)| {
+            CUTS.map(|splits| {
+                cost(keys, sliding, queries, splits);
+                Vec::new()
+            })
+        });
+        for _ in 0..ROUNDS {
+            for (each, (keys, sliding, queries)) in taken.iter_mut().zip(shapes) {
+                for (readings, splits) in each.iter_mut().zip(CUTS) {
+                    readings.push(cost(keys, sliding, queries, splits));
+                }
+            }
+        }
+
+        eprintln!(
+            "{:>26}{}",
+            "splits a call",
+            CUTS.map(|c| format!("{c:>10}")).concat()
+        );
+        for ((keys, sliding, queries), each) in shapes.iter().zip(&taken) {
+            let window = match sliding {
+                0 => "global".to_string(),
+                _ => format!("window {sliding}"),
+            };
+            let cells: String = each
+                .iter()
+                .map(|readings| {
+                    let mean = readings.iter().sum::<Duration>() / readings.len() as u32;
+                    format!("{:>10}", format!("{mean:.2?}"))
+                })
+                .collect();
+            eprintln!("{keys:>6} keys, {queries:>2} rows, {window:>11}{cells}");
+        }
+        for (keys, queries) in [(769, 1), (8192, 1), (8192, 3), (8192, 9), (8192, 769)] {
+            eprintln!(
+                "  the shipped predicate cuts {queries:>3} rows over {keys:>4} keys \
+                 — {:>5} threadgroups — into {} splits",
+                32 * queries,
+                splits_for(32 * queries, keys, 128),
+            );
+        }
     }
 
     /// **What the attention step costs as the context grows into a coding
