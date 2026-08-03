@@ -2097,6 +2097,185 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// A kernel's own decode given an entry point of its own, so that the
+    /// sixteen floats it produces can be read out one code at a time.
+    ///
+    /// Appended to a source rather than written beside it: what this compiles is
+    /// that source's own `element` and not a second copy of it, through the same
+    /// compiler and the same options as the dispatch that multiplies.
+    const DECODED_ELEMENTS: &str = r#"
+kernel void decoded_elements(
+    device float *out [[buffer(0)]],
+    uint code [[thread_position_in_grid]]
+) {
+    out[code] = element(code);
+}
+"#;
+
+    /// What `written`'s decode makes of each of the sixteen codes, as the bits
+    /// the device wrote.
+    fn each_code_decoded(device: &Device, written: &str) -> Vec<u32> {
+        let kernel = device
+            .compile(&format!("{written}{DECODED_ELEMENTS}"), "decoded_elements")
+            .expect("the probe compiles");
+        let mut out = device
+            .zeroed::<f32>(ELEMENTS.len())
+            .expect("the buffer allocates");
+        device
+            .run(
+                &kernel,
+                &[out.arg()],
+                Grid::new(ELEMENTS.len(), ELEMENTS.len()),
+                size_of::<f32>() * ELEMENTS.len(),
+            )
+            .expect("the dispatch completes");
+        bit_patterns(&out.to_vec())
+    }
+
+    fn bit_patterns(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    /// The kernel's decode and the one that would replace it, against
+    /// [`ELEMENTS`], as bit patterns.
+    ///
+    /// **The two that decode a code have a row here and the one that decodes a
+    /// byte does not.** A table of pairs is indexed by both codes at once, so
+    /// there is no `element` in it to give an entry point to; what stands in for
+    /// this on that arm is
+    /// [`every_way_of_decoding_a_byte_multiplies_to_the_same_bits`], which holds
+    /// its whole multiply against the shipped one's.
+    ///
+    /// **Bits rather than floats, for the two readings a comparison of values
+    /// would let through.** Code 8 is `-0.0`, which `==` calls equal to code 0's
+    /// `+0.0` — MLX carries that sign through the scale multiply, and a decode
+    /// that lost it would agree with this table everywhere `assert_eq!` looks.
+    ///
+    /// **And this is where the arithmetic arm's one constraint was found.** Its
+    /// first form laid a code's three bits straight into an f32's own and
+    /// multiplied by `2^126`, which is exact for all sixteen and needs no
+    /// comparison: the code E2M1 calls subnormal lands on the f32 subnormal
+    /// `2^-127`, which is `0.5` under the same factor. **This device flushes f32
+    /// subnormals to zero**, so that form answered `0.0` for code 1 and `-0.0`
+    /// for code 9 and was bit-exact for the other fourteen — caught here rather
+    /// than in the fourth decimal of a projection, and the reason
+    /// [`assembled_from_the_bits`] counts up from `HALF_FIELD` instead.
+    #[test]
+    fn every_way_of_decoding_a_code_answers_the_tables_sixteen_floats_bit_for_bit() {
+        let Some(device) = device() else { return };
+        let want = bit_patterns(&ELEMENTS);
+        assert_ne!(
+            want[0],
+            want[ELEMENTS.len() / 2],
+            "a table whose two zeros were one bit pattern would prove nothing here"
+        );
+
+        for (what, written) in [
+            ("the shipped gather", source()),
+            (
+                "the field its bits assemble",
+                assembled_from_the_bits(&source()),
+            ),
+        ] {
+            assert_eq!(each_code_decoded(&device, &written), want, "{what}");
+        }
+    }
+
+    /// The shipped source with the gather replaced by the same sixteen floats
+    /// assembled out of each code's own bits.
+    ///
+    /// **E2M1 is f32's own layout an exponent field apart**, which is why
+    /// sixteen values could do without a table at all. A code's three low bits
+    /// are an exponent over a mantissa in the order an f32 keeps them, so a
+    /// magnitude with a nonzero exponent is `0.5`'s exponent field counted up by
+    /// the magnitude itself; the one magnitude below that is subnormal in E2M1,
+    /// where the format reads the same bit as half of the smallest step — the
+    /// same `HALF_FIELD`, multiplied rather than added. The sign is or'ed into
+    /// the bits rather than applied to the value, which is what gives code 8 its
+    /// `-0.0` without a branch.
+    ///
+    /// The constants are written into the arm rather than into the shipped
+    /// prelude, where nothing would read them, and every replacement is asserted
+    /// by [`crate::testing::instead_of`] — an arm that matched nothing would be
+    /// the shipped kernel measured against itself under another name.
+    fn assembled_from_the_bits(shipped: &str) -> String {
+        let sign_bit = 1u32 << (BITS - 1);
+        let half_field = (EXPONENT_BIAS - 1) << 1;
+        let carried = crate::testing::instead_of(
+            shipped,
+            "using namespace metal;",
+            &format!(
+                "using namespace metal;\n\
+                 constant uint SIGN_BIT = {sign_bit};\n\
+                 constant uint SIGN_SHIFT = {};\n\
+                 constant uint MAGNITUDE_MASK = {};\n\
+                 constant uint MAGNITUDE_SHIFT = {};\n\
+                 constant uint HALF_FIELD = {half_field};\n\
+                 constant uint NORMAL_FLOOR = {NORMAL_FLOOR};",
+                u32::BITS - BITS as u32,
+                sign_bit - 1,
+                EXPONENT_SHIFT - 1,
+            ),
+        );
+        crate::testing::instead_of(
+            &carried,
+            "    return ELEMENTS[code];",
+            "    const uint magnitude = code & MAGNITUDE_MASK;\n    const uint field = magnitude \
+             < NORMAL_FLOOR\n        ? magnitude * HALF_FIELD\n        : magnitude + \
+             HALF_FIELD;\n    return as_type<float>(((code & SIGN_BIT) << SIGN_SHIFT) | (field << \
+             MAGNITUDE_SHIFT));",
+        )
+    }
+
+    /// What an f32's exponent field is biased by, which is what a code's own
+    /// exponent counts up from.
+    const EXPONENT_BIAS: u32 = f32::MAX_EXP as u32 - 1;
+
+    /// The first magnitude whose exponent is not zero, which is where the
+    /// counting turns from a multiply into an add.
+    const NORMAL_FLOOR: u32 = 2;
+
+    /// Each decode's whole multiply against each other decode's, over the widths
+    /// and the spread of codes and scales the checkpoint holds.
+    ///
+    /// **This is what licenses shipping whichever of them is fastest.**
+    /// Bit-safety here is by construction rather than by tolerance: each decode
+    /// produces the same sixteen floats, every product and every partial sum
+    /// after it takes the same operands in the same order, and nothing else in
+    /// either entry moves. So the claim is equality of bit patterns and not a
+    /// bound — a deviation of any size at all would mean the values were not the
+    /// same values.
+    ///
+    /// Both entries, because the two decode in different places: the tiled one
+    /// decodes four columns of a byte into registers before it multiplies, and
+    /// `weight_dot` decodes one code at a time inside its own accumulate.
+    #[test]
+    fn every_way_of_decoding_a_byte_multiplies_to_the_same_bits() {
+        let Some(device) = device() else { return };
+        let case = Case::noisy(IN_DIM, OUT_DIM, 3);
+        let through = |matmul: &PackedMatmul| {
+            case.upload(&device, matmul)
+                .multiply(&case.x)
+                .expect("the dispatch completes")
+        };
+
+        let shipped = matmul(&device);
+        let (want, tiled) = (through(&shipped), a_tiled_call_answers(&device, &shipped));
+        for (what, written) in each_way_of_decoding_a_byte() {
+            let arm = PackedMatmul::from_source(&device, &written).expect("the arm compiles");
+            assert_eq!(
+                bit_patterns(&through(&arm)),
+                bit_patterns(&want),
+                "{what}: a projection"
+            );
+            assert_eq!(
+                bit_patterns(&a_tiled_call_answers(&device, &arm)),
+                bit_patterns(&tiled),
+                "{what}: a tile"
+            );
+        }
+    }
+
     /// The kernel against the CPU it replaces, over the reduction length and the
     /// spread of codes and scales the checkpoint actually holds.
     ///
@@ -4194,6 +4373,66 @@ mod tests {
             );
             row(what, &cost(&mutant));
         }
+    }
+
+    /// The shipped source with both decodes taken through one gather into a
+    /// 256-entry table of pairs, one entry per packed byte.
+    ///
+    /// **A byte is the unit the kernel reads and a byte is two codes**, so a
+    /// table indexed by the whole byte is one load where the table above is two,
+    /// against 2 KiB of constant memory rather than 64 bytes. Both call sites
+    /// move, which is what the two replacements are.
+    fn through_a_table_of_pairs(shipped: &str) -> String {
+        let pairs: Vec<String> = (0..1usize << u8::BITS)
+            .map(|byte| {
+                let (low, high) = (byte & (ELEMENTS.len() - 1), byte >> BITS);
+                format!("float2({:?}f, {:?}f)", ELEMENTS[low], ELEMENTS[high])
+            })
+            .collect();
+        let carried = crate::testing::instead_of(
+            shipped,
+            "using namespace metal;",
+            &format!(
+                "using namespace metal;\nconstant float2 ELEMENT_PAIRS[] = {{ {} }};",
+                pairs.join(", ")
+            ),
+        );
+        let walked = crate::testing::instead_of(
+            &carried,
+            "            dot += element(low) * v[0] + element(high) * v[1];",
+            "            const float2 pair = ELEMENT_PAIRS[code];\n            dot += pair.x * \
+             v[0] + pair.y * v[1];",
+        );
+        crate::testing::instead_of(
+            &walked,
+            "                low[c] = element(code & CODE_MASK);\n                high[c] = \
+             element((code >> BITS) & CODE_MASK);",
+            "                const float2 pair = ELEMENT_PAIRS[code];\n                low[c] = \
+             pair.x;\n                high[c] = pair.y;",
+        )
+    }
+
+    /// The ways a packed byte's two codes can be turned into the two floats they
+    /// stand for, each of which answers the same bits.
+    ///
+    /// **The arms differ in what the decode costs and in nothing else.** Every
+    /// one of them produces [`ELEMENTS`] for every code — the table arms by
+    /// holding it and the arithmetic arm by assembling it — so what the table below
+    /// ranks is three ways of spending time on one answer, and the case asserts
+    /// the answer rather than assuming it.
+    fn each_way_of_decoding_a_byte() -> Vec<(&'static str, String)> {
+        let shipped = source();
+        vec![
+            ("two gathers into a table — shipped", shipped.clone()),
+            (
+                "the field its bits assemble",
+                assembled_from_the_bits(&shipped),
+            ),
+            (
+                "one gather into a table of pairs",
+                through_a_table_of_pairs(&shipped),
+            ),
+        ]
     }
 
     /// The shipped source with a threadgroup array of `floats` nobody reads for
