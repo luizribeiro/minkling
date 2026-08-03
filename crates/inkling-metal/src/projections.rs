@@ -139,18 +139,18 @@ impl LayerKernels {
 
     /// The same, under numerics the caller chose.
     ///
-    /// **Only the matmul takes it**, and that is the flag's whole reach on this
-    /// side: the norm, the convolution and the argmax have no reduction a matrix
-    /// instruction could carry, and the attention step is the milestone after
-    /// this one. A kernel that does not take the flag is a kernel both paths
-    /// run, which is what "it selects the innermost compute only" means when it
-    /// is spelled in types.
+    /// **The matmul and the attention step take it and nothing else does**, and
+    /// that is the flag's whole reach on this side: the norm, the convolution
+    /// and the argmax have no reduction a matrix instruction could carry, so a
+    /// kernel that does not take the flag is a kernel both paths run — which is
+    /// what "it selects the innermost compute only" means when it is spelled in
+    /// types.
     pub fn compiling(device: &Device, numerics: Numerics) -> Result<Self, MetalError> {
         Ok(Self {
             matmul: PackedMatmul::under(device, numerics)?,
             norm: RmsNorm::new(device)?,
             conv: ShortConvolution::new(device)?,
-            attention: FusedAttention::new(device)?,
+            attention: FusedAttention::compiling(device, numerics)?,
             argmax: GreedyArgmax::new(device)?,
         })
     }

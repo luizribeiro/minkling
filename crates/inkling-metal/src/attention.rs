@@ -55,8 +55,13 @@ use inkling_core::profile::{self, Op};
 use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
 use crate::kernel::{Batch, Grid, Kernel, extent};
+use crate::numerics::Numerics;
 
 const ENTRY: &str = "fused_attention";
+
+/// The entry behind [`Numerics::Production`], which is the same step over a
+/// block of query rows with both multiplies on the matrix instruction.
+const BLOCK: &str = "mma_attention";
 
 /// The second dispatch, which folds one query's splits back into one row.
 const COMBINE: &str = "attention_combine";
@@ -227,6 +232,156 @@ const LEAST_SPLIT: usize = 16;
 /// every length, which two numbers and a length threshold would have to earn.
 const WANTED_GROUPS: usize = 2048;
 
+/// The square edge of the hardware matrix instruction, which every fragment
+/// below is a tile of.
+///
+/// `simdgroup_multiply_accumulate` over `simdgroup_float8x8` is the one shape
+/// this part offers, and 32 lanes holding a 64-element tile is two elements a
+/// lane — which is what [`MMA`] indexes with `fm` and `fn` and the whole reason
+/// a lane can say which query row and which key each of its scores belongs to.
+const MMA_FRAGMENT: usize = 8;
+
+/// Query rows one threadgroup of the production entry carries.
+///
+/// **A fragment row apiece for the eight simdgroups a threadgroup holds**, which
+/// is what makes a lane's query row fixed for the whole walk: the row is
+/// `simd * MMA_FRAGMENT + fm` and neither term moves inside the kernel. That is
+/// what lets the online softmax live in two registers rather than in threadgroup
+/// memory, and what lets `tau`, the position and the relative-feature row be
+/// read once at the top and held.
+const MMA_ROWS_A_BLOCK: usize = THREADS_PER_GROUP / NARROWEST_SIMD * MMA_FRAGMENT;
+
+/// Keys one step of the walk brings in, which is the width of the score block a
+/// step forms.
+///
+/// The same 32 the reference entry's tile is at this checkpoint's `head_dim`,
+/// which is a coincidence of two different arithmetics rather than a shared
+/// constant — and a convenient one, since it puts `reach`'s rounding on the same
+/// boundary in both.
+const MMA_KEYS_A_BLOCK: usize = 32;
+
+/// Channels of a head the production entry serves, which is a compile-time bound
+/// here where [`MOST_CHANNELS`] is a runtime one.
+///
+/// **The fragments are registers and a register array has to be indexed by a
+/// constant**, so the walk over a row's channels is unrolled against this rather
+/// than against `shape.head_dim` — a loop the compiler cannot unroll is a
+/// fragment array the compiler puts in scratch memory, which is the whole of
+/// what this kernel is trying not to do. A head wider than this stays on the
+/// reference entry, which bounds nothing at compile time and serves every width
+/// [`MOST_CHANNELS`] allows.
+///
+/// A head *narrower* than this is served and pays for it: the fragments past its
+/// last channel are loaded as zeros on both sides of the multiply and contribute
+/// exactly nothing, which is correct and is wasted work. Inkling's `head_dim` is
+/// 128 and reaches neither case.
+const MMA_MOST_CHANNELS: usize = 128;
+
+/// Fragments a query row's channels are cut into, and fragments a key block's
+/// keys are — the two unrolled extents of the walk.
+const MMA_FRAGS_A_ROW: usize = MMA_MOST_CHANNELS / MMA_FRAGMENT;
+const MMA_FRAGS_A_KEY_BLOCK: usize = MMA_KEYS_A_BLOCK / MMA_FRAGMENT;
+
+/// The stride of the staged key block, which holds `[channel, key]` so that the
+/// four keys a lane's fragment column wants lie beside each other.
+///
+/// Padded off the fragment's own width for the reason
+/// [`MMA_CHANNEL_STRIDE`] is padded: a stride that is a multiple of the
+/// fragment puts every lane of a load on one bank.
+const MMA_KEY_STRIDE: usize = MMA_KEYS_A_BLOCK + 4;
+
+/// The stride of the staged value block, which holds `[key, channel]` — the
+/// layout the values already lie in, and the one the second multiply wants.
+const MMA_CHANNEL_STRIDE: usize = MMA_MOST_CHANNELS + 4;
+
+/// Query rows a call brings before it is given a block.
+///
+/// A block computes [`MMA_ROWS_A_BLOCK`] rows whether the call has them or not:
+/// the rows past its own read the last live row again, walk every key with the
+/// rest, and are thrown away at the store. So the shape states a bound — a call
+/// that cannot fill one block is a call the whole span is walked for a handful
+/// of rows — and where the measurement turns is somewhere else again, which is
+/// what `what_a_block_of_query_rows_is_worth_at_each_height` is for. On the
+/// device's own clock, the block against the reference entry:
+///
+/// ```text
+/// rows   n over n   over 385   over 2048   over 8192
+///    5      0.48x      1.00x       1.13x       1.06x
+///    8      0.52x      0.87x       1.16x       1.11x
+///   16      0.87x      1.44x       2.15x       2.20x
+///   20      1.09x      1.66x       2.32x       2.20x
+///   32      1.27x      2.31x       3.06x       3.02x
+///   64      1.95x      3.58x       4.92x       5.54x
+/// ```
+///
+/// **Half a block's rows is where every shape agrees**, and that is the line.
+/// The block turns at twenty rows on the shape that turns latest — a call whose
+/// span is no longer than its own rows, which is a prompt of twenty tokens — and
+/// at eight to sixteen on every span a real prompt gives it. Under it the call
+/// stays on the reference entry, which is a rate and never an answer.
+///
+/// **What this floor is worth is a decode step, and it is not the only thing
+/// standing there.** `splits_for` cuts the span of any call whose grid is short
+/// of the machine, and [`FusedAttention::blocked`] refuses a cut call outright —
+/// so a decode step is turned away twice. The rows above say why that is worth
+/// having twice: at one query row the block is **0.45×**, which is A7's
+/// speculative round met again at eight times the block height.
+const MMA_ROWS_A_CALL: usize = MMA_ROWS_A_BLOCK / 2;
+
+/// Whether a block brings its keys, and whether it brings its values, into
+/// threadgroup memory before it multiplies against them.
+///
+/// **Two constants because the two copies are not the same copy**, which is the
+/// whole of what `what_staging_a_blocks_keys_and_values_is_worth` measures.
+/// Apple's guidance for this family is that threadgroup memory used as a
+/// software-managed cache of a device buffer is slower than reading the buffer:
+/// the two share one cache hierarchy, so a copy moves nothing nearer the
+/// multiply and what it adds is the copy, its barriers, and a declaration that
+/// decides how many threadgroups a core will hold.
+///
+/// The values are exactly that copy — the second multiply wants them `[key,
+/// channel]`, which is how they already lie — so the guidance applies to them
+/// undiluted.
+///
+/// The keys are not. The score multiply's right operand wants them transposed,
+/// and read where they lie a lane's two elements are `head_dim` floats apart
+/// while the copy that lands them can be coalesced. So a key staging buys a
+/// layout where a value staging buys nothing, and which of those the guidance
+/// reaches is a number rather than a rule.
+const MMA_STAGES_KEYS: bool = false;
+const MMA_STAGES_VALUES: bool = true;
+
+/// Floats the one staging array holds, which is the larger of what the blocks
+/// it is asked to hold want.
+///
+/// **The keys are read before the values are staged**, so the two never coexist
+/// and one array serves both — which is what keeps a block that stages both at
+/// 18 KiB rather than 34, and four of them on a core rather than two.
+const MMA_STAGED: usize = {
+    let keys = if MMA_STAGES_KEYS {
+        MMA_MOST_CHANNELS * MMA_KEY_STRIDE
+    } else {
+        1
+    };
+    let values = if MMA_STAGES_VALUES {
+        MMA_KEYS_A_BLOCK * MMA_CHANNEL_STRIDE
+    } else {
+        1
+    };
+    if keys > values { keys } else { values }
+};
+
+/// What the layout above rests on, asserted where it is decided rather than
+/// discovered as a wrong answer.
+const _: () = {
+    assert!(MMA_ROWS_A_BLOCK == THREADS_PER_GROUP / NARROWEST_SIMD * MMA_FRAGMENT);
+    assert!(MMA_FRAGS_A_ROW * MMA_FRAGMENT == MMA_MOST_CHANNELS);
+    assert!(MMA_FRAGS_A_KEY_BLOCK * MMA_FRAGMENT == MMA_KEYS_A_BLOCK);
+    assert!(MMA_MOST_CHANNELS <= MOST_CHANNELS);
+    assert!(MMA_KEY_STRIDE >= MMA_KEYS_A_BLOCK);
+    assert!(MMA_CHANNEL_STRIDE >= MMA_MOST_CHANNELS);
+};
+
 /// What wrapping one layer's step can fail with.
 ///
 /// Wrapping and not calling: everything here is a shape, settled once against
@@ -276,14 +431,32 @@ pub struct FusedAttention {
     /// entries share [`Shape`] and a mutation to one is a source a test has to
     /// be able to compile both out of.
     combine: Kernel,
+    /// The block, under the same two names, where the flag asked for it.
+    ///
+    /// **Charged to the rows the entry above is charged to**, so that a
+    /// per-kernel table taken under one word can be read against the same table
+    /// taken under the other. What the two do is the layer's attention step
+    /// either way; which arithmetic carried it is the column and not the row.
+    block: Option<[Kernel; 2]>,
 }
 
 impl FusedAttention {
+    /// The kernel a caller who does not ask gets, which is the reference
+    /// accumulation — see [`Numerics`].
     pub fn new(device: &Device) -> Result<Self, MetalError> {
+        Self::compiling(device, Numerics::default())
+    }
+
+    pub fn compiling(device: &Device, numerics: Numerics) -> Result<Self, MetalError> {
         Self::from_sources(
             device,
-            &source(STAGED_BY_AN_UNSPLIT_CALL, RESIDENCY),
-            &source(STAGED_BY_A_SPLIT_CALL, NO_RESIDENCY),
+            &source(STAGED_BY_AN_UNSPLIT_CALL, RESIDENCY, numerics),
+            // **The block is not compiled into the source a split call runs.**
+            // A split is what a call gets when its grid is short of the machine,
+            // which is a decode step's shape and the one shape a block of 64
+            // query rows has nothing to carry — so the entry is refused there by
+            // the predicate and absent there from the string.
+            &source(STAGED_BY_A_SPLIT_CALL, NO_RESIDENCY, Numerics::Reference),
         )
     }
 
@@ -302,11 +475,24 @@ impl FusedAttention {
     fn from_sources(device: &Device, unsplit: &str, split: &str) -> Result<Self, MetalError> {
         let whole = device.compile(unsplit, ENTRY)?;
         let cut = device.compile(split, ENTRY)?;
+        // **The source is asked rather than the flag**, which is the same thing
+        // said once instead of twice: [`source`] writes the entry where the flag
+        // asked and nowhere else, so a string that does not carry it is a string
+        // it cannot be compiled out of — and a test driving a block of its own
+        // through [`FusedAttention::from_source`] gets one for the same reason.
+        let block = match unsplit.contains(BLOCK) {
+            false => None,
+            true => {
+                let blocked = device.compile(unsplit, BLOCK)?;
+                Some([blocked.under(GLOBAL), blocked.under(WINDOWED)])
+            }
+        };
         Ok(Self {
             windowed: whole.under(WINDOWED),
             global: whole.under(GLOBAL),
             split: [cut.under(GLOBAL), cut.under(WINDOWED)],
             combine: device.compile(split, COMBINE)?,
+            block,
         })
     }
 
@@ -333,6 +519,61 @@ impl FusedAttention {
             (_, 0) => &self.split[0],
             (_, _) => &self.split[1],
         }
+    }
+
+    /// The shortest call the entry behind [`Numerics::Production`] is given, in
+    /// query rows.
+    ///
+    /// **Public because a differential run is worthless without it**, which is
+    /// the reason [`PackedMatmul::SHORTEST_BLOCKED_CALL`](crate::PackedMatmul::
+    /// SHORTEST_BLOCKED_CALL) is public: a call under this height runs the same
+    /// kernel under both words, so a corpus of prompts shorter than it would
+    /// report perfect agreement between a thing and itself.
+    pub const SHORTEST_BLOCKED_CALL: usize = MMA_ROWS_A_CALL;
+
+    /// The block, where this call's shape is one it should run.
+    ///
+    /// **The block is correct for every shape it is compiled for and fast for
+    /// some**, so this is where the difference is drawn rather than in the
+    /// kernel. Three things decide it and only the last is a measurement.
+    ///
+    /// **A split call never reaches it.** [`splits_for`] cuts a span only where
+    /// the grid is short of the machine, which is a decode step and a
+    /// speculative round — and a decode step is *one query row*, where a block
+    /// computes [`MMA_ROWS_A_BLOCK`] of them whether the call brought them or
+    /// not. That is the same shape of refusal `PackedMatmul::blocks` draws and
+    /// it is drawn harder here: A7 measured a verify block of four rows on a
+    /// 32-row matmul block at 2.2× *slower*, and a decode step is a
+    /// sixty-fourth of this one rather than an eighth.
+    ///
+    /// **A head this entry has no fragments for stays on the reference entry.**
+    /// [`MMA_MOST_CHANNELS`] is a compile-time bound where [`MOST_CHANNELS`] is
+    /// a runtime one, and a head that is not whole fragments has channels no
+    /// fragment covers. Inkling's 128 is neither.
+    ///
+    /// **And a call has to bring [`MMA_ROWS_A_CALL`] query rows**, which is the
+    /// line the two above cannot draw: a call of a handful of rows reaches
+    /// neither of them and would still have a block walk the whole span for
+    /// rows it throws away.
+    fn blocked(
+        &self,
+        sliding: usize,
+        queries: usize,
+        head_dim: usize,
+        splits: usize,
+        floor: usize,
+    ) -> Option<&Kernel> {
+        let worth = splits == 1
+            && queries >= floor
+            && head_dim <= MMA_MOST_CHANNELS
+            && head_dim % MMA_FRAGMENT == 0;
+        self.block
+            .as_ref()
+            .filter(|_| worth)
+            .map(|block| match sliding {
+                0 => &block[0],
+                _ => &block[1],
+            })
     }
 }
 
@@ -382,6 +623,33 @@ fn keys_a_call_walks(
 ) -> usize {
     (0..queries)
         .map(|i| keys_walked(q_offset + i, keys, sliding, tile))
+        .sum()
+}
+
+/// The same for a call the block runs, which reads a key once for the
+/// [`MMA_ROWS_A_BLOCK`] query rows of a block rather than once for each of them.
+///
+/// **One predicate decides the entry and the accounting**, so that a bandwidth
+/// column cannot describe a dispatch other than the one that ran. A block walks
+/// the union of its rows' spans — the first row's `reach` to the last live row's
+/// `last` — which is what the kernel's own bound takes and is what the rows
+/// inside it then mask themselves out of.
+fn keys_the_blocks_walk(queries: usize, q_offset: usize, keys: usize, sliding: usize) -> usize {
+    (0..queries.div_ceil(MMA_ROWS_A_BLOCK))
+        .map(|block| {
+            let first = block * MMA_ROWS_A_BLOCK;
+            let lastrow = (first + MMA_ROWS_A_BLOCK).min(queries) - 1;
+            let to = keys.min(lastrow + q_offset + 1);
+            let opening = first + q_offset;
+            let from = match sliding {
+                0 => 0,
+                window if opening >= window => {
+                    (opening - (window - 1)) / MMA_KEYS_A_BLOCK * MMA_KEYS_A_BLOCK
+                }
+                _ => 0,
+            };
+            to.saturating_sub(from)
+        })
         .sum()
 }
 
@@ -708,6 +976,16 @@ pub struct LayerAttention<'a> {
     /// it and nothing inside it does but
     /// `what_the_split_over_the_key_span_is_worth`.
     pinned: Cell<Option<usize>>,
+    /// The query rows a call brings before it is given a block, where a caller
+    /// has pinned it rather than left it to
+    /// [`FusedAttention::SHORTEST_BLOCKED_CALL`].
+    ///
+    /// A seam for the reason the one above it is: the floor *is* a sweep across
+    /// heights, and a sweep that could not reach the heights the predicate
+    /// refuses would be a sweep re-deriving the predicate it is meant to be
+    /// fitting. Nothing outside this crate can set it and nothing inside it does
+    /// but `what_a_block_of_query_rows_is_worth_at_each_height`.
+    floor: Cell<Option<usize>>,
 }
 
 impl<'a> LayerAttention<'a> {
@@ -758,6 +1036,7 @@ impl<'a> LayerAttention<'a> {
             span: RefCell::new(KeyValues::new(device, config.kv_heads, config.head_dim)?),
             rel_extent,
             pinned: Cell::new(None),
+            floor: Cell::new(None),
             device,
             attention,
             config,
@@ -961,7 +1240,27 @@ impl<'a> LayerAttention<'a> {
         // makes the pair the threadgroup's own position and so what makes the
         // barriers below uniform: a threadgroup either runs a split or returns
         // from one, and never splits over the question.
-        let grid = Grid::new(pairs * splits * THREADS_PER_GROUP, THREADS_PER_GROUP);
+        //
+        // The block counts in blocks of query rows where the entry above counts
+        // in queries, which is the one thing about the dispatch that differs
+        // between the two words: the same nine bindings, the same [`Shape`], the
+        // same command buffer, and a grid that covers the call either way.
+        let blocked = self.attention.blocked(
+            self.config.sliding,
+            queries,
+            head_dim,
+            splits,
+            self.floor
+                .get()
+                .unwrap_or(FusedAttention::SHORTEST_BLOCKED_CALL),
+        );
+        let grid = match blocked {
+            None => Grid::new(pairs * splits * THREADS_PER_GROUP, THREADS_PER_GROUP),
+            Some(_) => Grid::new(
+                heads * queries.div_ceil(MMA_ROWS_A_BLOCK) * THREADS_PER_GROUP,
+                THREADS_PER_GROUP,
+            ),
+        };
         // **The spans are bound whole and walked a query row at a time**, which
         // is the difference between what this dispatch binds and what it moves:
         // a layer's keys and values have room for a thousand, an eight-token
@@ -981,13 +1280,16 @@ impl<'a> LayerAttention<'a> {
         // partition `[0, keys)`, so between them they hold each live key once.
         let row = out.len();
         let staged = pairs * splits * partial;
-        let walked = keys_a_call_walks(
-            queries,
-            step.q_offset,
-            step.keys,
-            self.config.sliding,
-            tile_keys(head_dim),
-        );
+        let walked = match blocked {
+            None => keys_a_call_walks(
+                queries,
+                step.q_offset,
+                step.keys,
+                self.config.sliding,
+                tile_keys(head_dim),
+            ),
+            Some(_) => keys_the_blocks_walk(queries, step.q_offset, step.keys, self.config.sliding),
+        };
         let moves = size_of::<f32>()
             * (step.q.len()
                 + if splits == 1 { row } else { staged }
@@ -996,7 +1298,7 @@ impl<'a> LayerAttention<'a> {
                 + step.keys.min(self.rel_extent) * self.config.d_rel
                 + queries);
         batch.add(
-            self.attention.on(self.config.sliding, splits),
+            blocked.unwrap_or_else(|| self.attention.on(self.config.sliding, splits)),
             &[
                 shape.arg(),
                 step.q.arg(),
@@ -1041,6 +1343,14 @@ impl<'a> LayerAttention<'a> {
     #[cfg(test)]
     pub(crate) fn split_into(&self, splits: Option<usize>) {
         self.pinned.set(splits);
+    }
+
+    /// Give every call of this layer a block from `floor` query rows up, or
+    /// `None` to leave it to [`FusedAttention::SHORTEST_BLOCKED_CALL`] — see
+    /// [`LayerAttention::floor`].
+    #[cfg(test)]
+    pub(crate) fn block_from(&self, floor: Option<usize>) {
+        self.floor.set(floor);
     }
 
     /// What this layer's keys and values occupy on the device.
@@ -1121,8 +1431,8 @@ fn by_distance(proj: &[f32], d_rel: usize, rel_extent: usize) -> Vec<f32> {
 /// the reference rather than about this kernel — the CPU path emits it and the
 /// committed masks hold the bfloat16 rounding of it, and a second spelling here
 /// is one that can drift from the module that owns it.
-fn source(staged: usize, residency: usize) -> String {
-    format!(
+fn source(staged: usize, residency: usize, numerics: Numerics) -> String {
+    let mut written = format!(
         "constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n\
          constant uint MOST_CHANNELS = {MOST_CHANNELS};\n\
          constant uint MOST_FEATURES = {MOST_FEATURES};\n\
@@ -1132,7 +1442,28 @@ fn source(staged: usize, residency: usize) -> String {
          constant uint STAGED_VALUES = {staged};\n\
          constant uint RESIDENCY = {residency};\n\
          constant float MASKED = {MASKED:e}f;\n{BODY}"
-    )
+    );
+    // Appended where the flag asked and nowhere else, so that a reference run
+    // hands the compiler the string it handed before this entry existed —
+    // `the_reference_source_does_not_carry_the_block` is where that is held.
+    if numerics.is_production() {
+        let keys = usize::from(MMA_STAGES_KEYS);
+        let values = usize::from(MMA_STAGES_VALUES);
+        written.push_str(&format!(
+            "constant uint MMA_FRAGMENT = {MMA_FRAGMENT};\n\
+             constant uint MMA_ROWS_A_BLOCK = {MMA_ROWS_A_BLOCK};\n\
+             constant uint MMA_KEYS_A_BLOCK = {MMA_KEYS_A_BLOCK};\n\
+             constant uint MMA_MOST_CHANNELS = {MMA_MOST_CHANNELS};\n\
+             constant uint MMA_FRAGS_A_ROW = {MMA_FRAGS_A_ROW};\n\
+             constant uint MMA_FRAGS_A_KEY_BLOCK = {MMA_FRAGS_A_KEY_BLOCK};\n\
+             constant uint MMA_KEY_STRIDE = {MMA_KEY_STRIDE};\n\
+             constant uint MMA_CHANNEL_STRIDE = {MMA_CHANNEL_STRIDE};\n\
+             constant uint STAGES_KEYS = {keys};\n\
+             constant uint STAGES_VALUES = {values};\n\
+             constant uint MMA_STAGED = {MMA_STAGED};\n{MMA}"
+        ));
+    }
+    written
 }
 
 /// Everything of the kernel that those constants do not decide.
@@ -1180,9 +1511,18 @@ struct Shape {
 /// than across a simdgroup. Sixteen multiplies over one cache line is not work
 /// worth a reduction, and matching the CPU's association costs nothing to
 /// arrange.
+///
+/// **The features are a template parameter because the two entries hold them in
+/// different memories**, and an address space is part of a pointer's type in
+/// this language. One threadgroup to a query row stages the one row it needs;
+/// one threadgroup to a block of rows would have to stage all of them, and each
+/// of its lanes reads only its own — so the block reads them where they lie.
+/// The derivation is the same four branches in the same order either way, which
+/// is what the flag's rule asks of everything that is not the accumulate.
+template <typename Features>
 inline float banded_entry(
     device const float *proj,
-    threadgroup const float *features,
+    Features features,
     constant Shape &shape,
     int dist,
     float tau
@@ -1556,6 +1896,306 @@ kernel void attention_combine(
 }
 "#;
 
+/// The same step over a block of query rows, with both multiplies carried by
+/// `simdgroup_multiply_accumulate` and the softmax kept in registers.
+///
+/// **A threadgroup is `MMA_ROWS_A_BLOCK` query rows of one head rather than one
+/// query row**, and that is the whole of the structure. The entry above gives a
+/// simdgroup to each key and reduces the channels across its lanes: one
+/// multiply-add a lane a channel, and a `simd_sum` behind every score. Here the
+/// scores of 64 query rows against 32 keys are one 64x32 block formed by 8x8x8
+/// matrix instructions, so an instruction carries 512 multiply-adds where the
+/// other carries one — and the weighted values are a second such block rather
+/// than a thread walking its own channel down the tile.
+///
+/// **The answer is not the entry above's bit for bit and cannot be.** A hardware
+/// matrix multiply-accumulate sums its `k` dimension in an order the instruction
+/// defines and this side does not choose, where the entry above sums the channels
+/// in a lane-strided walk under one `simd_sum`. `fast::exp2` against
+/// `precise::exp` is a second difference, on every weight. See [`Numerics`],
+/// which is the flag that lets this be written at all, and
+/// `a_block_answers_what_the_reference_entry_answers`, which is where the two
+/// are held against an f64 accumulation rather than against each other.
+///
+/// **A lane's query row does not move for the whole walk.** The row is
+/// `simd * MMA_FRAGMENT + fm` and both terms are fixed, so `tau`, the position,
+/// the relative-feature row and the running peak and total are read or held once
+/// and never indexed again — which is what puts the online softmax in two
+/// registers and its two reductions in two `simd_shuffle_xor` steps over the four
+/// lanes that share a row, with no threadgroup traffic and no barrier at all.
+///
+/// **The band is derived per score exactly as it is above**, from the backward
+/// distance the lane can name for each of its two elements. What that costs is
+/// the same `d_rel` multiplies a query-key pair either way; what it does not
+/// cost is the 31 idle lanes the entry above leaves waiting on lane 0, because
+/// here every lane derives the entries of its own elements.
+///
+/// **The base of the exponential is folded into the scale.** `fast::exp2` is one
+/// hardware instruction where `precise::exp` is a range reduction around one, so
+/// the scale carries `M_LOG2E_F` and so does `tau` — which puts the learned bias
+/// in the same units as the scores it is added to. `MASKED` is left as it is:
+/// it is a magnitude that rules a key out at any base, and `exp2` of it
+/// underflows to the same exact zero `exp` of it does.
+///
+/// **One split, always.** A call with the query rows to fill a block has tens of
+/// thousands of threadgroups before any span is cut — `splits_for` gives one at
+/// every shape this entry is reached at — so there are no partials to leave and
+/// no fold behind it. The binding stays in the signature because the encoder is
+/// the one the entry above uses, unchanged.
+const MMA: &str = r#"
+/// One `simdgroup_multiply_accumulate` over fragments held as the two elements
+/// a lane owns.
+///
+/// The matrix type is built and taken apart around the instruction rather than
+/// carried, so that everything between two multiplies — the scale, the band, the
+/// softmax, the rescale — is ordinary arithmetic on a `float2` a lane can index.
+inline void accumulate(thread float2 &d, float2 a, float2 b, float2 c) {
+    simdgroup_float8x8 lhs, rhs, into, sum;
+    reinterpret_cast<thread float2 &>(lhs.thread_elements()) = a;
+    reinterpret_cast<thread float2 &>(rhs.thread_elements()) = b;
+    reinterpret_cast<thread float2 &>(into.thread_elements()) = c;
+    simdgroup_multiply_accumulate(sum, lhs, rhs, into);
+    d = reinterpret_cast<thread float2 &>(sum.thread_elements());
+}
+
+/// The largest of a row's scores and their total, over the four lanes of a
+/// simdgroup that hold one fragment row between them.
+///
+/// A lane's two elements are consecutive columns and the four lanes holding a
+/// row differ in exactly the two bits `fn` is built from, so the whole reduction
+/// is two shuffles and no memory.
+inline float across_the_row_max(float held) {
+    held = fmax(held, simd_shuffle_xor(held, 1u));
+    return fmax(held, simd_shuffle_xor(held, 8u));
+}
+
+inline float across_the_row_sum(float held) {
+    held += simd_shuffle_xor(held, 1u);
+    return held + simd_shuffle_xor(held, 8u);
+}
+
+kernel void mma_attention(
+    constant Shape &shape [[buffer(0)]],
+    device const float *q [[buffer(1)]],
+    device const float *k [[buffer(2)]],
+    device const float *v [[buffer(3)]],
+    device const float *rel [[buffer(4)]],
+    device const float *proj [[buffer(5)]],
+    device const float *taus [[buffer(6)]],
+    device float *out [[buffer(7)]],
+    device float *partials [[buffer(8)]],
+    uint block [[threadgroup_position_in_grid]],
+    uint local [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float staged[MMA_STAGED];
+
+    const uint blocks = (shape.queries + MMA_ROWS_A_BLOCK - 1u) / MMA_ROWS_A_BLOCK;
+    const uint head = block / blocks;
+    const uint first = (block % blocks) * MMA_ROWS_A_BLOCK;
+    // Unreachable under the grid this is dispatched over, which covers exactly
+    // the blocks the two extents cut the call into. Here for the reason the
+    // entry above carries the same guard: a dispatch whose grid and shape
+    // disagreed would be a wrong answer rather than a failure.
+    if (head >= shape.heads) {
+        return;
+    }
+
+    // Where this lane's two elements of every fragment lie: row `fm` of the
+    // 8x8 tile, columns `fn` and `fn + 1`. This is the layout the instruction
+    // defines and it is the same for all four operands, which is what lets a
+    // lane say which query row and which key each of its scores belongs to.
+    const uint quad = lane / 4u;
+    const uint fm = (quad & 4u) + ((lane / 2u) % 4u);
+    const uint fn = (quad & 2u) * 2u + (lane % 2u) * 2u;
+
+    // The query row this lane holds for the whole walk. A block past the last
+    // query reads the last one again rather than off the end; `live` is what
+    // keeps the repeat from being written out.
+    const uint row = simd * MMA_FRAGMENT + fm;
+    const bool live = first + row < shape.queries;
+    const uint i = min(first + row, shape.queries - 1u);
+    const uint kv = head / (shape.heads / shape.kv_heads);
+    const int position = (int)(i + shape.q_offset);
+    // `M_LOG2E_F` folded into both, so that every exponential below is one
+    // hardware instruction and the learned bias is in the units of the scores
+    // it is added to.
+    const float scale = as_type<float>(shape.scale_bits) * M_LOG2E_F;
+    const float tau = taus[i] * M_LOG2E_F;
+
+    device const float *q_row = q + ((ulong)head * shape.queries + i) * shape.head_dim;
+    device const float *keys_of = k + (ulong)kv * shape.key_stride * shape.head_dim;
+    device const float *values_of = v + (ulong)kv * shape.key_stride * shape.head_dim;
+    device const float *features = rel + ((ulong)i * shape.heads + head) * shape.d_rel;
+
+    // The row's own channels, held as the fragments the first multiply wants:
+    // element `jj` of fragment `dd` is channel `dd * MMA_FRAGMENT + fn + jj`,
+    // which is the `k` index of the left operand. Read once for the whole walk,
+    // where the entry above stages a row in threadgroup memory for one query.
+    //
+    // **A channel past the head's own is a zero on both sides of the multiply**,
+    // which is what serves a head narrower than MMA_MOST_CHANNELS without a
+    // bound the compiler cannot unroll against.
+    float2 held[MMA_FRAGS_A_ROW];
+    float2 weighted[MMA_FRAGS_A_ROW];
+    for (uint dd = 0; dd < MMA_FRAGS_A_ROW; ++dd) {
+        const uint d = dd * MMA_FRAGMENT + fn;
+        held[dd] = float2(
+            d < shape.head_dim ? q_row[d] : 0.0f,
+            d + 1u < shape.head_dim ? q_row[d + 1u] : 0.0f
+        );
+        weighted[dd] = float2(0.0f);
+    }
+
+    float peak = -INFINITY;
+    float total = 0.0f;
+
+    // BLOCK BOUND: the keys some row of this block can reach, which is the same
+    // `[reach, last)` the entry above walks taken over the block's rows rather
+    // than over one. `reach` does not fall as a position rises and `last` does
+    // not rise as it falls, so the first row's `reach` and the last live row's
+    // `last` cover every row between them — and what a row inside the block may
+    // not attend to is masked per score, exactly as it is above.
+    const uint lastrow = min(first + MMA_ROWS_A_BLOCK, shape.queries) - 1u;
+    const uint to = min(shape.keys, (uint)(lastrow + shape.q_offset) + 1u);
+    const uint opening = first + shape.q_offset;
+    const uint from = shape.sliding > 0u && opening >= shape.sliding
+        ? (opening - (shape.sliding - 1u)) / MMA_KEYS_A_BLOCK * MMA_KEYS_A_BLOCK
+        : 0u;
+
+    // A key past the block's own bound is read from the last one inside it and
+    // scored anyway. Every row of the block is at or before `to - 1`, so a score
+    // against a key at or after `to` is masked by the distance alone — which
+    // makes what it was computed from immaterial, and makes a clamp cheaper than
+    // the branch that would have skipped it. A channel past the head's own is
+    // read the same way and multiplied against a query the fill above zeroed.
+    const uint edge = to - 1u;
+    const uint rim = shape.head_dim - 1u;
+
+    for (uint j0 = from; j0 < to; j0 += MMA_KEYS_A_BLOCK) {
+        if (STAGES_KEYS) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // The keys as `[channel, key]` — the transpose the right operand of
+            // `scores = q @ k^T` wants, made where the copy is rather than by a
+            // second pass over the block.
+            for (uint at = local; at < MMA_KEYS_A_BLOCK * MMA_MOST_CHANNELS; at += threads) {
+                const uint j = at / MMA_MOST_CHANNELS;
+                const uint d = at % MMA_MOST_CHANNELS;
+                staged[d * MMA_KEY_STRIDE + j] =
+                    keys_of[(ulong)min(j0 + j, edge) * shape.head_dim + min(d, rim)];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float2 scores[MMA_FRAGS_A_KEY_BLOCK];
+        for (uint kk = 0; kk < MMA_FRAGS_A_KEY_BLOCK; ++kk) {
+            scores[kk] = float2(0.0f);
+        }
+        for (uint dd = 0; dd < MMA_FRAGS_A_ROW; ++dd) {
+            // The right operand's `k` index is its fragment *row*, so what this
+            // lane reads for the channel block is row `fm` of it against the
+            // channel block the left operand's column `fn` reads.
+            //
+            // **The two walks are the same keys in the same order out of two
+            // memories**, and they are written twice rather than once around a
+            // choice because a threadgroup pointer and a device pointer are
+            // different types and nothing can name both.
+            const uint d = dd * MMA_FRAGMENT + fm;
+            threadgroup const float *channel = staged + d * MMA_KEY_STRIDE;
+            device const float *lying = keys_of + min(d, rim);
+            for (uint kk = 0; kk < MMA_FRAGS_A_KEY_BLOCK; ++kk) {
+                const uint j = j0 + kk * MMA_FRAGMENT + fn;
+                const float2 key = STAGES_KEYS
+                    ? float2(channel[j - j0], channel[j - j0 + 1u])
+                    : float2(
+                        lying[(ulong)min(j, edge) * shape.head_dim],
+                        lying[(ulong)min(j + 1u, edge) * shape.head_dim]
+                    );
+                accumulate(scores[kk], held[dd], key, scores[kk]);
+            }
+        }
+
+        // The band, one entry per score, from the backward distance this lane
+        // can name for each of its two elements.
+        for (uint kk = 0; kk < MMA_FRAGS_A_KEY_BLOCK; ++kk) {
+            const uint j = j0 + kk * MMA_FRAGMENT + fn;
+            scores[kk][0] = scores[kk][0] * scale
+                + banded_entry(proj, features, shape, position - (int)j, tau);
+            scores[kk][1] = scores[kk][1] * scale
+                + banded_entry(proj, features, shape, position - (int)(j + 1u), tau);
+        }
+
+        // The online softmax, in registers. A block whose largest score is below
+        // the running peak rescales by one and a first block rescales what is not
+        // there yet by `exp2(-INFINITY)`, which is zero — neither a case worth
+        // branching on, which is the reading the entry above takes too.
+        float top = peak;
+        for (uint kk = 0; kk < MMA_FRAGS_A_KEY_BLOCK; ++kk) {
+            top = fmax(top, fmax(scores[kk][0], scores[kk][1]));
+        }
+        top = across_the_row_max(top);
+        const float rescale = fast::exp2(peak - top);
+        peak = top;
+
+        float sum = 0.0f;
+        for (uint kk = 0; kk < MMA_FRAGS_A_KEY_BLOCK; ++kk) {
+            scores[kk][0] = fast::exp2(scores[kk][0] - top);
+            scores[kk][1] = fast::exp2(scores[kk][1] - top);
+            sum += scores[kk][0] + scores[kk][1];
+        }
+        total = total * rescale + across_the_row_sum(sum);
+        for (uint dd = 0; dd < MMA_FRAGS_A_ROW; ++dd) {
+            weighted[dd] *= rescale;
+        }
+
+        // The values, over the keys the scores were just taken on, as
+        // `[key, channel]` — which is how they lie and what the second multiply
+        // wants, so the staged arm of this one transposes nothing.
+        if (STAGES_VALUES) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint at = local; at < MMA_KEYS_A_BLOCK * MMA_MOST_CHANNELS; at += threads) {
+                const uint j = at / MMA_MOST_CHANNELS;
+                const uint d = at % MMA_MOST_CHANNELS;
+                staged[j * MMA_CHANNEL_STRIDE + d] =
+                    values_of[(ulong)min(j0 + j, edge) * shape.head_dim + min(d, rim)];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        for (uint kk = 0; kk < MMA_FRAGS_A_KEY_BLOCK; ++kk) {
+            const uint j = j0 + kk * MMA_FRAGMENT + fm;
+            threadgroup const float *value = staged + (j - j0) * MMA_CHANNEL_STRIDE;
+            device const float *lying = values_of + (ulong)min(j, edge) * shape.head_dim;
+            for (uint dd = 0; dd < MMA_FRAGS_A_ROW; ++dd) {
+                const uint d = dd * MMA_FRAGMENT + fn;
+                const float2 slice = STAGES_VALUES
+                    ? float2(value[d], value[d + 1u])
+                    : float2(lying[min(d, rim)], lying[min(d + 1u, rim)]);
+                accumulate(weighted[dd], scores[kk], slice, weighted[dd]);
+            }
+        }
+    }
+
+    // A call over no keys leaves a total of zero, which is a forward pass over
+    // no tokens rather than a row to divide by it.
+    const float norm = total > 0.0f ? 1.0f / total : 0.0f;
+    if (!live) {
+        return;
+    }
+    device float *result = out + ((ulong)i * shape.heads + head) * shape.head_dim;
+    for (uint dd = 0; dd < MMA_FRAGS_A_ROW; ++dd) {
+        const uint d = dd * MMA_FRAGMENT + fn;
+        if (d < shape.head_dim) {
+            result[d] = weighted[dd][0] * norm;
+            result[d + 1u] = weighted[dd][1] * norm;
+        }
+    }
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -1582,7 +2222,7 @@ mod tests {
     /// `a_split_call_stages_a_whole_tile_and_answers_the_same_bits` holds
     /// against this.
     fn source() -> String {
-        super::source(STAGED_BY_AN_UNSPLIT_CALL, RESIDENCY)
+        super::source(STAGED_BY_AN_UNSPLIT_CALL, RESIDENCY, Numerics::Reference)
     }
 
     /// The kernel with its loop bound taken off, which scores every key of the
@@ -1917,6 +2557,45 @@ mod tests {
                 .sum()
         }
 
+        /// The same for a call the block runs, which is [`Case::moves`] with the
+        /// keys counted once for the rows of a block rather than once for each
+        /// of them.
+        ///
+        /// **A block's own bound worked out from the rows in it**, rather than
+        /// from the closed form [`keys_the_blocks_walk`] takes: a block reads
+        /// every key some row of it may attend to, which is the union of the
+        /// spans `walked` counts one row at a time.
+        fn blocks_move(&self) -> usize {
+            let tile = tile_keys(self.config.head_dim);
+            let reach = |position: usize| match self.config.sliding {
+                window if window > 0 && position >= window => {
+                    (position - (window - 1)) / tile * tile
+                }
+                _ => 0,
+            };
+            let walked: usize = (0..self.queries.div_ceil(MMA_ROWS_A_BLOCK))
+                .map(|block| {
+                    let first = block * MMA_ROWS_A_BLOCK;
+                    let rows = first..(first + MMA_ROWS_A_BLOCK).min(self.queries);
+                    (0..self.keys)
+                        .filter(|&key| {
+                            rows.clone().any(|row| {
+                                let position = row + self.q_offset;
+                                key <= position && key >= reach(position)
+                            })
+                        })
+                        .count()
+                })
+                .sum();
+            let rel_extent = self.proj.len() / self.config.d_rel;
+            size_of::<f32>()
+                * (2 * self.q.len()
+                    + 2 * self.config.heads * walked * self.config.head_dim
+                    + self.rel.len()
+                    + self.keys.min(rel_extent) * self.config.d_rel
+                    + self.queries)
+        }
+
         fn wrapped<'d>(
             &self,
             device: &'d Device,
@@ -2118,15 +2797,16 @@ mod tests {
         let Some(device) = device() else { return };
         let attention = FusedAttention::new(&device).expect("the kernel compiles");
 
-        let declared = |case: &Case| -> u64 {
-            let layer = case.wrapped(&device, &attention);
+        let against = |attention: &FusedAttention, case: &Case, want: usize| -> u64 {
+            let layer = case.wrapped(&device, attention);
             layer.hold(0, case.keys).expect("the span reserves");
             let moved = crate::testing::moved(&device, |batch| {
                 layer.encode(batch, case.step()).expect("the step encodes");
             });
-            assert_eq!(moved as usize, case.moves(), "{}", case.name);
+            assert_eq!(moved as usize, want, "{}", case.name);
             moved
         };
+        let declared = |case: &Case| against(&attention, case, case.moves());
 
         // The span the layer holds has room for 64 keys and this call reaches
         // sixteen. A figure taken off what was bound would be charging the step
@@ -2160,6 +2840,23 @@ mod tests {
              {over_the_span} of the whole 600-key span"
         );
         declared(&blocked(600, SLIDING_WINDOW, 9));
+
+        // **And a call the block runs is charged a span a block**, which is the
+        // half a per-row figure would over-count: a block reads a key once for
+        // the [`MMA_ROWS_A_BLOCK`] rows that share it, so the same call declares
+        // fewer bytes on the other side of the flag for reading the same keys
+        // fewer times.
+        let production =
+            FusedAttention::compiling(&device, Numerics::Production).expect("the block compiles");
+        for case in [blocked(600, 0, 300), blocked(600, SLIDING_WINDOW, 300)] {
+            let a_row = declared(&case);
+            let a_block = against(&production, &case, case.blocks_move());
+            assert!(
+                a_block < a_row,
+                "{}: a block was charged {a_block} bytes against a row's {a_row}",
+                case.name
+            );
+        }
     }
 
     /// The keys a query row walks, at the four bounds that decide it: a global
@@ -2500,6 +3197,149 @@ mod tests {
             "{} cases agree bit for bit over {elements} elements",
             cases.len()
         );
+    }
+
+    /// **Nothing behind the flag is in the source a caller who does not ask
+    /// hands the compiler**, which is what "nothing changes for a caller who
+    /// does not ask" means when it is checked rather than asserted: not
+    /// dispatched is weaker than not compiled, and only the second says a
+    /// reference run went through the pipelines it went through before this
+    /// entry was written.
+    #[test]
+    fn the_reference_source_does_not_carry_the_block() {
+        let under = |numerics| super::source(STAGED_BY_AN_UNSPLIT_CALL, RESIDENCY, numerics);
+        let (reference, production) = (under(Numerics::Reference), under(Numerics::Production));
+        assert!(!reference.contains(BLOCK));
+        assert!(production.contains(BLOCK));
+        assert_eq!(
+            reference,
+            production[..reference.len()],
+            "the production source is not the reference one with the entry after it"
+        );
+    }
+
+    /// **A decode step is one query row and a block computes sixty-four**, so
+    /// the shapes a decode-time call comes in are the shapes this predicate has
+    /// to refuse — and it has to refuse them before any timing claim, which is
+    /// why this is a case and not a row of a table.
+    ///
+    /// A7 measured what the same mistake costs on the matmul: a verify block of
+    /// four rows landed on a 32-row block and read 2.2× *slower* than the
+    /// reference. A block here is sixty-four rows against a decode step's one.
+    #[test]
+    fn a_decode_shaped_call_is_refused_a_block() {
+        let Some(device) = device() else { return };
+        let production =
+            FusedAttention::compiling(&device, Numerics::Production).expect("the block compiles");
+        let (heads, head_dim) = (32, 128);
+        let shortest = FusedAttention::SHORTEST_BLOCKED_CALL;
+
+        // Every context this file quotes a decode step at, and every depth
+        // speculation runs at — the rows a verify block brings are the depth
+        // plus one.
+        for keys in [8, 97, 385, 769, 2048, 8192, 32768] {
+            for queries in [1, 2, 3, 4, 5] {
+                let pairs = heads * queries;
+                let splits = splits_for(pairs, keys, head_dim);
+                assert!(
+                    production
+                        .blocked(0, queries, head_dim, splits, shortest)
+                        .is_none(),
+                    "{queries} queries over {keys} keys reached the block"
+                );
+            }
+        }
+
+        // And the line itself, from both sides, at a shape whose grid is long
+        // enough that `splits_for` leaves the call whole.
+        for (queries, wanted) in [(shortest - 1, false), (shortest, true)] {
+            let splits = splits_for(heads * queries, 32768, head_dim);
+            assert_eq!(splits, 1, "{queries} queries were cut");
+            assert_eq!(
+                production
+                    .blocked(0, queries, head_dim, splits, shortest)
+                    .is_some(),
+                wanted,
+                "{queries} queries against a floor of {shortest}"
+            );
+        }
+
+        // And a head the fragments cannot cover, which stays on the entry that
+        // bounds nothing at compile time.
+        for head_dim in [MMA_MOST_CHANNELS + MMA_FRAGMENT, MMA_FRAGMENT - 1] {
+            assert!(
+                production
+                    .blocked(0, shortest, head_dim, 1, shortest)
+                    .is_none()
+            );
+        }
+    }
+
+    /// **The block against the CPU path, at both kinds of layer and at heights
+    /// the two extents divide and do not.**
+    ///
+    /// What this cannot be is a bit-for-bit case, and that is the whole of what
+    /// the flag exists for: a hardware matrix multiply sums its `k` dimension in
+    /// an order the instruction defines. So the standard is the one `matmul`'s
+    /// production entries are held to — the CPU path's answer, within a
+    /// tolerance the reference entry itself is measured at on the same cases —
+    /// and the reference entry is run beside it so that the two are read against
+    /// each other rather than against a number in a comment.
+    #[test]
+    fn a_block_answers_what_the_reference_entry_answers() {
+        let Some(device) = device() else { return };
+        let reference = FusedAttention::new(&device).expect("the kernel compiles");
+        let production =
+            FusedAttention::compiling(&device, Numerics::Production).expect("the block compiles");
+
+        // Heights the block divides and heights it does not, spans the key block
+        // divides and spans it does not, both kinds of layer, and a call whose
+        // queries sit past the start of its span.
+        let cases = [
+            blocked(512, 0, 512),
+            blocked(512, SLIDING_WINDOW, 512),
+            blocked(300, 0, 300),
+            blocked(300, SLIDING_WINDOW, 300),
+            blocked(1200, 0, 1200),
+            blocked(1200, SLIDING_WINDOW, 1200),
+            blocked(1000, 0, 300),
+            blocked(1000, SLIDING_WINDOW, 300),
+            blocked(157, 0, 129),
+        ];
+        let mut worst = 0.0f32;
+        for case in &cases {
+            let splits = splits_for(case.config.heads * case.queries, case.keys, 128);
+            assert!(
+                production
+                    .blocked(
+                        case.config.sliding,
+                        case.queries,
+                        128,
+                        splits,
+                        FusedAttention::SHORTEST_BLOCKED_CALL,
+                    )
+                    .is_some(),
+                "{}: the case does not reach the block",
+                case.name
+            );
+            let want = case.on_the_cpu();
+            let block = case.on_the_device(&device, &production);
+            let entry = case.on_the_device(&device, &reference);
+            let (from_cpu, entry_from_cpu) = (deviation(&block, &want), deviation(&entry, &want));
+            eprintln!(
+                "{}: the block is {from_cpu:e} from the CPU where the entry is \
+                 {entry_from_cpu:e}, and {:e} from the entry",
+                case.name,
+                deviation(&block, &entry),
+            );
+            assert!(
+                from_cpu <= CPU_TOLERANCE,
+                "{}: the block is {from_cpu:e} from the CPU",
+                case.name
+            );
+            worst = worst.max(from_cpu);
+        }
+        eprintln!("worst over {} cases: {worst:e}", cases.len());
     }
 
     /// **The memory the turn rests on is memory a call gets**, which is the two
@@ -3712,11 +4552,22 @@ mod tests {
         tokens: usize,
         sliding: usize,
     ) -> Duration {
+        a_call_costs(device, attention, &blocked(tokens, sliding, tokens), None)
+    }
+
+    /// The same for a call of any shape, with the block's floor pinned where a
+    /// sweep across heights has to reach the heights the predicate refuses.
+    fn a_call_costs(
+        device: &Device,
+        attention: &FusedAttention,
+        case: &Case,
+        floor: Option<usize>,
+    ) -> Duration {
         const ROUNDS: usize = 2;
-        let case = blocked(tokens, sliding, tokens);
         let layer = case.wrapped(device, attention);
-        layer.hold(0, tokens).expect("the span reserves");
-        layer.span().appended(tokens);
+        layer.block_from(floor);
+        layer.hold(0, case.keys).expect("the span reserves");
+        layer.span().appended(case.keys);
         let mut q = device.buffer(&case.q).expect("the queries upload");
         let mut rel = device.buffer(&case.rel).expect("the features upload");
         let mut span = layer.span();
@@ -3726,13 +4577,182 @@ mod tests {
             let each = crate::testing::device_time(device, 1, |batch| {
                 held = Some(
                     layer
-                        .encode_over(batch, &mut span, &mut q, &mut rel, None, 0)
-                        .expect("the prefill encodes"),
+                        .encode_over(batch, &mut span, &mut q, &mut rel, None, case.q_offset)
+                        .expect("the call encodes"),
                 );
             });
             taken = if round == 0 { taken } else { taken.min(each) };
         }
         taken
+    }
+
+    /// The shipped block with its keys and values brought into threadgroup
+    /// memory rather than read where they lie, which is the arm
+    /// [`MMA_STAGES`] chooses between.
+    ///
+    /// **Both the walk and the declaration**, because the two are what a staging
+    /// is: an entry that copied a block in and declared nothing for it would not
+    /// compile, and one that declared the memory and read past it would be
+    /// measuring the residency rather than the copy.
+    fn staging(keys: bool, values: bool) -> String {
+        let source = super::source(STAGED_BY_AN_UNSPLIT_CALL, RESIDENCY, Numerics::Production);
+        // The anchors are built from the shipped constants rather than written
+        // out, so that moving which arm ships moves what this mutates rather
+        // than stranding it.
+        let asked = |source: &str, what: &str, shipped: bool, staged: bool| {
+            crate::testing::instead_of(
+                source,
+                &format!("constant uint STAGES_{what} = {};", usize::from(shipped)),
+                &format!("constant uint STAGES_{what} = {};", usize::from(staged)),
+            )
+        };
+        let declared = match (keys, values) {
+            (false, false) => 1,
+            (false, true) => MMA_KEYS_A_BLOCK * MMA_CHANNEL_STRIDE,
+            (true, _) => MMA_MOST_CHANNELS * MMA_KEY_STRIDE,
+        };
+        crate::testing::instead_of(
+            &asked(
+                &asked(&source, "KEYS", MMA_STAGES_KEYS, keys),
+                "VALUES",
+                MMA_STAGES_VALUES,
+                values,
+            ),
+            &format!("constant uint MMA_STAGED = {MMA_STAGED};"),
+            &format!("constant uint MMA_STAGED = {declared};"),
+        )
+    }
+
+    /// **What staging a block's keys and values is worth, which is nothing and
+    /// costs.**
+    ///
+    /// The reference entry's own occupancy turn found a threadgroup that stages
+    /// *any* of a tile 63% worse than one that stages none at the same
+    /// declaration, and left why unsettled. Apple's guidance for this family
+    /// settles it: threadgroup memory and the buffers a staging would copy from
+    /// share one cache hierarchy, so a copy moves nothing nearer and what it
+    /// adds is the copy, the barriers and the declaration.
+    ///
+    /// **What a staging can still buy here is the transpose**, which the score
+    /// multiply's right operand wants and which a copy makes free — so this is
+    /// the one place the guidance could have been wrong for this kernel, and it
+    /// is measured rather than taken.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_staging_a_blocks_keys_and_values_is_worth() {
+        let Some(device) = device() else { return };
+        let arms: Vec<(String, FusedAttention)> = [
+            ("neither", false, false),
+            ("the keys", true, false),
+            ("the values", false, true),
+            ("both", true, true),
+        ]
+        .into_iter()
+        .map(|(what, keys, values)| {
+            let arm = FusedAttention::from_source(&device, &staging(keys, values))
+                .expect("the arm compiles");
+            let block = arm.block.as_ref().expect("the arm carries the entry");
+            (
+                format!("{what} ({} KiB)", block[0].threadgroup_memory() / 1024),
+                arm,
+            )
+        })
+        .collect();
+
+        // The answers first, because a staging that dropped a key would be
+        // faster and wrong: the four read the same keys in the same order out of
+        // one memory or the other.
+        for case in [blocked(1000, 0, 300), blocked(1000, SLIDING_WINDOW, 300)] {
+            let want = case.on_the_device(&device, &arms[0].1);
+            for (what, arm) in &arms[1..] {
+                let got = case.on_the_device(&device, arm);
+                assert!(
+                    deviation(&got, &want) <= CPU_TOLERANCE,
+                    "{}: staging {what} answered differently",
+                    case.name
+                );
+            }
+        }
+
+        let header: String = arms.iter().map(|(what, _)| format!("{what:>22}")).collect();
+        eprintln!("  {:<26}{header}", "a call, staging");
+        for (tokens, sliding, what) in bound_cells() {
+            let case = blocked(tokens, sliding, tokens);
+            let taken: Vec<Duration> = arms
+                .iter()
+                .map(|(_, arm)| a_call_costs(&device, arm, &case, None))
+                .collect();
+            let cells: String = taken
+                .iter()
+                .map(|each| {
+                    format!(
+                        "{:>13}{:>9}",
+                        format!("{each:.2?}"),
+                        format!("{:.2}x", taken[0].as_secs_f64() / each.as_secs_f64()),
+                    )
+                })
+                .collect();
+            eprintln!("  {:<26}{cells}", format!("{tokens} tokens, {what}"));
+        }
+    }
+
+    /// **What a block of query rows is worth at each height, which is the
+    /// measurement that had to land before any other.**
+    ///
+    /// A block computes [`MMA_ROWS_A_BLOCK`] query rows whether the call brought
+    /// them or not: the rows past its own read the last live row again, walk
+    /// every key with the rest, and are thrown away at the store. So a call of
+    /// one row does a block's work for a row's answer, and *a decode step is one
+    /// query row* — which is the shape this engine is most ahead on and the one
+    /// a kernel written for a prefill is most able to ruin.
+    ///
+    /// **Two shapes and not one, because the height is not the only thing that
+    /// moves with it.** A prefill's rows come with a span as long as themselves,
+    /// so a short call there is short of keys as well as of rows; a speculative
+    /// round's four or five rows come with every key the sequence has. The
+    /// second is the shape A7's floor was drawn against on the matmul and it is
+    /// the one that inverted the sign there.
+    ///
+    /// Both kinds of layer, because a windowed layer's span stops at its window
+    /// and a global one's does not — so the keys a block amortises its staging
+    /// over are not the same count on the two.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_block_of_query_rows_is_worth_at_each_height() {
+        let Some(device) = device() else { return };
+        let reference = FusedAttention::new(&device).expect("the kernel compiles");
+        let production =
+            FusedAttention::compiling(&device, Numerics::Production).expect("the block compiles");
+
+        const HEIGHTS: [usize; 18] = [
+            1, 2, 4, 5, 8, 12, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256, 385, 769,
+        ];
+        for (what, keys_for) in [
+            ("its own rows", (|rows| rows) as fn(usize) -> usize),
+            ("385 keys", |_| 385),
+            ("2048 keys", |_| 2048),
+            ("8192 keys", |_| 8192),
+        ] {
+            for (layer, sliding) in [("global", 0), ("window 512", SLIDING_WINDOW)] {
+                eprintln!("\n  a call of n rows over {what}, {layer}");
+                eprintln!(
+                    "  {:>6}{:>14}{:>14}{:>10}",
+                    "rows", "reference", "block", "change"
+                );
+                for rows in HEIGHTS {
+                    let keys = keys_for(rows).max(rows);
+                    let case = blocked(keys, sliding, rows);
+                    let entry = a_call_costs(&device, &reference, &case, None);
+                    let block = a_call_costs(&device, &production, &case, Some(1));
+                    eprintln!(
+                        "  {rows:>6}{:>14}{:>14}{:>10}",
+                        format!("{entry:.2?}"),
+                        format!("{block:.2?}"),
+                        format!("{:.2}x", entry.as_secs_f64() / block.as_secs_f64()),
+                    );
+                }
+            }
+        }
     }
 
     /// One arm of the limiter table: a name, and the shipped source with one
@@ -4007,7 +5027,7 @@ mod tests {
     /// two is the memory and where a value is read from, and not the number of
     /// keys a tile holds.
     fn staging_the_tiles_values() -> String {
-        super::source(STAGED_BY_A_SPLIT_CALL, NO_RESIDENCY)
+        super::source(STAGED_BY_A_SPLIT_CALL, NO_RESIDENCY, Numerics::Reference)
     }
 
     /// The shipped source with a tile's two reductions taken by one thread and
@@ -4263,9 +5283,12 @@ mod tests {
             for (what, arm) in [
                 (
                     "where they lie",
-                    super::source(STAGED_BY_AN_UNSPLIT_CALL, floats),
+                    super::source(STAGED_BY_AN_UNSPLIT_CALL, floats, Numerics::Reference),
                 ),
-                ("staged", super::source(floats, NO_RESIDENCY)),
+                (
+                    "staged",
+                    super::source(floats, NO_RESIDENCY, Numerics::Reference),
+                ),
             ] {
                 if what == "staged" && floats < TILED_VALUES {
                     continue;
