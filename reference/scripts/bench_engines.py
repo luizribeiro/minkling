@@ -34,70 +34,15 @@ across the two by construction rather than by measurement.
 
 import argparse
 import sys
-import time
-from pathlib import Path
 
-from inkling_ref import load_model, tokenizer
-from mlx_vlm.generate.ar import generate_step
-from mlx_vlm.generate.common import generation_stream, wired_limit
-from mlx_vlm.models import cache
-
-import mlx.core as mx
+from bench_common import prompt_ids, timed
+from inkling_ref import load_model
 
 # The (prompt, generated) pairs, which are `inkling_core::workload::REALISTIC`.
 # A copy rather than a shared file, and the harness is what checks it: two arms
 # that do not report the same readings are refused by name, so a table this
 # disagreed about would not be published, it would fail to run.
 REALISTIC = ((97, 128), (385, 128), (769, 128), (97, 512))
-
-PROMPT = (
-    Path(__file__).resolve().parents[2]
-    / "crates"
-    / "inkling-core"
-    / "src"
-    / "workload.txt"
-)
-
-
-def prompt_ids(processor, tokens):
-    """The shared prompt, tiled to `tokens` and cut there.
-
-    Real ids repeated rather than one id repeated, for the reason
-    `inkling_core::workload::tiled` gives: which experts a token routes to is
-    decided by the token, so a prompt of one id would measure a stack nobody
-    runs.
-    """
-    ids = tokenizer(processor).encode(
-        PROMPT.read_text().rstrip("\n"), add_special_tokens=False
-    )
-    repeats = -(-tokens // len(ids))
-    return mx.array([(ids * repeats)[:tokens]])
-
-
-def timed(model, ids, generated):
-    """One generation of exactly `generated` tokens, timed a step at a time.
-
-    `generate_step` is mlx-vlm's own loop and stops on its token budget rather
-    than on an end-of-message token, which is what the Rust arm's `Ending` does
-    with no eos. Greedy by default — temperature 0 — as both sides are.
-
-    The wired limit is entered per generation rather than around the sitting,
-    because that is where `stream_generate` enters it; at the default limit of 0
-    nothing is guaranteed GPU-resident and a decode step costs 2.6 s instead of
-    32 ms. See `results/prefill.md`.
-    """
-    steps, tokens = [], []
-    with wired_limit(model, [generation_stream]):
-        prompt_cache = cache.make_prompt_cache(model.language_model)
-        at = time.perf_counter()
-        for token, _ in generate_step(
-            ids, model, None, None, max_tokens=generated, prompt_cache=prompt_cache
-        ):
-            now = time.perf_counter()
-            steps.append(now - at)
-            tokens.append(token)
-            at = now
-    return steps, tokens
 
 
 def readings(steps, prompted, generated, depth):
