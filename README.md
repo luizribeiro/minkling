@@ -2506,6 +2506,76 @@ measured warm is not a promise about a kernel running at 95% of peak, and the
 three attention items left on A4's list are all arithmetic rather than traffic.
 **The one thing that can move a row at that ceiling is reading fewer bytes.**
 
+### What this milestone shipped, which is no kernel at all
+
+**Two of the four items on A4's list were taken to a measurement and neither
+paid**, so what the engine runs is what it ran: the packed matmul keeps its
+gather and the attention kernel keeps its 256 redundant walks. The one change to
+a source is `element`, an inline function the two matmul entries now decode
+through instead of spelling the same gather twice, and it is free — 9126.6 ms of
+device time against 9125.4 over a paired 2048-token prefill, ranges across.
+
+**Nothing moved, and here is the check rather than the argument.** 593 gated
+cases pass and 44 are skipped, which is A5's 590 and 42 plus the three cases and
+two measurements this milestone adds. The recorded continuation is `[656, 13,
+623, 180069, 86333, 60500, 220, 23]`; `--backend cpu` answers what it answered;
+`the_bounded_loop_is_the_unbounded_one_bit_for_bit`,
+`a_query_row_walks_the_keys_its_window_and_its_position_leave_it` and
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` pass
+unrelaxed; the resident-set bound holds.
+
+**The wall a user waits, one sitting a length**, against A5's column and the
+reference's, which is A2's and was not re-measured:
+
+    tokens        A5       here     tok/s     mlx-vlm       gap
+     2048    11.32 s    11.31 s     181.1      2.66 s     ×4.25
+     4096    22.56 s    22.14 s     185.0      5.61 s     ×3.95
+     8192    46.77 s    46.08 s     177.8     13.05 s     ×3.53
+    16384   109.51 s   108.90 s     150.4     34.31 s     ×3.17
+
+Every length is at or just inside where A5 left it, which is what a milestone
+that shipped no kernel should read.
+
+**Decode, paired against the commit this milestone opened at**, on the device's
+own clock: 27.275 ms against 27.316 at 8192 and 20.032 against 20.024 at 385,
+ranges across, no claim at either. A first sitting at 385 read 20.085 against
+19.986 with the ranges apart, which a second sitting did not reproduce — a
+0.5% claim on a change that is one inline function is a sitting and not an
+effect, and saying so is cheaper than believing it. The timing tier's unpaired
+table reads 18.41, 19.63 and 20.37 ms at 97, 385 and 769 keys, all at or under
+the figures A5 recorded.
+
+**Speculation is where it was and `k = 4` has fallen further.** Acceptance is
+84.8% / 87.0-78.3% / 85-65-55% / 82.4-64.7-52.9-47.1% and the tokens a round are
+1.829, 2.560, 2.909 and 3.368 — digit for digit A5's. `k = 4` reads **0.972×**
+in this sitting where A5 read 0.997 and 1.000 and A4 read 1.011, one unpaired
+sitting against A5's five pairs. **Speculation's useful range keeps narrowing at
+the top**, which nothing here targets and which is worth knowing: `k = 2` is
+still the depth that pays, at 1.17×.
+
+### What this milestone did not reach, and what the ceiling says about it
+
+**The band it derives and the keys and values were not reached**, and the
+reduction's two regimes say something about both. The attention rows inside a
+prefill run at 88 to 95% of this part's peak bandwidth. The band is arithmetic —
+a few operations per key against a small staged row — and the reduction is the
+measured precedent for what arithmetic is worth under that ceiling: 23 to 29% by
+warm ablation, and 8% the wrong way in the model. **The keys and values are the
+traffic itself**, which is the one term a ceiling like that leaves open, and the
+only way to move it is to read fewer bytes rather than to read the same bytes
+better — which is a format decision and not a scheduling one.
+
+So the list A5 left is now two items shorter by measurement and the two that
+remain are ranked differently than the shares rank them. Neither was taken here.
+
+**What was not measured, and why.** The per-kernel table at 16384 was not
+re-taken: it is 110 s a reading before the sampling overhead, and no shipped
+change touches a dispatch — the 769-token table was taken instead, on both arms
+of the one experiment that needed an in-model reading. The paired decode sweep
+was taken at two of the six contexts rather than all six, and the paired prefill
+at 2048 rather than at all four lengths, for the same reason: what those would
+be re-proving is a kernel nobody edited.
+
 ## The tail of a step
 
 **What a decode step did last was a round trip, and the only reason was that the
