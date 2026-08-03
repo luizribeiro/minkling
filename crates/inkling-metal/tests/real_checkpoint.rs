@@ -544,12 +544,13 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// why it is asserted, since a layer that started forcing a *wait* would leave
 /// this number where it is and the step nowhere near it.
 ///
-/// **The last layer is a layer with something after it now**, and that is the
-/// two dispatches added here and the submission taken away: the final norm and
-/// `lm_head` go into the buffer layer 41 left open, so the run does not end at
-/// the layer and the head does not open one of its own. Whether that buffer is
-/// the one layer 41 encoded into or a fresh one is the same greedy rule, walked
-/// past the end of the stack rather than stopping short of it.
+/// **The last layer is a layer with something after it**, and that is the four
+/// dispatches added here and the submission that is not: the final norm,
+/// `lm_head` and the two the argmax over its output is go into the buffer layer
+/// 41 left open, so the run does not end at the layer and the head does not open
+/// one of its own. Whether that buffer is the one layer 41 encoded into or a
+/// fresh one is the same greedy rule, walked past the end of the stack rather
+/// than stopping short of it.
 ///
 /// A prefill wide enough that one layer reaches the bytes a run may hold is
 /// still one a layer, and deliberately — see `ModelLayers::carries`, where what
@@ -568,7 +569,7 @@ fn per_step(layers: u64, dense: u64) -> (u64, u64) {
             encoded = 0;
         }
     }
-    (dispatches + 2, submissions + 1)
+    (dispatches + 4, submissions + 1)
 }
 
 /// What a run of the engine is asked for, since standing the model up is the
