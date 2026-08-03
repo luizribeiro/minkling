@@ -1370,6 +1370,23 @@ const SHAPE_FIELDS: usize = 10;
 /// reading of the format on this side of the engine and a second copy of it
 /// would be a second reading that could drift.
 pub(crate) const BODY: &str = r#"
+/// The float a 4-bit code stands for.
+///
+/// **A gather into sixteen constant floats, which is the cheapest decode
+/// measured** — see `what_each_way_of_decoding_a_packed_byte_costs`, where
+/// assembling the same value out of the code's own bits costs 11.0 and 13.6% of
+/// this kernel's two shapes and one gather into a table of whole bytes costs 7.5
+/// and 2.1%. The table is 64 bytes and every lane of a simdgroup indexes it
+/// separately; what that reads as, against those two, is a load nothing waits
+/// on.
+///
+/// One function for both entries because it is the one reading of the format on
+/// this side of the engine, and a second copy of it would be a second reading
+/// that could drift.
+inline float element(uint code) {
+    return ELEMENTS[code];
+}
+
 /// One output element: lane `l` walks the weight row from byte
 /// `l * BYTES_PER_LANE` in strides of that many times the simdgroup width, and
 /// the caller reduces what the lanes held.
@@ -1407,7 +1424,7 @@ inline float weight_dot(
             const uint high = (code >> BITS) & CODE_MASK;
             device const float *v = values + (b + i) * CODES_PER_BYTE;
 
-            dot += ELEMENTS[low] * v[0] + ELEMENTS[high] * v[1];
+            dot += element(low) * v[0] + element(high) * v[1];
         }
         sum += dot * as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
     }
@@ -1687,8 +1704,8 @@ kernel void __ENTRY__(
             float high[COLS_A_TILE];
             for (uint c = 0; c < COLS_A_TILE; ++c) {
                 const uint code = packed[c][b + i];
-                low[c] = ELEMENTS[code & CODE_MASK];
-                high[c] = ELEMENTS[(code >> BITS) & CODE_MASK];
+                low[c] = element(code & CODE_MASK);
+                high[c] = element((code >> BITS) & CODE_MASK);
             }
             const uint at = (b + i) * CODES_PER_BYTE;
 
@@ -2140,8 +2157,8 @@ mod tests {
         let case = Case::noisy(IN_DIM, OUT_DIM, 1);
 
         let reversed = source().replace(
-            "ELEMENTS[low] * v[0] + ELEMENTS[high] * v[1]",
-            "ELEMENTS[high] * v[0] + ELEMENTS[low] * v[1]",
+            "element(low) * v[0] + element(high) * v[1]",
+            "element(high) * v[0] + element(low) * v[1]",
         );
         assert_ne!(reversed, source(), "the mutation changed nothing");
         let mutant = PackedMatmul::from_source(&device, &reversed).expect("the mutant compiles");
@@ -4072,7 +4089,7 @@ mod tests {
                 "the table it decodes through",
                 crate::testing::instead_of(
                     &shipped,
-                    "                low[c] = ELEMENTS[code & CODE_MASK];\n                high[c] = ELEMENTS[(code >> BITS) & CODE_MASK];",
+                    "                low[c] = element(code & CODE_MASK);\n                high[c] = element((code >> BITS) & CODE_MASK);",
                     "                low[c] = (float)(code & CODE_MASK);\n                high[c] = (float)((code >> BITS) & CODE_MASK);",
                 ),
             ),
