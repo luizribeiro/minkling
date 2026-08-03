@@ -169,6 +169,50 @@ const RUNS_A_GROUPING: usize = 2;
 /// gives for the lane.
 const THREADS_PER_GROUP: usize = 256;
 
+/// Floats of threadgroup memory a tile declares and never reads for anything,
+/// which is what puts the two tiled entries on the fast side of their occupancy
+/// turn.
+///
+/// **A tile of this kernel is a simdgroup and wants no threadgroup memory at
+/// all**, so it ran at whatever residency this part gives a kernel that asks for
+/// nothing — which turns out to be too many threadgroups a core rather than too
+/// few. [`how_many_threadgroups_of_a_prefills_packed_matmul_a_core_holds`]
+/// sweeps it: a 4096-token prompt's `q_proj` is 5.90 ms declaring nothing and
+/// 5.19 declaring this, and its routed bank 19.55 ms against 16.37.
+///
+/// **Dead memory is the whole mechanism and there is nothing here it could
+/// hold.** A tile's working set is registers — [`ROWS_A_TILE`] by
+/// [`COLS_A_TILE`] running sums, four weight pointers and four scale pointers —
+/// and none of it is shared across the simdgroups of a threadgroup, which is
+/// what makes a threadgroup of this kernel eight independent tiles rather than
+/// a unit. So there is no cooperative load to move here and no tile to stage;
+/// what the declaration buys is bought by being declared.
+///
+/// **Sized to the middle of its plateau rather than to its edge.** The row
+/// improves at every step down to three threadgroups a core and gives 17% back
+/// at two: 20 KiB is 5.20 ms, 24 is 5.19, 26 is 5.19 and 28 is 6.07. Three of
+/// them is every declaration in (20, 26.67] KiB and this is 24.
+///
+/// **It reaches no dispatch a decode step makes.** Only the tiled entries
+/// declare it, and [`tiles`] is false for every shape a decode step has — a
+/// single-row projection, a two-row shared bank naming two experts, a six-row
+/// routed bank naming six.
+///
+/// **`fused_attention` declares memory the same way and needs no `volatile` for
+/// it, and the difference is what the compiler can see.** There the fill is a
+/// strided loop over one array and the read is a different loop over another,
+/// with a runtime bound between them; here it is one store to a thread's own
+/// slot and a load of the same slot on the next line, which is the shape a
+/// forwarding pass is looking for. Neither kernel argues the point: each has a
+/// case that reads the bytes its pipeline reports, and a compiler that started
+/// or stopped folding either would fail it rather than quietly give the memory
+/// back.
+const RESIDENCY: usize = 6144;
+
+/// **Every thread of a threadgroup fills and reads its own entry**, which is
+/// what keeps the residency free of a barrier and free of a race.
+const _: () = assert!(RESIDENCY >= THREADS_PER_GROUP);
+
 /// Codes packed into one byte, which is what makes a byte a whole number of
 /// codes and so what lets the weight be read without regard to word alignment.
 pub(crate) const CODES_PER_BYTE: usize = u8::BITS as usize / BITS;
@@ -1307,6 +1351,7 @@ constant uint BYTES_PER_LANE = {BYTES_PER_LANE};
 constant uint EXPONENT_SHIFT = {EXPONENT_SHIFT};
 constant uint ROWS_A_TILE = {ROWS_A_TILE};
 constant uint COLS_A_TILE = {COLS_A_TILE};
+constant uint RESIDENCY = {RESIDENCY};
 constant float ELEMENTS[] = {{ {} }};
 {BODY}{}{}",
         (1u32 << BITS) - 1,
@@ -1546,6 +1591,7 @@ kernel void __ENTRY__(
     device const uchar *scales [[buffer(4)]],
     device float *out [[buffer(5)]],__ORDER__
     uint position [[thread_position_in_grid]],
+    uint local [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint width [[threads_per_simdgroup]]
 ) {
@@ -1606,13 +1652,26 @@ kernel void __ENTRY__(
             + (ulong)col * scale_bytes;
     }
 
+    // Declared so that a core holds three threadgroups of this kernel rather
+    // than as many as it has room for, and read only for the zero it was filled
+    // with — see RESIDENCY. Every thread fills and reads its own entry, so
+    // nothing here needs a barrier.
+    //
+    // **`volatile` is what keeps it**, and without it this array is not here at
+    // all: a store of a zero to a thread's own slot followed by a load of the
+    // same slot is exactly what a forwarding pass removes, and measured against
+    // a pipeline that reported no threadgroup memory whatever this declared.
+    threadgroup float residency[RESIDENCY];
+    threadgroup volatile float *held = residency;
+    held[local] = 0.0f;
+
     uint sources[ROWS_A_TILE];
     float sums[ROWS_A_TILE][COLS_A_TILE];
     for (uint r = 0; r < ROWS_A_TILE; ++r) {
         const uint row = first + min(r, rows - 1);
         sources[r] = tile_source(shape, __READS__);
         for (uint c = 0; c < COLS_A_TILE; ++c) {
-            sums[r][c] = 0.0f;
+            sums[r][c] = held[local];
         }
     }
 
@@ -4135,44 +4194,75 @@ mod tests {
     /// at every size**, which is what keeps this a knob on the memory rather
     /// than on the work. Whether the array survived the compiler is read off
     /// `staticThreadgroupMemoryLength` rather than hoped for.
-    fn with_ballast(floats: usize) -> String {
-        let declared = crate::testing::instead_of(
-            &source(),
-            "    const uint tile = position / width;",
-            &format!(
-                "    threadgroup float ballast[{floats}];\n\
-                 \x20   for (uint at = lane; at < width; at += width) {{\n\
-                 \x20       ballast[at] = 0.0f;\n\
-                 \x20   }}\n\
-                 \x20   const uint tile = position / width;"
-            ),
-        );
+    fn at_residency(floats: usize) -> String {
+        assert!(floats >= THREADS_PER_GROUP, "a thread fills its own entry");
         crate::testing::instead_of(
-            &declared,
-            "+ leftmost + c] = sum;",
-            "+ leftmost + c] = sum + ballast[lane];",
+            &source(),
+            &format!("constant uint RESIDENCY = {RESIDENCY};"),
+            &format!("constant uint RESIDENCY = {floats};"),
         )
     }
 
+    /// **The memory the turn rests on is memory a tile declares, and it reaches
+    /// no dispatch a decode step makes** — the two things about [`RESIDENCY`]
+    /// this side can check without a clock.
+    ///
+    /// A store of a zero followed by a load of it is what a forwarding pass
+    /// exists to remove, and a compiler that removed this one would put the
+    /// dispatches back on the wrong side of the turn with nothing else to show
+    /// for it. What says it did not is `staticThreadgroupMemoryLength`, which is
+    /// a figure the pipeline reports after it was compiled.
+    #[test]
+    fn a_tile_declares_the_memory_its_occupancy_turn_rests_on() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        for tiled in [&matmul.tiled, &matmul.grouped] {
+            assert_eq!(
+                tiled.threadgroup_memory(),
+                size_of::<f32>() * RESIDENCY,
+                "a tiled entry declares neither more nor less than the turn wants"
+            );
+        }
+        assert_eq!(
+            matmul.kernel.threadgroup_memory(),
+            0,
+            "the entry a decode step dispatches declares memory it has no use for"
+        );
+
+        // Three threadgroups a core is every declaration in (20, 26.67] KiB by
+        // the sweep below, which is where a shipped figure has to sit for a
+        // compiler's own rounding not to move it off the plateau.
+        let held = matmul.tiled.threadgroup_memory();
+        let (least, most) = (20 * 1024 + 1, 26 * 1024 + 512);
+        assert!(
+            (least..=most).contains(&held),
+            "{held} bytes is off the plateau three threadgroups a core sit on, {least}..={most}"
+        );
+    }
+
     /// **How many threadgroups of this kernel a core holds, and what holding
-    /// fewer would be worth** — the occupancy candidate, on the two rows that
-    /// are 54% of a long prefill.
+    /// fewer is worth** — the occupancy term, on the two rows that are 54% of a
+    /// long prefill.
     ///
-    /// The attention kernel's own sweep found its row to be a function of the
-    /// declared threadgroup memory and of nothing else in it, with a turn a
-    /// quarter below where the shipped kernel sits. A tile of this kernel
-    /// declares none, so it runs at whatever residency a kernel that asks for
-    /// nothing gets — and this is the one direction available from there.
+    /// A tile of this kernel is a simdgroup and wants no threadgroup memory at
+    /// all, so it ran at whatever residency this part gives a kernel that asks
+    /// for nothing — and the row says that is too many threadgroups a core
+    /// rather than too few. There is nothing here a declaration could hold, so
+    /// the memory it declares is memory nobody reads and the row is what says
+    /// how much of it to take.
     ///
-    /// **The ballast is not a proposal and could not become one.** It is dead
-    /// memory; what a row below the shipped one would say is that residency is
-    /// worth something here, and what it would cost to get is a different
-    /// question from what this measures.
+    /// **Every arm answers what the shipped kernel answers, and that is
+    /// asserted rather than argued**: the declaration reaches no operand and no
+    /// order, so a row that moved the answer would be a row about something
+    /// other than residency.
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn how_many_threadgroups_of_a_prefills_packed_matmul_a_core_holds() {
         let Some(device) = device() else { return };
-        const BALLAST: [usize; 7] = [0, 256, 1024, 2048, 3072, 4096, 6144];
+        /// Floats a tile declares, from a kernel that declares nothing at all
+        /// past the turn to the most a threadgroup may take.
+        const DECLARED: [usize; 11] =
+            [0, 256, 1024, 2048, 3072, 4096, 5120, 6144, 6656, 7168, 8192];
 
         let shipped = matmul(&device);
         let want = a_tiled_call_answers(&device, &shipped);
@@ -4182,16 +4272,28 @@ mod tests {
         );
         eprintln!("  {:<32}{}", "a threadgroup", bound_header());
 
-        for floats in BALLAST {
-            let matmul = match floats {
-                0 => PackedMatmul::new(&device).expect("the kernel compiles"),
-                floats => PackedMatmul::from_source(&device, &with_ballast(floats))
-                    .expect("the arm compiles"),
+        for floats in DECLARED {
+            // A tile that declares nothing is the entry a decode step
+            // dispatches, reached by taking the residency out of the walk
+            // rather than by shrinking it: an array of no floats is not a
+            // declaration a kernel may make.
+            let arm = match floats {
+                0 => crate::testing::instead_of(
+                    &crate::testing::instead_of(
+                        &source(),
+                        "    threadgroup float residency[RESIDENCY];\n    threadgroup volatile float *held = residency;\n    held[local] = 0.0f;\n",
+                        "",
+                    ),
+                    "sums[r][c] = held[local];",
+                    "sums[r][c] = 0.0f;",
+                ),
+                floats => at_residency(floats),
             };
+            let matmul = PackedMatmul::from_source(&device, &arm).expect("the arm compiles");
             assert_eq!(
                 a_tiled_call_answers(&device, &matmul),
                 want,
-                "{floats} floats of ballast moved the answer"
+                "{floats} floats of residency moved the answer"
             );
             let cells: String = a_prefills_shapes_cost(&device, &matmul)
                 .iter()
