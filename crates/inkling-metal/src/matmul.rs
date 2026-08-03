@@ -1549,22 +1549,33 @@ impl<'a> PackedBank<'a> {
     fn moves(&self, rows: usize, values: usize, layout: &Layout<'_>) -> usize {
         let rows_a_read = self.matmul.rows_a_read(layout, rows, self.experts);
         let tiles = rows.div_ceil(rows_a_read);
-        // The worst layout the shape allows, which is what a call whose runs
-        // this side cannot count has to be charged.
-        let straddling =
-            rows.min(tiles + (rows_a_read - 1) * tiles.min(self.experts.saturating_sub(1)));
+        let boundaries = tiles.min(self.experts.saturating_sub(1));
+        // **A straddling tile is charged every weight it could name, and a
+        // straddling block only the two it can.** The two arms differ because
+        // their gates do. A tile of [`ROWS_A_TILE`] rows is dispatched at runs of
+        // four and a grouped call is dispatched at runs of two, so a tile can
+        // hold as many runs as it has rows and is charged that many weights. A
+        // block is dispatched at [`MMA_RUNS_A_BLOCK`] runs an expert — a block's
+        // worth — so a block of [`MMA_ROWS_A_BLOCK`] rows spans at most two of
+        // them, and charging it thirty-two would put a routed bank's declared
+        // bytes thirteen times over what it reads and its bandwidth column at
+        // 290% of this part's peak. Both are bounds and neither is below what the
+        // call reads; this is the tighter one its own predicate licenses.
+        let extra = match rows_a_read > self.matmul.rows_a_tile {
+            true => boundaries,
+            false => (rows_a_read - 1) * boundaries,
+        };
+        let straddling = rows.min(tiles + extra);
         let read = match layout {
             Layout::Each => rows,
             // **A tiled call is charged flat only while a tile is the height
             // [`tiles`] gated it at.** That predicate keeps the shortest run at
             // least [`ROWS_A_TILE`] long, which bounds a straddling tile to two
-            // experts and the whole call to one extra read a run. A block of
-            // [`MMA_ROWS_A_BLOCK`] rows is eight times that height against the
-            // same gate, so a block can span eight runs and read eight weights
-            // where this would charge one — and a bandwidth column that flattered
-            // the change by a factor of eight is exactly what this method exists
-            // not to print. Above the tile height it takes the same worst case
-            // the grouped arm takes.
+            // experts and the whole call to one extra read a run. A block is
+            // eight times that height against the same gate, so it can span more
+            // runs than the flat charge admits — and a bandwidth column that
+            // flattered this change is exactly what this method exists not to
+            // print.
             Layout::Tiled if rows_a_read > self.matmul.rows_a_tile => straddling,
             Layout::Tiled => tiles,
             Layout::Grouped { .. } => straddling,
