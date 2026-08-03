@@ -42,7 +42,9 @@ use inkling_cli::args::Backend;
 use inkling_cli::{backend, config};
 use inkling_core::generate::{Proposer, Round};
 use inkling_core::mtp::{CheckpointHeads, MtpProposer};
-use inkling_core::workload::{BEST, DECODED, REALISTIC, STRUCTURED_PROMPT, SWEPT, tiled};
+use inkling_core::workload::{
+    BEST, CORPUS, DECODED, DIFFERENTIAL, REALISTIC, STRUCTURED_PROMPT, SWEPT, tiled,
+};
 use inkling_core::{
     Checkpoint, CheckpointWeights, Ending, ModelCache, TextConfig, Tokenizer, profile,
 };
@@ -62,6 +64,7 @@ const USAGE: &str = "usage:\n  \
     bench sweep   <checkpoint> [--tokens <n>] [--depth <k>] [--numerics <which>]\n  \
     bench engines <checkpoint> [--depth <k>] [--numerics <which>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
+    bench diverge <checkpoint> [--tokens <n>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
 
 /// What an invocation nobody could parse exits with, apart from one that ran and
@@ -185,6 +188,9 @@ enum Job {
         tokens: usize,
         depth: usize,
     },
+    /// The same prompts through both numerics, and where their tokens part
+    /// company.
+    Diverge { checkpoint: PathBuf, tokens: usize },
 }
 
 impl Job {
@@ -196,10 +202,12 @@ impl Job {
             Some("sweep") => Some(What::Sweep),
             Some("engines") => Some(What::Engines),
             Some("alternate") => return Self::alternating(args),
+            Some("diverge") => return Self::diverging(args),
             Some("guesses") => None,
-            Some(word) => {
-                bail!("{word} is not one of decode, prefill, sweep, engines, guesses or alternate")
-            }
+            Some(word) => bail!(
+                "{word} is not one of decode, prefill, sweep, engines, guesses, diverge or \
+                 alternate"
+            ),
             None => bail!("no measurement given"),
         };
 
@@ -286,6 +294,29 @@ impl Job {
         })
     }
 
+    /// `diverge`, which takes one checkpoint and runs both numerics itself —
+    /// so it is the one measurement here that names neither of them.
+    fn diverging(args: impl Iterator<Item = String>) -> Result<Self> {
+        let mut args = args.into_iter();
+        let mut checkpoints = Vec::new();
+        let mut tokens = DIFFERENTIAL;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--tokens" | "-n" => tokens = count(&arg, &mut args)?,
+                _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
+                _ => checkpoints.push(PathBuf::from(arg)),
+            }
+        }
+        let [checkpoint] =
+            <[PathBuf; 1]>::try_from(checkpoints).map_err(|given: Vec<PathBuf>| {
+                anyhow::anyhow!(
+                    "diverge takes one checkpoint directory, given {}",
+                    given.len()
+                )
+            })?;
+        Ok(Self::Diverge { checkpoint, tokens })
+    }
+
     fn alternating(args: impl Iterator<Item = String>) -> Result<Self> {
         let mut args = args.into_iter();
         let mut pairs = PAIRS;
@@ -339,6 +370,12 @@ impl Job {
                 depth,
             } => {
                 for reading in guesses(checkpoints, *tokens, *depth)? {
+                    println!("{}", reading.line());
+                }
+                Ok(())
+            }
+            Self::Diverge { checkpoint, tokens } => {
+                for reading in diverge(checkpoint, *tokens)? {
                     println!("{}", reading.line());
                 }
                 Ok(())
@@ -824,6 +861,148 @@ fn guesses(dirs: &[PathBuf; 2], tokens: usize, depth: usize) -> Result<Vec<Readi
     Ok(taken)
 }
 
+/// The corpus through both numerics, and where the two continuations part
+/// company.
+///
+/// **This is the instrument the flag exists for.** Under the reference the
+/// engine's answer is checkable against a recorded array of bits, and every
+/// gated case in the tree checks it. Under the production numerics there is no
+/// such array and there cannot be one — a matrix instruction's summation order
+/// is not this side's to record — so what stands in for the oracle is a second
+/// implementation: two GPU paths that share every tiling decision, every
+/// predicate and every dispatch, and differ only in how the innermost sum is
+/// carried. Where those two agree, the structure around the sum is agreed by two
+/// independent accumulations; where they disagree, the disagreement is between
+/// the arithmetic and nothing else, and the position it first appears at is
+/// where to look.
+///
+/// **What is reported is leading agreement and not a count of differing
+/// tokens.** Two free-running generations that part company at step 12 have
+/// nothing comparable after step 12 — the shorter path is now continuing a
+/// different sentence — so "how many of the 64 differ" is a number about the two
+/// continuations rather than about the arithmetic. How far they got before the
+/// first disagreement is the number that means something, and it is per prompt
+/// because a prompt is what decides how close two logits get.
+///
+/// **One device at a time.** The two paths run in sequence rather than side by
+/// side: each wraps the whole model, and holding two of those at once would
+/// double a resident set this repo bounds a test on for nothing — nothing here
+/// is timed.
+fn diverge(dir: &Path, tokens: usize) -> Result<Vec<Reading>> {
+    let config = config::of_checkpoint(dir)?;
+    let text = &config.text_config;
+    let tokenizer = Tokenizer::open(dir, &config)?;
+    let ckpt = Checkpoint::open(dir)?;
+
+    let prompts = CORPUS
+        .iter()
+        .map(|prompt| {
+            Ok(tokenizer
+                .encode(prompt)?
+                .into_iter()
+                .map(|id| id as usize)
+                .collect::<Vec<usize>>())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut answers = Vec::new();
+    for numerics in [Numerics::Reference, Numerics::Production] {
+        let gpu = backend::open(Backend::Metal, numerics)?;
+        let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0)?;
+        let generator = weights.generator();
+        let mut ran = Vec::new();
+        for (at, ids) in prompts.iter().enumerate() {
+            let cache = &mut ModelCache::speculating(text, 0);
+            let mut continued = Vec::new();
+            // No end-of-sequence token, so both paths spend the whole budget:
+            // one that stopped early would be shorter than the other for a
+            // reason that is not a disagreement about a token.
+            let ending = Ending {
+                budget: tokens,
+                eos: None,
+            };
+            generator.stream(cache, ids, ending, &weights, &mut |token| {
+                continued.push(token);
+                ControlFlow::Continue(())
+            });
+            eprintln!(
+                "{}: prompt {} of {}, {} tokens from {} prompted",
+                numerics.named(),
+                at + 1,
+                prompts.len(),
+                continued.len(),
+                ids.len()
+            );
+            ran.push(continued);
+        }
+        answers.push(ran);
+    }
+    let [reference, production] = <[Vec<Vec<usize>>; 2]>::try_from(answers)
+        .map_err(|_| anyhow::anyhow!("a differential run answers twice"))?;
+
+    for (at, (was, is)) in reference.iter().zip(&production).enumerate() {
+        let agreed = agreement(was, is);
+        match agreed < was.len() {
+            true => eprintln!(
+                "prompt {} parted at token {}: reference {:?}, production {:?}",
+                at + 1,
+                agreed + 1,
+                &was[agreed..was.len().min(agreed + 4)],
+                &is[agreed..is.len().min(agreed + 4)],
+            ),
+            false => eprintln!("prompt {} agreed for all {} tokens", at + 1, was.len()),
+        }
+    }
+    Ok(parted(&reference, &production))
+}
+
+/// How many tokens two continuations agreed on before the first that they did
+/// not.
+///
+/// **Leading agreement rather than a count of differing positions**, and the
+/// reason is what a free-running generation is: two paths that part company at
+/// step 12 have nothing comparable after step 12, because each is now continuing
+/// a different sentence. "How many of the 64 differ" is a number about the two
+/// continuations; how far they got before the first disagreement is a number
+/// about the arithmetic.
+fn agreement(was: &[usize], is: &[usize]) -> usize {
+    was.iter().zip(is).take_while(|(a, b)| a == b).count()
+}
+
+/// The corpus's readings, out of what the two paths answered.
+///
+/// Split from the run above so that the arithmetic is checkable without a
+/// device: what a differential sitting reports is the whole of what it is for,
+/// and a share computed the wrong way would be wrong in the direction nobody
+/// looks at.
+fn parted(reference: &[Vec<usize>], production: &[Vec<usize>]) -> Vec<Reading> {
+    let mut taken = Vec::new();
+    let (mut apart, mut generated, mut agreed_over) = (0, 0, 0);
+    for (at, (was, is)) in reference.iter().zip(production).enumerate() {
+        let agreed = agreement(was, is);
+        let named = format!("prompt{}", at + 1);
+        taken.push(Reading::new(
+            format!("{named}.tokens"),
+            was.len() as f64,
+            "t",
+        ));
+        taken.push(Reading::new(format!("{named}.agreed"), agreed as f64, "t"));
+        generated += was.len();
+        agreed_over += agreed;
+        apart += usize::from(agreed < was.len());
+    }
+    taken.push(Reading::new("prompts", reference.len() as f64, "n"));
+    taken.push(Reading::new("parted", apart as f64, "n"));
+    taken.push(Reading::new("tokens", generated as f64, "t"));
+    taken.push(Reading::new("agreed", agreed_over as f64, "t"));
+    taken.push(Reading::new(
+        "agreed.share",
+        100.0 * agreed_over as f64 / generated.max(1) as f64,
+        "%",
+    ));
+    taken
+}
+
 /// Two executables, run against each other for `pairs` pairs with the order
 /// flipped each pair.
 fn alternate(pairs: usize, arms: &[Vec<String>; 2], args: &[String]) -> Result<()> {
@@ -1211,6 +1390,27 @@ mod tests {
         ));
     }
 
+    /// **The differential run is the one measurement that names neither**, since
+    /// it runs both itself — so a word choosing one of them is a mistake there.
+    #[test]
+    fn a_differential_run_takes_one_checkpoint_and_no_numerics() {
+        assert_eq!(
+            Job::parse(["diverge".to_string(), "models/small".to_string()]).expect("parses"),
+            Job::Diverge {
+                checkpoint: PathBuf::from("models/small"),
+                tokens: DIFFERENTIAL,
+            }
+        );
+        for name in ["reference", "production"] {
+            assert!(
+                Job::parse(["diverge", "models/small", "--numerics", name].map(str::to_string))
+                    .is_err(),
+                "{name} was taken by a measurement that runs both"
+            );
+        }
+        assert!(Job::parse(["diverge".to_string()]).is_err());
+    }
+
     /// The same refusal on `guesses`, and **about whether the word was given
     /// rather than about which of the two it named** — a check against the
     /// default would let `--numerics reference` through for being equal to it.
@@ -1225,6 +1425,60 @@ mod tests {
                 "{name} was taken by a measurement whose arms are two sets of heads"
             );
         }
+    }
+
+    /// **What a differential sitting reports is the whole of what it is for**,
+    /// so the arithmetic behind it is checked without a device rather than
+    /// trusted because the run is expensive.
+    ///
+    /// The cases are the four shapes a pair of continuations has: agreeing
+    /// throughout, parting at the very first token, parting at the last one, and
+    /// parting in the middle.
+    #[test]
+    fn leading_agreement_is_counted_up_to_the_first_token_that_differs() {
+        assert_eq!(agreement(&[1, 2, 3], &[1, 2, 3]), 3);
+        assert_eq!(agreement(&[1, 2, 3], &[9, 2, 3]), 0);
+        assert_eq!(agreement(&[1, 2, 3], &[1, 2, 9]), 2);
+        assert_eq!(agreement(&[1, 2, 3], &[1, 9, 3]), 1);
+        assert_eq!(agreement(&[], &[]), 0);
+    }
+
+    /// **A prompt that parted is counted once however many of its tokens
+    /// differ**, and the share is over tokens rather than over prompts: the two
+    /// answer different questions and a sitting that reported one of them under
+    /// the other's name would read as agreement it did not have.
+    #[test]
+    fn a_differential_sitting_reports_prompts_apart_and_tokens_agreed() {
+        let reference = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 9, 9, 9]];
+        let production = vec![vec![1, 2, 3, 4], vec![5, 0, 0, 0], vec![0, 0, 0, 0]];
+        let taken = parted(&reference, &production);
+        let read = |name: &str| {
+            taken
+                .iter()
+                .find(|reading| reading.name == name)
+                .unwrap_or_else(|| panic!("{name} was not reported"))
+                .value
+        };
+        assert_eq!(read("prompts"), 3.0);
+        assert_eq!(read("parted"), 2.0);
+        assert_eq!(read("tokens"), 12.0);
+        // Four, one and none, which is five of twelve.
+        assert_eq!(read("agreed"), 5.0);
+        assert!((read("agreed.share") - 100.0 * 5.0 / 12.0).abs() < 1e-9);
+        assert_eq!(read("prompt2.agreed"), 1.0);
+        assert_eq!(read("prompt3.tokens"), 4.0);
+    }
+
+    /// Nothing generated is not agreement, and the share it would be divided by
+    /// is the one number here that could be a zero.
+    #[test]
+    fn a_differential_sitting_over_nothing_reports_no_agreement_rather_than_dividing_by_zero() {
+        let taken = parted(&[], &[]);
+        let share = taken
+            .iter()
+            .find(|reading| reading.name == "agreed.share")
+            .expect("a share is reported");
+        assert_eq!(share.value, 0.0);
     }
 
     /// **A context of zero is the prompt and any other is the prompt tiled to

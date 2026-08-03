@@ -161,7 +161,7 @@ CPU → Metal, one arrow, settled by rerunning a command with `--backend cpu`. I
 is now **CPU → Metal under the reference → Metal under the production
 numerics**, and the middle of the three is what says whether a wrong token came
 from the kernel structure or from the arithmetic inside it. `--backend cpu` plays
-the same role it always did.
+the same role it always did; the new arrow is the one `just diverge` walks.
 
 **The flag selects the innermost compute and nothing else.** Tiling decisions,
 the submission structure, the grouping, KV handling, `splits_for`, both occupancy
@@ -180,7 +180,8 @@ flag existed. `--numerics` on `--backend cpu` is refused rather than dropped: th
 CPU path has one arithmetic, and a run that took the word and ignored it would
 print a command line saying something other than what it did.
 
-    just bench-numerics prefill --tokens 2048   # the two paired, alternating, out of one build
+    just diverge                              # the corpus through both, and where they part
+    just bench-numerics prefill --tokens 2048  # the two paired, alternating, out of one build
 
 **Nothing is copied onto the device.** The forty layers' banks are 137 GB, which
 is the whole checkpoint but for its two ends, and they are handed to the GPU

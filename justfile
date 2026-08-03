@@ -201,6 +201,17 @@ bench-numerics *measurement:
         "$bin --numerics production {{ absolute_path(checkpoint) }}" \
         -- {{ measurement }}
 
+# The corpus through both numerics, and where their tokens part company.
+#
+# **The gate the production path has to pass before any timing claim.** There is
+# no recorded array of bits on that side of the flag and there cannot be one, so
+# what stands in for the oracle is the reference path itself: two GPU
+# implementations sharing every tiling decision and every dispatch, differing
+# only in how the innermost sum is carried. What comes back is how far each
+# prompt's two continuations agreed before they parted.
+diverge *args:
+    cargo run -q --bin bench -- diverge {{ absolute_path(checkpoint) }} {{ args }}
+
 # What two sets of MTP heads guess, held against each other over one generation.
 #
 # The gate a change to the heads has to pass before any timing claim, and it is
