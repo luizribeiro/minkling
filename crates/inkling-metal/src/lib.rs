@@ -26,6 +26,7 @@
 //! which weights another dispatch will read and what the rows they produce are
 //! worth, and [`combine`] is where those rows and those weights meet.
 
+pub mod argmax;
 pub mod attention;
 pub mod buffer;
 pub mod combine;
@@ -47,6 +48,7 @@ pub mod tail;
 #[cfg(test)]
 mod testing;
 
+pub use argmax::{GreedyArgmax, Vocabulary};
 pub use attention::{AttentionError, FusedAttention, LayerAttention, Step};
 pub use buffer::{Arg, Buffer, Bytes, Element, Inline, Landing, Mapped};
 pub use combine::MoeCombine;
