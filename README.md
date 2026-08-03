@@ -781,7 +781,19 @@ under 2%, which is where they turned at one column — so the two axes are
 independent to the resolution this measures at, and `ROWS_A_TILE` is where the
 row tile left it.
 
-**M9's hypothesis did not hold, and the table is what says so.** It was that
+**M9's hypothesis has been re-measured and it is where the work is now — but it
+is a decode finding rather than a prefill one.** `fused_attention` is 548.47 ms
+of a 769-token prefill — 13.3% of the passes the profile sums and 14.4% of the
+3.80 s the command buffers clocked — and an attention kernel
+that cost nothing at all would take that prefill's 5.39 s to 4.84. That is what
+the paragraph below always said and it still holds. **What changed is the other
+regime**: the same span-walking is 19 ms of every decode token at a 769-token
+context, which over 128 generated tokens is 2.4 s — larger than the whole
+`packed_matmul_grouped` row. See "Against the reference, end to end". The kernel
+this milestone should have been about is this one, and the measurement that says
+so is the cross-engine table rather than the prefill profile.
+
+**M9's hypothesis did not hold against a prefill, and the table is what says so.** It was that
 every `(head, query)` threadgroup re-reading all keys is the next order of
 magnitude here. `fused_attention` is 4.4% of a 385-token prefill's device time
 and 7.5% of a 769-token one — growing with the prompt, as the hypothesis
@@ -805,18 +817,117 @@ merges two layers into one. The 42 submissions are 250 µs against a gap of seve
 seconds, which is where that argument stood before, and the round-trip table now
 says it rather than the arithmetic.
 
-**Two things in the diagnosis are unexplained and are written down as such.** A
-sampled prefill is *faster* in wall time than an unsampled one — 3.57 s against
-4.62 and 4.65 at 385 tokens, 7.26 against 8.37 and 8.29 at 769 — while the
-device's own clock does not move: 3.36 s against 3.32 and 3.36, and 6.96 s
-against 6.96 and 6.87. It is not the first read of a length faulting its pages
-in, because the two unsampled runs sit either side of the sampled one and agree
-with each other and with the figure the command line reports cold. So about a
-second of a prefill is this process's own, it is not execution, and putting each
-dispatch in a compute pass of its own removes it. Nothing here has attributed
-that, and no
-number above rests on it — every row in the tables is device time. The other is
-the pipeline that costs a prefill 2 to 3% by existing, above.
+**Two things in the diagnosis were unexplained, and both were re-checked rather
+than carried.** A sampled prefill is still *faster* in wall time than an
+unsampled one — 4.05 s against 5.39 and 5.36 at 769 tokens — while the device's
+own clock does not move: 3.80 s against 3.81 and 3.80. **So it is not gone**, and
+S5's removal of the host sampling round trip did not touch it: putting each
+dispatch in a compute pass of its own still takes 1.3 s off a prefill's wall and
+nothing off its execution. What that number is worth reading beside is the
+prefill itself — **1.58 s of a 5.39 s prefill is not device time at all**, which
+is 29% of it and larger than any kernel row below the first two. The other
+unexplained figure, the pipeline that costs a prefill 2 to 3% by existing, is
+where it was.
+
+### Why the two tiled rows report bandwidths a factor of two apart
+
+**This was the largest unexplained number in the prefill table and it is now
+explained.** `packed_matmul_rows` reports 283 GB/s where `packed_matmul_grouped`
+reports 556 — this milestone's own re-reading of the two rows the table above
+records at 281 and 556 — at the same tile shape and out of the same source
+string — the two
+entries are one string with three expressions substituted and nothing else. The
+two things that could separate them are the indirection and the weight a dispatch
+walks, and both were crossed rather than argued about: one shape held fixed at a
+769-token routed bank's, over banks of 1 to 256 experts, through both entries
+with the rows pre-sorted so the grouping is the identity and the tiles are the
+same tiles.
+
+    experts        a run   distinct    untiled       tiled     grouped        tiled      grouped
+    1               4614       4 MB     7829µs      3501µs      3556µs    1469 GB/s    1446 GB/s
+    4               1153      18 MB     7845µs      3497µs      3551µs    1471 GB/s    1460 GB/s
+    16               288      71 MB     7837µs      3530µs      3585µs    1457 GB/s    1491 GB/s
+    64                72     285 MB     7818µs      3635µs      3732µs    1415 GB/s    1604 GB/s
+    256               18    1141 MB     7672µs      4015µs      4277µs    1281 GB/s    1999 GB/s
+
+**Neither candidate is worth a factor of two.** The indirection is 1.6% at one
+expert and 6.5% at 256, the second of which includes the sort dispatch. The
+weight a dispatch walks is 15% across a 285-fold change in it — 4 MB to 1141 MB
+for 3501 µs to 4015. **But the two rate columns part by 1.56× over that same
+range while the two time columns stay within 6.5%**, and that is the whole of the
+finding: the rates are moving because their denominators are, not because the
+kernel is.
+
+**`achieved` is `PackedBank::moves` over device time, and `moves` charges a whole
+weight per tile.** What each of a prefill's nine packed shapes declares against
+the weight it actually holds:
+
+    shape                 rows  distinct  declared    over    a call    achieved   a prefill
+    q_proj, o_proj         769      9 MB   1720 MB    ×193    1124µs   1531 GB/s     94.40ms
+    k_proj, v_proj         769      2 MB    430 MB    ×193     297µs   1449 GB/s     24.93ms
+    r_proj                 769      1 MB    215 MB    ×193     148µs   1452 GB/s      6.22ms
+    shared gate, up       1538      9 MB   1716 MB    ×192    1170µs   1466 GB/s     93.64ms
+    shared down           1538      9 MB   1716 MB    ×192    1009µs   1701 GB/s     40.36ms
+    dense gate, up         769     36 MB   6881 MB    ×193    4287µs   1605 GB/s     17.15ms
+    dense down             769     36 MB   6881 MB    ×193    6376µs   1079 GB/s     12.75ms
+    routed gate, up       4614   1141 MB   8552 MB      ×7    4292µs   1992 GB/s    343.38ms
+    routed down           4614   1141 MB   8552 MB      ×7    3977µs   2151 GB/s    159.06ms
+
+**Every shape on the tiled entry is charged 193 times the weight it holds and a
+routed bank is charged 7.** Across a whole prefill that is 444765 MB declared
+against 2.34 GB of distinct weight for `packed_matmul_rows` — ×190 — and 1034803
+MB against 129 GB for `packed_matmul_grouped` — ×8. **The two rows divide by
+denominators inflated against each other by a factor of 24**, so 283 and 556 are
+two amplification factors rather than two bandwidths, and the ratio between them
+is mostly the ratio of those amplifications.
+
+**Which is what says neither row is near this machine and the table's `of peak`
+column is misleading for both.** The bytes that *must* come from memory are the
+distinct ones: 2.3 GB over 1.57 s for the tiled row, which is 1.5 GB/s, and 129
+GB over 1.86 s for the grouped one, which is 69 GB/s. Against 819. The rates
+above 819 in both tables are the arithmetic saying the same thing from the other
+side — a dispatch cannot move 8552 MB in 4292 µs, so most of what it is charged
+for it did not fetch.
+
+**So grouping does not help and rows is not broken, and there is no factor of two
+of headroom here to go and get.** That is a negative finding and it is the point
+of having taken it: the number that looked like the largest deficit in the
+prefill table was an artefact of the denominator, and a milestone spent chasing
+it would have found nothing.
+
+### The one lever this left, measured and declined
+
+**`ROWS_A_TILE` was fitted on a bank small enough to stay in cache**, which is
+the one thing its own sweep could not ask about: at one expert and 2 to 36 MB
+every weight read a taller tile saves was already a cache hit, so the sweep turns
+at four and says so emphatically. A routed bank is 1141 MB a dispatch. Swept
+there instead:
+
+    rows a tile         a call  declared    achieved   a prefill
+    2                   4549µs  11417 MB   2510 GB/s    545.83ms
+    3                   4115µs   9127 MB   2218 GB/s    493.85ms
+    4                   4243µs   8552 MB   2015 GB/s    509.21ms
+    6                   5246µs   9109 MB   1736 GB/s    629.49ms
+    8                   6935µs  10526 MB   1518 GB/s    832.18ms
+
+**The turn moves from four to three and is worth 3.0%** — 509 ms of a prefill's
+routed dispatches against 494, which is 15 ms of a 5.39 s prefill, 0.3%. **It is
+not being taken, and the reason is the other regime.** `tiles` refuses a run
+shorter than the height, so the height is what keeps every shape a decode step
+and a speculative round dispatch off the tiled entry — and a round of depth `k`
+verifies `k + 1` rows in one pass, so `k = 2` dispatches a three-row projection
+that is tiled the moment the height is three. That is the 16.48 ms figure and
+60.7 tokens a second, risked for 0.3% of a prefill. `a_calls_rows_share_a_weight
+_read_only_where_they_name_one_expert` now asserts it directly: every block a
+round can propose stays untiled at this height, and a tile of three would not.
+**The height may rise and may not fall**, and nothing here moved it.
+
+**What was changed in the kernel: nothing.** The two entries, the tile shape, the
+grouping and the predicate that selects between them are where P4 left them. What
+was added is three measurements and one assertion, because what the milestone
+found is that its premise was wrong — see "Against the reference, end to end" for
+where the time actually is, and `fused_attention` below for the row that Part 1
+promoted from a rounding error to the largest single item this engine has.
 
 **A whole decoder layer is now one command buffer**, and twenty-six dispatches
 on a layer that routes — twenty-seven where the prompt is long enough to lay the
