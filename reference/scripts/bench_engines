@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# The reference arm as `bench alternate` needs it: one executable.
+#
+# An arm's own arguments go *after* the shared ones, so `python script.py` as an
+# arm would run `python engines <checkpoint> script.py` — python, handed the
+# measurement's name as its script. One word is what the harness can drive, and
+# this is that word.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$here/../.venv/bin/python" "$here/bench_engines.py" "$@"

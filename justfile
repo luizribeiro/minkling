@@ -138,6 +138,43 @@ bench-weights a b *measurement:
     "$root/target/debug/bench" alternate --pairs {{ pairs }} \
         "$bin {{ absolute_path(a) }}" "$bin {{ absolute_path(b) }}" -- {{ measurement }}
 
+# Both engines against each other in one sitting:
+#
+#   just bench-engines
+#   BENCH_PAIRS=3 just bench-engines --depth 4
+#
+# **The one measurement here whose other arm is not this engine.** An arm is an
+# executable that prints `name value unit` lines, and nothing in that contract
+# says which engine produced them — so `reference/scripts/bench_engines` is
+# mlx-vlm behind the same protocol, alternating with ours pair by pair. A
+# cross-engine figure taken by running one engine and then the other carries the
+# drift of the machine between them, and this host has moved 1.7% inside a single
+# sitting.
+#
+# What comes back per (prompt, generated) pair is the wall a user waits, the
+# prefill inside it and the decode step after it, at `k = 0` and at the depth
+# that pays best. The reference speculates nothing, so its two depths are one
+# measurement printed twice.
+#
+# **Point it at the packed heads to read this engine at its best**, which is what
+# the README's table is taken over and is not this file's default checkpoint:
+#
+#   just checkpoint=models/Inkling-Small-mxfp4-mtp4 bench-engines
+bench-engines *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    cargo build --quiet --bin bench
+    bin="$root/target/bench/bin/working-tree"
+    mkdir -p "$(dirname "$bin")"
+    # Copied out rather than run in place, for the reason `bench-weights` gives:
+    # the next `cargo build` would otherwise swap the binary under a sitting that
+    # is still running.
+    cp "$root/target/debug/bench" "$bin"
+    "$root/target/debug/bench" alternate --pairs {{ pairs }} \
+        "$bin" "$root/reference/scripts/bench_engines" \
+        -- engines {{ args }} "{{ absolute_path(checkpoint) }}"
+
 # What two sets of MTP heads guess, held against each other over one generation.
 #
 # The gate a change to the heads has to pass before any timing claim, and it is
