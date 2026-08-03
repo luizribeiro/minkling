@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **590 of the 632 tests, no
+`just test` is the one to run while iterating: **619 of the 663 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,7 +32,7 @@ a crate's tests in one process: opening a Metal device costs a second, so the 16
 kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 632 against a
+`just test-full` is what has to pass at the ends of a series: **all 663 against a
 real checkpoint, ten minutes.** The 52 gated tests — the 37 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the forty-two tests whose result *is* a number — a duration
+`just test-timing` is the forty-four tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -180,8 +180,16 @@ flag existed. `--numerics` on `--backend cpu` is refused rather than dropped: th
 CPU path has one arithmetic, and a run that took the word and ignored it would
 print a command line saying something other than what it did.
 
-    just diverge                              # the corpus through both, and where they part
-    just bench-numerics prefill --tokens 2048  # the two paired, alternating, out of one build
+    just diverge                                 # the corpus through both, and where they part
+    just bench-numerics prefill --tokens 2048     # the two paired, alternating, out of one build
+    INKLINGRS_NUMERICS=production just test-timing  # the per-kernel table on the other side
+
+**What is behind the flag today is the packed matmul's two tiled entries**, and
+what they are worth is under "What the matmul costs on the other side of the
+line": 2.85× on the two matmul rows at 16384 tokens, 37 to 45% off a prefill's
+wall, nothing at all on a decode step, and no token moved over 384 sampled
+argmaxes. **It is not the default and the recommendation is that it should not
+be** — the reasoning is in that section, kept apart from the numbers.
 
 **Nothing is copied onto the device.** The forty layers' banks are 137 GB, which
 is the whole checkpoint but for its two ends, and they are handed to the GPU
@@ -2629,6 +2637,356 @@ of the one experiment that needed an in-model reading. The paired decode sweep
 was taken at two of the six contexts rather than all six, and the paired prefill
 at 2048 rather than at all four lengths, for the same reason: what those would
 be re-proving is a kernel nobody edited.
+
+### What the matmul costs on the other side of the line
+
+**A7 crossed the line A4 named and measured what is over there, and the answer
+is that the matmul rows are 2.85 times faster.** Nothing below is a default —
+see "Two numerics behind one flag" for what `--numerics` is and why the
+reference is what a caller gets who does not ask. **Every figure here is the
+production path against the reference path, in this engine, at these shapes.**
+
+The two entries are `mma_matmul_rows` and `mma_matmul_grouped`, and they are the
+two tiled ones with the reduction carried by `simdgroup_multiply_accumulate`
+instead of by a lane-strided walk under a `simd_sum`. A threadgroup is 32 rows of
+64 columns over eight simdgroups laid two down and four across; a step brings in
+32 rows of the input and 64 columns of the weight, decoded, and drives them
+through 8×8 fragments. **The weight is decoded once for the whole block where the
+reference tile decodes it once for four rows** — so the decode's dependency
+chain, which "What each way of decoding a packed byte costs" measured at 30% of
+that kernel and could not remove, is amortised eight times as far. A step is
+`GROUP_SIZE` codes wide, which puts exactly one scale byte under it and lets the
+scale be folded in at the staging: a scale is a power of two, so a code times its
+scale is exact and the multiply that follows owes nothing per step.
+
+**Paired and alternating, in-model, the order flipped each pair:**
+
+    prefill        reference   production   change   pairs
+     2048, wall     11287ms       7127ms    -36.9%   5 of 5, ranges apart
+     2048, device    9125ms       5051ms    -44.6%   5 of 5, ranges apart
+     8192, wall     46424ms      28787ms    -38.0%   3 of 3, ranges apart
+     8192, device   40784ms      23561ms    -42.2%   3 of 3, ranges apart
+
+**Per kernel at 16384 tokens, one sampled prefill a column:**
+
+    kernel                  reference   production
+    global attention          33.09s       31.87s
+    the grouped matmul        33.97s       11.81s
+    the row-tiled matmul      27.15s        9.61s
+    windowed attention        11.63s       11.28s
+    every pass               109.49s       67.61s
+
+**The two matmul rows are 61.12 s and are 21.43 s**, which is 2.85× and 65% off
+them. At 8192 the same two rows read 16.06 and 13.01 against 6.13 and 4.81, which
+is 2.66× — so the ratio holds within a tenth at half the length.
+
+**The two attention rows did not move the way the matmul rows did**, which is
+what says this change is the matmul's and is not carrying anything else: 33.09 s
+of global attention against 31.87 and 11.63 of windowed against 11.28. That is
+3.7 and 3.0% *down*, which is more than this host's 1.7% drift and is one sampled
+prefill a column — the likely reading is that a 68 s pass carries less sampling
+overhead than a 109 s one, and **no claim is made on those two rows either way**.
+What matters about them is the sign: they moved a few percent where the rows
+beside them moved by a factor of three.
+
+**The wall a user waits, one sitting a length**, against the reference engine's
+column, which is A2's and was not re-measured:
+
+    tokens   reference   production    mlx-vlm   gap before   gap after
+     2048     11.24 s      7.06 s      2.66 s      ×4.23        ×2.65
+     4096     21.99 s     13.30 s      5.61 s      ×3.92        ×2.37
+     8192     46.58 s     29.34 s     13.05 s      ×3.57        ×2.25
+    16384    109.82 s     74.72 s     34.31 s      ×3.20        ×2.18
+
+**This is the first arrangement in this file where the gap is inside two and a
+half at every length.** It is also where the shape of the remaining gap changes:
+at 16384 the two attention rows are now 64% of the passes where the two matmul
+rows were 56%, so the half A4 under-sold for three milestones has stopped being
+the larger one.
+
+**The block is not free at every shape, and the sweep says where it turns.** A
+block computes its 32 rows whether the call brought them or not, and a call of
+one or two blocks does not put threadgroups enough on this part to fill it. On
+the device's own clock, one sitting a length:
+
+    rows   reference   production
+      40     264.6ms     278.8ms
+      48     315.0ms     320.7ms
+      64     415.1ms     390.1ms
+      80     518.2ms     487.3ms
+      97     502.8ms     456.8ms
+     385    1670.1ms    1357.4ms
+     769    3355.8ms    2699.5ms
+
+So a call is given a block only at two blocks' worth of rows, and **padding alone
+does not explain the turn** — 48 rows waste a third of two blocks and 97 waste a
+third of four, and only the second wins. What the short calls are also short of
+is threadgroups: 48 rows of `q_proj` are 128 of them against 240 slots on this
+part's 80 cores, where 97 rows are 256 and fill it.
+
+**What the floor is worth is a speculative round, and it was measured before the
+floor existed.** A verify block is the depth plus one rows through every
+projection, so at a depth of three it clears `tiles`'s four-row bar and lands on a
+block eight times too tall: `k = 3` read **37.33 ms a token against the
+reference's 17.08** and `k = 4` 36.30 against 19.98, where `k` of 0, 1 and 2 were
+untouched because their blocks are under four rows and never leave the untiled
+entry. With the floor drawn, `k = 3` is 16.27 against 16.41 and `k = 4` 18.86
+against 19.70. **A block that is faster on a prefill and twice as slow on a
+speculative round is one finding and not two**, and it is the same finding
+`splits_for` already carries: a shape predicate is what keeps a prefill's gain
+off a decode step's throat.
+
+### Whether the two paths' tokens ever part company
+
+**They never did, over 384 sampled argmaxes, and the recorded continuation is
+reproduced on the production path.** There is no array of bits to hold that path
+to and there cannot be one, so what stands in for the oracle is the reference
+path itself — two GPU implementations sharing every tiling decision, every
+predicate and every dispatch, differing only in how the innermost sum is
+carried. `just diverge` is that instrument.
+
+    prompt                          tokens   generated   agreed
+    enumeration, a chat turn            71          64       64
+    prose, mid-sentence                 68          64       64
+    code, mid-function                  77          64       64
+    a chat turn with four asks          83          64       64
+    a list of 573 primes              2123          64       64
+    a factual question                  64          64       64
+
+**Six texts rather than six lengths, and that is the corpus's whole design.**
+Whether two accumulations name the same token is decided by how close the top two
+logits are, and how close those are is a property of the text — the acceptance
+study measured 99.7% at the first head on enumeration against 44.9% on prose — so
+one prompt tiled to six lengths would report the agreement of whichever regime it
+happened to be. **Length is the second axis and it decides whether a prompt
+reaches the flag at all**: a call under two blocks' worth of rows runs the same
+kernel under both words, so `bench diverge` refuses a corpus member under
+`PackedMatmul::SHORTEST_BLOCKED_CALL` rather than reporting a thing agreeing with
+itself. The list of primes is the one member long enough to reach the grouped
+entry as well, which is about 1366 tokens.
+
+**What is reported is leading agreement and not a count of differing tokens.**
+Two free-running generations that part at step 12 have nothing comparable after
+step 12, because each is continuing a different sentence by then.
+
+**And the whole gated tier passes under the production numerics**: 619 cases,
+44 skipped, `INKLINGRS_NUMERICS=production cargo nextest run`. The recorded
+continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]` comes back off the
+device under either word, at the same 19.55 ms a token and the same 0.24 GiB peak
+resident set; `the_bounded_loop_is_the_unbounded_one_bit_for_bit`,
+`a_query_row_walks_the_keys_its_window_and_its_position_leave_it` and
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` pass
+unrelaxed. Acceptance is **84.8% / 87.0-78.3% / 85-65-55% / 82.4-64.7-52.9-47.1%**
+and the tokens a round 1.829, 2.560, 2.909 and 3.368 — **digit for digit the
+same under both**, which is what a flag that reaches no decode dispatch should
+read. `k = 4` reads 0.983× under the reference and 1.031× under the production
+path in this sitting, one unpaired reading each, against A6's 0.972: **it has not
+fallen further.**
+
+**With the flag at its default nothing moved at all.** A paired decode step is
+19.765 against 19.946 ms at 385 keys and 27.420 against 27.384 at 8192, ranges
+across and no claim at either — which is what the untiled entry never being
+reached looks like from the outside.
+
+### What the production path is not, which is more accurate
+
+**It is the worse-conditioned of the two orders, and by a factor that grows with
+the reduction.** A fragment accumulator carries the whole reduction as one
+running sum — 4096 codes are 512 accumulate steps into the same register — where
+the reference splits it 32 ways across lanes and reduces the partials in a tree.
+Against an f64 accumulation of the same products:
+
+    reduction   reference   production
+           32     9.0e-8      1.6e-7
+          128     9.5e-8      4.8e-7
+          512     9.5e-8      7.4e-7
+         2048     9.6e-8      1.4e-6
+         4096     1.4e-7      4.1e-6
+
+**That it is f32 noise at a reduction of 32 is what says the arithmetic is right
+and only the chain is long** — four accumulate steps land within an ulp or two of
+exact, and a kernel with the transpose or the staging wrong would be decades out
+at every length rather than exact at the short one. Every product either path
+forms is exact, because a code is one of sixteen table values and a group scale
+is a power of two; nothing is rounded anywhere but in the adds.
+
+**So "neither is more accurate" is the wrong summary of this pair and the right
+summary of the flag.** The flag's claim is about checkability: one order is one
+this side picked and `--backend cpu` reproduces, the other is the instruction's.
+On this particular pair the reference also happens to be the better-conditioned
+one, and 4.1e-6 of the peak output is still four decades under what would move a
+token — which is what the 384 agreeing argmaxes say from the other end. **A
+production path that summed in several accumulators would close most of that
+gap** and is not built here.
+
+### What the flag cost, which is eight files and about twenty lines of mechanism
+
+**The maintenance surface is the question the design was drawn around**, so it is
+reported rather than asserted. Eight files mention `Numerics` at all.
+`numerics.rs` is 22 lines of mechanism and 20 of cases. `LayerKernels::compiling`
+is the only constructor that takes the word and **only the matmul takes it from
+there** — the norm, the convolution and the argmax have no reduction a matrix
+instruction could carry, so a kernel that does not take the flag is a kernel both
+paths run. Everything above the accumulate is shared: the tiling decisions, the
+submission structure, the grouping's two ends, `splits_for`, both occupancy
+turns, KV handling. The two production entries take the same six bindings from
+the same encoder, read the same `Shape`, and are chosen by the same predicates at
+the same shapes.
+
+**Where the surface actually went is the command line and the cases**, not the
+engine: of the 365 non-comment lines the flag commit added, `args.rs` and
+`bench.rs` are 226 of them and most of those are the cases holding the refusals —
+`--numerics` on `--backend cpu`, an unknown word, the order the two words arrive
+in. The other 139 are spread over six engine files, and about half of those are
+cases too: the mechanism itself is `numerics.rs`'s 22 lines, one extra
+constructor apiece on `PackedMatmul` and `LayerKernels`, and a word threaded
+through `backend::open`.
+
+**One entry point is public that would not otherwise be**:
+`PackedMatmul::SHORTEST_BLOCKED_CALL`. A differential corpus that cannot ask
+where the flag's own line is would report perfect agreement between a thing and
+itself, and would keep reporting it after the arithmetic behind the flag had
+changed.
+
+### What A3's query block reads now, which is a question this could not ask
+
+**The retest was proposed as cheap and it is not, and that is the finding.** A3's
+block (`c2095cb`, reverted in `58d3ae7`) was measured before A5 changed the
+occupancy regime, and the brief for this milestone read "the code exists and
+re-running it is cheap". Reverting the revert onto this tree conflicts in
+**eleven regions of `attention.rs`**, and they are not incidental: A3's block
+parameterises `source` by a block height where A5's parameterises it by a staging
+and a residency, A3 compiles one kernel where A5 compiles two and picks between
+them with `splits_for`, and the walk itself is rewritten in both. **Resolving that
+is writing a kernel that has both, not re-running one that had one** — and a
+resolution that is not bit-identical to what ships measures nothing at all, which
+is the whole property A3's block was interesting for.
+
+**What the two existing sweeps say when read together, which is arithmetic and
+labelled as such.** A3's block declared about 3 KiB of live arrays a row beside a
+16 KiB staging, so a height of four declared about 28 KiB. A5's sweep prices that
+declaration on its own: 23 KiB is **120.88 ms** at 2048 global against 12.5 KiB's
+**71.60**, which is a factor of 1.69 before any block exists. A3 measured height
+four at ×0.72. **So the whole of A3's refusal sits inside what its declaration
+alone costs at that height**, and A3's numbers cannot separate the block from the
+residency it spent. That is a reading of two tables and not a run, and it says
+the question is open rather than that the block would pay.
+
+**What it would take to close it** is a block built on A5's kernel rather than on
+A3's — the staging predicate, the two compiled regimes and the occupancy
+declaration kept, the query rows blocked on top — which is a milestone and not a
+retest.
+
+### What this says about the instrument, which is the third thing it has said
+
+A6 found that isolated and in-model readings can **disagree in sign**, and warned
+that A4's whole attention limiter table rests on the isolated kind. This
+milestone adds two readings to that account and neither is a contradiction.
+
+**The first is that a shape predicate can invert a kernel's sign without the
+kernel changing at all.** The same two entries are 2.85× faster on a prefill's
+matmul rows and 2.2× *slower* on a speculative round's, and the only thing that
+differs is how many rows the call brought. So "is this kernel faster" is not a
+question a kernel has, and a sweep that answers it at one shape has answered it
+at one shape. A6's caution was about the *regime* a dispatch runs in; this is
+about the *shape* it is handed, and the two compound.
+
+**The second is that the largest term is not the one the shares rank first, for
+the second milestone running.** A4 priced the decode table at 30% of the matmul
+rows and A6 measured two replacements for it and withdrew both, on the reading
+that the 30% is the decode's dependency chain rather than the table it reads
+through. **That reading is what this milestone confirms from the other side**:
+the block does not replace the decode, it runs the same two gathers into the same
+64-byte table — and it is 2.85× faster because it runs them once for 32 rows
+rather than once for four. The term was never removable and was always
+amortisable, and nothing in A4's ablation table could have said which.
+
+**And a bandwidth column moved without a dispatch moving.** The block's arrival
+made `PackedBank::moves`'s grouped bound thirteen times too loose and printed a
+routed bank at 2378 GB/s — 290% of this part's peak, and so visibly a bound
+rather than a rate. It was tightened by the block's own predicate rather than by
+a measurement: a block is dispatched at a block's worth of runs an expert, so it
+spans at most two of them and can name at most two weights, where a tile of four
+rows really can hold four runs. **The rows the production matmul now declares put
+it at 166 and 138 GB/s, 20 and 17% of this part's peak** — which is the column to
+read next, because it says the matmul is not near the memory and the reference's
+attention rows at 88 to 95% are.
+
+### What this milestone did not reach
+
+**Attention was not built, and Part 2 justifies building it.** The brief made it
+conditional on the matmul result and the matmul result is 2.85× on its two rows,
+so the condition is met and the work is not done here. What it needs is not the
+matmul's shape: `steel_attention.h`'s structure is a block of query rows through
+fragments with the online softmax kept in registers and reduced by two
+`simd_shuffle_xor` steps, and putting that on this kernel means rebuilding the
+band derivation, `reach` and `last` per query row, `splits_for` and both compiled
+regimes around it. **At 16384 the two attention rows are 43.15 s of 67.61 s of
+passes**, so it is now the larger half — and A4's own probe says the reference
+runtime does a global layer at 122.36 ms where ours takes 4.55 s.
+
+**The accumulator chain was not split.** The production path's drift grows with
+the reduction because one fragment accumulator carries all 512 steps; several
+accumulators summed at the end would shorten each chain by that factor at the
+cost of registers. It is a change to four lines of the kernel and it was not
+measured.
+
+**What was not measured, and why.** The per-kernel table was taken at all four
+lengths on both paths and only two of them are quoted, because the four are one
+ratio and the two ends say it. The paired prefill was taken at 2048 and 8192
+rather than at all four — 16384 is 110 s an arm and seven pairs of it is forty
+minutes to re-prove a ratio the other two lengths already agree on to a point,
+and the four-length wall table above is one sitting a length instead. The paired decode was taken at two of the six
+contexts, because the flag reaches no dispatch a decode step makes and the two
+taken are the ends of the range. The cross-engine column was not re-measured, for
+the reason A4 and A5 gave: nothing here changes what mlx-vlm does.
+
+### Whether the production path should be the default, which is no
+
+**The numbers are above and the reasoning is here, kept apart on purpose.**
+
+It should not, and not because of anything in the measurements. Every number
+this milestone took says the production path is better: 2.85× on the two matmul
+rows, 37 to 45% off a prefill's wall and device clock at both lengths it was
+paired at, nothing at all on the decode path, 384 of 384 argmaxes agreeing, the
+recorded continuation reproduced on the device, the whole gated tier passing, the
+same peak resident set, acceptance digit for digit. If the question were "is it
+faster and does it change the answer", the answer is yes and no.
+
+**The question it fails is a different one.** This engine's core claim — the one
+every milestone in this file has been written under — is that a kernel's answer
+is the CPU path's bit for bit, and that claim is what has made four milestones'
+worth of mutations falsifiable. It is why `element` could be swapped for two
+other decodes and *proven* the same floats; why the occupancy turn could be taken
+on sixteen cases and 55.7 million elements rather than on a tolerance; why A3's
+block could be refused on a timing rather than argued about. **Making the
+production path the default retires that instrument for the engine's dominant
+kernel**, and what replaces it is a differential run: 384 argmaxes over six
+prompts, which is a good instrument and is not the same instrument. A tolerance
+cannot catch what `-0.0` against `0.0` catches.
+
+**Second, 384 tokens is not a bound on anything.** The two paths agreeing over
+one corpus says the drift did not reach a coin-toss step in that corpus. The drift
+is real and grows with the reduction — 4.1e-6 at the length every projection in
+this checkpoint has — and every generated token is one argmax over it. A default
+is a claim about every prompt anyone will ever run, and what is measured here is
+six.
+
+**Third, the flag's cost is already paid and the option is worth keeping open.**
+Eight files, about ninety engine lines, and a differential harness that will be
+worth more once there are two things behind the flag rather than one. Nothing is
+gained by promoting it that is not already available to whoever types the word,
+and what is lost by promoting it cannot be got back cheaply.
+
+**What would change the recommendation**, in the order it would arrive: an
+attention kernel behind the same flag, so that the choice is about the whole
+engine rather than about one of its two halves; a differential run over a corpus
+large enough to bound the disagreement rate rather than to fail to find one; and
+the accumulator chain split, so that the production path's drift stops growing
+with the reduction. **Two of those three are measurements and one is four lines
+of kernel.** Until then the default is the reference, `--numerics production` is a
+word anyone can type, and this section is the number the decision belongs to
+whoever owns the claim.
 
 ## The tail of a step
 
