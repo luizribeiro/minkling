@@ -2146,15 +2146,21 @@ mod tests {
         // grid has moved out from under it.
         // The checkpoint's own two kinds of layer: seven global and thirty-five
         // capped at 512.
-        let spans = [
-            (8, 0),
-            (97, 0),
-            (512, 0),
-            (4096, 0),
-            (512, 512),
-            (4096, 512),
-            (16384, 512),
-        ];
+        // **Every context the stack is priced at is here at both window
+        // settings**, because that is the whole of the split a decode step's
+        // `fused_attention` row has to be read as: 35 of the 42 layers are the
+        // windowed row and 7 are the global one, and one row per key count could
+        // not say which of the two grows. The other four are the shape of each
+        // curve either side of the window.
+        let spans: Vec<(usize, usize)> = [8, 512, 4096, 16384]
+            .into_iter()
+            .flat_map(|keys| [(keys, 0), (keys, SLIDING_WINDOW)])
+            .chain(
+                CONTEXTS
+                    .into_iter()
+                    .flat_map(|keys| [(keys, 0), (keys, SLIDING_WINDOW)]),
+            )
+            .collect();
         let grid = |keys: usize, sliding: usize| {
             let case = windowed(keys, sliding);
             Grid::new(
@@ -2184,26 +2190,29 @@ mod tests {
 
         // Warm: the first dispatch of a fresh pipeline pays for the driver's
         // first look at these buffers, which a decode loop pays once.
-        let mut taken = spans.map(|(keys, sliding)| {
-            cost(&attention, keys, sliding);
-            cost(&walking, keys, sliding);
-            [const { Vec::new() }; 3]
-        });
+        let mut taken: Vec<[Vec<Duration>; 3]> = spans
+            .iter()
+            .map(|&(keys, sliding)| {
+                cost(&attention, keys, sliding);
+                cost(&walking, keys, sliding);
+                [const { Vec::new() }; 3]
+            })
+            .collect();
         empty.cost(&device, CALLS, grid(spans[0].0, spans[0].1));
         for _ in 0..ROUNDS {
-            for (each, (keys, sliding)) in taken.iter_mut().zip(spans) {
+            for (each, &(keys, sliding)) in taken.iter_mut().zip(&spans) {
                 each[0].push(cost(&attention, keys, sliding));
             }
-            for (each, (keys, sliding)) in taken.iter_mut().zip(spans) {
+            for (each, &(keys, sliding)) in taken.iter_mut().zip(&spans) {
                 each[1].push(cost(&walking, keys, sliding));
             }
-            for (each, (keys, sliding)) in taken.iter_mut().zip(spans) {
+            for (each, &(keys, sliding)) in taken.iter_mut().zip(&spans) {
                 each[2].push(empty.cost(&device, CALLS, grid(keys, sliding)));
             }
         }
 
+        let mean = |of: &Vec<Duration>| of.iter().sum::<Duration>() / of.len() as u32;
         for ((keys, sliding), each) in spans.iter().zip(&taken) {
-            let mean = |of: &Vec<Duration>| of.iter().sum::<Duration>() / of.len() as u32;
             let (bounded, walked, launch) = (mean(&each[0]), mean(&each[1]), mean(&each[2]));
             let window = match sliding {
                 0 => "global".to_string(),
@@ -2214,6 +2223,152 @@ mod tests {
                  {bounded:>8.2?} a dispatch against {walked:>8.2?} walking the span whole \
                  — ×{:.2}, over a {launch:.2?} launch",
                 walked.as_secs_f64() / bounded.as_secs_f64(),
+            );
+        }
+
+        // **The stack's own 42 dispatches, from the two rows they are made of.**
+        // A decode step's `fused_attention` row is 35 windowed layers and 7
+        // global ones, and the per-kernel table sums them into one figure — so
+        // what says which half grows is this sum beside that row, at the same
+        // three contexts.
+        let at = |keys: usize, sliding: usize| {
+            let found = spans
+                .iter()
+                .position(|span| *span == (keys, sliding))
+                .expect("the span is measured");
+            mean(&taken[found][0])
+        };
+        for keys in CONTEXTS {
+            let (window, global) = (at(keys, SLIDING_WINDOW), at(keys, 0));
+            let (sliding_layers, global_layers) = (
+                SLIDING_LAYERS as u32 * window,
+                GLOBAL_LAYERS as u32 * global,
+            );
+            eprintln!(
+                "over {keys:>5} keys the stack's 42 dispatches are {:>8.2?} — \
+                 {SLIDING_LAYERS} windowed at {window:.2?} making {sliding_layers:.2?}, \
+                 {GLOBAL_LAYERS} global at {global:.2?} making {global_layers:.2?}",
+                sliding_layers + global_layers,
+            );
+        }
+    }
+
+    /// The contexts a decode step is priced at, which are the cross-engine
+    /// table's own prompt lengths.
+    const CONTEXTS: [usize; 3] = [97, 385, 769];
+
+    /// The checkpoint's own split: layers 5, 11, 17, 23, 29, 35 and 41 are full
+    /// attention and the other 35 cap at a 512-token window.
+    const SLIDING_LAYERS: usize = 35;
+    const GLOBAL_LAYERS: usize = 7;
+    const SLIDING_WINDOW: usize = 512;
+
+    /// **The contexts a coding session actually has**, which is the question
+    /// [`CONTEXTS`] cannot answer: every decode figure in this repo tops out at
+    /// 769 tokens and a coding turn opens at thousands and grows all session.
+    /// Whether a step is linear in the context or plateaus is what decides
+    /// whether this engine is usable there at all, and one cannot be told from
+    /// the other over an eightfold range.
+    const LONG_CONTEXTS: [usize; 9] = [97, 385, 769, 2048, 4096, 8192, 16384, 32768, 65536];
+
+    /// Dispatches one reading of a span puts in a command buffer.
+    ///
+    /// **Scaled by the span so every reading costs about the same wall time.**
+    /// A fixed count is what the sweeps above use over shapes within a factor of
+    /// two of each other; here the spans differ by 675, so a count that suits
+    /// the short one puts the long one at a minute a reading. Bounded below so a
+    /// long span is still an average of several dispatches rather than of one.
+    fn readings_of(keys: usize) -> usize {
+        ((1 << 20) / keys).clamp(8, 128)
+    }
+
+    /// **What the attention step costs as the context grows into a coding
+    /// one**, out to 65536 keys — 85 times the longest context this repo has
+    /// ever quoted a decode figure at.
+    ///
+    /// **This is the one row of a decode step that is not flat in the context**,
+    /// which `which_kernels_own_a_decode_step_at_each_context` establishes over
+    /// the three lengths the cross-engine table uses: every other kernel moves
+    /// by under 20% between 97 and 769 keys while this one goes 3.93 ms to
+    /// 17.35. So the shape of *this* curve is the shape of the step's, and the
+    /// two halves of it are shaped differently on purpose — 35 layers cap at a
+    /// 512-token window and 7 do not.
+    ///
+    /// **The per-key column is what says which.** A row whose per-key cost is
+    /// constant is walking the span; one whose per-key cost falls as `1/keys` is
+    /// flat in the context. Nothing here asserts a slope — the numbers go to
+    /// stderr — because the point of the table is the shape rather than a bound
+    /// anyone would have to maintain.
+    ///
+    /// The span is held on the device across the readings rather than handed
+    /// over per call, which is the difference between measuring this kernel and
+    /// measuring a 268 MB copy: [`LayerAttention::encode`] uploads the whole
+    /// span per call, and the fixed 128 readings the sweep above takes would be
+    /// 34 GB of buffers for one command buffer to retain at this size. What the
+    /// layer holds is what a decode step reads — see
+    /// [`LayerAttention::encode_over`] — and the contents are the zeroes the
+    /// span was allocated with, because what a key costs does not depend on
+    /// what is in it.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_the_attention_step_costs_as_the_context_grows() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        const ROUNDS: usize = 3;
+
+        let cost = |keys: usize, sliding: usize| -> Duration {
+            let case = windowed(keys, sliding);
+            let layer = case.wrapped(&device, &attention);
+            layer.hold(0, keys).expect("the span reserves");
+            layer.span().appended(keys);
+
+            let mut q = device.buffer(&case.q).expect("the query uploads");
+            let mut rel = device.buffer(&case.rel).expect("the features upload");
+            let mut span = layer.span();
+            let calls = readings_of(keys);
+            let mut held = Vec::with_capacity(calls);
+            crate::testing::device_time(&device, calls, |batch| {
+                held.push(
+                    layer
+                        .encode_over(batch, &mut span, &mut q, &mut rel, None, keys - 1)
+                        .expect("the step encodes"),
+                );
+            })
+        };
+
+        let mut taken = LONG_CONTEXTS.map(|keys| {
+            // Warm, for the reason the sweep above warms: the first dispatch of
+            // a fresh pipeline pays for the driver's first look at its buffers.
+            cost(keys, 0);
+            cost(keys, SLIDING_WINDOW);
+            [const { Vec::new() }; 2]
+        });
+        for _ in 0..ROUNDS {
+            for (each, keys) in taken.iter_mut().zip(LONG_CONTEXTS) {
+                each[0].push(cost(keys, 0));
+            }
+            for (each, keys) in taken.iter_mut().zip(LONG_CONTEXTS) {
+                each[1].push(cost(keys, SLIDING_WINDOW));
+            }
+        }
+
+        let mean = |of: &Vec<Duration>| of.iter().sum::<Duration>() / of.len() as u32;
+        eprintln!(
+            "{:>7}{:>12}{:>10}{:>12}{:>10}{:>12}{:>14}",
+            "keys", "global", "a key", "window 512", "a key", "the stack", "a decode step"
+        );
+        for (keys, each) in LONG_CONTEXTS.iter().zip(&taken) {
+            let (global, window) = (mean(&each[0]), mean(&each[1]));
+            let stack = SLIDING_LAYERS as u32 * window + GLOBAL_LAYERS as u32 * global;
+            let a_key = |of: Duration| of.as_secs_f64() * 1e6 / *keys as f64;
+            eprintln!(
+                "{keys:>7}{:>12}{:>10}{:>12}{:>10}{:>12}{:>14}",
+                format!("{global:.2?}"),
+                format!("{:.3}µs", a_key(global)),
+                format!("{window:.2?}"),
+                format!("{:.3}µs", a_key(window)),
+                format!("{stack:.2?}"),
+                format!("{:.1}ms", stack.as_secs_f64() * 1e3),
             );
         }
     }
