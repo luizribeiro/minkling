@@ -4263,7 +4263,10 @@ kernel void decoded_elements(
             // The dequantisation, which is two gathers into a 16-entry constant
             // array for every packed byte — and the one term here whose cost is
             // a memory access nobody counts, since `PackedBank::moves` charges
-            // the codes and not the table they index.
+            // the codes and not the table they index. What this arm removes is
+            // the decode and not the table: see
+            // `what_each_way_of_decoding_a_packed_byte_costs`, which holds the
+            // gather against the two ways of answering the same bits for less.
             (
                 "the table it decodes through",
                 crate::testing::instead_of(
@@ -4433,6 +4436,37 @@ kernel void decoded_elements(
                 through_a_table_of_pairs(&shipped),
             ),
         ]
+    }
+
+    /// **What each way of decoding a packed byte costs**, over the two shapes a
+    /// prefill gives this kernel.
+    ///
+    /// A4 priced the decode by removing it — an integer-to-float conversion in
+    /// its place read 70 and 71% of the kernel — and read that as a table
+    /// lookup's latency, "a memory access nobody counts". This asks the question
+    /// the ablation could not: what the *cheapest* decode is, among decodes that
+    /// answer the same sixteen floats. A term worth 30% is only worth taking if
+    /// something else can produce the same bits for less.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_each_way_of_decoding_a_packed_byte_costs() {
+        let Some(device) = device() else { return };
+        let want = bit_patterns(&a_tiled_call_answers(&device, &matmul(&device)));
+        eprintln!("  {:<34}{}", "the decode", bound_header());
+
+        for (what, written) in each_way_of_decoding_a_byte() {
+            let arm = PackedMatmul::from_source(&device, &written).expect("the arm compiles");
+            assert_eq!(
+                bit_patterns(&a_tiled_call_answers(&device, &arm)),
+                want,
+                "{what}: the arm answered other bits than the shipped decode"
+            );
+            let cells: String = a_prefills_shapes_cost(&device, &arm)
+                .iter()
+                .map(|taken| format!("{:>26}", format!("{:.2}ms", 1e3 * taken.as_secs_f64())))
+                .collect();
+            eprintln!("  {what:<34}{cells}");
+        }
     }
 
     /// The shipped source with a threadgroup array of `floats` nobody reads for
