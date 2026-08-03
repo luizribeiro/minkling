@@ -23,17 +23,17 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **527 of the 552 tests, no
+`just test` is the one to run while iterating: **576 of the 602 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
-36 that need weights report a skip and pass. It runs through libtest, which puts
+37 that need weights report a skip and pass. It runs through libtest, which puts
 a crate's tests in one process: opening a Metal device costs a second, so the 168
 kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 552 against a
-real checkpoint, ten minutes.** The 48 gated tests — the 36 above and twelve
+`just test-full` is what has to pass at the ends of a series: **all 602 against a
+real checkpoint, ten minutes.** The 49 gated tests — the 37 above and twelve
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the twenty-five tests whose result *is* a number — a duration
+`just test-timing` is the twenty-six tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -89,7 +89,8 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 20 ms against mlx-vlm's 23 ms, and the timings go to
+A decode step is about 20 ms against mlx-vlm's 23 ms — 16.5 ms a token
+speculating two deep, which is 60.7 tokens a second — and the timings go to
 stderr so stdout stays pipeable. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
@@ -125,10 +126,10 @@ inferred.** Every operation a forward pass runs opens a scope charged the time
 inside it that no scope inside *it* claimed, so the rows of a decode step sum to
 the step and what they leave over is a number rather than a shrug:
 
-    submit and wait      28    66%      of which the device executed for 18 ms
-    dispatch encode    1078    27%
+    submit and wait      28    65%      of which the device executed for 18 ms
+    dispatch encode    1080    29%
     readback              1     0%
-    everything else                     7%
+    everything else                     5%
 
 **Every row that named an operation of a layer has left it, and the shape of
 what is left has not changed.** The routers' gates were 19% and every layer's
@@ -144,15 +145,17 @@ readback behind them, because what a layer answers with is now one tensor rather
 than five. **They cost more where they went than they cost here**, which is the
 first handover in this project of which that is true — see the layer's own
 paragraph below. Two thirds of a step is a wait and the device is executing for
-**90%** of the step, which is a share above the row it sits in: a run of layers
+**93%** of the step, which is a share above the row it sits in: a run of layers
 commits part way through and keeps encoding, so a command buffer executes while
 this process is charging its time to `dispatch encode`. Nothing an operation of a
 layer would open a scope around is left in the table at all: what remains beside
-the round trip is encoding it, the sampling at the end, and the embedding at the
-start. **And the back of the model has left it too** — the final norm and the
-muP divide were the last two rows here that were arithmetic rather than asking,
-and they are dispatches now: `readback` is one call where it was two and
-`sample` is the argmax alone. See "The tail of a step" below.
+the round trip is encoding it and the embedding at the start. **And the back of
+the model has left it too, to the last operation** — the final norm, the muP
+divide and the argmax over the vocabulary were the last three rows here that were
+arithmetic rather than asking, and all three are dispatches: there is no `sample`
+row, and `readback` is three microseconds where it was seventy, because what a
+step reads back is a token rather than the 200058 logits it was taken from. See
+"The tail of a step" and "Sampling on the device" below.
 
 **"Three quarters of a step is a round trip" was a sentence worth reading twice,
 because a milestone that read it as three quarters of a step spent asking would
@@ -1014,21 +1017,143 @@ each binary from the other's directory moves nothing — the cost follows the
 binary. Why the driver charges one process twenty times what it charges another
 for opening the same device is not attributed here.
 
-**Sampling did not follow, and what stopped it is a number rather than a
-scruple.** The argmax over 200058 logits is the last thing a step asks this
-process for, and it is `sample` at 279 to 288 µs over three readings — 1.4% of a
-decode step, beside a `readback` of 61 to 74 µs. On a chain of eight it is worth far more and is measured far
-worse: five sampled readings put it between 2.2 and 7.2 ms, and the spread is
-most of what those say. What a device argmax would have to buy first is the tie
-rule the whole engine's token identity rests on — `greedy` is `top_k(logits, 1)`
-and takes the lower id — over a reduction across eighty cores, which is its own
-equivalence argument and not a corollary of this one. It is the next thing at the
-back of the model; it is not this.
+**Sampling did not follow here and has since**, and what it had to buy first was
+not a tolerance. The argmax over 200058 logits was the last thing a step asked
+this process for — `sample` at 279 to 288 µs over three readings, 1.4% of a
+decode step, beside a `readback` of 61 to 74 µs — and on a chain of eight it was
+worth far more and measured far worse. What a device argmax has to reproduce is
+the tie rule the whole engine's token identity rests on, `greedy` being
+`top_k(logits, 1)` and taking the lower id, over a reduction across eighty cores.
+That is its own equivalence argument and not a corollary of this one, so it has
+its own section: see "Sampling on the device" below.
 
 There is no operation of a layer left outside the GPU, and nothing of the model
-past its last layer either but the argmax. Both backends generate the same
-tokens, and the CPU one stays the oracle every kernel here is validated
-against.
+past its last layer either. Both backends generate the same tokens, and the CPU
+one stays the oracle every kernel here is validated against.
+
+## Sampling on the device
+
+**The argmax was the last thing past the model this process still did**, and it
+is the only operation in a step whose whole answer is four bytes: `lm_head`
+writes 200058 floats, they cross a seam, and a pass over them names one id. Two
+milestones declined to move it and both were right to, for a reason that is not a
+numerics one. **Every other kernel in this engine is held to the CPU within a
+tolerance; this one has to be held to it exactly.**
+
+**The tie rule survives a tree because of what the tree combines.** A candidate
+is a value and the id holding it; combining two keeps the larger value and, where
+the two agree, the lower id; and that operator is a *maximum under a total order*
+— candidates ranked by value ascending and, within a value, by id descending. A
+maximum over a set is the same element whatever order the set is folded in, so
+the tie rule is not a property each combining step has to re-establish: it is a
+property of the operator, and every step is the same operator — a thread's own
+stripe, a simdgroup, a threadgroup, and the second dispatch over what the
+threadgroups left. The empty candidate is that operator's identity, which is what
+lets a stripe with nothing in it take part rather than be branched around.
+
+**And nothing here compares floats.** `top_k` ranks with `total_cmp`, which is a
+total order over every float: it separates `-0.0` from `0.0` and places a NaN at
+whichever end its sign says. A kernel comparing with `>` agrees everywhere the
+two values are distinct and disagrees exactly where a tie rule is what is being
+tested — `-0.0 > 0.0` and `0.0 > -0.0` are both false, so a float comparison
+calls them tied and takes the lower id where the host takes the `0.0`. So a
+float's bits are mapped to the unsigned integer that ranks them and the reduction
+compares integers, which makes the equality the whole rule turns on **bit
+equality** and makes NaN and `-0.0` answers rather than caveats.
+
+**The tie cases were written before the kernel, and a reduction that is correct
+on random logits passes none of them.** A tie in each of the four places this
+reduction breaks one — two lanes of a simdgroup, two simdgroups, one thread on
+two of its own strides, and two threadgroups — and the cross-threadgroup one at
+three different cuts, so that the second dispatch is asked to break it as two
+lanes, as two simdgroups and as one thread twice. A tie at the padding edge. A
+tie in a row of a block that is not the first. `-0.0` against `0.0`, NaN at both
+ends, subnormals, infinities. And **two mutations of the rule**, each asserted to
+move the ties it decides *and to leave the others where they are* — because a
+mutation that moved every answer would mean the cases were pinned by something
+coarser than the rule they are written for.
+
+**966 slots that must never win a reduction.** `lm_head` is 201024 rows and
+200058 of them are vocabulary. The projection is already cut there, so the padded
+rows are never multiplied — and the argmax is told the vocabulary anyway and
+ranks nothing past it, because a cut made in one place is a cut that stops being
+made the day something else feeds this. The case that says so fills those slots
+with infinities and asks, and a second one puts a tie across the boundary so that
+the padded id loses for being padding rather than for being higher.
+
+**Two dispatches, which is the opposite of what the norm decided**, and the
+sweep is what says the arithmetic flipped. A norm measured a split across
+threadgroups over a 4096-wide row and declined it at four microseconds of
+encoding against six saved. A row of the vocabulary is fifty times that, and one
+threadgroup is one core of eighty:
+
+    threadgroups a row      1       2       8      32      80     128     512
+    one row              284µs   135µs  40.6µs  16.0µs  10.9µs   9.8µs  12.0µs
+    nine rows            268µs   141µs  39.6µs  17.6µs  16.7µs  19.7µs  45.4µs
+
+**One threadgroup is 284 microseconds, which is this process's own argmax to
+within its spread** — so a device argmax on one core would have bought exactly
+nothing, and the whole of what this is worth is the cut. Eighty is the machine's
+own core count and is never more than 11% off the best cut at any block width,
+where the fitted best is 128 at one and two rows and 80 at four and nine.
+
+### What it is worth
+
+**Over seven alternating pairs against the commit before it, on the packed-head
+checkpoint** — every depth moving the same way in every pair, and no two ranges
+overlapping at any of them:
+
+    k                      0      1      2      3      4
+    before ms/token    20.90  18.00  17.61  18.23  21.61
+    after  ms/token    20.59  17.16  16.48  16.83  19.74
+    before speedup     1.000  1.161  1.187  1.146  0.967
+    after  speedup     1.000  1.200  1.250  1.224  1.043
+    device, before     19.47  15.87  14.97  15.03  17.54
+    device, after      19.49  15.87  14.97  15.03  17.52
+    accepted                  85%   87/78%  85/65/55%  82/65/53/47%
+
+**Every depth pays now, which has never been true in this file.** `k = 4` is
+1.043× where it was 0.967×, and the best is still `k = 2` at **1.250× and 16.48
+ms/token, 60.7 tokens/s** against 17.61 and 56.8. The deeper the round, the more
+this is worth — 1.5% at `k = 0` and 8.7% at `k = 4` — because a round of depth
+`k` takes `k + 1` argmaxes on the chain and one on the block, and every one of
+them was a pass over 200058 floats on this side.
+
+**The device's own clock did not move at any depth**, which is the whole of what
+says this is the asking rather than the work: 19.47 against 19.49, 15.87 against
+15.87, 14.97 against 14.97, 15.03 against 15.03 and 17.54 against 17.52, with
+every one of those five reading "no claim" by this file's own standard in the
+same sitting the wall times read "ranges apart, seven pairs of seven". The two
+argmax dispatches are 0.13 ms of a chain's device time and are the only thing
+that was added.
+
+**Acceptance is identical to the digit at every depth**, in the same sitting —
+84.8% at `k = 1`, 87.0/78.3% at `k = 2`, 85/65/55% at `k = 3` and
+82.4/64.7/52.9/47.1% at `k = 4`, banking 1.829, 2.560, 2.909 and 3.368 tokens a
+round either side. Which is what it has to be: no guess moved, because the
+argmax that makes a guess is the same argmax.
+
+**Where the milliseconds came from is two rows of the profile and one of them is
+the noisiest number in this file.** On a chain of eight heads, three warm
+readings before put `sample` at 7.44, 5.12 and 2.38 ms — S3's own 2.2 to 7.2 ms,
+tracking the drift of the runs around it rather than the work — and `readback` at
+0.75, 0.69 and 0.52 ms. After, there is no `sample` row and `readback` is 0.091,
+0.086 and 0.132 ms. The chain itself went **17.14, 17.87 and 17.99 ms to 14.64,
+14.62 and 15.45**, and its device clock 10.18, 10.31 and 10.31 against 10.34,
+10.34 and 10.38. On a decode step `sample` was 280 µs of 20 ms and `readback` 69,
+71 and 73 µs; there is no `sample` row, and `readback` is 2.8, 3.5 and 4.9 µs.
+
+**A prefill did not move and could not**, which is the control: 5591 ms against
+5644 over seven pairs with the ranges across each other, and the device's own
+clock 3813.55 against 3813.28. A prompt takes one token out of its last position
+however many positions it had.
+
+**The peak resident set went down rather than up**, over three pairs of
+`inklingrs generate` at eight tokens: 402.8, 402.6 and 402.8 MB against 402.1,
+398.8 and 398.6, and a run speculating two deep 431.5, 431.8 and 431.7 against
+426.3, 426.3 and 394.5. The argmax's own allocations are a candidate a
+threadgroup and one id a row — 644 bytes against the 800 KB of logits that stop
+being copied into this process's memory once a step a token is all anybody wants.
 
 Or the same model behind an OpenAI-compatible endpoint, loaded once:
 
@@ -1217,11 +1342,13 @@ the heads were packed, and as they read now:
     fused_attention       8  131.81µs    0.7%      1.05 MB     8 GB/s      1%
     swiglu                8   47.62µs    0.2%      3.15 MB    66 GB/s      8%
 
-    packed_matmul        80    9.79ms   91.9%   5866.69 MB   599 GB/s     73%
+    packed_matmul        80    9.73ms   91.1%   5866.69 MB   603 GB/s     74%
     rms_norm             40  429.10µs    4.0%      2.37 MB     6 GB/s      1%
     short_conv           32  268.69µs    2.5%      5.77 MB    21 GB/s      3%
     fused_attention       8  118.52µs    1.1%      1.05 MB     9 GB/s      1%
+    argmax                8   86.18µs    0.8%      6.41 MB    74 GB/s      9%
     swiglu                8   45.62µs    0.4%      3.15 MB    69 GB/s      8%
+    argmax_combine        8   41.49µs    0.4%      0.01 MB     0 GB/s      0%
 
 **The row that was two thirds of the table is not a smaller row, it is absent.**
 `dense_matmul` was the only kernel in the model reading a format nobody packed,
@@ -1285,13 +1412,15 @@ move the layers made four milestones ago, and what it needed was not a kernel:
 `LayerProjections` and `DenseFfn` hold a weight either format answers for, so a
 head's block is wrapped as the decoder layer it always was.
 
-What is left after those three is this process's own: `sample` is 14.4% of a
-sampled chain and `readback` 2.1%, which are the argmax over 201024 logits and
-the logits arriving to be argmaxed — eight times over, for the same reason
-`queued` is nothing. **`sample` is also the noisiest row in this file**: five
-sampled readings put it between 2.2 and 7.2 ms, tracking the drift of the runs
-around it rather than the work, which is why a device argmax is described at the
-end of "The tail of a step" rather than costed here.
+**What was left after those three was this process's own, and it was the argmax
+and the logits arriving to be argmaxed** — eight times over, for the same reason
+`queued` is nothing. `sample` was the noisiest row in this file while it existed:
+five sampled readings put it between 2.2 and 7.2 ms, tracking the drift of the
+runs around it rather than the work. It is not a row any more and `readback` is
+0.5% of a sampled chain where it was 2.1%, both for the reason "Sampling on the
+device" above gives — a head's guess comes back as an id and not as the 200058
+logits it was taken from. A chain of eight is **14.6 to 15.5 ms** where those
+readings were taken at 17.1 to 18.0, and its device clock did not follow.
 
 **What was left of the chain was the format, and it is taken below.** Of 27.4 ms
 the device executed 18.2, and 12.6 of those were `dense_matmul` reading the 4.5
