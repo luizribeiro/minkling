@@ -3363,52 +3363,18 @@ mod tests {
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn whether_a_prefills_attention_is_waiting_on_the_keys_it_reads() {
         let Some(device) = device() else { return };
-        const ROUNDS: usize = 2;
         const TOKENS: [usize; 3] = [2048, 4096, 8192];
 
-        let from_one_slot = source()
-            .replace(
-                "values_of + (ulong)first * shape.head_dim",
-                "values_of + (ulong)0 * shape.head_dim",
-            )
-            .replace(
-                "keys_of + (ulong)j * shape.head_dim",
-                "keys_of + (ulong)0 * shape.head_dim",
-            );
-        assert_ne!(from_one_slot, source(), "the mutation changed nothing");
         let walking = FusedAttention::new(&device).expect("the kernel compiles");
         let cached =
-            FusedAttention::from_source(&device, &from_one_slot).expect("the mutant compiles");
+            FusedAttention::from_source(&device, &reading_one_slot()).expect("the mutant compiles");
         assert_ne!(
             blocked(97, 0, 97).on_the_device(&device, &walking),
             blocked(97, 0, 97).on_the_device(&device, &cached),
             "reading one slot answered what reading the span answers"
         );
-
-        let cost = |attention: &FusedAttention, tokens: usize, sliding: usize| -> Duration {
-            let case = blocked(tokens, sliding, tokens);
-            let layer = case.wrapped(&device, attention);
-            layer.hold(0, tokens).expect("the span reserves");
-            layer.span().appended(tokens);
-            let mut q = device.buffer(&case.q).expect("the queries upload");
-            let mut rel = device.buffer(&case.rel).expect("the features upload");
-            let mut span = layer.span();
-            let mut held = None;
-            let mut taken = Duration::MAX;
-            // Warm once, for the reason the sweep above warms: the first
-            // dispatch of a fresh pipeline pays for the driver's first look at
-            // its buffers.
-            for round in 0..=ROUNDS {
-                let each = crate::testing::device_time(&device, 1, |batch| {
-                    held = Some(
-                        layer
-                            .encode_over(batch, &mut span, &mut q, &mut rel, None, 0)
-                            .expect("the prefill encodes"),
-                    );
-                });
-                taken = if round == 0 { taken } else { taken.min(each) };
-            }
-            taken
+        let cost = |attention: &FusedAttention, tokens, sliding| {
+            a_prefill_costs(&device, attention, tokens, sliding)
         };
 
         eprintln!(
@@ -3428,6 +3394,325 @@ mod tests {
                     format!("{:.0}%", 1e2 * slot.as_secs_f64() / span.as_secs_f64()),
                 );
             }
+        }
+    }
+
+    /// The prompt lengths the limiter table below is taken at — the shortest
+    /// and the longest of [`PREFILL_CONTEXTS`] that a sweep of nine arms can
+    /// afford three passes of.
+    const BOUND_TOKENS: [usize; 2] = [2048, 8192];
+
+    /// The four dispatches every table below is read across: both prompt lengths
+    /// on both kinds of layer, as `(tokens, sliding, what to call it)`.
+    fn bound_cells() -> Vec<(usize, usize, &'static str)> {
+        BOUND_TOKENS
+            .iter()
+            .flat_map(|&tokens| {
+                [("global", 0), ("window 512", SLIDING_WINDOW)]
+                    .map(|(what, sliding)| (tokens, sliding, what))
+            })
+            .collect()
+    }
+
+    /// What one prefill-shaped dispatch of `attention` costs on the device — `n`
+    /// query rows over `n` keys, the shape
+    /// [`what_a_prefills_attention_costs_as_the_prompt_grows`] prices and the
+    /// one both tables below mutate underneath.
+    ///
+    /// The best of `ROUNDS` after a warming call, for the reason every sweep
+    /// here warms: the first dispatch of a fresh pipeline pays for the driver's
+    /// first look at its buffers, and at this shape that is seconds.
+    fn a_prefill_costs(
+        device: &Device,
+        attention: &FusedAttention,
+        tokens: usize,
+        sliding: usize,
+    ) -> Duration {
+        const ROUNDS: usize = 2;
+        let case = blocked(tokens, sliding, tokens);
+        let layer = case.wrapped(device, attention);
+        layer.hold(0, tokens).expect("the span reserves");
+        layer.span().appended(tokens);
+        let mut q = device.buffer(&case.q).expect("the queries upload");
+        let mut rel = device.buffer(&case.rel).expect("the features upload");
+        let mut span = layer.span();
+        let mut held = None;
+        let mut taken = Duration::MAX;
+        for round in 0..=ROUNDS {
+            let each = crate::testing::device_time(device, 1, |batch| {
+                held = Some(
+                    layer
+                        .encode_over(batch, &mut span, &mut q, &mut rel, None, 0)
+                        .expect("the prefill encodes"),
+                );
+            });
+            taken = if round == 0 { taken } else { taken.min(each) };
+        }
+        taken
+    }
+
+    /// One arm of the limiter table: a name, and the shipped source with one
+    /// thing taken out of it.
+    ///
+    /// **Every arm here answers wrongly and is meant to.** What each measures is
+    /// the shipped kernel minus one term, so an arm that still answered what the
+    /// kernel answers would be the kernel measured twice under another name —
+    /// which is the failure the slot-zero case above already guards against, met
+    /// once per term rather than once.
+    struct Without {
+        what: &'static str,
+        source: String,
+        /// Whether the arm's answer must differ from the shipped kernel's.
+        ///
+        /// True everywhere but the barrier arm: taking the barriers out is a
+        /// race rather than a different arithmetic, and a race that happens to
+        /// resolve the shipped way at one shape is not evidence the source was
+        /// unchanged.
+        answers_differently: bool,
+    }
+
+    /// `source` with `what` written as `with`, refusing a pattern the source
+    /// does not hold.
+    ///
+    /// **A replacement that matched nothing is the failure mode every arm here
+    /// shares**: it compiles, it runs, and it reports the shipped kernel under
+    /// another name. Comparing the whole string against the whole source catches
+    /// that only where an arm makes one replacement, and several make two.
+    fn instead_of(source: &str, what: &str, with: &str) -> String {
+        assert!(source.contains(what), "the source holds `{what}`");
+        source.replace(what, with)
+    }
+
+    /// The shipped source with every key and every value read from slot zero:
+    /// the same tiles, the same barriers and the same arithmetic over a 16 KB
+    /// working set that never leaves cache, so what separates it from the kernel
+    /// is the memory and nothing else.
+    fn reading_one_slot() -> String {
+        let staged = instead_of(
+            &source(),
+            "values_of + (ulong)first * shape.head_dim",
+            "values_of + (ulong)0 * shape.head_dim",
+        );
+        instead_of(
+            &staged,
+            "keys_of + (ulong)j * shape.head_dim",
+            "keys_of + (ulong)0 * shape.head_dim",
+        )
+    }
+
+    /// The nine arms, each the shipped source with one term of the walk removed.
+    ///
+    /// **The replacements are cheap rather than absent, so that nothing an arm
+    /// removes can take something else with it.** A term deleted outright would
+    /// let the compiler drop every load that fed it and the arm would price two
+    /// things; a term replaced by one instruction over the same operands leaves
+    /// the reads where they are and prices itself.
+    fn without_each_term() -> Vec<Without> {
+        let shipped = source();
+        let mut arms = Vec::new();
+        let mut arm = |what, source: String, answers_differently| {
+            assert_ne!(source, shipped, "{what}: the mutation changed nothing");
+            arms.push(Without {
+                what,
+                source,
+                answers_differently,
+            });
+        };
+
+        arm("the keys and values", reading_one_slot(), true);
+
+        // The band, which is `d_rel` device reads and `d_rel` multiplies made by
+        // lane 0 of a simdgroup for every key the other 31 lanes scored — and is
+        // the whole of what this kernel does that the reference's does not,
+        // since mlx-vlm reads a mask somebody else materialised. `fmin` of the
+        // two operands is one instruction that cannot be folded away and lands
+        // in [0, 1], so nothing downstream overflows.
+        arm(
+            "the band it derives",
+            instead_of(
+                &shipped,
+                "banded_entry(proj, features, shape, position - (int)j, tau);",
+                "fmin(tau, (float)(position - (int)j));",
+            ),
+            true,
+        );
+
+        // The transcendental, twice: once at the precision the reference uses
+        // and once at no precision at all. `fast::exp2` is a hardware
+        // instruction and `precise::exp` a range reduction around one, so the
+        // first arm is the cost of the accuracy and the second the cost of the
+        // function.
+        //
+        // **Both rewrite the fold's exponential as well as the walk's**, and
+        // that is inert rather than intended: `splits_for` gives one split at
+        // every shape here, so no dispatch of `attention_combine` is encoded.
+        arm(
+            "the exp's precision",
+            instead_of(&shipped, "precise::exp(", "fast::exp2("),
+            true,
+        );
+        arm(
+            "the exp",
+            instead_of(
+                &instead_of(
+                    &shipped,
+                    "using namespace metal;",
+                    "using namespace metal;\n\
+                     inline float cheap_exp(float x) { return fmax(1.0f + x, 0.0f); }",
+                ),
+                "precise::exp(",
+                "cheap_exp(",
+            ),
+            true,
+        );
+
+        // Every barrier, which is the four a tile takes, the one that publishes
+        // the staged query row ahead of the walk, and the fold's — the last of
+        // which no dispatch here encodes.
+        arm(
+            "the barriers",
+            instead_of(
+                &shipped,
+                "threadgroup_barrier(mem_flags::mem_threadgroup);",
+                ";",
+            ),
+            false,
+        );
+
+        // The two serial reductions over the tile, which every one of the 256
+        // threads runs for itself: 32 threadgroup reads and 32 operations
+        // apiece, twice a tile, for two numbers.
+        arm(
+            "the tile's two reductions",
+            instead_of(
+                &instead_of(
+                    &shipped,
+                    "float top = peak;\n        for (uint s = 0; s < held; ++s) {",
+                    "float top = peak;\n        for (uint s = 0; s < 1u; ++s) {",
+                ),
+                "float sum = 0.0f;\n        for (uint s = 0; s < held; ++s) {",
+                "float sum = 0.0f;\n        for (uint s = 0; s < 1u; ++s) {",
+            ),
+            true,
+        );
+
+        // The weighting, which is the tile's values against the tile's weights:
+        // 32 threadgroup reads and 32 multiply-adds on each of the 128 threads a
+        // 128-channel head leaves busy.
+        arm(
+            "the weighting",
+            instead_of(
+                &shipped,
+                "for (uint s = 0; s < held; ++s) {\n                acc += scores[s]",
+                "for (uint s = 0; s < 1u; ++s) {\n                acc += scores[s]",
+            ),
+            true,
+        );
+
+        // The scoring dot, which is four multiply-adds a lane and the four key
+        // reads under them — so this arm takes three quarters of the key traffic
+        // with it and is read beside the slot-zero arm rather than alone.
+        arm(
+            "three quarters of the dot",
+            instead_of(
+                &shipped,
+                "for (uint d = lane; d < shape.head_dim; d += width) {",
+                "for (uint d = lane; d < width; d += width) {",
+            ),
+            true,
+        );
+
+        // The cross-lane reduction behind it: five shuffle steps for each of the
+        // four keys a simdgroup scores in a tile.
+        arm(
+            "the simd_sum",
+            instead_of(&shipped, "            dot = simd_sum(dot);\n", ""),
+            true,
+        );
+
+        arms
+    }
+
+    /// **What a prefill's attention is bound by, one term at a time** — the
+    /// question A3's slot-zero mutation answered for memory alone, asked of
+    /// every other candidate on the same denominator.
+    ///
+    /// A3 established that the keys and values are 15 to 19% of this kernel and
+    /// that a lever dividing the reads could never pay. What it did not
+    /// establish is what the other four fifths are, and three milestones in a
+    /// row have now picked a lever from a number that turned out to be the wrong
+    /// denominator. **So the instrument generalises rather than the finding**:
+    /// each arm is the shipped source with exactly one term replaced by
+    /// something that costs an instruction and cannot be folded away, and the
+    /// column that matters is what the clock does.
+    ///
+    /// **The shares do not sum to one and are not meant to.** Removing a term
+    /// removes the instructions that issue it, the registers it held and
+    /// whatever it was waiting on, and two terms that were waiting on each other
+    /// each look like the whole of the wait. What the table ranks is which terms
+    /// are worth anything at all, and the two that are worth nothing are as much
+    /// of the finding as the two that are.
+    ///
+    /// Both kinds of layer, because the band is bounded by `rel_extent` and a
+    /// windowed layer's live keys are all inside it where a global layer's are
+    /// mostly not — so a term that is a rounding error on one row can be most of
+    /// the other.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_prefills_attention_is_bound_by() {
+        let Some(device) = device() else { return };
+
+        let shipped = FusedAttention::new(&device).expect("the kernel compiles");
+        let answered =
+            |attention: &FusedAttention| blocked(97, 0, 97).on_the_device(&device, attention);
+        let want = answered(&shipped);
+        let cost = |attention: &FusedAttention, tokens, sliding| {
+            a_prefill_costs(&device, attention, tokens, sliding)
+        };
+
+        let cells = bound_cells();
+        let header: String = cells
+            .iter()
+            .map(|(tokens, _, what)| format!("{:>21}", format!("{tokens} {what}")))
+            .collect();
+        eprintln!("  {:<28}{header}", "without");
+
+        let whole: Vec<Duration> = cells
+            .iter()
+            .map(|&(tokens, sliding, _)| cost(&shipped, tokens, sliding))
+            .collect();
+        let row = |what: &str, taken: &[Duration]| {
+            let cells: String = taken
+                .iter()
+                .zip(&whole)
+                .map(|(each, whole)| {
+                    format!(
+                        "{:>12}{:>9}",
+                        format!("{each:.2?}"),
+                        format!("{:.0}%", 1e2 * each.as_secs_f64() / whole.as_secs_f64()),
+                    )
+                })
+                .collect();
+            eprintln!("  {what:<28}{cells}");
+        };
+        row("nothing — the kernel", &whole);
+
+        for arm in without_each_term() {
+            let mutant =
+                FusedAttention::from_source(&device, &arm.source).expect("the mutant compiles");
+            if arm.answers_differently {
+                assert_ne!(
+                    answered(&mutant),
+                    want,
+                    "{}: the mutation answered what the kernel answers",
+                    arm.what
+                );
+            }
+            let taken: Vec<Duration> = cells
+                .iter()
+                .map(|&(tokens, sliding, _)| cost(&mutant, tokens, sliding))
+                .collect();
+            row(arm.what, &taken);
         }
     }
 

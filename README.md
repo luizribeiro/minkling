@@ -1615,6 +1615,85 @@ height of one measured, which is the 0.4% arriving where it was spent. A decode
 step never moved either way: 19.463 ms against 19.475 over seven pairs, ranges
 across, three of the seven falling the other way.
 
+### What a prefill's attention is bound by, one term at a time
+
+**The slot-zero mutation said what the memory is worth and nothing about the
+other four fifths, and three milestones in a row have now picked a lever from a
+number whose denominator was wrong.** So the instrument generalises rather than
+the finding. `what_a_prefills_attention_is_bound_by` compiles the shipped source
+nine times, each with exactly one term replaced by something that costs an
+instruction over the same operands and cannot be folded away, and prices all ten
+kernels on the same four dispatches. Every arm answers wrongly and the case
+asserts that it does — an arm that still answered what the kernel answers would
+be the kernel measured twice under another name.
+
+    without                     2048 global   2048 window   8192 global   8192 window
+    nothing — the kernel            92.64ms       44.45ms         1.25s      196.63ms
+    the keys and values        78.07ms  84%  37.89ms  85%  1.01s  81%  167.69ms  85%
+    the band it derives        71.77ms  77%  32.07ms  72%  1.14s  91%  141.97ms  72%
+    the exp's precision        93.28ms 101%  44.74ms 101%  1.26s 101%  198.01ms 101%
+    the exp                    93.17ms 101%  44.69ms 101%  1.26s 101%  197.79ms 101%
+    the barriers               89.27ms  96%  42.61ms  96%  1.20s  96%  187.85ms  96%
+    the tile's two reductions  69.82ms  75%  34.11ms  77%  890ms  71%  150.63ms  77%
+    the weighting              80.07ms  86%  38.83ms  87%  1.05s  84%  171.97ms  87%
+    three quarters of the dot  82.30ms  89%  39.83ms  90%  1.08s  86%  176.14ms  90%
+    the simd_sum               92.26ms 100%  44.24ms 100%  1.25s 100%  195.75ms 100%
+
+**The shares do not sum to one and are not meant to.** Removing a term removes
+the instructions that issue it, the registers it held and whatever it was
+waiting on, so two terms waiting on each other each read as the whole of the
+wait. What the table ranks is which terms are worth anything, and the two that
+are worth nothing are as much of the finding as the two that are.
+
+**The transcendental is free and so is the cross-lane reduction, and both were
+candidates.** `precise::exp` against `fast::exp2` — the hardware instruction the
+reference's softmax is built on — is 101%, and against a two-instruction stand-in
+that is not an exponential at all it is 101% again. The `simd_sum` behind every
+key's dot is 100%. **Neither is a rounding error inside a large number; they are
+nothing**, twice, on both kinds of layer at both lengths, and the milestone that
+went to remove either would have found what these two rows say.
+
+**The barriers are 4%.** Four a tile on a threadgroup that is one query row, and
+taking all of them out — which is a race and answers accordingly — buys 4% at
+every length on both kinds of layer. That figure is generous in the arm's favour:
+without the barriers the compiler may also drop threadgroup loads it can no
+longer prove another thread wrote.
+
+**The largest single term is a reduction nobody needed to compute twice.** A tile
+lands 32 scores in threadgroup memory and then every one of the 256 threads walks
+all 32 of them for the maximum and all 32 again for the sum — 64 threadgroup
+reads and 64 operations a thread a tile, for two scalars. Cut to one entry apiece
+the kernel is **71 to 77%** of itself, and it is the same 23 to 29% on every
+column. Nothing about that term is memory, arithmetic the answer needs, or
+synchronisation: it is issue slots spent because the running peak and total are
+every thread's rather than one thread's and broadcast — which is a trade this
+file made deliberately at 32 entries and against a barrier, and which the table
+now prices.
+
+**The band this kernel derives is the second, and it is the one term that is
+shaped like the reference comparison.** `banded_entry` is `d_rel` device reads and
+`d_rel` multiplies made by lane 0 while the other 31 lanes of its simdgroup wait,
+once for every key scored — and it is **28% of a windowed layer** at both lengths
+against **23% and 9%** of a global one. The split is the band's own extent: a
+windowed layer's live keys are all within 512 of the query and every one of them
+is inside the 1024-distance band, where a global layer at 8192 reads mostly keys
+further back than that and takes the early return. **So the mask this engine does
+not materialise is not free** — it is a quarter of the 14.14 s windowed row and a
+tenth of the 44.06 s global one, which is about 5.5 s of a 16384-token prefill.
+
+**The weighting and the dot are 13 to 16% and 10 to 14%, and the second of those
+carries three quarters of the key traffic with it.** Read beside the slot-zero
+arm's 15 to 19% they say the same thing from two sides: what this kernel spends
+on the arithmetic an attention step is actually for is a minority of it.
+
+**What is left over is the shape of the answer.** No term here is half the
+kernel; the largest is 29% and five of the nine are under 15%. A kernel bound by
+one thing has one large row and this has six small ones — which is the signature
+of instruction issue rather than of any single resource, and is consistent with
+A2's 352 GFLOP/s on a part that does far more: the walk issues about a hundred
+lane-instructions per key of which a handful are the multiply-adds the answer
+needs.
+
 ### What this leaves for whoever caps the spans
 
 **A prefill writes every key of a layer before that layer's one attention
