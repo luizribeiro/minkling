@@ -37,11 +37,36 @@ use inkling_core::{
 use inkling_metal::{
     DISPATCHES_A_SUBMISSION, DenseMatmul, DenseWeight, Device, ExpertGrouping, ExpertKernels,
     LayerKernels, LayerProjections, LayerRouter, MetalError, ModelHeads, ModelLayers, ModelTail,
-    MoeCombine, PackedBank, PackedMatmul, PackedProjection, RoundTrip, Router, RouterWeights,
-    StackShape, SwiGlu, TailWeights,
+    MoeCombine, Numerics, PackedBank, PackedMatmul, PackedProjection, RoundTrip, Router,
+    RouterWeights, StackShape, SwiGlu, TailWeights,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
+
+/// Which numerics the measurements in this file run the engine under.
+///
+/// **A variable rather than an argument, because these are `#[ignore]`d
+/// measurements and libtest has no way to pass one.** The per-kernel table below
+/// is the arbiter for what a change to a dispatch is worth, and a change behind
+/// [`Numerics`] can only be arbitrated by the same table taken on the other
+/// side of it — so the same run has to be reachable both ways:
+///
+///     INKLINGRS_NUMERICS=production just test-timing
+///
+/// **Unset is the reference**, which is what every figure this file records was
+/// taken under and what a run that says nothing gets.
+const NUMERICS_VAR: &str = "INKLINGRS_NUMERICS";
+
+/// The numerics this process measures under, refused rather than defaulted where
+/// the word is not one — a table headed "reference" that ran something else is
+/// the one failure mode worth a panic here.
+fn numerics() -> Numerics {
+    match std::env::var(NUMERICS_VAR) {
+        Err(_) => Numerics::default(),
+        Ok(name) => Numerics::parse(&name)
+            .unwrap_or_else(|| panic!("{NUMERICS_VAR}={name} is not reference or production")),
+    }
+}
 
 /// The projection this measures, which is the largest in the model and the one
 /// M3 routes through the kernel first.
@@ -757,7 +782,8 @@ impl OnTheDevice {
         device
             .time_each_dispatch(asked.sampling)
             .expect("the device times a dispatch");
-        let kernels = LayerKernels::compile(device).expect("the layer kernels compile");
+        let kernels =
+            LayerKernels::compiling(device, numerics()).expect("the layer kernels compile");
         let matmul = kernels.matmul();
         let dense = DenseMatmul::new(device).expect("the dense matmul compiles");
         let swiglu = SwiGlu::new(device).expect("the swiglu compiles");
