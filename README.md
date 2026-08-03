@@ -2455,6 +2455,57 @@ That form answered `0.0` for code 1 and `-0.0` for code 9 and was bit-exact for
 the other fourteen — a decode wrong in one code of sixteen, on the two codes a
 tolerance would never have found, caught by a probe that costs a dispatch.
 
+### What reducing a tile in one thread costs, in two regimes that disagree
+
+**A5 left the tile's two reductions as a measurement rather than an inference
+and the measurement has two answers.** Every one of 256 threads walks a tile's
+32 scores twice for two scalars each of them ends up holding — A4 priced that at
+23 to 29% of the attention rows, the largest term of the walk after the keys.
+One thread walking it and broadcasting is the same serial chain over the same
+operands in the same order, so what the others read is the float they would have
+computed; it costs no barrier inside the tile, because the maximum crosses on
+the barrier already standing between the scores' last read and their first
+overwrite, and the total is not wanted until the walk is over.
+`what_reducing_a_tile_in_one_thread_costs` compiles both:
+
+    the two reductions     a threadgroup   2048 global  2048 window   8192 global  8192 window
+    every thread              12.50 KiB       71.60ms      34.64ms      923.26ms     152.73ms
+    one thread, broadcast     12.52 KiB       67.58ms      34.10ms      856.63ms     148.49ms
+
+**5.6 and 7.2% on the two global cells of that sitting**, and 5.4 to 6.1% on the
+first of them across three — and 16 bytes of declared memory, which is the
+column that says the arm did not move the occupancy instead of the reduction.
+
+**In the model it loses, and the model is the arbiter.** The same arm inside a
+769-token prefill, one sampled pass an arm:
+
+    kernel                 every thread   one thread
+    windowed attention         392.79ms     423.49ms
+    global attention            88.75ms      95.99ms
+    every pass                    3.41s        3.45s
+
+That is **7.8 and 8.2% the wrong way**, and a paired 2048-token prefill agrees:
+11273 ms against 11411 and 9126 ms of device time against 9395, every pair the
+same way and the ranges apart. **So the arm was withdrawn and the kernel keeps
+its 256 redundant walks.**
+
+**What separates the two regimes is what else is running, and the bandwidth
+column says so.** Alone, three rounds over one set of keys, the dispatch is warm
+and issue-bound, and 255 threads' issue slots are worth having back. In the
+model the same dispatch sits between two matmuls that stream a terabyte, and its
+attention rows read **722 and 782 GB/s — 88 and 95% of this part's peak**. Under
+a ceiling like that the redundant walks were already free, hidden behind memory
+the kernel was waiting on anyway, and what the broadcast adds is a serialization
+that is paid in full.
+
+**This is a caution about the instrument and not only about the arm.** A4's
+whole attention limiter table is taken on `a_prefill_costs`, a dispatch measured
+alone, and this is the first arm carried across to the model and read there.
+Nothing above is retracted — a term's share is still its share — but a share
+measured warm is not a promise about a kernel running at 95% of peak, and the
+three attention items left on A4's list are all arithmetic rather than traffic.
+**The one thing that can move a row at that ceiling is reading fewer bytes.**
+
 ## The tail of a step
 
 **What a decode step did last was a round trip, and the only reason was that the

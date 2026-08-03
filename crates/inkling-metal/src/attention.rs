@@ -4001,6 +4001,202 @@ mod tests {
         super::source(STAGED_BY_A_SPLIT_CALL, NO_RESIDENCY)
     }
 
+    /// The shipped source with a tile's two reductions taken by one thread and
+    /// handed to the other 255 through threadgroup memory.
+    ///
+    /// **The same two floats in the same order, computed once instead of 256
+    /// times.** Every thread of a threadgroup needs a tile's largest score and
+    /// its total, and each of them arrives at both by walking the tile itself —
+    /// 256 threads running the same serial chain over the same 32 scores for a
+    /// scalar every one of them ends up holding. One thread walking it and
+    /// storing the result is the same chain over the same operands in the same
+    /// order, so what the others read is the float they would have computed:
+    /// bit-safe by construction rather than by tolerance, and
+    /// [`a_tile_reduced_by_one_thread_is_reduced_by_all_of_them_bit_for_bit`]
+    /// holds it to that.
+    ///
+    /// **It costs no barrier in the tile.** The maximum needs its readers held
+    /// off until the one thread has read every score, which is exactly what the
+    /// barrier already standing between the maximum and the rescaling does — the
+    /// store lands before it and the loads after it. The total is read by nobody
+    /// until the walk is over, so it crosses once at the end rather than once a
+    /// tile, which is the one barrier this adds and it is per dispatch.
+    ///
+    /// The two floats are 8 bytes beside the 12.5 KiB an unsplit call declares,
+    /// reported as 16 — a kibibyte inside the near edge of the occupancy
+    /// plateau, and a column of the table below rather than an assumption.
+    fn reduced_by_one_thread() -> String {
+        let declared = crate::testing::instead_of(
+            &source(),
+            "    threadgroup float scores[MOST_SIMDGROUPS * KEYS_PER_SIMD];",
+            "    threadgroup float scores[MOST_SIMDGROUPS * KEYS_PER_SIMD];\n    threadgroup \
+             float reduced[2];",
+        );
+        let most = crate::testing::instead_of(
+            &declared,
+            "        float top = peak;\n        for (uint s = 0; s < held; ++s) {\n            \
+             top = fmax(top, scores[s]);\n        }\n",
+            "        if (local == 0) {\n            float most = peak;\n            for (uint s \
+             = 0; s < held; ++s) {\n                most = fmax(most, scores[s]);\n            \
+             }\n            reduced[0] = most;\n        }\n        \
+             threadgroup_barrier(mem_flags::mem_threadgroup);\n        const float top = \
+             reduced[0];\n",
+        );
+        let once = crate::testing::instead_of(
+            &most,
+            "        const float rescale = precise::exp(peak - top);\n        peak = top;\n       \
+             \x20threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+            "        const float rescale = precise::exp(peak - top);\n        peak = top;\n",
+        );
+        let summed = crate::testing::instead_of(
+            &once,
+            "        float sum = 0.0f;\n        for (uint s = 0; s < held; ++s) {\n            \
+             sum += scores[s];\n        }\n        total = total * rescale + sum;\n",
+            "        if (local == 0) {\n            float sum = 0.0f;\n            for (uint s = \
+             0; s < held; ++s) {\n                sum += scores[s];\n            }\n            \
+             total = total * rescale + sum;\n        }\n",
+        );
+        crate::testing::instead_of(
+            &summed,
+            "    if (shape.splits == 1u) {",
+            "    if (local == 0) {\n        reduced[1] = total;\n    }\n    \
+             threadgroup_barrier(mem_flags::mem_threadgroup);\n    total = reduced[1];\n\n    if \
+             (shape.splits == 1u) {",
+        )
+    }
+
+    /// **A tile reduced by one thread is a tile reduced by all of them, bit for
+    /// bit**, which is what would have made the choice between them a rate and
+    /// never an answer.
+    ///
+    /// The claim is that a broadcast is a copy: the two scalars come off the
+    /// same serial chain over the same scores in the same ascending order, and
+    /// what a thread reads out of threadgroup memory is the float it would have
+    /// computed for itself. So this is `assert_eq!` on the bits rather than a
+    /// tolerance — `-0.0` and `0.0` compare equal as floats and are two
+    /// different answers — over the same cases and both paths
+    /// [`a_value_weighted_where_it_lies_is_a_staged_one_bit_for_bit`] drives,
+    /// because the peak and the total are what a split call's partials carry and
+    /// a fold is where a wrong one would show.
+    ///
+    /// **Kept though the arm is not shipped**, because what it establishes is
+    /// what makes the table below a table of rates: two arms answering different
+    /// bits would be two kernels and their times would not be comparable at all.
+    #[test]
+    fn a_tile_reduced_by_one_thread_is_reduced_by_all_of_them_bit_for_bit() {
+        let Some(device) = device() else { return };
+        let all = FusedAttention::from_source(&device, &source()).expect("the kernel compiles");
+        let broadcast = reduced_by_one_thread();
+        assert_ne!(broadcast, source(), "the arm changed nothing");
+        let one =
+            FusedAttention::from_source(&device, &broadcast).expect("the broadcast arm compiles");
+
+        let mut cases = Case::synthetic();
+        cases.extend([
+            blocked(2048, 0, 2048),
+            blocked(2048, SLIDING_WINDOW, 2048),
+            blocked(600, SLIDING_WINDOW, 13),
+            blocked(97, 0, 97),
+            blocked(1200, 0, 1),
+            blocked(1200, SLIDING_WINDOW, 1),
+        ]);
+        cases.extend(
+            Case::all(ACTIVATIONS)
+                .expect("the committed capture")
+                .into_iter()
+                .map(|(case, _)| case),
+        );
+
+        let mut elements = 0;
+        for case in &cases {
+            for splits in [1, 8] {
+                let want = case.cut(&device, &all, splits);
+                let got = case.cut(&device, &one, splits);
+                let apart = want
+                    .iter()
+                    .zip(&got)
+                    .position(|(want, got)| want.to_bits() != got.to_bits());
+                assert_eq!(
+                    apart,
+                    None,
+                    "{} in {splits}: one thread reducing answered {:?} where all of them answered \
+                     {:?}",
+                    case.name,
+                    apart.map(|at| got[at]),
+                    apart.map(|at| want[at]),
+                );
+                elements += want.len();
+            }
+        }
+        eprintln!(
+            "{} cases agree bit for bit over {elements} elements",
+            cases.len()
+        );
+    }
+
+    /// **What reducing a tile in one thread costs**, which is the measurement
+    /// A4's list asked for and A5 declined to infer — and which answers the
+    /// opposite of what the model does.
+    ///
+    /// A4 priced the two reductions at 23 to 29% of the attention rows: every
+    /// one of 256 threads walks a tile's 32 scores twice for two scalars, and
+    /// that is the largest term of the walk after the keys. One thread reducing
+    /// frees 255 threads' issue slots and puts the same serial chain on the
+    /// critical path with everyone else waiting at a barrier for it, so whether
+    /// it pays is a measurement rather than an inference either way.
+    ///
+    /// **Here it pays and in the model it does not, and the model is the
+    /// arbiter.** This dispatch is 5.6 and 7.2% faster at the two global cells;
+    /// the same kernel inside a 769-token prefill is 7.8 and 8.2% *slower* on
+    /// the two attention rows, and a paired 2048-token prefill is 2.9% slower on
+    /// the device's own clock. What separates them is what else is running: a
+    /// dispatch measured alone, three rounds over one set of keys, is warm and
+    /// issue-bound, where the same dispatch between two matmuls that stream a
+    /// terabyte is reading from memory at 88 to 95% of this part's peak — and
+    /// issue slots freed under a bandwidth ceiling buy nothing while the
+    /// serialization is still paid.
+    ///
+    /// **So this table is kept for the caution rather than for the number.** It
+    /// is the instrument A4's whole attention limiter table is taken on, and
+    /// this is the first arm measured on both sides of it.
+    ///
+    /// The declared column is here because it moves: the arm holds two floats
+    /// the kernel does not, and a change of sixteen bytes that crossed the
+    /// occupancy turn would be measuring the turn rather than the reduction.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_reducing_a_tile_in_one_thread_costs() {
+        let Some(device) = device() else { return };
+        let cells = bound_cells();
+        let header: String = cells
+            .iter()
+            .map(|(tokens, _, what)| format!("{:>17}", format!("{tokens} {what}")))
+            .collect();
+        eprintln!(
+            "  {:<24}{:>14}{header}",
+            "the two reductions", "a threadgroup"
+        );
+
+        for (what, arm) in [
+            ("every thread — shipped", source()),
+            ("one thread, broadcast", reduced_by_one_thread()),
+        ] {
+            let attention = FusedAttention::from_source(&device, &arm).expect("the arm compiles");
+            let held = attention.global.threadgroup_memory();
+            let taken: String = cells
+                .iter()
+                .map(|&(tokens, sliding, _)| {
+                    let each = a_prefill_costs(&device, &attention, tokens, sliding);
+                    format!("{:>17}", format!("{each:.2?}"))
+                })
+                .collect();
+            eprintln!(
+                "  {what:<24}{:>14}{taken}",
+                format!("{:.2} KiB", held as f64 / 1024.0),
+            );
+        }
+    }
+
     /// **How many threadgroups of this kernel a core holds, what holding a
     /// different number is worth, and which of the two things that decide it is
     /// doing the work** — the occupancy term, turned by a knob at each end.
