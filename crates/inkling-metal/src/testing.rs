@@ -45,6 +45,22 @@ pub fn correction_bias() -> Vec<f32> {
         .collect()
 }
 
+/// `source` with `what` written as `with`, refusing a pattern the source does
+/// not hold.
+///
+/// **A replacement that matched nothing is the failure mode every mutation
+/// measurement shares**: it compiles, it runs, and it reports the shipped kernel
+/// under another name. Comparing the whole mutated string against the whole
+/// source catches that only where a mutation makes one replacement, and the
+/// limiter tables in `attention` and `matmul` both make several.
+///
+/// Here rather than beside either of them because both do it, and a second
+/// spelling is one that could drift into an unchecked `str::replace`.
+pub fn instead_of(source: &str, what: &str, with: &str) -> String {
+    assert!(source.contains(what), "the source holds `{what}`");
+    source.replace(what, with)
+}
+
 /// The default device, or `None` with a reported skip.
 ///
 /// These tests need no checkpoint and no fixture, so they are ordinary tests

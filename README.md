@@ -1755,6 +1755,73 @@ the wrong side of the turn, and the only thing standing between it and the turn 
 16 KiB of staging that has been shown to buy nothing at this shape.** Nothing was
 changed.
 
+### What a prefill's two matmul rows are bound by, one term at a time
+
+**The same instrument on the kernel beside it.** `packed_matmul_grouped` and
+`packed_matmul_rows` are 72.3 s of a 132.97 s prefill at 16384 tokens, larger
+than both attention rows together, and A3 established one thing about them: that
+96-fold re-reading of an expert's weight costs 10.4% against reading it once. So
+all but a tenth of those reads are served without reaching memory — and what the
+other nine tenths of the row *are* was never asked.
+`what_a_prefills_packed_matmul_is_bound_by` asks it the same way, over a
+4096-token prompt's `q_proj` on the tiled entry and its routed bank on the
+grouped one.
+
+    without                          q_proj, tiled   a routed bank, grouped
+    nothing — the kernel                   5.93ms                   19.52ms
+    the weight it reads               3.78ms   64%          12.76ms      65%
+    the input rows it walks           4.50ms   76%          14.47ms      74%
+    the table it decodes through      4.17ms   70%          13.77ms      71%
+    three quarters of the columns     3.28ms   55%          11.41ms      58%
+    three quarters of the rows        2.49ms   42%           8.41ms      43%
+    the scale it walks to             5.99ms  101%          19.50ms     100%
+    the simd_sum                      5.96ms  101%          19.54ms     100%
+
+**The two entries answer the same, term for term, and that is the first
+finding.** Not one row differs between the columns by more than three points,
+over calls whose weights are 8 MB and 1.07 GB and whose experts are 1 and 256.
+So whatever separates 38.15 s from 34.16 s in the profile is the number of calls
+and their shapes, and not anything either entry does differently — which is what
+"Why the two tiled rows report bandwidths a factor of two apart" said from the
+denominator's side and this says from the kernel's.
+
+**The weight is a third of it, which is three times what A3 priced.** Pointing
+every column of every tile at expert zero's first row — the same bytes decoded,
+the same arithmetic, a 2 KB working set — is 64 and 65%. A3's 10.4% is the
+*re-reading*, and this is the whole fetch: so about a third of these two rows is
+the weight arriving, of which under a third is redundant and the rest is the
+model being read. **That part is not a defect and nothing removes it.**
+
+**The dequantisation table is 30%, and it is a memory access nobody counts.**
+Every packed byte is two gathers into `ELEMENTS`, a 16-entry constant array
+indexed by a nibble, and replacing both with an integer-to-float conversion is 70
+and 71% on both entries. `PackedBank::moves` charges the codes and says nothing
+about the table they index — so a third of what looks like arithmetic in this
+kernel is a dependent load whose latency the byte load has to be waited for
+first.
+
+**The input rows are a quarter**, which is the term the column tile was taken
+for and which that change did not finish. Confining the two input loads to eight
+floats — the same two loads issued from the same place, landing in cache — is 76
+and 74%. This file has called the input "small and warm"; it is small, and a
+quarter of the row says it is not warm enough.
+
+**The multiply-adds are the largest term either way.** Cutting three quarters of
+the columns leaves every weight byte and every input float where they were and
+takes only the accumulate — 55 and 58% of the kernel, so the accumulate across a
+tile is **45 and 42%**. Cutting three quarters of the rows takes the input reads
+with it — 42 and 43%, so **58 and 57%** — and what separates the two arms is 0.79
+ms and 3.00 ms, against the 1.43 ms and 5.05 ms the input term costs measured on
+its own. **Those two do not reconcile and are not asserted to**: one arm removes
+three quarters of the input loads and the other removes none of them and confines
+where they land.
+
+**The scale and the cross-lane reduction are nothing**, both entries, the same
+way the transcendental and the `simd_sum` are nothing in the attention table.
+Four scale loads and sixteen multiply-adds per four bytes read as 100 and 101%,
+and one `simd_sum` per output element at the end of a walk thousands of bytes
+long reads the same.
+
 ### What this leaves for whoever caps the spans
 
 **A prefill writes every key of a layer before that layer's one attention

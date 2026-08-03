@@ -3613,8 +3613,6 @@ mod tests {
         let Some(device) = device() else { return };
         let matmul = matmul(&device);
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
-        const CALLS: usize = 4;
-        const ROUNDS: usize = 3;
         const TOKENS: usize = 769;
 
         // `(what, rows, in_dim, out_dim, experts, calls a prefill, grouped)`.
@@ -3642,40 +3640,9 @@ mod tests {
         );
         let mut totals = [Duration::ZERO; 2];
         for (what, rows, in_dim, out_dim, experts, calls, groups) in shapes {
-            let case = Case::seeded(1, in_dim, experts * out_dim, rows);
-            let bank = PackedBank::upload(
-                &device,
-                &matmul,
-                experts,
-                in_dim,
-                out_dim,
-                &case.packed(),
-                &case.scales,
-            )
-            .expect("the bank's shapes pair");
-            let chosen: Vec<u32> = (0..rows).map(|row| (row * experts / rows) as u32).collect();
-            let mut x = device.buffer(&case.x).expect("the rows upload");
-
-            let mut best = Duration::MAX;
-            for _ in 0..ROUNDS {
-                best = best.min(crate::testing::device_time(&device, CALLS, |batch| {
-                    let mut picked = device.buffer(&chosen).expect("the selection uploads");
-                    match groups {
-                        false => bank
-                            .encode_over(batch, &chosen, &mut x)
-                            .expect("the dispatch encodes"),
-                        true => {
-                            let mut sorted = grouping
-                                .encode(batch, &mut picked, experts)
-                                .expect("the grouping encodes");
-                            bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)
-                                .expect("the dispatch encodes")
-                        }
-                    };
-                }));
-            }
-
-            let call = best / CALLS as u32;
+            let call = a_packed_call_costs(
+                &device, &matmul, &grouping, rows, in_dim, out_dim, experts, groups,
+            );
             let tiles = rows.div_ceil(ROWS_A_TILE);
             let read = match groups {
                 false => tiles,
@@ -3900,6 +3867,292 @@ mod tests {
             RUNS[0] <= ROWS_A_TILE,
             "no arm here reads an expert's weight only the once it must"
         );
+    }
+
+    /// The two dispatches the tables below are read across: one shape a prefill
+    /// gives each tiled entry, at a 4096-token prompt.
+    ///
+    /// `q_proj` is 4096 rows over one expert, which is the tiled entry's largest
+    /// shape; the routed bank is 96 rows an expert over 256 of them, which is the
+    /// run length [`how_often_a_long_prefill_reads_one_experts_weight`]'s third
+    /// arm measured and a 1.07 GB weight nothing caches.
+    ///
+    /// `(what, rows, in_dim, out_dim, experts, grouped)`.
+    const BOUND_SHAPES: [(&str, usize, usize, usize, usize, bool); 2] = [
+        ("q_proj, tiled", 4096, 4096, 4096, 1, false),
+        ("a routed bank, grouped", 6 * 4096, 4096, 2048, 256, true),
+    ];
+
+    fn bound_header() -> String {
+        BOUND_SHAPES
+            .iter()
+            .map(|(what, ..)| format!("{:>26}", *what))
+            .collect()
+    }
+
+    /// What one dispatch of a bank of this shape costs `matmul` on the device,
+    /// through whichever tiled entry `grouped` names.
+    ///
+    /// Four dispatches to a command buffer, so what the device's clock is
+    /// divided by is the dispatch rather than the submission around it — the
+    /// reason every sweep here takes the same number. The rows are sorted, so a
+    /// tile straddles two experts only where the run length made it and not by
+    /// accident of the routing.
+    #[allow(clippy::too_many_arguments)]
+    fn a_packed_call_costs(
+        device: &Device,
+        matmul: &PackedMatmul,
+        grouping: &ExpertGrouping,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        experts: usize,
+        grouped: bool,
+    ) -> Duration {
+        const CALLS: usize = 4;
+        const ROUNDS: usize = 3;
+        let case = Case::seeded(1, in_dim, experts * out_dim, rows);
+        let bank = PackedBank::upload(
+            device,
+            matmul,
+            experts,
+            in_dim,
+            out_dim,
+            &case.packed(),
+            &case.scales,
+        )
+        .expect("the bank's shapes pair");
+        let chosen: Vec<u32> = (0..rows).map(|row| (row * experts / rows) as u32).collect();
+        let mut x = device.buffer(&case.x).expect("the rows upload");
+
+        let mut best = Duration::MAX;
+        for _ in 0..ROUNDS {
+            best = best.min(crate::testing::device_time(device, CALLS, |batch| {
+                let mut picked = device.buffer(&chosen).expect("the selection uploads");
+                match grouped {
+                    false => bank
+                        .encode_over(batch, &chosen, &mut x)
+                        .expect("the dispatch encodes"),
+                    true => {
+                        let mut sorted = grouping
+                            .encode(batch, &mut picked, experts)
+                            .expect("the grouping encodes");
+                        bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)
+                            .expect("the dispatch encodes")
+                    }
+                };
+            }));
+        }
+        best / CALLS as u32
+    }
+
+    /// The same over both of [`BOUND_SHAPES`], which is what a row of either
+    /// table below is.
+    fn a_prefills_shapes_cost(device: &Device, matmul: &PackedMatmul) -> Vec<Duration> {
+        let grouping = ExpertGrouping::new(device).expect("the grouping compiles");
+        BOUND_SHAPES
+            .iter()
+            .map(|&(_, rows, in_dim, out_dim, experts, grouped)| {
+                a_packed_call_costs(
+                    device, matmul, &grouping, rows, in_dim, out_dim, experts, grouped,
+                )
+            })
+            .collect()
+    }
+
+    /// One arm of the limiter table: a name, and the shipped source with one
+    /// term of the tile's inner loop replaced by something that costs an
+    /// instruction over the same operands and cannot be folded away.
+    ///
+    /// **The replacements are cheap rather than absent**, so that nothing an arm
+    /// removes takes something else with it: a value deleted outright would let
+    /// the compiler drop every load that fed it and the arm would price two
+    /// things at once.
+    fn without_each_term_of_a_tile() -> Vec<(&'static str, String)> {
+        let shipped = source();
+        vec![
+            // The weight, which is the term A3's slot-zero mutation is on the
+            // attention kernel: every column of every tile walks expert zero's
+            // first row instead of its own, so the whole weight working set is
+            // one 2 KB row and its scales. The tile walks the same bytes, decodes
+            // the same codes and does the same arithmetic. `col * 0` rather than
+            // a constant, so that nothing the tile computed goes unused and the
+            // arm cannot be a shorter kernel by accident.
+            (
+                "the weight it reads",
+                crate::testing::instead_of(
+                    &shipped,
+                    "(ulong)expert * shape.code_stride\n            + (ulong)col * bytes;\n        \
+                     scale[c] = scales + shape.scale_base + (ulong)expert * shape.scale_stride\n    \
+                     \x20       + (ulong)col * scale_bytes;",
+                    "(ulong)(expert * 0u) * shape.code_stride\n            \
+                     + (ulong)(col * 0u) * bytes;\n        \
+                     scale[c] = scales + shape.scale_base + (ulong)(expert * 0u) * \
+                     shape.scale_stride\n            + (ulong)(col * 0u) * scale_bytes;",
+                ),
+            ),
+            // The input, which is what the column tile was taken for: a row tile
+            // alone reads 32 input floats for every byte of weight and four
+            // columns bring that to eight. **Confined rather than removed**, the
+            // way the weight arm confines the weight: the same two loads are
+            // issued from the same place in the loop and land inside eight
+            // floats, so what comes off is the traffic and not the load.
+            (
+                "the input rows it walks",
+                crate::testing::instead_of(
+                    &shipped,
+                    "device const float *v = x + sources[r] + at;",
+                    "device const float *v = x + ((sources[r] + at) & 7u);",
+                ),
+            ),
+            // The dequantisation, which is two gathers into a 16-entry constant
+            // array for every packed byte — and the one term here whose cost is
+            // a memory access nobody counts, since `PackedBank::moves` charges
+            // the codes and not the table they index.
+            (
+                "the table it decodes through",
+                crate::testing::instead_of(
+                    &shipped,
+                    "                low[c] = ELEMENTS[code & CODE_MASK];\n                high[c] = ELEMENTS[(code >> BITS) & CODE_MASK];",
+                    "                low[c] = (float)(code & CODE_MASK);\n                high[c] = (float)((code >> BITS) & CODE_MASK);",
+                ),
+            ),
+            // Three quarters of the multiply-adds, twice: once down the tile and
+            // once across it. The columns arm leaves every weight byte and every
+            // input float where it was and takes only the accumulate; the rows
+            // arm takes the input reads with it, which is why the two are read
+            // beside each other rather than either alone.
+            (
+                "three quarters of the columns",
+                crate::testing::instead_of(
+                    &shipped,
+                    "                for (uint c = 0; c < COLS_A_TILE; ++c) {\n                    dots[r][c] +=",
+                    "                for (uint c = 0; c < 1u; ++c) {\n                    dots[r][c] +=",
+                ),
+            ),
+            (
+                "three quarters of the rows",
+                crate::testing::instead_of(
+                    &shipped,
+                    "            for (uint r = 0; r < ROWS_A_TILE; ++r) {\n                device const float *v",
+                    "            for (uint r = 0; r < 1u; ++r) {\n                device const float *v",
+                ),
+            ),
+            // The group scale, which is a byte read and a divide per chunk and
+            // then a multiply-add per accumulator. Reading the row's first scale
+            // instead leaves the load in the kernel and takes it out of the loop.
+            (
+                "the scale it walks to",
+                crate::testing::instead_of(
+                    &shipped,
+                    "as_type<float>(uint(scale[c][b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);",
+                    "as_type<float>(uint(scale[c][0]) << EXPONENT_SHIFT);",
+                ),
+            ),
+            // The cross-lane reduction, which is one per output element at the
+            // end of a walk thousands of bytes long.
+            (
+                "the simd_sum",
+                crate::testing::instead_of(
+                    &shipped,
+                    "const float sum = simd_sum(sums[r][c]);",
+                    "const float sum = sums[r][c];",
+                ),
+            ),
+        ]
+    }
+
+    /// **What a prefill's two tiled matmul rows are bound by, one term at a
+    /// time** — 72.3 s of a 132.97 s prefill at 16384 tokens, and neither row
+    /// near a plausible ceiling of anything.
+    ///
+    /// A3 priced the weight re-reading and found it worth 10.4%: on a fixed 1.07
+    /// GB bank, ideal placement costs 2758 ns a row and 96-fold re-reading costs
+    /// 3046. **So all but a tenth of those reads are served without reaching
+    /// memory, and what the other nine tenths of the row are was never asked.**
+    /// The same instrument the attention kernel got, on the kernel beside it.
+    ///
+    /// **Both entries, because they are the same source and two rows.** A tiled
+    /// call is a projection over one expert and a grouped one a routed bank over
+    /// 256, and the profile puts them 38.15 s and 34.16 s apart — so a term that
+    /// reads differently on the two is a fact about the call rather than about
+    /// the walk.
+    ///
+    /// The shapes are a 4096-token prompt's: `q_proj` is 4096 rows of one expert
+    /// and the routed bank is 96 rows an expert over 256 of them, which is the
+    /// run length A3's third arm measured. Every arm answers wrongly and the
+    /// case asserts that it does.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_prefills_packed_matmul_is_bound_by() {
+        let Some(device) = device() else { return };
+
+        let shipped = matmul(&device);
+        let want = a_tiled_call_answers(&device, &shipped);
+        eprintln!("  {:<32}{}", "without", bound_header());
+
+        let cost = |matmul: &PackedMatmul| a_prefills_shapes_cost(&device, matmul);
+        let whole = cost(&shipped);
+        let row = |what: &str, taken: &[Duration]| {
+            let cells: String = taken
+                .iter()
+                .zip(&whole)
+                .map(|(each, whole)| {
+                    format!(
+                        "{:>17}{:>9}",
+                        format!("{:.2}ms", 1e3 * each.as_secs_f64()),
+                        format!("{:.0}%", 1e2 * each.as_secs_f64() / whole.as_secs_f64()),
+                    )
+                })
+                .collect();
+            eprintln!("  {what:<32}{cells}");
+        };
+        row("nothing — the kernel", &whole);
+
+        for (what, written) in without_each_term_of_a_tile() {
+            let mutant = PackedMatmul::from_source(&device, &written).expect("the mutant compiles");
+            assert_ne!(
+                a_tiled_call_answers(&device, &mutant),
+                want,
+                "{what}: the mutation answered what the kernel answers"
+            );
+            row(what, &cost(&mutant));
+        }
+    }
+
+    /// What one small tiled call answers, which is how an arm of the table above
+    /// is held to having changed the kernel rather than only its source.
+    ///
+    /// Two experts and eleven rows apiece, which is the shape
+    /// `a_tiled_dispatch_answers_row_for_row_what_the_untiled_one_answers`
+    /// establishes the tiled entry over: a partial last tile, a run that
+    /// straddles one, and columns that do not fill theirs.
+    fn a_tiled_call_answers(device: &Device, matmul: &PackedMatmul) -> Vec<f32> {
+        const EXPERTS: usize = 2;
+        const SOURCES: usize = 11;
+        let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, SOURCES);
+        let bank = PackedBank::upload(
+            device,
+            matmul,
+            EXPERTS,
+            IN_DIM,
+            OUT_DIM,
+            &case.packed(),
+            &case.scales,
+        )
+        .expect("the bank's shapes pair");
+        let chosen: Vec<u32> = (0..EXPERTS * SOURCES)
+            .map(|row| (row / SOURCES) as u32)
+            .collect();
+        assert!(tiles(&chosen, ROWS_A_TILE), "the call was not tiled");
+
+        let mut batch = device.batch().expect("a command buffer opens");
+        let mut input = device.buffer(&case.x).expect("the input uploads");
+        let got = bank
+            .encode_repeating(&mut batch, &chosen, &mut input)
+            .expect("the dispatch encodes");
+        batch.wait().expect("the dispatch completes");
+        got.take()
     }
 
     /// The shipped kernel with a different tile shape written into its prelude,

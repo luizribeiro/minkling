@@ -3471,29 +3471,17 @@ mod tests {
         answers_differently: bool,
     }
 
-    /// `source` with `what` written as `with`, refusing a pattern the source
-    /// does not hold.
-    ///
-    /// **A replacement that matched nothing is the failure mode every arm here
-    /// shares**: it compiles, it runs, and it reports the shipped kernel under
-    /// another name. Comparing the whole string against the whole source catches
-    /// that only where an arm makes one replacement, and several make two.
-    fn instead_of(source: &str, what: &str, with: &str) -> String {
-        assert!(source.contains(what), "the source holds `{what}`");
-        source.replace(what, with)
-    }
-
     /// The shipped source with every key and every value read from slot zero:
     /// the same tiles, the same barriers and the same arithmetic over a 16 KB
     /// working set that never leaves cache, so what separates it from the kernel
     /// is the memory and nothing else.
     fn reading_one_slot() -> String {
-        let staged = instead_of(
+        let staged = crate::testing::instead_of(
             &source(),
             "values_of + (ulong)first * shape.head_dim",
             "values_of + (ulong)0 * shape.head_dim",
         );
-        instead_of(
+        crate::testing::instead_of(
             &staged,
             "keys_of + (ulong)j * shape.head_dim",
             "keys_of + (ulong)0 * shape.head_dim",
@@ -3529,7 +3517,7 @@ mod tests {
         // in [0, 1], so nothing downstream overflows.
         arm(
             "the band it derives",
-            instead_of(
+            crate::testing::instead_of(
                 &shipped,
                 "banded_entry(proj, features, shape, position - (int)j, tau);",
                 "fmin(tau, (float)(position - (int)j));",
@@ -3548,13 +3536,13 @@ mod tests {
         // every shape here, so no dispatch of `attention_combine` is encoded.
         arm(
             "the exp's precision",
-            instead_of(&shipped, "precise::exp(", "fast::exp2("),
+            crate::testing::instead_of(&shipped, "precise::exp(", "fast::exp2("),
             true,
         );
         arm(
             "the exp",
-            instead_of(
-                &instead_of(
+            crate::testing::instead_of(
+                &crate::testing::instead_of(
                     &shipped,
                     "using namespace metal;",
                     "using namespace metal;\n\
@@ -3571,7 +3559,7 @@ mod tests {
         // which no dispatch here encodes.
         arm(
             "the barriers",
-            instead_of(
+            crate::testing::instead_of(
                 &shipped,
                 "threadgroup_barrier(mem_flags::mem_threadgroup);",
                 ";",
@@ -3584,8 +3572,8 @@ mod tests {
         // apiece, twice a tile, for two numbers.
         arm(
             "the tile's two reductions",
-            instead_of(
-                &instead_of(
+            crate::testing::instead_of(
+                &crate::testing::instead_of(
                     &shipped,
                     "float top = peak;\n        for (uint s = 0; s < held; ++s) {",
                     "float top = peak;\n        for (uint s = 0; s < 1u; ++s) {",
@@ -3601,7 +3589,7 @@ mod tests {
         // 128-channel head leaves busy.
         arm(
             "the weighting",
-            instead_of(
+            crate::testing::instead_of(
                 &shipped,
                 "for (uint s = 0; s < held; ++s) {\n                acc += scores[s]",
                 "for (uint s = 0; s < 1u; ++s) {\n                acc += scores[s]",
@@ -3614,7 +3602,7 @@ mod tests {
         // with it and is read beside the slot-zero arm rather than alone.
         arm(
             "three quarters of the dot",
-            instead_of(
+            crate::testing::instead_of(
                 &shipped,
                 "for (uint d = lane; d < shape.head_dim; d += width) {",
                 "for (uint d = lane; d < width; d += width) {",
@@ -3626,7 +3614,7 @@ mod tests {
         // four keys a simdgroup scores in a tile.
         arm(
             "the simd_sum",
-            instead_of(&shipped, "            dot = simd_sum(dot);\n", ""),
+            crate::testing::instead_of(&shipped, "            dot = simd_sum(dot);\n", ""),
             true,
         );
 
@@ -3725,22 +3713,22 @@ mod tests {
     /// are one expression in the shipped kernel and would otherwise move
     /// together.
     fn reading_the_values_where_they_lie() -> String {
-        let narrowed = instead_of(
+        let narrowed = crate::testing::instead_of(
             &source(),
             &format!("constant uint STAGED_VALUES = {STAGED_VALUES};"),
             "constant uint STAGED_VALUES = 4;",
         );
-        let unpinned = instead_of(
+        let unpinned = crate::testing::instead_of(
             &narrowed,
             "min(simds * KEYS_PER_SIMD, STAGED_VALUES / shape.head_dim)",
             "simds * KEYS_PER_SIMD",
         );
-        let unstaged = instead_of(
+        let unstaged = crate::testing::instead_of(
             &unpinned,
             "        for (uint at = local; at < held * shape.head_dim; at += threads) {\n            staged[at] = tiled[at];\n        }\n",
             "",
         );
-        instead_of(
+        crate::testing::instead_of(
             &unstaged,
             "staged[s * shape.head_dim + d]",
             "tiled[s * shape.head_dim + d]",
@@ -3764,7 +3752,7 @@ mod tests {
     /// already there.
     fn with_ballast(source: &str, floats: usize) -> String {
         assert!(floats >= MOST_CHANNELS, "the ballast covers a whole head");
-        let declared = instead_of(
+        let declared = crate::testing::instead_of(
             source,
             "    threadgroup float staged[STAGED_VALUES];",
             &format!(
@@ -3775,7 +3763,7 @@ mod tests {
                  \x20   }}"
             ),
         );
-        instead_of(
+        crate::testing::instead_of(
             &declared,
             "weighted[d] = 0.0f;",
             "weighted[d] = ballast[d];",
