@@ -274,7 +274,7 @@ impl KeyValues {
         if keys <= self.capacity {
             return Ok(());
         }
-        let capacity = keys.next_power_of_two().max(LEAST_KEYS);
+        let capacity = Self::capacity_for(keys);
         let mut grown = [
             device.zeroed::<f32>(self.kv_heads * capacity * self.head_dim)?,
             device.zeroed::<f32>(self.kv_heads * capacity * self.head_dim)?,
@@ -291,6 +291,33 @@ impl KeyValues {
         let [keys, values] = grown;
         (self.keys, self.values, self.capacity) = (keys, values, capacity);
         Ok(())
+    }
+
+    /// Slots a span holding `keys` keys is allocated: powers of two from
+    /// [`LEAST_KEYS`], so a decode loop reallocates a logarithmic number of
+    /// times over a generation.
+    ///
+    /// Named rather than inlined into [`KeyValues::reserve`] because
+    /// `what_a_context_costs_in_keys_and_values` asks what a span *would* cost
+    /// against a key count no span was allocated for, and a second copy of this
+    /// rule is one that can go stale against the first while the table it feeds
+    /// goes on reading like a measurement.
+    pub(crate) fn capacity_for(keys: usize) -> usize {
+        keys.next_power_of_two().max(LEAST_KEYS)
+    }
+
+    /// What the two spans occupy on the device.
+    ///
+    /// **The one part of a sequence's footprint that grows with it**, and the
+    /// figure the architecture's KV arithmetic is a claim about: the README puts
+    /// a 1M-token context under 30 GiB on the grounds that only the 7 global
+    /// layers grow, where 35 cap at a 512-token window. This is what a layer
+    /// actually holds, so that the claim is measured rather than repeated.
+    ///
+    /// The capacity and not the keys: a span is allocated in powers of two and
+    /// what it costs is what it reserved.
+    pub(crate) fn bytes(&self) -> u64 {
+        2 * (self.kv_heads * self.capacity * self.head_dim) as u64 * size_of::<f32>() as u64
     }
 
     /// Where a dispatch writing this call's keys should put them, and where one
@@ -677,6 +704,19 @@ impl<'a> LayerAttention<'a> {
     /// are.
     pub fn held(&self) -> usize {
         self.span.borrow().held
+    }
+
+    /// What this layer's keys and values occupy on the device.
+    ///
+    /// **A windowed layer is charged the same as a global one here and that is
+    /// the finding rather than the interface.** [`KeyValues`] is allocated
+    /// against the keys a sequence has seen and nothing in it consults
+    /// [`AttentionConfig::sliding`], so a layer that can only ever attend over
+    /// its last 512 keys retains all of them — see
+    /// `what_a_context_costs_in_keys_and_values`, which is where that is
+    /// weighed against the window.
+    pub fn span_bytes(&self) -> u64 {
+        self.span.borrow().bytes()
     }
 
     /// Take the span for a sequence that has seen `keys` keys, with room for
@@ -2280,6 +2320,108 @@ mod tests {
     /// long span is still an average of several dispatches rather than of one.
     fn readings_of(keys: usize) -> usize {
         ((1 << 20) / keys).clamp(8, 128)
+    }
+
+    /// **What a stack of 42 spans holds as the context grows, against what the
+    /// window says it needs to.**
+    ///
+    /// The architecture note has claimed since this repo began that KV costs
+    /// "28 KiB/token plus a fixed 70 MiB per sequence" because "only the 7
+    /// global layers grow with sequence length", and that "a 1M-token context
+    /// fits in under 30 GiB". **That is a claim about a design and this engine
+    /// does not implement it.** [`KeyValues::reserve`] allocates against the
+    /// keys a sequence has seen and consults nothing else, so all 42 layers
+    /// grow — including the 35 that can never read past their own last 512
+    /// keys.
+    ///
+    /// So the table has three columns and the gap between two of them is the
+    /// finding: what the spans hold, what the 35 windowed layers hold of that,
+    /// and what they would hold capped at a window they cannot see past. Note
+    /// what the third column is not — it is not a measurement of anything that
+    /// exists, it is the arithmetic of the cap this engine does not make.
+    ///
+    /// **The bytes are exact and the resident set is the cross-check.** A span
+    /// is `[kv_heads, capacity, head_dim]` float32 twice over and capacity is a
+    /// power of two, so what a context costs is arithmetic rather than an
+    /// estimate; what `ps` reports beside it is whether those pages are this
+    /// process's, which for a buffer nothing has written to yet they need not
+    /// be.
+    ///
+    /// One stack grown through the contexts rather than one per context, which
+    /// is what a session does: a span only ever grows, so the last row is the
+    /// footprint and the ones above it are what it passed through.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_context_costs_in_keys_and_values() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let stack: Vec<LayerAttention<'_>> = (0..SLIDING_LAYERS + GLOBAL_LAYERS)
+            .map(|layer| {
+                let case = windowed(1, window_of(layer));
+                case.wrapped(&device, &attention)
+            })
+            .collect();
+
+        let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
+        eprintln!(
+            "{:>8}{:>12}{:>12}{:>14}{:>10}{:>12}",
+            "context", "the spans", "windowed", "if capped", "saved", "resident"
+        );
+        for context in LONG_CONTEXTS {
+            for layer in &stack {
+                layer.hold(0, context).expect("the span reserves");
+            }
+            let (held, of_window, capped) = stack
+                .iter()
+                .map(|layer| {
+                    let bytes = layer.span_bytes();
+                    let config = layer.config();
+                    // What the layer would have reserved if the window were
+                    // what it reserved against, which is the keys it may read.
+                    let reach = match config.sliding {
+                        0 => context,
+                        window => window.min(context),
+                    };
+                    // **A global layer's two columns have to be the same
+                    // number**, because a layer with no window reaches every
+                    // key it has and the cap is the allocation. That is what
+                    // says the third column is this engine's own arithmetic
+                    // applied to a different reach rather than a second guess
+                    // at what a span costs.
+                    if config.sliding == 0 {
+                        assert_eq!(span_bytes_for(config, reach), bytes);
+                    }
+                    (
+                        bytes,
+                        u64::from(config.sliding > 0) * bytes,
+                        span_bytes_for(config, reach),
+                    )
+                })
+                .fold((0, 0, 0), |(a, b, c), (x, y, z)| (a + x, b + y, c + z));
+            eprintln!(
+                "{context:>8}{:>12}{:>12}{:>14}{:>10}{:>12}",
+                format!("{:.0} MiB", mib(held)),
+                format!("{:.0} MiB", mib(of_window)),
+                format!("{:.0} MiB", mib(capped)),
+                format!("×{:.1}", held as f64 / capped as f64),
+                format!("{:.0} MiB", mib(inkling_core::fixture::resident_bytes())),
+            );
+        }
+    }
+
+    /// The window of layer `layer` under the checkpoint's 5:1 split: layers 5,
+    /// 11, 17 and every sixth after them are global and the rest are capped.
+    fn window_of(layer: usize) -> usize {
+        if layer % 6 == 5 { 0 } else { SLIDING_WINDOW }
+    }
+
+    /// What one layer's keys and values would occupy with room for `keys` of
+    /// them, through [`KeyValues::capacity_for`] rather than beside it — so a
+    /// change to how a span grows moves this column with the one it is compared
+    /// against.
+    fn span_bytes_for(config: AttentionConfig, keys: usize) -> u64 {
+        let slots = KeyValues::capacity_for(keys);
+        2 * (config.kv_heads * slots * config.head_dim) as u64 * size_of::<f32>() as u64
     }
 
     /// **What the attention step costs as the context grows into a coding
