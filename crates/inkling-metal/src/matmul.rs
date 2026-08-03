@@ -1780,6 +1780,7 @@ mod tests {
     use inkling_core::ops::DenseProjection;
     use inkling_core::quant::dequantize_blocks;
     use inkling_core::weights::PackedRows;
+    use inkling_core::workload::BEST;
 
     use crate::grouping::ExpertGrouping;
     use crate::testing::{device, drift};
@@ -2423,6 +2424,26 @@ mod tests {
             !tiles(&shared(ROWS_A_TILE - 1), ROWS_A_TILE),
             "runs under a tile"
         );
+
+        // **And a speculative round's block, which is the shape a decode figure
+        // is most easily lost through.** A round of depth `k` verifies `k + 1`
+        // rows in one pass, so the deepest depth this repo quotes dispatches a
+        // three-row projection — and three is one under the tile. Every block a
+        // round can propose stays on the untiled kernel, which is what says the
+        // 16.48 ms at `k = 2` cannot be reached from here.
+        for verified in 1..=BEST + 1 {
+            assert!(
+                !tiles(&projection(verified), ROWS_A_TILE),
+                "a block of {verified} rows"
+            );
+            assert!(!tiles(&routed(verified), ROWS_A_TILE), "its routed bank");
+        }
+        // **Which is a fact about the height and not about the block**, and it
+        // is why the height may rise and may not fall: a tile of three would
+        // take a `k = 2` verify's projections into the tiled path, and what a
+        // cold routed bank says that is worth is 3% of one row of a prefill —
+        // see `whether_the_tile_height_turns_at_four_on_a_bank_too_big_to_cache`.
+        assert!(tiles(&projection(BEST + 1), BEST + 1));
     }
 
     /// **The tiled kernel's answer against the untiled one's, bit for bit.**
@@ -3682,6 +3703,89 @@ mod tests {
             "  the shapes on the tiled entry are {:.2?} of a prefill and the grouped ones {:.2?}",
             totals[0], totals[1]
         );
+    }
+
+    /// **Whether the tile height still turns at four once the bank is too big to
+    /// cache**, which is the one thing [`ROWS_A_TILE`]'s own sweep could not ask.
+    ///
+    /// That sweep runs over `Case::seeded(1, ..)` — a single expert, 2 to 36 MB,
+    /// which this machine holds in cache and re-reads for free. Every extra row a
+    /// tile carries there buys nothing, because the weight read it saves was
+    /// already a cache hit, and it costs registers — so the sweep turns at four
+    /// and says so emphatically. **A routed bank is 1141 MB a dispatch and 129 GB
+    /// across a prefill**, where a saved weight read is a saved trip to memory
+    /// rather than a saved hit, and the trade could land somewhere else entirely.
+    ///
+    /// So: the same height sweep, over the bank a 769-token prefill's routed gate
+    /// actually is. If the turn moves outward here, `ROWS_A_TILE` was fitted on
+    /// the wrong shape.
+    ///
+    /// **A taller tile is the safe direction and a shorter one is not.** [`tiles`]
+    /// refuses a run shorter than the height, so raising it can only take calls
+    /// *out* of the tiled path — and the three rows a `k = 2` verify dispatches
+    /// stay untiled at four and at anything above it. Nothing here lowers it.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn whether_the_tile_height_turns_at_four_on_a_bank_too_big_to_cache() {
+        let Some(device) = device() else { return };
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const CALLS: usize = 4;
+        const ROUNDS: usize = 3;
+        const IN: usize = 4096;
+        const OUT: usize = 2048;
+        const EXPERTS: usize = 256;
+        /// A 769-token prefill's routed bank: six rows a token.
+        const ROWS: usize = 769 * 6;
+        const HEIGHTS: [usize; 5] = [2, 3, 4, 6, 8];
+
+        assert!(HEIGHTS.contains(&ROWS_A_TILE), "{ROWS_A_TILE}");
+        let case = Case::seeded(1, IN, EXPERTS * OUT, ROWS);
+        let packed = case.packed();
+        let chosen: Vec<u32> = (0..ROWS).map(|row| (row * EXPERTS / ROWS) as u32).collect();
+
+        eprintln!(
+            "  {:<16}{:>10}{:>10}{:>12}{:>12}",
+            "rows a tile", "a call", "declared", "achieved", "a prefill"
+        );
+        for height in HEIGHTS {
+            let matmul = PackedMatmul::tiling(
+                &device,
+                &a_tile_of(height, COLS_A_TILE),
+                height,
+                COLS_A_TILE,
+            )
+            .unwrap_or_else(|err| panic!("{height} rows a tile compiles: {err}"));
+            let bank =
+                PackedBank::upload(&device, &matmul, EXPERTS, IN, OUT, &packed, &case.scales)
+                    .expect("the bank's shapes pair");
+            let mut x = device.buffer(&case.x).expect("the rows upload");
+
+            let mut best = Duration::MAX;
+            for _ in 0..ROUNDS {
+                best = best.min(crate::testing::device_time(&device, CALLS, |batch| {
+                    let mut picked = device.buffer(&chosen).expect("the selection uploads");
+                    let mut sorted = grouping
+                        .encode(batch, &mut picked, EXPERTS)
+                        .expect("the grouping encodes");
+                    bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)
+                        .expect("the dispatch encodes");
+                }));
+            }
+
+            let call = best / CALLS as u32;
+            let tiles = ROWS.div_ceil(height);
+            let read = ROWS.min(tiles + (height - 1) * tiles.min(EXPERTS - 1));
+            let codes = read * OUT * IN;
+            let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+            eprintln!(
+                "  {height:<16}{:>10}{:>10}{:>12}{:>12}",
+                format!("{:.0}µs", 1e6 * call.as_secs_f64()),
+                format!("{:.0} MB", moved / 1e6),
+                format!("{:.0} GB/s", moved / call.as_secs_f64() / 1e9),
+                // 120 routed dispatches a prefill, which is what this shape is.
+                format!("{:.2?}", call * 120),
+            );
+        }
     }
 
     /// The shipped kernel with a different tile shape written into its prelude,
