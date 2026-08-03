@@ -1822,6 +1822,40 @@ Four scale loads and sixteen multiply-adds per four bytes read as 100 and 101%,
 and one `simd_sum` per output element at the end of a walk thousands of bytes
 long reads the same.
 
+### What a threadgroup's memory is worth on a kernel that declares none
+
+**A tile of this kernel holds no threadgroup memory at all**, so it runs at
+whatever residency this part gives a kernel that asks for nothing — and the
+attention sweep above found a row that was a quarter faster on the other side of
+a turn. `how_many_threadgroups_of_a_prefills_packed_matmul_a_core_holds` adds the
+same dead array, filled by one store a lane at every size so the work does not
+move with the knob, and this can only lower residency and never raise it.
+
+    a threadgroup    q_proj, tiled   a routed bank, grouped
+     0 KiB                  5.90ms                  19.53ms
+     1 KiB                  5.98ms                  19.72ms
+     4 KiB                  5.97ms                  19.72ms
+     8 KiB                  5.61ms                  18.80ms
+    12 KiB                  5.27ms                  16.99ms
+    16 KiB                  5.22ms                  16.67ms
+    24 KiB                  5.19ms                  16.38ms
+
+**Monotone, reproducible to a hundredth of a millisecond over two passes, and in
+the direction that says this kernel runs too many threadgroups a core.** 5.19 ms
+against 5.90 is 12% and 16.38 against 19.53 is 16%, bought with memory nobody
+reads. Nothing about the walk changed: the same bytes, the same decode, the same
+accumulators, one extra store a lane.
+
+**So both dominant kernels are on the same side of the same turn, and neither
+was fitted against it.** 23 to 27% of the attention rows and 12 to 16% of the
+matmul rows, which over the 16384-token table is about 14 s of the 58.2 s
+attention pair and about 10 s of the 72.3 s matmul pair — **24 s of a 133 s
+prefill, by arithmetic off two sweeps rather than by a run.** What it would cost
+to get is a different question from what these measure: the attention turn is on
+the other side of a staging this file has now shown buys nothing at prefill shape,
+and the matmul turn was reached here with dead memory rather than with anything a
+kernel would want. **Nothing was changed.**
+
 ### What this leaves for whoever caps the spans
 
 **A prefill writes every key of a layer before that layer's one attention

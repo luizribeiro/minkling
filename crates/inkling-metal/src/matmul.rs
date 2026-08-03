@@ -4120,6 +4120,93 @@ mod tests {
         }
     }
 
+    /// The shipped source with a threadgroup array of `floats` nobody reads for
+    /// anything, which is the occupancy knob the attention kernel's own table
+    /// turns — met on the kernel that declares none at all.
+    ///
+    /// **A tile holds no threadgroup memory, so this can only lower how many
+    /// threadgroups a core holds and never raise it.** That is the whole of the
+    /// question here: the shipped dispatch is already at whatever residency this
+    /// part gives a kernel that asks for nothing, and the attention table says a
+    /// row can be a quarter faster on the other side of a turn.
+    ///
+    /// Every lane fills and reads its own entry, so no barrier stands between
+    /// the two and the value added to the output is a zero. **One store a lane
+    /// at every size**, which is what keeps this a knob on the memory rather
+    /// than on the work. Whether the array survived the compiler is read off
+    /// `staticThreadgroupMemoryLength` rather than hoped for.
+    fn with_ballast(floats: usize) -> String {
+        let declared = crate::testing::instead_of(
+            &source(),
+            "    const uint tile = position / width;",
+            &format!(
+                "    threadgroup float ballast[{floats}];\n\
+                 \x20   for (uint at = lane; at < width; at += width) {{\n\
+                 \x20       ballast[at] = 0.0f;\n\
+                 \x20   }}\n\
+                 \x20   const uint tile = position / width;"
+            ),
+        );
+        crate::testing::instead_of(
+            &declared,
+            "+ leftmost + c] = sum;",
+            "+ leftmost + c] = sum + ballast[lane];",
+        )
+    }
+
+    /// **How many threadgroups of this kernel a core holds, and what holding
+    /// fewer would be worth** — the occupancy candidate, on the two rows that
+    /// are 54% of a long prefill.
+    ///
+    /// The attention kernel's own sweep found its row to be a function of the
+    /// declared threadgroup memory and of nothing else in it, with a turn a
+    /// quarter below where the shipped kernel sits. A tile of this kernel
+    /// declares none, so it runs at whatever residency a kernel that asks for
+    /// nothing gets — and this is the one direction available from there.
+    ///
+    /// **The ballast is not a proposal and could not become one.** It is dead
+    /// memory; what a row below the shipped one would say is that residency is
+    /// worth something here, and what it would cost to get is a different
+    /// question from what this measures.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn how_many_threadgroups_of_a_prefills_packed_matmul_a_core_holds() {
+        let Some(device) = device() else { return };
+        const BALLAST: [usize; 7] = [0, 256, 1024, 2048, 3072, 4096, 6144];
+
+        let shipped = matmul(&device);
+        let want = a_tiled_call_answers(&device, &shipped);
+        eprintln!(
+            "  a threadgroup may declare {} KiB of a core's own memory",
+            device.most_threadgroup_bytes() / 1024
+        );
+        eprintln!("  {:<32}{}", "a threadgroup", bound_header());
+
+        for floats in BALLAST {
+            let matmul = match floats {
+                0 => PackedMatmul::new(&device).expect("the kernel compiles"),
+                floats => PackedMatmul::from_source(&device, &with_ballast(floats))
+                    .expect("the arm compiles"),
+            };
+            assert_eq!(
+                a_tiled_call_answers(&device, &matmul),
+                want,
+                "{floats} floats of ballast moved the answer"
+            );
+            let cells: String = a_prefills_shapes_cost(&device, &matmul)
+                .iter()
+                .map(|each| format!("{:>26}", format!("{:.2}ms", 1e3 * each.as_secs_f64())))
+                .collect();
+            eprintln!(
+                "  {:<32}{cells}",
+                format!(
+                    "{:.0} KiB",
+                    matmul.tiled.threadgroup_memory() as f64 / 1024.0
+                ),
+            );
+        }
+    }
+
     /// What one small tiled call answers, which is how an arm of the table above
     /// is held to having changed the kernel rather than only its source.
     ///
