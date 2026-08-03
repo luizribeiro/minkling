@@ -56,7 +56,7 @@ const PREFILLED: usize = 385;
 const PAIRS: usize = 7;
 
 const USAGE: &str = "usage:\n  \
-    bench decode  <checkpoint> [--tokens <n>]\n  \
+    bench decode  <checkpoint> [--tokens <n>] [--context <n>]\n  \
     bench prefill <checkpoint> [--tokens <n>]\n  \
     bench sweep   <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench engines <checkpoint> [--depth <k>]\n  \
@@ -149,6 +149,14 @@ enum Job {
         checkpoint: PathBuf,
         /// Tokens decoded, or — for a prefill — tokens in the prompt.
         tokens: usize,
+        /// Keys the sequence already holds when the steps being timed run, which
+        /// is the one axis a decode step moves along: the README's own table
+        /// puts a step 1.45 times its 97-key figure at 8192 keys, on one build.
+        ///
+        /// **Zero is the structured prompt as it stands** rather than a context
+        /// of no keys, which is what every decode figure in this repo was taken
+        /// at before there was a flag for it.
+        context: usize,
         depth: usize,
     },
     /// The harness: two commands that already exist, run against each other.
@@ -189,6 +197,7 @@ impl Job {
 
         let mut checkpoints = Vec::new();
         let mut tokens = None;
+        let mut context = None;
         // A sweep runs every depth up to its own, where a cross-engine table
         // quotes one beside `k = 0` — so the default depth is what the flag
         // means to the measurement asking for it.
@@ -199,6 +208,7 @@ impl Job {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--tokens" | "-n" => tokens = Some(count(&arg, &mut args)?),
+                "--context" | "-c" => context = Some(count(&arg, &mut args)?),
                 "--depth" | "-k" => depth = count(&arg, &mut args)?,
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
                 _ => checkpoints.push(PathBuf::from(arg)),
@@ -208,6 +218,9 @@ impl Job {
             let [a, b] = <[PathBuf; 2]>::try_from(checkpoints).map_err(|given: Vec<PathBuf>| {
                 anyhow::anyhow!("guesses takes two checkpoints, given {}", given.len())
             })?;
+            if context.is_some() {
+                bail!("guesses takes no --context: it asks both chains the same rounds");
+            }
             return Ok(Self::Guesses {
                 checkpoints: [a, b],
                 tokens: tokens.unwrap_or(DECODED),
@@ -232,6 +245,15 @@ impl Job {
                 REALISTIC.len()
             );
         }
+        // **Only a decode step has a context to be taken at.** A prefill's
+        // context is its own prompt and `--tokens` already says how long that
+        // is; a sweep and a cross-engine table each fix their own prompt because
+        // acceptance is the workload's. Silently dropping the number would leave
+        // a row saying something other than what was asked for, which is the
+        // same rule the length above is refused under.
+        if what != What::Decode && context.is_some() {
+            bail!("{what:?} takes no --context: only a decode step has one to be taken at");
+        }
         Ok(Self::Measure {
             what,
             checkpoint,
@@ -239,6 +261,7 @@ impl Job {
                 What::Prefill => PREFILLED,
                 _ => DECODED,
             }),
+            context: context.unwrap_or(0),
             depth,
         })
     }
@@ -280,9 +303,10 @@ impl Job {
                 what,
                 checkpoint,
                 tokens,
+                context,
                 depth,
             } => {
-                for reading in measure(*what, checkpoint, *tokens, *depth)? {
+                for reading in measure(*what, checkpoint, *tokens, *context, *depth)? {
                     println!("{}", reading.line());
                 }
                 Ok(())
@@ -411,7 +435,27 @@ fn millis(elapsed: Duration) -> f64 {
 
 /// What this run of the engine is asked to time, taken once against a checkpoint
 /// this process opens exactly one device for.
-fn measure(what: What, dir: &Path, tokens: usize, depth: usize) -> Result<Vec<Reading>> {
+/// The prompt the steps being timed run behind, tiled to the context asked for.
+///
+/// **What a decode step costs is a function of the keys behind it**, and that is
+/// the one thing about it a caller can choose: the same build is 19.97 ms a
+/// token at 97 keys and 29.02 at 8192. A context of zero is the prompt as it
+/// stands, which is the 34 keys every decode figure in this repo was taken over
+/// before there was a flag for it.
+fn behind_a_step(prompt: &[usize], context: usize) -> Vec<usize> {
+    match context {
+        0 => prompt.to_vec(),
+        context => tiled(prompt, context),
+    }
+}
+
+fn measure(
+    what: What,
+    dir: &Path,
+    tokens: usize,
+    context: usize,
+    depth: usize,
+) -> Result<Vec<Reading>> {
     let config = config::of_checkpoint(dir)?;
     let text = &config.text_config;
     let tokenizer = Tokenizer::open(dir, &config)?;
@@ -509,7 +553,7 @@ fn measure(what: What, dir: &Path, tokens: usize, depth: usize) -> Result<Vec<Re
                 }
             }
             What::Decode => {
-                let run = timed(&prompt, tokens);
+                let run = timed(&behind_a_step(&prompt, context), tokens);
                 taken.push(Reading::new("decode", millis(run.step()), "ms"));
                 taken.push(Reading::new("device", millis(run.gpu), "ms"));
             }
@@ -1057,6 +1101,7 @@ mod tests {
                 what: What::Sweep,
                 checkpoint: PathBuf::from("models/small"),
                 tokens: DECODED,
+                context: 0,
                 depth: SWEPT,
             }
         );
@@ -1066,6 +1111,7 @@ mod tests {
                 what: What::Prefill,
                 checkpoint: PathBuf::from("models/small"),
                 tokens: PREFILLED,
+                context: 0,
                 depth: SWEPT,
             }
         );
@@ -1083,6 +1129,7 @@ mod tests {
                 what: What::Engines,
                 checkpoint: PathBuf::from("models/small"),
                 tokens: DECODED,
+                context: 0,
                 depth: BEST,
             }
         );
@@ -1090,6 +1137,57 @@ mod tests {
         // And it takes no length, because it runs four of them.
         assert!(
             Job::parse(["engines", "models/small", "--tokens", "769"].map(str::to_string)).is_err()
+        );
+    }
+
+    /// **A context of zero is the prompt and any other is the prompt tiled to
+    /// it**, which is what decides the length the steps being timed run behind.
+    ///
+    /// The rejection case above says the flag reaches the right measurement;
+    /// this says it does something when it gets there, without opening a device
+    /// to find out.
+    #[test]
+    fn a_step_is_timed_behind_the_context_it_was_given() {
+        let prompt = [11, 22, 33];
+        assert_eq!(behind_a_step(&prompt, 0), prompt);
+        assert_eq!(behind_a_step(&prompt, 8).len(), 8);
+        assert_eq!(behind_a_step(&prompt, 2).len(), 2);
+    }
+
+    /// **A decode step is the one measurement here with a context to be taken
+    /// at**, and the flag is refused everywhere else rather than dropped.
+    ///
+    /// What a step costs is a function of the keys behind it — 19.9 ms a token
+    /// at 97 and 28.7 at 8192 — so a paired comparison of two builds taken only
+    /// at the structured prompt's own 34 keys is a comparison at the one length
+    /// a user does not have. A prefill's context is its prompt and `--tokens`
+    /// already says how long that is; a sweep and a cross-engine table fix their
+    /// own prompts because acceptance is the workload's.
+    #[test]
+    fn only_a_decode_step_takes_a_context_to_be_taken_at() {
+        assert_eq!(
+            Job::parse(["decode", "models/small", "--context", "8192"].map(str::to_string))
+                .expect("parses"),
+            Job::Measure {
+                what: What::Decode,
+                checkpoint: PathBuf::from("models/small"),
+                tokens: DECODED,
+                context: 8192,
+                depth: SWEPT,
+            }
+        );
+        for what in ["prefill", "sweep", "engines"] {
+            assert!(
+                Job::parse([what, "models/small", "--context", "8192"].map(str::to_string))
+                    .is_err(),
+                "{what} took a context it has no use for"
+            );
+        }
+        assert!(
+            Job::parse(
+                ["guesses", "models/a", "models/b", "--context", "8192"].map(str::to_string)
+            )
+            .is_err()
         );
     }
 
