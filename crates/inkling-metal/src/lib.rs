@@ -38,6 +38,7 @@ pub mod heads;
 pub mod kernel;
 pub mod matmul;
 pub mod norm;
+pub mod numerics;
 pub mod projections;
 pub mod router;
 pub mod sampling;
@@ -60,6 +61,7 @@ pub use heads::ModelHeads;
 pub use kernel::{Batch, Grid, Kernel, Submitted};
 pub use matmul::{MatmulError, Multiply, PackedBank, PackedMatmul, PackedProjection};
 pub use norm::{LayerNorm, RmsNorm};
+pub use numerics::Numerics;
 pub use projections::{
     DISPATCHES_A_SUBMISSION, DenseFfn, LayerDevice, LayerKernels, LayerProjections, ModelLayers,
     StackShape,

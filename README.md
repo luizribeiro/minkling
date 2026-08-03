@@ -129,6 +129,59 @@ GB of packed bytes the GPU path indexes into and never decodes at all. The rest
 is every layer's own projections — five for attention, three more on each of the
 two dense layers — which are 9 GB of float32 that *every* token reads all of.
 
+### Two numerics behind one flag, and which of them is checkable
+
+    inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' \
+        --numerics production
+
+**`--numerics` is `reference` unless a command line says otherwise, and nothing
+in this file is measured under anything else unless it says so.** Every kernel
+here has been held to one standard since the first — the answer is the CPU
+path's bit for bit, and the recorded continuation `[656, 13, 623, 180069, 86333,
+60500, 220, 23]` has never moved — and that standard is what makes a mutation
+falsifiable. It is also a ceiling, and "Whether the fast structure can keep the
+bits" is where this file first said which one: a hardware `simdgroup_matrix`
+multiply-accumulate sums its `k` dimension in an order the instruction defines
+and this side does not choose, so **any kernel built on one is ruled out before
+it is written**. The flag is what lets it be written and measured anyway.
+
+**Neither of the two is "more accurate", and saying so is not a hedge.** Both
+sum the same exact products of the same exactly-decoded codes — MXFP4's sixteen
+values are one table and a group scale is a power of two, so no product either
+path forms is rounded at all. What separates them is the order the sums are
+taken in and nothing else, and a matrix instruction's order is not the worse of
+the two; on a long reduction it is usually a little better. What the reference
+has that the production path cannot have is an **oracle**: an order this side
+picked, that `--backend cpu` reproduces exactly, so that a wrong token has a
+witness. That is the whole of the difference and it is a difference about
+checkability rather than about precision.
+
+**So the chain a disagreement is bisected through gains a link.** It was
+CPU → Metal, one arrow, settled by rerunning a command with `--backend cpu`. It
+is now **CPU → Metal under the reference → Metal under the production
+numerics**, and the middle of the three is what says whether a wrong token came
+from the kernel structure or from the arithmetic inside it. `--backend cpu` plays
+the same role it always did.
+
+**The flag selects the innermost compute and nothing else.** Tiling decisions,
+the submission structure, the grouping, KV handling, `splits_for`, both occupancy
+turns — all shared, all exercised whichever way it reads. A kernel behind this
+flag is a different accumulation over the same dispatch, taking the same bindings
+from the same encoder, at the same shapes the same predicates chose. That bound
+is the point rather than a tidiness preference: `attention.rs` and `matmul.rs`
+are the two most-edited files here, and a fork of the engine at any level above
+the accumulate would have two of everything that moved in the last four
+milestones and would rot inside two more.
+
+**Nothing changes for a caller who does not ask.** Under the reference the
+production entries are not compiled, not dispatched and not in the pipeline
+cache — `PackedMatmul::new` builds exactly the three kernels it built before this
+flag existed. `--numerics` on `--backend cpu` is refused rather than dropped: the
+CPU path has one arithmetic, and a run that took the word and ignored it would
+print a command line saying something other than what it did.
+
+    just bench-numerics prefill --tokens 2048   # the two paired, alternating, out of one build
+
 **Nothing is copied onto the device.** The forty layers' banks are 137 GB, which
 is the whole checkpoint but for its two ends, and they are handed to the GPU
 where the checkpoint mapped them — `newBufferWithBytesNoCopy` over all of it in

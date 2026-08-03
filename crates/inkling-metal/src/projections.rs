@@ -64,6 +64,7 @@ use crate::experts::{ExpertKernels, LayerExperts};
 use crate::kernel::{Batch, Submitted};
 use crate::matmul::{MatmulError, Multiply, PackedMatmul, PackedProjection, Pending, together};
 use crate::norm::{LayerNorm, RmsNorm};
+use crate::numerics::Numerics;
 use crate::sconv::{LayerConv, ShortConvolution};
 use crate::swiglu::SwiGlu;
 use crate::tail::ModelTail;
@@ -130,9 +131,23 @@ pub struct LayerKernels {
 }
 
 impl LayerKernels {
+    /// The four under the numerics every caller gets who does not ask for the
+    /// other, which is the reference — see [`Numerics`].
     pub fn compile(device: &Device) -> Result<Self, MetalError> {
+        Self::compiling(device, Numerics::default())
+    }
+
+    /// The same, under numerics the caller chose.
+    ///
+    /// **Only the matmul takes it**, and that is the flag's whole reach on this
+    /// side: the norm, the convolution and the argmax have no reduction a matrix
+    /// instruction could carry, and the attention step is the milestone after
+    /// this one. A kernel that does not take the flag is a kernel both paths
+    /// run, which is what "it selects the innermost compute only" means when it
+    /// is spelled in types.
+    pub fn compiling(device: &Device, numerics: Numerics) -> Result<Self, MetalError> {
         Ok(Self {
-            matmul: PackedMatmul::new(device)?,
+            matmul: PackedMatmul::under(device, numerics)?,
             norm: RmsNorm::new(device)?,
             conv: ShortConvolution::new(device)?,
             attention: FusedAttention::new(device)?,
@@ -1697,6 +1712,32 @@ mod tests {
     /// stands up, passes every shape check there is, and attends to the wrong
     /// thing.
     ///
+    /// **Of a layer's five kernels the matmul is the only one the flag reaches,
+    /// and that is the flag's whole surface on this side.**
+    ///
+    /// The norm, the convolution and the argmax have no reduction a matrix
+    /// instruction could carry, and the attention step is a milestone of its
+    /// own — so a kernel that took the word would be a kernel forking further
+    /// than "the innermost compute only" allows. Read off the compiled kernels
+    /// rather than off the constructor, because what a caller can check is what
+    /// was built.
+    #[test]
+    fn only_a_layers_matmul_is_compiled_under_the_numerics_it_was_given() {
+        let Some(device) = device() else { return };
+        for numerics in [Numerics::Reference, Numerics::Production] {
+            let kernels = LayerKernels::compiling(&device, numerics).expect("the kernels compile");
+            assert_eq!(kernels.matmul().numerics(), numerics);
+        }
+        assert_eq!(
+            LayerKernels::compile(&device)
+                .expect("the kernels compile")
+                .matmul()
+                .numerics(),
+            Numerics::Reference,
+            "the constructor nobody passes a word to is the reference one"
+        );
+    }
+
     /// Three distinct tensors over five slots means two slots have to repeat two
     /// others, and which two is what the rounds exchange: the first round
     /// repeats at `(q, r)` and `(k, o)`, the second at `(k, r)` and `(q, o)`. No

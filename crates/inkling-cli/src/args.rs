@@ -9,6 +9,8 @@
 
 use std::path::PathBuf;
 
+use inkling_metal::Numerics;
+
 /// What to run, and what against.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -54,6 +56,19 @@ impl Backend {
     }
 }
 
+/// Which arithmetic the device's innermost accumulation may use, and the refusal
+/// that keeps the word from being asked of a backend that has none.
+///
+/// **`--numerics production --backend cpu` is a mistake rather than a request.**
+/// The CPU path is the oracle both device paths are measured against and it has
+/// exactly one arithmetic; a run that took the flag and dropped it would print a
+/// command line saying something other than what it did, which is the same rule
+/// `bench` refuses a `--context` on a prefill under.
+fn numerics(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<Numerics, ArgError> {
+    let name = value(flag, args)?;
+    Numerics::parse(&name).ok_or(ArgError::UnknownNumerics(name))
+}
+
 /// A generation, as a command line describes one.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Generate {
@@ -68,6 +83,9 @@ pub struct Generate {
     pub max_tokens: usize,
     /// Where the weights are multiplied against.
     pub backend: Backend,
+    /// Which arithmetic the device's innermost accumulation uses, which the
+    /// backend above has to be `metal` for anyone to have asked.
+    pub numerics: Numerics,
     /// How many tokens a round guesses ahead with the multi-token prediction
     /// heads, and zero for a generation that decodes one at a time.
     ///
@@ -89,6 +107,8 @@ pub struct Serve {
     pub max_tokens: usize,
     /// Where the weights are multiplied against.
     pub backend: Backend,
+    /// Which arithmetic the device's innermost accumulation uses.
+    pub numerics: Numerics,
 }
 
 /// How many tokens `generate` decodes when the caller names no budget.
@@ -116,9 +136,9 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
 pub const USAGE: &str = "usage:\n  \
     inklingrs inspect <config.json>\n  \
     inklingrs generate <checkpoint-dir> --prompt <text> [--max-tokens <n>] \
-        [--backend cpu|metal] [--speculate <k>]\n  \
+        [--backend cpu|metal] [--numerics reference|production] [--speculate <k>]\n  \
     inklingrs serve <checkpoint-dir> [--address <host:port>] [--max-tokens <n>] \
-        [--backend cpu|metal]";
+        [--backend cpu|metal] [--numerics reference|production]";
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ArgError {
@@ -148,6 +168,12 @@ pub enum ArgError {
 
     #[error("{0} is not a backend, which is cpu or metal")]
     UnknownBackend(String),
+
+    #[error("{0} is not numerics, which is reference or production")]
+    UnknownNumerics(String),
+
+    #[error("--numerics {0} takes a device: the cpu backend has one arithmetic")]
+    NumericsOffDevice(&'static str),
 }
 
 impl Command {
@@ -209,6 +235,7 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
     let mut prompt = None;
     let mut max_tokens = DEFAULT_MAX_TOKENS;
     let mut backend = Backend::default();
+    let mut asked = None;
     let mut speculate = 0;
 
     while let Some(arg) = args.next() {
@@ -216,6 +243,7 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
             "--prompt" | "-p" => prompt = Some(value(&arg, &mut args)?),
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
             "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
+            "--numerics" => asked = Some(numerics(&arg, &mut args)?),
             "--speculate" | "-k" => speculate = depth(&arg, &mut args)?,
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
             _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
@@ -239,8 +267,18 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
             })?,
         max_tokens,
         backend,
+        numerics: on_device(backend, asked)?,
         speculate,
     }))
+}
+
+/// The numerics a run was asked for, refused where the backend has none to
+/// select between.
+fn on_device(backend: Backend, asked: Option<Numerics>) -> Result<Numerics, ArgError> {
+    match (backend, asked) {
+        (Backend::Cpu, Some(numerics)) => Err(ArgError::NumericsOffDevice(numerics.named())),
+        (_, asked) => Ok(asked.unwrap_or_default()),
+    }
 }
 
 fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
@@ -249,12 +287,14 @@ fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
     let mut address = DEFAULT_ADDRESS.to_string();
     let mut max_tokens = DEFAULT_SERVE_MAX_TOKENS;
     let mut backend = Backend::default();
+    let mut asked = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--address" | "-a" => address = value(&arg, &mut args)?,
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
             "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
+            "--numerics" => asked = Some(numerics(&arg, &mut args)?),
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
             _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
             _ => return Err(ArgError::Unexpected(arg)),
@@ -269,6 +309,7 @@ fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
         address,
         max_tokens,
         backend,
+        numerics: on_device(backend, asked)?,
     }))
 }
 
@@ -349,6 +390,7 @@ mod tests {
                 prompt: "Once".to_string(),
                 max_tokens: 3,
                 backend: Backend::Metal,
+                numerics: Numerics::Reference,
                 speculate: 0,
             })
         );
@@ -465,6 +507,159 @@ mod tests {
         }
     }
 
+    /// The numerics are a word the same way the backend is, and each command
+    /// reads the same two.
+    #[test]
+    fn either_command_takes_its_numerics_by_name() {
+        for (name, want) in [
+            ("reference", Numerics::Reference),
+            ("production", Numerics::Production),
+        ] {
+            assert_eq!(
+                generated(&["generate", "models/small", "-p", "Once", "--numerics", name])
+                    .expect("parses")
+                    .numerics,
+                want
+            );
+            assert_eq!(
+                serving(&["serve", "models/small", "--numerics", name])
+                    .expect("parses")
+                    .numerics,
+                want
+            );
+        }
+    }
+
+    /// **What a run nobody said anything about gets, which is the reference.**
+    /// The whole of what the other side of this flag is for is being measured,
+    /// and a default that drifted to it would make every figure in this file a
+    /// figure about arithmetic nobody asked for.
+    #[test]
+    fn a_command_that_names_no_numerics_runs_the_reference() {
+        assert_eq!(
+            generated(&["generate", "models/small", "-p", "Once"])
+                .expect("parses")
+                .numerics,
+            Numerics::Reference
+        );
+        assert_eq!(
+            serving(&["serve", "models/small"])
+                .expect("parses")
+                .numerics,
+            Numerics::Reference
+        );
+    }
+
+    #[test]
+    fn numerics_this_binary_does_not_have_are_refused() {
+        for name in ["fast", "mma", "Reference", "reference ", ""] {
+            assert_eq!(
+                parse(&["generate", "models/small", "-p", "Once", "--numerics", name]),
+                Err(ArgError::UnknownNumerics(name.to_string())),
+                "{name:?}"
+            );
+        }
+    }
+
+    /// **The CPU path has one arithmetic, so a word choosing between two is a
+    /// mistake there rather than a request.** A run that took the flag and
+    /// dropped it would print a command line saying something other than what it
+    /// did — and this flag's whole job is to be readable off the line that ran.
+    #[test]
+    fn numerics_asked_of_the_cpu_backend_are_refused() {
+        for name in ["reference", "production"] {
+            for command in [
+                vec!["generate", "models/small", "-p", "Once"],
+                vec!["serve", "models/small"],
+            ] {
+                let mut line = command.clone();
+                line.extend(["--backend", "cpu", "--numerics", name]);
+                assert!(
+                    matches!(parse(&line), Err(ArgError::NumericsOffDevice(_))),
+                    "{line:?}"
+                );
+            }
+        }
+    }
+
+    /// And the refusal is about the pair rather than about either word: the same
+    /// flag on the device path parses, and the CPU path with no flag parses.
+    #[test]
+    fn the_cpu_backend_takes_no_numerics_and_needs_none() {
+        assert_eq!(
+            generated(&["generate", "models/small", "-p", "Once", "-b", "cpu"])
+                .expect("parses")
+                .numerics,
+            Numerics::Reference
+        );
+        assert_eq!(
+            generated(&[
+                "generate",
+                "models/small",
+                "-p",
+                "Once",
+                "-b",
+                "metal",
+                "--numerics",
+                "production"
+            ])
+            .expect("parses")
+            .numerics,
+            Numerics::Production
+        );
+    }
+
+    /// **The pair is read after the whole line rather than as the words arrive**,
+    /// so which of the two was written first cannot decide whether the run is
+    /// refused — and a repeated backend is the last one, the way every other
+    /// flag here is.
+    #[test]
+    fn which_of_the_two_words_came_first_decides_nothing() {
+        assert!(matches!(
+            parse(&[
+                "generate",
+                "models/small",
+                "-p",
+                "Once",
+                "--numerics",
+                "production",
+                "-b",
+                "cpu"
+            ]),
+            Err(ArgError::NumericsOffDevice(_))
+        ));
+        assert_eq!(
+            generated(&[
+                "generate",
+                "models/small",
+                "-p",
+                "Once",
+                "--numerics",
+                "production",
+                "-b",
+                "metal"
+            ])
+            .expect("parses")
+            .numerics,
+            Numerics::Production
+        );
+        assert!(matches!(
+            parse(&[
+                "generate",
+                "models/small",
+                "-p",
+                "Once",
+                "-b",
+                "metal",
+                "--numerics",
+                "production",
+                "-b",
+                "cpu"
+            ]),
+            Err(ArgError::NumericsOffDevice(_))
+        ));
+    }
+
     /// A prompt is text and not a flag, so what follows `--prompt` is taken as
     /// it stands — which is what lets a prompt carry the model's own turn
     /// markers, and what stops one that opens with a dash from being read as an
@@ -573,6 +768,7 @@ mod tests {
                 address: "0.0.0.0:9000".to_string(),
                 max_tokens: 3,
                 backend: Backend::Metal,
+                numerics: Numerics::Reference,
             })
         );
     }

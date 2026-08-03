@@ -61,6 +61,7 @@ use crate::buffer::{Arg, Buffer, Bytes};
 use crate::device::{Device, MetalError};
 use crate::grouping::Grouped;
 use crate::kernel::{Batch, Grid, Kernel, extent};
+use crate::numerics::Numerics;
 
 const ENTRY: &str = "packed_matmul";
 
@@ -310,6 +311,9 @@ pub struct PackedMatmul {
     kernel: Kernel,
     tiled: Kernel,
     grouped: Kernel,
+    /// Which arithmetic the innermost accumulation is allowed to use, which is
+    /// [`Numerics::Reference`] unless a command line asked otherwise.
+    numerics: Numerics,
     /// The rows a tile of `tiled` holds, which is [`ROWS_A_TILE`] for the
     /// shipped source and whatever the sweep wrote into a mutant's prelude.
     rows_a_tile: usize,
@@ -318,13 +322,28 @@ pub struct PackedMatmul {
 }
 
 impl PackedMatmul {
+    /// The kernel under the numerics every caller gets who does not ask for the
+    /// other, which is the reference — see [`Numerics`].
     pub fn new(device: &Device) -> Result<Self, MetalError> {
         Self::from_source(device, &source())
+    }
+
+    /// The same, under numerics the caller chose.
+    ///
+    /// **One place holds the default**, which is [`PackedMatmul::tiling`]
+    /// below, so that "reference unless asked" is a fact about one line rather
+    /// than a convention twenty-eight call sites keep.
+    pub fn under(device: &Device, numerics: Numerics) -> Result<Self, MetalError> {
+        Self::compiled(device, &source(), ROWS_A_TILE, COLS_A_TILE, numerics)
     }
 
     /// [`PackedMatmul::new`] out of a source string of the caller's own, which
     /// is how a test puts a deliberately wrong kernel through the same plumbing
     /// as the right one and measures the difference.
+    ///
+    /// **Under the reference, which is what a mutant is for.** Every arm this
+    /// module compiles is held against the shipped kernel's own bits, and there
+    /// is nothing to hold a mutant against on the other side of the flag.
     pub(crate) fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
         Self::tiling(device, source, ROWS_A_TILE, COLS_A_TILE)
     }
@@ -343,6 +362,24 @@ impl PackedMatmul {
         rows_a_tile: usize,
         cols_a_tile: usize,
     ) -> Result<Self, MetalError> {
+        Self::compiled(
+            device,
+            source,
+            rows_a_tile,
+            cols_a_tile,
+            Numerics::default(),
+        )
+    }
+
+    /// The whole of it, which is [`PackedMatmul::tiling`] and the one thing that
+    /// is not a property of the source string.
+    fn compiled(
+        device: &Device,
+        source: &str,
+        rows_a_tile: usize,
+        cols_a_tile: usize,
+        numerics: Numerics,
+    ) -> Result<Self, MetalError> {
         for declares in [
             format!("constant uint ROWS_A_TILE = {rows_a_tile};"),
             format!("constant uint COLS_A_TILE = {cols_a_tile};"),
@@ -357,9 +394,18 @@ impl PackedMatmul {
             kernel: device.compile(source, ENTRY)?,
             tiled: device.compile(source, TILED_ENTRY)?,
             grouped: device.compile(source, GROUPED_ENTRY)?,
+            numerics,
             rows_a_tile,
             cols_a_tile,
         })
+    }
+
+    /// Which arithmetic this one accumulates with.
+    ///
+    /// Read back rather than only obeyed, because the first thing a report about
+    /// a wrong token has to say is which of the two produced it.
+    pub fn numerics(&self) -> Numerics {
+        self.numerics
     }
 
     /// The entry a call goes through and the simdgroups it takes to cover
@@ -2273,6 +2319,65 @@ kernel void decoded_elements(
                 bit_patterns(&tiled),
                 "{what}: a tile"
             );
+        }
+    }
+
+    /// **Both numerics answer the same call, and the flag reaches the kernel
+    /// that ran it.**
+    ///
+    /// The two entries this flag selects between are the tiled ones, so the case
+    /// is taken through both of the shapes that reach them — an untiled
+    /// projection, which no flag touches, and a tiled call over a bank, which is
+    /// where a kernel behind the flag would run.
+    ///
+    /// **Bounded and not bit-for-bit, deliberately.** That is the whole content
+    /// of the flag: a production kernel accumulates in an order the instruction
+    /// picks, so equality of bits is exactly what cannot be asserted across it.
+    /// What can be asserted is that both are summing the same exact products —
+    /// nothing either path forms is rounded — so the two may only differ by what
+    /// summation order is worth, which is the bound [`TOLERANCE`] already holds
+    /// this module's kernel to against the CPU.
+    ///
+    /// **As this lands the two are the same three kernels and the deviation is
+    /// zero.** That is not what the case asserts and it is not what it is for:
+    /// what it pins is the plumbing — that `under` carries the word to the
+    /// struct, that the default constructor is the reference, and that a call
+    /// dispatched under either answers the same thing — and it is the commit
+    /// that puts a kernel behind the flag that makes it bite.
+    #[test]
+    fn a_call_under_either_numerics_answers_what_the_other_answers() {
+        let Some(device) = device() else { return };
+        let compiled =
+            |numerics| PackedMatmul::under(&device, numerics).expect("the packed matmul compiles");
+        let (reference, production) = (
+            compiled(Numerics::Reference),
+            compiled(Numerics::Production),
+        );
+        assert_eq!(reference.numerics(), Numerics::Reference);
+        assert_eq!(production.numerics(), Numerics::Production);
+        assert_eq!(
+            matmul(&device).numerics(),
+            Numerics::Reference,
+            "the constructor nobody passes a word to is the reference one"
+        );
+
+        let case = Case::noisy(IN_DIM, OUT_DIM, 3);
+        let untiled = |matmul: &PackedMatmul| {
+            case.upload(&device, matmul)
+                .multiply(&case.x)
+                .expect("the dispatch completes")
+        };
+        for (what, was, is) in [
+            ("a projection", untiled(&reference), untiled(&production)),
+            (
+                "a tile",
+                a_tiled_call_answers(&device, &reference),
+                a_tiled_call_answers(&device, &production),
+            ),
+        ] {
+            let deviation = deviation(&is, &was);
+            eprintln!("{what}: the two numerics deviate {deviation:e}");
+            assert!(deviation <= TOLERANCE, "{what}: deviation {deviation:e}");
         }
     }
 

@@ -74,7 +74,7 @@ pub fn run(args: &Generate) -> Result<()> {
 
     // Before the checkpoint is mapped, so that a backend this machine cannot
     // give ends the command in a millisecond rather than after a 130 GiB load.
-    let gpu = backend::open(args.backend)?;
+    let gpu = backend::open(args.backend, args.numerics)?;
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let weights = backend::weights(
         gpu.as_ref(),

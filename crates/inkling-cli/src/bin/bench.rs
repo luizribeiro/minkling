@@ -46,6 +46,7 @@ use inkling_core::workload::{BEST, DECODED, REALISTIC, STRUCTURED_PROMPT, SWEPT,
 use inkling_core::{
     Checkpoint, CheckpointWeights, Ending, ModelCache, TextConfig, Tokenizer, profile,
 };
+use inkling_metal::Numerics;
 
 /// How long a prefill's prompt is, when nobody says. The middle of the three
 /// lengths this repo quotes.
@@ -56,10 +57,10 @@ const PREFILLED: usize = 385;
 const PAIRS: usize = 7;
 
 const USAGE: &str = "usage:\n  \
-    bench decode  <checkpoint> [--tokens <n>] [--context <n>]\n  \
-    bench prefill <checkpoint> [--tokens <n>]\n  \
-    bench sweep   <checkpoint> [--tokens <n>] [--depth <k>]\n  \
-    bench engines <checkpoint> [--depth <k>]\n  \
+    bench decode  <checkpoint> [--tokens <n>] [--context <n>] [--numerics <which>]\n  \
+    bench prefill <checkpoint> [--tokens <n>] [--numerics <which>]\n  \
+    bench sweep   <checkpoint> [--tokens <n>] [--depth <k>] [--numerics <which>]\n  \
+    bench engines <checkpoint> [--depth <k>] [--numerics <which>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
 
@@ -158,6 +159,13 @@ enum Job {
         /// at before there was a flag for it.
         context: usize,
         depth: usize,
+        /// Which arithmetic this arm's innermost accumulation uses.
+        ///
+        /// **This is what makes the two numerics pairable with one build.** An
+        /// arm is a command line, so the thing that differs between them can be
+        /// a word rather than an executable — the same shape `bench-weights`
+        /// puts two checkpoints through.
+        numerics: Numerics,
     },
     /// The harness: two commands that already exist, run against each other.
     Alternate {
@@ -198,6 +206,10 @@ impl Job {
         let mut checkpoints = Vec::new();
         let mut tokens = None;
         let mut context = None;
+        // An `Option` for the reason `context` above is one: the refusal below
+        // is about whether the word was *given*, and a plain `Numerics` would
+        // let `--numerics reference` through by being equal to the default.
+        let mut numerics = None;
         // A sweep runs every depth up to its own, where a cross-engine table
         // quotes one beside `k = 0` — so the default depth is what the flag
         // means to the measurement asking for it.
@@ -210,6 +222,7 @@ impl Job {
                 "--tokens" | "-n" => tokens = Some(count(&arg, &mut args)?),
                 "--context" | "-c" => context = Some(count(&arg, &mut args)?),
                 "--depth" | "-k" => depth = count(&arg, &mut args)?,
+                "--numerics" => numerics = Some(which(&arg, &mut args)?),
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
                 _ => checkpoints.push(PathBuf::from(arg)),
             }
@@ -220,6 +233,12 @@ impl Job {
             })?;
             if context.is_some() {
                 bail!("guesses takes no --context: it asks both chains the same rounds");
+            }
+            // The heads are the arms of this one and the numerics are shared by
+            // both of them, so a word naming one of the two would be a word this
+            // measurement dropped.
+            if numerics.is_some() {
+                bail!("guesses takes no --numerics: its two arms are two sets of heads");
             }
             return Ok(Self::Guesses {
                 checkpoints: [a, b],
@@ -263,6 +282,7 @@ impl Job {
             }),
             context: context.unwrap_or(0),
             depth,
+            numerics: numerics.unwrap_or_default(),
         })
     }
 
@@ -305,8 +325,9 @@ impl Job {
                 tokens,
                 context,
                 depth,
+                numerics,
             } => {
-                for reading in measure(*what, checkpoint, *tokens, *context, *depth)? {
+                for reading in measure(*what, checkpoint, *tokens, *context, *depth, *numerics)? {
                     println!("{}", reading.line());
                 }
                 Ok(())
@@ -324,6 +345,15 @@ impl Job {
             }
         }
     }
+}
+
+/// Which numerics a word names.
+fn which(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<Numerics> {
+    let name = args
+        .next()
+        .with_context(|| format!("{flag} takes a value"))?;
+    Numerics::parse(&name)
+        .with_context(|| format!("{name} is not numerics, which is reference or production"))
 }
 
 /// A count of at least one, which every number this takes is: no measurement is
@@ -455,6 +485,7 @@ fn measure(
     tokens: usize,
     context: usize,
     depth: usize,
+    numerics: Numerics,
 ) -> Result<Vec<Reading>> {
     let config = config::of_checkpoint(dir)?;
     let text = &config.text_config;
@@ -465,7 +496,7 @@ fn measure(
         .map(|id| id as usize)
         .collect();
 
-    let gpu = backend::open(Backend::Metal)?;
+    let gpu = backend::open(Backend::Metal, numerics)?;
     let ckpt = Checkpoint::open(dir)?;
 
     // Which depths this wants weights wrapped at: a sweep every one up to its
@@ -736,7 +767,7 @@ fn guesses(dirs: &[PathBuf; 2], tokens: usize, depth: usize) -> Result<Vec<Readi
         .map(|id| id as usize)
         .collect();
 
-    let gpu = backend::open(Backend::Metal)?;
+    let gpu = backend::open(Backend::Metal, Numerics::default())?;
     let stack = Checkpoint::open(&dirs[0])?;
     let beside = Checkpoint::open(&dirs[1])?;
     let weights = backend::weights(gpu.as_ref(), &stack, text, depth)?;
@@ -1103,6 +1134,7 @@ mod tests {
                 tokens: DECODED,
                 context: 0,
                 depth: SWEPT,
+                numerics: Numerics::default(),
             }
         );
         assert_eq!(
@@ -1113,6 +1145,7 @@ mod tests {
                 tokens: PREFILLED,
                 context: 0,
                 depth: SWEPT,
+                numerics: Numerics::default(),
             }
         );
     }
@@ -1131,6 +1164,7 @@ mod tests {
                 tokens: DECODED,
                 context: 0,
                 depth: BEST,
+                numerics: Numerics::default(),
             }
         );
         assert_ne!(BEST, SWEPT);
@@ -1138,6 +1172,59 @@ mod tests {
         assert!(
             Job::parse(["engines", "models/small", "--tokens", "769"].map(str::to_string)).is_err()
         );
+    }
+
+    /// **The numerics are an arm's own word and every measurement takes it**,
+    /// which is what makes the two paths pairable out of one build: an arm is a
+    /// command line, so `--numerics reference` against `--numerics production`
+    /// is the same arrangement `bench-weights` puts two checkpoints through.
+    #[test]
+    fn every_measurement_takes_the_numerics_its_arm_runs_under() {
+        for what in ["decode", "prefill", "sweep", "engines"] {
+            let job =
+                Job::parse([what, "models/small", "--numerics", "production"].map(str::to_string))
+                    .unwrap_or_else(|err| panic!("{what} takes numerics: {err:#}"));
+            assert!(
+                matches!(
+                    job,
+                    Job::Measure {
+                        numerics: Numerics::Production,
+                        ..
+                    }
+                ),
+                "{what} dropped the word"
+            );
+        }
+    }
+
+    /// And a measurement nobody said anything to runs the reference, which is
+    /// what makes an older arm — one built before this flag existed — comparable
+    /// to a new one asked for nothing.
+    #[test]
+    fn a_measurement_that_names_no_numerics_runs_the_reference() {
+        assert!(matches!(
+            Job::parse(["decode".to_string(), "models/small".to_string()]).expect("parses"),
+            Job::Measure {
+                numerics: Numerics::Reference,
+                ..
+            }
+        ));
+    }
+
+    /// The same refusal on `guesses`, and **about whether the word was given
+    /// rather than about which of the two it named** — a check against the
+    /// default would let `--numerics reference` through for being equal to it.
+    #[test]
+    fn the_heads_measurement_takes_no_numerics_under_either_word() {
+        for name in ["reference", "production"] {
+            assert!(
+                Job::parse(
+                    ["guesses", "models/a", "models/b", "--numerics", name].map(str::to_string)
+                )
+                .is_err(),
+                "{name} was taken by a measurement whose arms are two sets of heads"
+            );
+        }
     }
 
     /// **A context of zero is the prompt and any other is the prompt tiled to
@@ -1174,6 +1261,7 @@ mod tests {
                 tokens: DECODED,
                 context: 8192,
                 depth: SWEPT,
+                numerics: Numerics::default(),
             }
         );
         for what in ["prefill", "sweep", "engines"] {

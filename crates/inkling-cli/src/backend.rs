@@ -39,7 +39,7 @@ use inkling_core::mtp::{CheckpointHeads, FRONTIER};
 use inkling_core::{Checkpoint, CheckpointWeights, Config, TextConfig};
 use inkling_metal::{
     DenseMatmul, Device, ExpertGrouping, ExpertKernels, LayerKernels, ModelHeads, ModelLayers,
-    ModelTail, MoeCombine, PackedProjection, Router, RouterWeights, StackShape, SwiGlu,
+    ModelTail, MoeCombine, Numerics, PackedProjection, Router, RouterWeights, StackShape, SwiGlu,
     TailWeights,
 };
 
@@ -73,9 +73,10 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    fn open() -> Result<Self> {
+    fn open(numerics: Numerics) -> Result<Self> {
         let device = Device::open().context("opening a Metal device")?;
-        let kernels = LayerKernels::compile(&device).context("compiling a layer's kernels")?;
+        let kernels =
+            LayerKernels::compiling(&device, numerics).context("compiling a layer's kernels")?;
         let dense = DenseMatmul::new(&device).context("compiling the dense matmul")?;
         let swiglu = SwiGlu::new(&device).context("compiling the swiglu")?;
         let router = Router::new(&device).context("compiling the router")?;
@@ -92,6 +93,12 @@ impl Gpu {
             weights,
             combine,
         })
+    }
+
+    /// Which arithmetic this device's innermost accumulation uses, read back off
+    /// the kernel that was compiled rather than off the flag that asked for it.
+    pub fn numerics(&self) -> Numerics {
+        self.kernels.matmul().numerics()
     }
 
     /// The model's final norm, muP divide and `lm_head`, wrapped for whoever
@@ -132,10 +139,10 @@ impl Gpu {
 /// Separate from [`weights`] because of what has to outlive what: the uploaded
 /// projection borrows the device and the kernel, so they are opened by the
 /// caller and live in its scope, above the weights that point at them.
-pub fn open(backend: Backend) -> Result<Option<Gpu>> {
+pub fn open(backend: Backend, numerics: Numerics) -> Result<Option<Gpu>> {
     match backend {
         Backend::Cpu => Ok(None),
-        Backend::Metal => Gpu::open().map(Some),
+        Backend::Metal => Gpu::open(numerics).map(Some),
     }
 }
 
@@ -193,10 +200,15 @@ pub fn weights<'a>(
         },
     )
     .context("giving the model's layers to the Metal device")?;
+    // The numerics are said here rather than only obeyed, for the reason the
+    // backend itself is: the first thing a report about a wrong token has to say
+    // is which path produced it, and a line a run prints is a line that can be
+    // pasted into one.
     eprintln!(
-        "{:<LABEL$}metal, {rows} rows of lm_head and all {} layers — {} MoE banks, {} dense \
-         feed-forward networks — wrapped in {:.2?}",
+        "{:<LABEL$}metal, {} numerics, {rows} rows of lm_head and all {} layers — {} MoE banks, \
+         {} dense feed-forward networks — wrapped in {:.2?}",
         "backend",
+        gpu.numerics().named(),
         layers.layers(),
         layers.expert_layers(),
         layers.dense_layers(),

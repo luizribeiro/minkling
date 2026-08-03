@@ -175,6 +175,32 @@ bench-engines *args:
         "$bin" "$root/reference/scripts/bench_engines" \
         -- engines {{ args }} "{{ absolute_path(checkpoint) }}"
 
+# The two numerics against each other in one sitting, out of one build:
+#
+#   just bench-numerics prefill --tokens 2048
+#   just bench-numerics decode  --context 8192
+#
+# **The arm is a word rather than an executable.** Nothing about the production
+# path is a different commit — it is the same binary asked for a different
+# accumulation — so what differs between the two command lines is `--numerics`
+# and nothing else, which is the shape `bench-weights` puts two checkpoints
+# through. Same alternation, same report, one build.
+bench-numerics *measurement:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    cargo build --quiet --bin bench
+    bin="$root/target/bench/bin/working-tree"
+    mkdir -p "$(dirname "$bin")"
+    # Copied out rather than run in place, for the reason `bench-weights` gives:
+    # the next `cargo build` would otherwise swap the binary under a sitting that
+    # is still running.
+    cp "$root/target/debug/bench" "$bin"
+    "$root/target/debug/bench" alternate --pairs {{ pairs }} \
+        "$bin --numerics reference {{ absolute_path(checkpoint) }}" \
+        "$bin --numerics production {{ absolute_path(checkpoint) }}" \
+        -- {{ measurement }}
+
 # What two sets of MTP heads guess, held against each other over one generation.
 #
 # The gate a change to the heads has to pass before any timing claim, and it is
