@@ -1,0 +1,1 @@
+<|message_user|><|content_text|>Count from 1 to 30. Put each on its own line in exactly the form 'Line N: N squared is M'. No commentary.<|end_message|><|message_model|>

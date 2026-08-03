@@ -18,12 +18,36 @@
 /// acceptance study measured six regimes and found the spread between them
 /// larger than the spread between depths, so what a figure taken here says is
 /// "on text like this" and nothing wider.
-pub const STRUCTURED_PROMPT: &str = "<|message_user|><|content_text|>Count from 1 to 30. Put each on its own line in exactly \
-     the form 'Line N: N squared is M'. No commentary.<|end_message|><|message_model|>";
+///
+/// **It is a file rather than a literal because the other engine reads it too.**
+/// A cross-engine sitting is only a comparison of engines if both were given the
+/// same tokens, and `reference/scripts/bench_engines.py` reads these same bytes
+/// — where a copy on each side is a copy that can drift in one. The trailing
+/// newline `end-of-file-fixer` insists on is not part of the prompt.
+pub const STRUCTURED_PROMPT: &str = include_str!("workload.txt").trim_ascii_end();
+
+/// The (prompt, generated) pairs a cross-engine sitting is taken over.
+///
+/// **This is the number a user feels**, and prefill and decode trade against
+/// each other inside it: a long prompt is where this engine loses and a long
+/// generation is where it wins. So the pairs are chosen to straddle that — the
+/// three prompt lengths this repo quotes at one generation length, and the
+/// shortest prompt again at four times the generation.
+pub const REALISTIC: [(usize, usize); 4] = [(97, 128), (385, 128), (769, 128), (97, 512)];
 
 /// How many tokens a decode figure is the mean of, and how many each depth of a
 /// sweep decodes.
 pub const DECODED: usize = 64;
+
+/// The speculation depth this repo's own sweep says pays best, and so the depth
+/// a cross-engine table quotes beside `k = 0`.
+///
+/// Measured rather than derived — see the sweep under "Sampling on the device" —
+/// so a sitting that moves it moves this. **And moving it means moving
+/// `reference/scripts/bench_engines.py`'s own default with it**, since the two
+/// arms of a cross-engine sitting name their rows after their own depth and the
+/// harness refuses arms whose rows do not line up.
+pub const BEST: usize = 2;
 
 /// How deep a sweep of real generations goes.
 ///
@@ -64,17 +88,43 @@ mod tests {
         assert!(tiled(&[], 8).is_empty());
     }
 
-    /// The prompt is written across three source lines and is one line of text.
-    /// A continuation whose backslash went missing, or whose indentation landed
-    /// inside the string, would tokenize differently and quietly move every
-    /// acceptance figure this repo has.
+    /// The prompt is a file, and a file is edited by tools that do not know what
+    /// is in it: `end-of-file-fixer` appends a newline and
+    /// `trim-trailing-whitespace` takes spaces off a line. A prompt that gained
+    /// either would tokenize differently and quietly move every acceptance
+    /// figure this repo has.
     #[test]
-    fn the_prompt_carries_no_whitespace_from_the_source_it_is_written_in() {
+    fn the_prompt_carries_no_whitespace_from_the_file_it_is_held_in() {
         assert!(!STRUCTURED_PROMPT.contains('\n'), "{STRUCTURED_PROMPT}");
         assert!(!STRUCTURED_PROMPT.contains("  "), "{STRUCTURED_PROMPT}");
+        assert!(
+            STRUCTURED_PROMPT.starts_with("<|message_user|><|content_text|>Count from 1 to 30."),
+            "{STRUCTURED_PROMPT}"
+        );
         assert!(
             STRUCTURED_PROMPT.ends_with("No commentary.<|end_message|><|message_model|>"),
             "{STRUCTURED_PROMPT}"
         );
+    }
+
+    /// A cross-engine sitting says where prefill and decode cross over, and it
+    /// can only say it from pairs that fall either side: one prompt length at
+    /// two generation lengths says what a longer generation buys, and three
+    /// prompt lengths at one says what a longer prompt costs.
+    #[test]
+    fn the_realistic_pairs_vary_each_half_against_a_fixed_other() {
+        let generated: Vec<usize> = REALISTIC
+            .iter()
+            .filter(|(prompt, _)| *prompt == 97)
+            .map(|(_, generated)| *generated)
+            .collect();
+        assert!(generated.len() > 1, "{REALISTIC:?}");
+
+        let prompts: Vec<usize> = REALISTIC
+            .iter()
+            .filter(|(_, generated)| *generated == 128)
+            .map(|(prompt, _)| *prompt)
+            .collect();
+        assert_eq!(prompts, [97, 385, 769]);
     }
 }
