@@ -2769,11 +2769,16 @@ entry as well, which is about 1366 tokens.
 Two free-running generations that part at step 12 have nothing comparable after
 step 12, because each is continuing a different sentence by then.
 
-**And the whole gated tier passes under the production numerics**: 619 cases,
-44 skipped, `INKLINGRS_NUMERICS=production cargo nextest run`. The recorded
-continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]` comes back off the
-device under either word, at the same 19.55 ms a token and the same 0.24 GiB peak
-resident set; `the_bounded_loop_is_the_unbounded_one_bit_for_bit`,
+**And the gated tier passes under the production numerics**: 619 cases, 44
+skipped, `INKLINGRS_NUMERICS=production cargo nextest run`. **What that variable
+reaches is worth stating exactly**, because the run passing is weaker than it
+sounds: it is read by `real_checkpoint.rs`'s own device harness, so the cases
+that stand a stack up on the GPU run the production entries, and the ones that
+drive the binary as a subprocess do not — those spawn it without `--numerics` and
+get the reference, the way any caller does. The recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` is in the first group: it comes
+back off the device under either word, at the same 19.55 ms a token and the same
+0.24 GiB peak resident set; `the_bounded_loop_is_the_unbounded_one_bit_for_bit`,
 `a_query_row_walks_the_keys_its_window_and_its_position_leave_it` and
 `a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` pass
 unrelaxed. Acceptance is **84.8% / 87.0-78.3% / 85-65-55% / 82.4-64.7-52.9-47.1%**
