@@ -95,21 +95,77 @@ const MOST_SIMDGROUPS: usize = 32;
 /// weighted sum beside it. Inkling's `head_dim` is 128.
 const MOST_CHANNELS: usize = 256;
 
-/// Floats of a tile's values a threadgroup stages before it weights them, which
-/// with the four arrays beside it is 19 KB of the 32 KB an Apple GPU allows.
+/// Floats of a tile's values one pass of the weighting walks, which is what
+/// bounds the tile: a tile is the smaller of what the simdgroups can score and
+/// what this allows, so a head wider than 128 channels walks fewer keys a tile
+/// rather than more floats.
 ///
-/// **This is the whole of what makes the weighting affordable.** A thread that
-/// carries one channel across a tile reads that channel of each value in turn,
-/// and those reads are `head_dim` floats apart and each waits for the last: a
-/// dependent chain as long as the tile, at a memory latency apiece. Staged
-/// first, the same values arrive as one cooperative copy that every thread has
-/// several independent loads in — 726 µs of device time for one query over 1200
-/// keys before the staging and 458 µs after, on the same dispatch.
+/// **It is a bound on the tiling and not on any array**, which is what lets the
+/// two entries below declare different memory and still walk the same keys in
+/// the same tiles. Both are compiled from this one number, so a tile is the 32
+/// keys eight simdgroups score whichever entry a call lands on, and the claim
+/// that the two agree bit for bit rests on that.
+const TILED_VALUES: usize = 4096;
+
+/// Floats of a tile's values a threadgroup stages before it weights them, on the
+/// entry a split call runs.
 ///
-/// It also bounds the tile: a tile is the smaller of what the simdgroups can
-/// score and what this can hold, so a head wider than 128 channels stages fewer
-/// keys rather than overrunning.
-const STAGED_VALUES: usize = 4096;
+/// **This is what makes the weighting affordable at a decode step's shape.** A
+/// thread that carries one channel across a tile reads that channel of each
+/// value in turn, and those reads are `head_dim` floats apart and each waits for
+/// the last: a dependent chain as long as the tile, at a memory latency apiece.
+/// Staged first, the same values arrive as one cooperative copy that every
+/// thread has several independent loads in — 726 µs of device time for one query
+/// over 1200 keys before the staging and 458 after, on the same dispatch.
+const STAGED_BY_A_SPLIT_CALL: usize = TILED_VALUES;
+
+/// **A threadgroup that stages copies a whole tile whatever it declared**, so an
+/// entry that stages has to be able to hold one: the copy is bounded by the keys
+/// the tile holds and not by the array, and a smaller array would be a walk
+/// writing past its own memory rather than a smaller staging.
+const _: () = assert!(STAGED_BY_A_SPLIT_CALL >= TILED_VALUES);
+
+/// What the other entry stages, which is nothing: one float, so that the array
+/// is legal to declare and every use of it folds away.
+///
+/// A threadgroup that stages a tile declares 19 KiB and a core holds four of
+/// them, which is two steps past this walk's own occupancy turn. What the entry
+/// an unsplit call runs declares instead is [`RESIDENCY`].
+const STAGED_BY_AN_UNSPLIT_CALL: usize = 1;
+
+/// Floats of threadgroup memory the entry that stages nothing declares and never
+/// reads for anything, which is what puts an unsplit call on the fast side of
+/// its occupancy turn.
+///
+/// **This is a residency control and not a buffer, and it is load-bearing.** A
+/// threadgroup's four live arrays are 3 KiB; a core holds as many threadgroups
+/// as their declared memory divides into its own 80 KiB, and
+/// [`how_many_threadgroups_of_a_prefills_attention_a_core_holds`] measures this
+/// walk fastest at six of them — 71.11 ms against the staged entry's 92.63 on
+/// the same 2048-token dispatch, and 61% worse again at seven. So the memory
+/// nothing reads is what keeps the seventh threadgroup off the core.
+///
+/// **It has to be memory nobody reads rather than a smaller staging, and that
+/// is measured rather than assumed.** A threadgroup that stages *any* of a tile
+/// is 116 ms at this declaration where one that stages none is 71 — two keys of
+/// the tile costs as much as nineteen — while at the five-threadgroup
+/// declaration above it the two agree to 2%. So what the left arm of the curve
+/// punishes is the staging and not the memory, and an entry that wants six
+/// threadgroups a core cannot bring a value in early at all. Why is not settled
+/// here; that it is so is four rows of the sweep.
+///
+/// **Sized to the middle of its plateau rather than to its edge.** Six
+/// threadgroups a core is every declaration in (11.43, 13.33] KiB, measured to
+/// the quarter-kibibyte: 11.25 KiB is seven of them at 114.33 ms where 11.5 KiB
+/// is six at 71.11, and 13.25 KiB is six at 71.21 where 13.5 KiB is five at
+/// 76.73. This is 12.5 KiB declared, which leaves about a kibibyte of margin on
+/// each side.
+const RESIDENCY: usize = 2432;
+
+/// What the entry that stages a tile declares of it instead, which is nothing:
+/// the staging is already past the turn and a second array would only be more
+/// of what put it there.
+const NO_RESIDENCY: usize = 1;
 
 /// Relative features one query may carry, which bounds the staged `r_proj` row.
 /// Inkling's `d_rel` is 16.
@@ -207,6 +263,15 @@ pub struct FusedAttention {
     /// are shaped differently — linear in the prompt at a windowed layer and
     /// quadratic at a global one — and a single row is a sum that says neither.
     windowed: Kernel,
+    /// The same two, compiled to stage a whole tile of values rather than the
+    /// part of one an unsplit call's residency leaves room for.
+    ///
+    /// **Two pipelines and one kernel**, the way the two above are two names for
+    /// one: the source is the same string with one constant in it, the walk is
+    /// the same walk over the same tiles, and the answers are the same bits —
+    /// which `a_split_call_stages_a_whole_tile_and_answers_the_same_bits` is
+    /// what says. They are charged to the same two rows for the same reason.
+    split: [Kernel; 2],
     /// The fold behind a split call, out of the same source string: the two
     /// entries share [`Shape`] and a mutation to one is a source a test has to
     /// be able to compile both out of.
@@ -215,26 +280,58 @@ pub struct FusedAttention {
 
 impl FusedAttention {
     pub fn new(device: &Device) -> Result<Self, MetalError> {
-        Self::from_source(device, &source())
+        Self::from_sources(
+            device,
+            &source(STAGED_BY_AN_UNSPLIT_CALL, RESIDENCY),
+            &source(STAGED_BY_A_SPLIT_CALL, NO_RESIDENCY),
+        )
     }
 
     /// [`FusedAttention::new`] out of a source string of the caller's own, which
     /// is how a test puts a deliberately wrong kernel through the same plumbing
     /// as the right one and measures the difference.
-    pub(crate) fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
-        let global = device.compile(source, ENTRY)?;
+    ///
+    /// **One string drives both regimes**, so that an arm holding a term out of
+    /// the kernel holds it out wherever the call lands rather than only where
+    /// the predicate happens to send it.
+    #[cfg(test)]
+    fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
+        Self::from_sources(device, source, source)
+    }
+
+    fn from_sources(device: &Device, unsplit: &str, split: &str) -> Result<Self, MetalError> {
+        let whole = device.compile(unsplit, ENTRY)?;
+        let cut = device.compile(split, ENTRY)?;
         Ok(Self {
-            windowed: global.under(WINDOWED),
-            global: global.under(GLOBAL),
-            combine: device.compile(source, COMBINE)?,
+            windowed: whole.under(WINDOWED),
+            global: whole.under(GLOBAL),
+            split: [cut.under(GLOBAL), cut.under(WINDOWED)],
+            combine: device.compile(split, COMBINE)?,
         })
     }
 
-    /// The entry as a layer of this window is charged for it.
-    fn on(&self, sliding: usize) -> &Kernel {
-        match sliding {
-            0 => &self.global,
-            _ => &self.windowed,
+    /// The entry as a layer of this window is charged for it, out of the pair
+    /// this many splits picks.
+    ///
+    /// **The predicate is the one this kernel already draws**, which is whether
+    /// the call was cut and not whether it is a prefill. [`splits_for`] leaves a
+    /// call whole where the grid already fills the machine, where the span has
+    /// too few tiles to cut, and where a cut would be too narrow to spread the
+    /// live keys — so an uncut call is every prompt worth the name, a
+    /// speculative block at a long context, and a decode step with 32 keys or
+    /// fewer behind it, and those take the residency the occupancy turn wants.
+    /// A cut call is a decode step at a context somebody has, and keeps the
+    /// kernel it has with its tile staged whole.
+    ///
+    /// **The two answer the same bits**, so what this decides is a rate and
+    /// never an answer — which is what lets the line be drawn on a number that
+    /// was chosen for something else.
+    fn on(&self, sliding: usize, splits: usize) -> &Kernel {
+        match (splits, sliding) {
+            (1, 0) => &self.global,
+            (1, _) => &self.windowed,
+            (_, 0) => &self.split[0],
+            (_, _) => &self.split[1],
         }
     }
 }
@@ -242,10 +339,10 @@ impl FusedAttention {
 /// Keys one tile of the walk holds, as this side has to work it out.
 ///
 /// The kernel takes the same minimum of what its simdgroups can score and what
-/// its threadgroup memory can stage; here the first half is a floor rather than
-/// the device's own width, for the reason [`NARROWEST_SIMD`] gives.
+/// [`TILED_VALUES`] allows; here the first half is a floor rather than the
+/// device's own width, for the reason [`NARROWEST_SIMD`] gives.
 fn tile_keys(head_dim: usize) -> usize {
-    (THREADS_PER_GROUP / NARROWEST_SIMD * KEYS_PER_SIMD).min(STAGED_VALUES / head_dim)
+    (THREADS_PER_GROUP / NARROWEST_SIMD * KEYS_PER_SIMD).min(TILED_VALUES / head_dim)
 }
 
 /// Keys the query at `position` walks, which is the kernel's own `[reach, last)`
@@ -899,7 +996,7 @@ impl<'a> LayerAttention<'a> {
                 + step.keys.min(self.rel_extent) * self.config.d_rel
                 + queries);
         batch.add(
-            self.attention.on(self.config.sliding),
+            self.attention.on(self.config.sliding, splits),
             &[
                 shape.arg(),
                 step.q.arg(),
@@ -1024,14 +1121,16 @@ fn by_distance(proj: &[f32], d_rel: usize, rel_extent: usize) -> Vec<f32> {
 /// the reference rather than about this kernel — the CPU path emits it and the
 /// committed masks hold the bfloat16 rounding of it, and a second spelling here
 /// is one that can drift from the module that owns it.
-fn source() -> String {
+fn source(staged: usize, residency: usize) -> String {
     format!(
         "constant uint MOST_SIMDGROUPS = {MOST_SIMDGROUPS};\n\
          constant uint MOST_CHANNELS = {MOST_CHANNELS};\n\
          constant uint MOST_FEATURES = {MOST_FEATURES};\n\
          constant uint MOST_SPLITS = {MOST_SPLITS};\n\
          constant uint KEYS_PER_SIMD = {KEYS_PER_SIMD};\n\
-         constant uint STAGED_VALUES = {STAGED_VALUES};\n\
+         constant uint TILED_VALUES = {TILED_VALUES};\n\
+         constant uint STAGED_VALUES = {staged};\n\
+         constant uint RESIDENCY = {residency};\n\
          constant float MASKED = {MASKED:e}f;\n{BODY}"
     )
 }
@@ -1120,9 +1219,10 @@ inline float banded_entry(
 ///   the band's entry, which it derives rather than reads.
 /// - **Weight.** A thread to a channel: the tile's exponents are formed once in
 ///   threadgroup memory, and each thread carries its own channel's weighted sum
-///   across every tile. The values themselves are staged first, by the whole
-///   threadgroup and in the order they lie, so that what a thread then walks is
-///   threadgroup memory rather than a chain of `head_dim`-spaced device reads.
+///   across every tile. As many of the tile's values as `STAGED_VALUES` allows
+///   are brought in first, by the whole threadgroup and in the order they lie,
+///   so that what a thread then walks is threadgroup memory rather than a chain
+///   of `head_dim`-spaced device reads; the rest are read where they lie.
 ///
 /// The running peak and total are every thread's rather than one thread's and
 /// broadcast: each reduces the same tile out of the same threadgroup memory, and
@@ -1149,7 +1249,15 @@ kernel void fused_attention(
     threadgroup float weighted[MOST_CHANNELS];
     threadgroup float features[MOST_FEATURES];
     threadgroup float scores[MOST_SIMDGROUPS * KEYS_PER_SIMD];
+
+    // **One of these two is a tile of values and the other is a declaration,
+    // and which is which is the whole of what separates the two entries.** Both
+    // sizes are compile-time constants, so the entry that stages nothing folds
+    // every line below that mentions `staged` away and the entry that stages a
+    // tile folds away every line that mentions `residency`.
     threadgroup float staged[STAGED_VALUES];
+    threadgroup float residency[RESIDENCY];
+    const bool stages = STAGED_VALUES > 1u;
 
     // A threadgroup is one split of one query of one head, split-minor — so the
     // splits of a pair are consecutive threadgroups, which is the order they are
@@ -1186,9 +1294,20 @@ kernel void fused_attention(
     device const float *values_of = v + (ulong)kv * shape.key_stride * shape.head_dim;
     device const float *rel_row = rel + ((ulong)i * shape.heads + head) * shape.d_rel;
 
+    // The residency is read for the zero it was filled with, and by the thread
+    // that filled it, so nothing here needs a barrier. **What says the array
+    // survived the compiler is not this loop** — a store of a constant followed
+    // by a load of it is what a forwarding pass exists to remove — but
+    // `an_unsplit_call_gets_the_entry_its_occupancy_turn_rests_on`, which reads
+    // the bytes the pipeline reports.
+    if (!stages) {
+        for (uint at = local; at < MOST_CHANNELS; at += threads) {
+            residency[at] = 0.0f;
+        }
+    }
     for (uint d = local; d < shape.head_dim; d += threads) {
         query[d] = q_row[d];
-        weighted[d] = 0.0f;
+        weighted[d] = stages ? 0.0f : residency[d];
     }
     for (uint c = local; c < shape.d_rel; c += threads) {
         features[c] = rel_row[c];
@@ -1196,7 +1315,10 @@ kernel void fused_attention(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const int position = (int)(i + shape.q_offset);
-    const uint tile = min(simds * KEYS_PER_SIMD, STAGED_VALUES / shape.head_dim);
+    // **The tile does not move between the entries.** TILED_VALUES bounds it in
+    // both, so the two walk the same keys in the same tiles and differ in where
+    // a value is read from and in nothing else.
+    const uint tile = min(simds * KEYS_PER_SIMD, TILED_VALUES / shape.head_dim);
     float peak = -INFINITY;
     float total = 0.0f;
 
@@ -1249,11 +1371,14 @@ kernel void fused_attention(
     for (uint first = from; first < to; first += tile) {
         const uint held = min(tile, to - first);
 
+        device const float *tiled = values_of + (ulong)first * shape.head_dim;
+
         // The tile's values, brought in by the whole threadgroup in the order
         // they lie rather than by each thread down its own channel.
-        device const float *tiled = values_of + (ulong)first * shape.head_dim;
-        for (uint at = local; at < held * shape.head_dim; at += threads) {
-            staged[at] = tiled[at];
+        if (stages) {
+            for (uint at = local; at < held * shape.head_dim; at += threads) {
+                staged[at] = tiled[at];
+            }
         }
 
         for (uint n = 0; n < KEYS_PER_SIMD; ++n) {
@@ -1303,10 +1428,22 @@ kernel void fused_attention(
         }
         total = total * rescale + sum;
 
+        // **The same keys in the same order out of two memories**, which is what
+        // keeps the two entries bit-identical: a value is the same float
+        // whichever one it was read from, and each thread meets its tile's in
+        // the order it always met them. The walk is written twice rather than
+        // once around a choice because a threadgroup pointer and a device
+        // pointer are different types and nothing can name both.
         for (uint d = local; d < shape.head_dim; d += threads) {
             float acc = weighted[d] * rescale;
-            for (uint s = 0; s < held; ++s) {
-                acc += scores[s] * staged[s * shape.head_dim + d];
+            if (stages) {
+                for (uint s = 0; s < held; ++s) {
+                    acc += scores[s] * staged[s * shape.head_dim + d];
+                }
+            } else {
+                for (uint s = 0; s < held; ++s) {
+                    acc += scores[s] * tiled[s * shape.head_dim + d];
+                }
             }
             weighted[d] = acc;
         }
@@ -1436,6 +1573,17 @@ mod tests {
     /// pinned to, which is what puts the branches this kernel derives beside the
     /// tensor mlx-vlm wrote for them.
     const MASK_FIXTURE: &str = "mask.safetensors";
+
+    /// The kernel a call that fills the machine runs, which is the arm every
+    /// mutation here is cut from and the one both sweeps are taken over.
+    ///
+    /// The other entry is the same string with one constant in it and is
+    /// reached through [`staging_the_tiles_values`], which is what
+    /// `a_split_call_stages_a_whole_tile_and_answers_the_same_bits` holds
+    /// against this.
+    fn source() -> String {
+        super::source(STAGED_BY_AN_UNSPLIT_CALL, RESIDENCY)
+    }
 
     /// The kernel with its loop bound taken off, which scores every key of the
     /// span and lets the softmax discard the ones the band masks.
@@ -1707,6 +1855,17 @@ mod tests {
             self.wrapped(device, attention)
                 .forward(self.step())
                 .expect("the dispatch completes")
+        }
+
+        /// The same step with the number of splits pinned rather than left to
+        /// [`splits_for`], which is what a case comparing two kernels needs:
+        /// unsplit is what a prefill runs and a fold is what a decode step runs,
+        /// and holding the number fixed leaves the kernel as the only thing that
+        /// differs between two arms.
+        fn cut(&self, device: &Device, attention: &FusedAttention, splits: usize) -> Vec<f32> {
+            let layer = self.wrapped(device, attention);
+            layer.split_into(Some(splits));
+            layer.forward(self.step()).expect("the dispatch completes")
         }
 
         /// What the bandwidth column divides by, against what the kernel reads:
@@ -2258,6 +2417,131 @@ mod tests {
             cases.len()
         );
         assert!(skipped > 0, "no case here has a key the bound could skip");
+    }
+
+    /// **A value weighted where it lies is the value weighted out of threadgroup
+    /// memory, bit for bit**, which is what lets the two entries be two rates
+    /// and one answer.
+    ///
+    /// The claim is that a copy is a copy: a tile's values were brought into
+    /// threadgroup memory and read back out of it, and what the weighting
+    /// multiplies is the same float either way, met in the same order by the
+    /// same thread — one ascending run of keys, across two loops because a
+    /// threadgroup pointer and a device pointer are different types. Nothing
+    /// about the tiling moves with it: [`TILED_VALUES`] bounds the tile in both,
+    /// so a head of any width walks the keys a tile it walked.
+    ///
+    /// So this is `assert_eq!` on the bits rather than a tolerance, which is the
+    /// standard a change whose whole argument is that it changes nothing has to
+    /// be held to. `-0.0` and `0.0` compare equal as floats and are two
+    /// different answers.
+    ///
+    /// **Driven unsplit and through a fold**, because the two are different
+    /// paths out of the same walk and because the predicate sends each entry
+    /// down one of them: unsplit writes the row and a cut writes partials that a
+    /// second dispatch rescales onto one peak. Each arm is driven down both, so
+    /// what is compared is the staging rather than the path.
+    #[test]
+    fn a_value_weighted_where_it_lies_is_a_staged_one_bit_for_bit() {
+        let Some(device) = device() else { return };
+        let part = FusedAttention::from_source(&device, &source()).expect("the kernel compiles");
+        let whole = staging_the_tiles_values();
+        assert_ne!(whole, source(), "both entries stage the same values");
+        let tile = FusedAttention::from_source(&device, &whole).expect("the staged entry compiles");
+        assert!(
+            tile.global.threadgroup_memory() > part.global.threadgroup_memory(),
+            "staging a whole tile declares no more memory than staging part of one"
+        );
+
+        let mut cases = Case::synthetic();
+        cases.extend([
+            blocked(2048, 0, 2048),
+            blocked(2048, SLIDING_WINDOW, 2048),
+            blocked(600, SLIDING_WINDOW, 13),
+            blocked(97, 0, 97),
+            blocked(1200, 0, 1),
+            blocked(1200, SLIDING_WINDOW, 1),
+        ]);
+        cases.extend(
+            Case::all(ACTIVATIONS)
+                .expect("the committed capture")
+                .into_iter()
+                .map(|(case, _)| case),
+        );
+        cases.extend(
+            Case::all(LONG_ACTIVATIONS)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(case, _)| case),
+        );
+
+        let mut elements = 0;
+        for case in &cases {
+            for splits in [1, 8] {
+                let want = case.cut(&device, &tile, splits);
+                let got = case.cut(&device, &part, splits);
+                let apart = want
+                    .iter()
+                    .zip(&got)
+                    .position(|(want, got)| want.to_bits() != got.to_bits());
+                assert_eq!(
+                    apart,
+                    None,
+                    "{} in {splits}: reading a value where it lies answered {:?} where staging \
+                     it answered {:?}",
+                    case.name,
+                    apart.map(|at| got[at]),
+                    apart.map(|at| want[at]),
+                );
+                elements += want.len();
+            }
+        }
+        eprintln!(
+            "{} cases agree bit for bit over {elements} elements",
+            cases.len()
+        );
+    }
+
+    /// **The memory the turn rests on is memory a call gets**, which is the two
+    /// things about it this side can check without a clock: that an unsplit call
+    /// declares what leaves a core six threadgroups, and that the predicate
+    /// hands it the entry that does.
+    ///
+    /// The window is the sweep's own. Six threadgroups a core is every
+    /// declaration a core's 80 KiB divides into six times and not seven,
+    /// measured at 11.25 KiB against 11.5 and at 13.25 against 13.5 — so a
+    /// declaration inside it is on the plateau and one outside it is a step down
+    /// either side. A shipped figure at either edge would be a figure a
+    /// compiler's own rounding could move off the plateau.
+    #[test]
+    fn an_unsplit_call_gets_the_entry_its_occupancy_turn_rests_on() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let beside = size_of::<f32>()
+            * (2 * MOST_CHANNELS + MOST_FEATURES + MOST_SIMDGROUPS * KEYS_PER_SIMD);
+        // The one-float array each entry does not use is folded away, so what a
+        // pipeline reports is the four live arrays and whichever of the two the
+        // entry was compiled to hold.
+        for (splits, declared) in [
+            (1, RESIDENCY),
+            (8, STAGED_BY_A_SPLIT_CALL),
+            (64, STAGED_BY_A_SPLIT_CALL),
+        ] {
+            for sliding in [0, SLIDING_WINDOW] {
+                assert_eq!(
+                    attention.on(sliding, splits).threadgroup_memory(),
+                    beside + size_of::<f32>() * declared,
+                    "a call in {splits} at a window of {sliding} took the other entry"
+                );
+            }
+        }
+
+        let held = attention.on(0, 1).threadgroup_memory();
+        let (least, most) = (11 * 1024 + 512, 13 * 1024 + 256);
+        assert!(
+            (least..=most).contains(&held),
+            "{held} bytes is off the plateau six threadgroups a core sit on, {least}..={most}"
+        );
     }
 
     /// **And it is tight at both ends**, which the case above cannot say: a bound
@@ -3704,104 +3988,59 @@ mod tests {
         }
     }
 
-    /// The same walk with the tile's values read where they lie rather than
-    /// staged, which is the one thing that decides this kernel's threadgroup
-    /// memory: the four arrays beside `staged` are 3 KB and `staged` is 16.
+    /// The entry a split call runs: the same walk, staging a whole tile of
+    /// values rather than declaring memory nobody reads.
     ///
-    /// The tile is unpinned from the staging as it goes, so that what the arm
-    /// varies is the memory and not the number of keys a tile holds — the two
-    /// are one expression in the shipped kernel and would otherwise move
-    /// together.
-    fn reading_the_values_where_they_lie() -> String {
-        let narrowed = crate::testing::instead_of(
-            &source(),
-            &format!("constant uint STAGED_VALUES = {STAGED_VALUES};"),
-            "constant uint STAGED_VALUES = 4;",
-        );
-        let unpinned = crate::testing::instead_of(
-            &narrowed,
-            "min(simds * KEYS_PER_SIMD, STAGED_VALUES / shape.head_dim)",
-            "simds * KEYS_PER_SIMD",
-        );
-        let unstaged = crate::testing::instead_of(
-            &unpinned,
-            "        for (uint at = local; at < held * shape.head_dim; at += threads) {\n            staged[at] = tiled[at];\n        }\n",
-            "",
-        );
-        crate::testing::instead_of(
-            &unstaged,
-            "staged[s * shape.head_dim + d]",
-            "tiled[s * shape.head_dim + d]",
-        )
+    /// **What it stages is the one thing that decides how much memory the walk
+    /// declares**: the four live arrays are 3 KiB and a tile of values is 16,
+    /// which is two steps past the occupancy turn. The tile itself does not move
+    /// — [`TILED_VALUES`] bounds that in both entries — so what separates the
+    /// two is the memory and where a value is read from, and not the number of
+    /// keys a tile holds.
+    fn staging_the_tiles_values() -> String {
+        super::source(STAGED_BY_A_SPLIT_CALL, NO_RESIDENCY)
     }
 
-    /// The same source with a threadgroup array of `floats` nobody reads for
-    /// anything, which is how the occupancy knob is turned without moving
-    /// anything else.
+    /// **How many threadgroups of this kernel a core holds, what holding a
+    /// different number is worth, and which of the two things that decide it is
+    /// doing the work** — the occupancy term, turned by a knob at each end.
     ///
-    /// **It has to be written and read or the compiler drops it**, and whether
-    /// it did is checked rather than hoped for:
-    /// [`Kernel::threadgroup_memory`] is what the arm reports, so an array that
-    /// was optimised away shows up as a row that did not move.
+    /// A threadgroup here is one query row of one head, and its four live arrays
+    /// are 3 KiB of the 32 an Apple GPU allows a declaration. What else it
+    /// declares decides how many of it a core holds, so this sweeps that from
+    /// both sides: a walk that stages a tile and one that stages nothing and
+    /// declares the same bytes for nobody to read. Every arm walks the same keys
+    /// in the same tiles with the same instructions — [`TILED_VALUES`] bounds the
+    /// tile in all of them — which is what "changes nothing else" has to mean
+    /// for the rows to be readable against each other, and what
+    /// `a_value_weighted_where_it_lies_is_a_staged_one_bit_for_bit` holds to the
+    /// bits.
     ///
-    /// **What is touched is the same 256 floats at every size**, which is what
-    /// keeps this a knob on the memory rather than on the work: a fill over the
-    /// whole array would grow with it and the arm would price two things. The
-    /// fill and the read walk the same indices from the same threads, so no
-    /// barrier stands between them and the value read is the zero that was
-    /// already there.
-    fn with_ballast(source: &str, floats: usize) -> String {
-        assert!(floats >= MOST_CHANNELS, "the ballast covers a whole head");
-        let declared = crate::testing::instead_of(
-            source,
-            "    threadgroup float staged[STAGED_VALUES];",
-            &format!(
-                "    threadgroup float staged[STAGED_VALUES];\n\
-                 \x20   threadgroup float ballast[{floats}];\n\
-                 \x20   for (uint at = local; at < {MOST_CHANNELS}u; at += threads) {{\n\
-                 \x20       ballast[at] = 0.0f;\n\
-                 \x20   }}"
-            ),
-        );
-        crate::testing::instead_of(
-            &declared,
-            "weighted[d] = 0.0f;",
-            "weighted[d] = ballast[d];",
-        )
-    }
-
-    /// **How many threadgroups of this kernel a core can hold, and what holding
-    /// more of them would be worth** — the occupancy candidate, turned by a knob
-    /// that changes nothing else.
+    /// **The staged rows stop where a tile stops fitting**, which is what makes
+    /// them three rather than twelve: a threadgroup that stages copies a whole
+    /// tile whatever it declared, so an arm below [`TILED_VALUES`] would be a
+    /// walk writing past its own array rather than a smaller staging. The
+    /// declaration is what this sweeps and the staging is what it cannot.
     ///
-    /// A threadgroup here is one query row of one head, and it declares 19 KB of
-    /// the 32 an Apple GPU allows. Two of those do not fit, so a core runs one
-    /// at a time: 256 threads where the hardware schedules far more, and nothing
-    /// to interleave against on any of the four barriers a tile takes. **That is
-    /// arithmetic off two numbers the device states**, and this is what says
-    /// whether it costs anything.
+    /// **19 KiB against 19 KiB is the row worth reading twice.** The two arms
+    /// are within 0.2% there, on a walk whose values come from threadgroup
+    /// memory in one and from device memory in the other — so at this shape the
+    /// staging buys nothing at all and the whole of what it does to the row is
+    /// declare 16 KiB. That is what leaves an unsplit call free to declare
+    /// something else instead. It is not true at a decode step's shape, which is
+    /// why the other entry exists.
     ///
-    /// The knob is a threadgroup array nobody reads. Ballast added to the
-    /// shipped kernel can only lower residency and ballast added to a kernel
-    /// that stages nothing can only raise it, so the two halves of the table
-    /// approach the same question from either side — and every arm walks the
-    /// same tiles over the same keys with the same instructions, which is what
-    /// "changes nothing else" has to mean for the row to be readable.
-    ///
-    /// **The unstaged rows are not a proposal.** Reading a tile's values where
-    /// they lie is what this kernel did before the staging, and the staging is
-    /// worth what it is worth; the arm is here because it is the only way to get
-    /// this walk under 16 KB at all.
+    /// **The two shipped entries are rows of this table**, at 12.5 KiB staging
+    /// nothing and 19 KiB staging a tile.
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn how_many_threadgroups_of_a_prefills_attention_a_core_holds() {
         let Some(device) = device() else { return };
-        /// Ballast the shipped kernel can take before it passes what a
-        /// threadgroup may declare, and what the unstaged one can take to reach
-        /// the same place.
-        const STAGED_BALLAST: [usize; 3] = [0, 1024, 3072];
-        const UNSTAGED_BALLAST: [usize; 11] =
-            [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096, 5120, 7168];
+        /// Floats a threadgroup declares beside its four live arrays: finely
+        /// across the turn, and past it at either end.
+        const DECLARED: [usize; 12] = [
+            256, 1024, 1536, 2048, 2176, 2432, 2560, 2688, 3072, 4096, 5120, 7168,
+        ];
 
         let most = device.most_threadgroup_bytes();
         let cells = bound_cells();
@@ -3813,23 +4052,21 @@ mod tests {
             "  a threadgroup may declare {} KiB of a core's own memory",
             most / 1024
         );
-        eprintln!("  {:<18}{:>14}{header}", "the values", "a threadgroup");
+        eprintln!("  {:<15}{:>14}{header}", "the values", "a threadgroup");
 
-        for (what, source) in [
-            ("staged", source()),
-            ("where they lie", reading_the_values_where_they_lie()),
-        ] {
-            let ballast: &[usize] = match what {
-                "staged" => &STAGED_BALLAST,
-                _ => &UNSTAGED_BALLAST,
-            };
-            for &floats in ballast {
-                let written = match floats {
-                    0 => source.clone(),
-                    floats => with_ballast(&source, floats),
-                };
+        for floats in DECLARED {
+            for (what, arm) in [
+                (
+                    "where they lie",
+                    super::source(STAGED_BY_AN_UNSPLIT_CALL, floats),
+                ),
+                ("staged", super::source(floats, NO_RESIDENCY)),
+            ] {
+                if what == "staged" && floats < TILED_VALUES {
+                    continue;
+                }
                 let attention =
-                    FusedAttention::from_source(&device, &written).expect("the arm compiles");
+                    FusedAttention::from_source(&device, &arm).expect("the arm compiles");
                 let held = attention.global.threadgroup_memory();
                 let taken: String = cells
                     .iter()
@@ -3839,8 +4076,8 @@ mod tests {
                     })
                     .collect();
                 eprintln!(
-                    "  {what:<18}{:>14}{taken}",
-                    format!("{:.0} KiB", held as f64 / 1024.0),
+                    "  {what:<15}{:>14}{taken}",
+                    format!("{:.2} KiB", held as f64 / 1024.0),
                 );
             }
         }
