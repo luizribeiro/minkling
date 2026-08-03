@@ -1426,6 +1426,50 @@ length: `PackedBank::moves` charges a whole weight per tile, so those are
 amplification factors and the distinct bytes are decades below. Nothing about
 them moved here.
 
+### Whether a long prefill reads one expert's weight more than it must
+
+**It reads it 96 times where once would do, and that is worth 10%.** The two
+matmul rows are 72.3 s of a 132.97 s prefill at 16384 tokens — larger than both
+attention rows together — and the arithmetic that says they should not be is
+plain: a routed bank runs six rows a token over 256 experts, so an expert is
+named by `6n/256` rows — 2.3 at a 97-token prompt, 18 at 769 and **384 at
+16384** — where `ROWS_A_TILE` is 4. Every four of those 384 rows walk that
+expert's whole 4.5 MB weight for themselves.
+
+**The count was never in doubt and the price was.** A tile reads
+`out_dim × in_dim / 4` codes per row of output whatever the run, so the bytes a
+row is *charged* are flat by construction; what is not flat is how many of them
+have to come from memory. `how_often_a_long_prefill_reads_one_experts_weight`
+holds one 1.07 GB bank of 256 experts fixed and dispatches it at four run
+lengths, sorted, so the only thing varying is how many tiles want the same
+weight — with `group_by_expert` dispatched apart and taken off, since a pass
+over the rows would otherwise put a linear term in the column the question is
+about:
+
+    rows an expert       rows     reads      a call       a row    declared
+    4                    1024        1×       2.8ms      2758ns     1141 MB
+    24                   6144        6×      18.0ms      2928ns     6845 MB
+    96                  24576       24×      73.8ms      3001ns    27380 MB
+    384                 98304       96×     299.4ms      3046ns   109522 MB
+
+**The first row is the ideal rather than a baseline to beat**: four rows an
+expert is one tile an expert, so that arm reads each weight exactly the once it
+must. 96-fold re-reading costs **10.4% of the time a row** against it — 2758 ns
+to 3046 — over a declared figure that grows 96-fold beside it. So all but a
+tenth of those reads are served without reaching memory: 109522 MB declared in
+299.4 ms is 366 GB/s, of which 3.8 GB/s is distinct.
+
+**So it is real and it is a tenth rather than an order.** 10.4% of the two
+matmul rows at 16384 is about 7.5 s of a 133 s prefill, against the global
+attention row's 43.74 s, and 7.5 s is a *ceiling* rather than an offer: the only
+lever that reaches it is a taller tile, and that has now been swept three times —
+on a bank small enough to cache, on one too big, and here — turning at four,
+at three, and refused above three by the speculative round `a_calls_rows_share_a
+_weight_read_only_where_they_name_one_expert` pins out of the tiled path. The
+premise that the grouping reads an expert's weight 96 times where once would do
+is exactly right; the inference that it is where a long prefill's time went is
+not.
+
 ### What is left, sized and not taken
 
 A threadgroup that carried `R` query rows through one tile of keys would divide

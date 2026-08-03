@@ -3788,6 +3788,120 @@ mod tests {
         }
     }
 
+    /// **How many times a long prefill reads one expert's weight, against how
+    /// many times it must** — a question about [`ROWS_A_TILE`] rather than about
+    /// the grouping, and one the two sweeps above ask at a prompt where it does
+    /// not arise.
+    ///
+    /// A routed bank runs six rows a token over 256 experts, so an expert is
+    /// named by `6n/256` rows: 2.3 at a 97-token prompt, 18 at 769 and **384 at
+    /// 16384**. A tile is four rows, so at the long end one expert's weight is
+    /// walked 96 times where once would serve every row that named it. The
+    /// arithmetic is not in doubt; what it is worth is, and only a shape with the
+    /// runs that long can say.
+    ///
+    /// So: one bank of 256 experts, too big to cache at 1.07 GB, dispatched at
+    /// each of four run lengths, and the column that answers it is **device time
+    /// a row**. A tile reads `out_dim × in_dim / 4` codes per row whatever the
+    /// run, so the *declared* bytes a row are flat by construction — and the
+    /// bytes that have to come from memory are not: at four rows an expert the
+    /// weight is fetched once per four rows, and at 384 the same fetch could
+    /// serve 384 if the cache holds it between the 96 tiles that want it. A time
+    /// a row that falls with the run is that cache; one that is flat is a kernel
+    /// the weight reads were never the bound on.
+    ///
+    /// **The sort is measured and taken off rather than carried**, which matters
+    /// here in a way it does not in the sweeps above: `group_by_expert` is a pass
+    /// over the rows, so it grows with the arm while the question is about the
+    /// weight, and left in it would be 96-fold re-reading and a linear term
+    /// charged to the same column. The two are dispatched apart and the
+    /// difference is what the table prints.
+    ///
+    /// The same caution as every sweep here: one weight is dispatched against
+    /// repeatedly, so this ranks the run lengths and does not state a bandwidth.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn how_often_a_long_prefill_reads_one_experts_weight() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        // Four dispatches to a command buffer, so that what the device's clock
+        // is divided by is the dispatch rather than the buffer around it — the
+        // reason every sweep above takes the same number.
+        const CALLS: usize = 4;
+        const ROUNDS: usize = 3;
+        const IN: usize = 4096;
+        const OUT: usize = 2048;
+        const EXPERTS: usize = 256;
+        /// Rows an expert, at six of 256 a token: 4 is a 171-token prompt, 24 a
+        /// 1024-token one, 96 a 4096-token one and 384 a 16384-token one.
+        const RUNS: [usize; 4] = [4, 24, 96, 384];
+
+        let most = EXPERTS * RUNS[RUNS.len() - 1];
+        let case = Case::seeded(1, IN, EXPERTS * OUT, most);
+        let bank = PackedBank::upload(
+            &device,
+            &matmul,
+            EXPERTS,
+            IN,
+            OUT,
+            &case.packed(),
+            &case.scales,
+        )
+        .expect("the bank's shapes pair");
+        let bytes = |codes: usize| (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+        let held = bytes(EXPERTS * OUT * IN);
+
+        eprintln!(
+            "  {:<16}{:>10}{:>10}{:>12}{:>12}{:>12}",
+            "rows an expert", "rows", "reads", "a call", "a row", "declared"
+        );
+        for run in RUNS {
+            let rows = EXPERTS * run;
+            // Sorted already, so the tiles this measures are the tiles the sort
+            // produces and no tile straddles two experts by accident of the
+            // routing — which is what makes `reads` the run length's own figure.
+            let chosen: Vec<u32> = (0..rows).map(|row| (row * EXPERTS / rows) as u32).collect();
+            let mut x = device
+                .buffer(&case.x[..rows * IN])
+                .expect("the rows upload");
+
+            let mut best = [Duration::MAX; 2];
+            for _ in 0..ROUNDS {
+                for (at, multiplies) in [false, true].into_iter().enumerate() {
+                    let taken = crate::testing::device_time(&device, CALLS, |batch| {
+                        let mut picked = device.buffer(&chosen).expect("the selection uploads");
+                        let mut sorted = grouping
+                            .encode(batch, &mut picked, EXPERTS)
+                            .expect("the grouping encodes");
+                        if multiplies {
+                            bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)
+                                .expect("the dispatch encodes");
+                        }
+                    });
+                    best[at] = best[at].min(taken);
+                }
+            }
+
+            let call = best[1].saturating_sub(best[0]);
+            let reads = weights_read(&chosen, ROWS_A_TILE) / EXPERTS;
+            eprintln!(
+                "  {run:<16}{rows:>10}{:>12}{:>12}{:>12}{:>12}",
+                format!("{reads}×"),
+                format!("{:.1}ms", 1e3 * call.as_secs_f64()),
+                format!("{:.0}ns", 1e9 * call.as_secs_f64() / rows as f64),
+                format!("{:.0} MB", held * reads as f64 / 1e6),
+            );
+        }
+        // The shortest run is the arm with no redundancy in it at all — one tile
+        // an expert, so the weight is read the once it must be — and without it
+        // the table ranks four amounts of re-reading against no baseline.
+        assert!(
+            RUNS[0] <= ROWS_A_TILE,
+            "no arm here reads an expert's weight only the once it must"
+        );
+    }
+
     /// The shipped kernel with a different tile shape written into its prelude,
     /// which is the one thing the two sweeps above vary.
     ///
