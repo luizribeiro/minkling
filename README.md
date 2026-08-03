@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **585 of the 621 tests, no
+`just test` is the one to run while iterating: **589 of the 628 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,7 +32,7 @@ a crate's tests in one process: opening a Metal device costs a second, so the 16
 kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 621 against a
+`just test-full` is what has to pass at the ends of a series: **all 628 against a
 real checkpoint, ten minutes.** The 52 gated tests — the 37 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the thirty-six tests whose result *is* a number — a duration
+`just test-timing` is the thirty-nine tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -1487,6 +1487,11 @@ that the defect it was called to fix is not present, that the one superlinear
 term is inherent to full attention rather than a missing bound, and that the
 term is 33% of a 16384-token prefill against the two matmul rows' 54%.
 
+**It was taken, it is bit-identical, and it is slower — see the two sections
+below.** The `R` is real and the reads do divide by it; what the paragraph above
+gets wrong is `704 GB/s`, which is a rate over reads a walk *issues* and not
+over traffic it makes.
+
 **Carried out, 32768 tokens is about 5.9 minutes, and that figure is
 arithmetic.** Split the 133.63 s wall at 16384 by the passes' own shares — which
 assumes the over-reporting falls evenly across the kernels, and is a splice of
@@ -1496,6 +1501,108 @@ two runs: 43.96 s is the global row and 89.67 s is everything else, which is
 of the four lengths, and nothing past 16384 was run: a paired sitting of
 32768-token prefills is hours and the sweep above already answers which term
 grows.
+
+### Carrying a block of query rows through one tile of keys
+
+**The lever the section above sized was taken, and it is bit-identical to the
+kernel it replaces and slower than it at every height.** `QUERIES_A_BLOCK` gives
+a threadgroup a block of consecutive query rows of one head instead of a single
+row: the block stages one tile of values, reads each key of that tile once, and
+the `R` dots the key feeds come off that one read. Both the sweep and the
+identity case are in the tree; the shipped height is **one**, which is the
+kernel that was always there.
+
+**Tiles outer and rows inner, which is what makes it identical rather than
+close.** A row takes part in exactly the tiles its own `[reach, last)` gave it,
+in the same order, with its own `held` rather than the block's — so its running
+peak, total and weighted sum meet the same values in the same order they met a
+threadgroup at a time. A row with no live key in a tile is skipped rather than
+rescaled by `exp(peak - peak)`, which is a NaN where its peak is still
+`-INFINITY`. What a *block* reads is the union of its rows' walks rather than
+the sum, and `keys_a_call_walks` is that: a global prefill's `n²/2` becomes
+`n²/8 + n/2` at four rows, ×3.99 at 2048 tokens.
+
+**`a_block_of_query_rows_is_a_row_at_a_time_bit_for_bit` is the case, and it is
+on the bits rather than on the floats** — `-0.0` and `0.0` compare equal as
+floats and are two different answers. Sixteen cases at heights of two and four
+against a height of one, each driven unsplit and through an eight-way fold:
+six with a short last block, eight windowed — six of them holding a block whose
+rows do reach back to different keys, which is the thing the block is easiest to
+get wrong and the thing a windowed case does not automatically ask — and a
+prompt from nothing whose first block's rows are one, two, three and four keys
+long. **Not one bit of one element moved**, at either height.
+
+**And the sweep is emphatic in the wrong direction.** One dispatch of `n` query
+rows over `n` keys, both kinds of layer, against the same dispatch a row a
+threadgroup:
+
+    tokens   a block      global   against  window 512   against   the stack
+      2048         1     94.04ms     ×1.00     45.18ms     ×1.00       2.24s
+      2048         2     98.74ms     ×0.95     47.84ms     ×0.94       2.37s
+      2048         4    130.15ms     ×0.72     63.60ms     ×0.71       3.14s
+      2048         8   does not compile at this height
+      8192         1       1.26s     ×1.00    199.83ms     ×1.00      15.84s
+      8192         2       1.28s     ×0.98    211.25ms     ×0.95      16.39s
+      8192         4       1.65s     ×0.77    280.67ms     ×0.71      21.35s
+      8192         8   does not compile at this height
+
+**It generalised to windowed layers and that is not the good news it sounds
+like**: the same tiling, the same bound, the same losses — ×0.71 at four rows on
+both kinds of layer at both lengths. Eight rows does not compile, the arrays a
+block carries being 3 KB a row against the 32 KB an Apple GPU allows. The widest
+threadgroup the pipeline reports is the device's own 1024 at every height, which
+is the one place this side could have seen register pressure, and it saw none.
+
+### Whether a prefill's attention is waiting on the keys it reads
+
+**It is not, and that is why the block loses.** `704 GB/s` is
+`PackedBank::moves`'s mistake met on the other kernel: it is the reads a walk
+*issues* divided by device time, and 32 query heads and their neighbouring rows
+walk almost the same keys at almost the same time, so a tile fetched for one is
+in cache for the rest. A rate over issued reads says nothing about traffic.
+
+Settled by a mutation rather than by an argument —
+`whether_a_prefills_attention_is_waiting_on_the_keys_it_reads` runs the same
+kernel with every key and every value read from slot zero. It walks the same
+tiles, scores the same keys, takes the same barriers and does the same
+arithmetic; its whole working set is one 16 KB tile that never leaves the cache.
+What separates the two is the memory and nothing else:
+
+    tokens         layer    the span    one slot     of it
+      2048        global     94.10ms     79.26ms       84%
+      2048    window 512     45.18ms     38.54ms       85%
+      4096        global    339.35ms    280.05ms       83%
+      4096    window 512     96.83ms     82.54ms       85%
+      8192        global       1.27s       1.02s       81%
+      8192    window 512    200.10ms    170.54ms       85%
+
+**So the memory is 15 to 19% of this kernel and the other four fifths are not
+the keys.** A lever that removed *every* key and value fetch would take a fifth
+off the row; one that divides the reads by four takes at most three quarters of
+that, so **11 to 14% at best**. Against it, a block of four costs 39% — 94.04 ms
+to 130.15 at 2048 tokens, which is the ×0.72 above read from the slower side.
+Both percentages are of the kernel a row at a time, so they subtract. That bound
+is generous in the mutant's favour, too: reading one slot also makes the address
+loop-invariant, so what it removes is a little more than the memory.
+
+**Which closes M9's hypothesis, deferred five times and now measured rather than
+sized.** "Every `(head, query)` threadgroup re-reads all keys; sharing a K/V tile
+across queries is the next order of magnitude" is true about the reads and false
+about the time. It is the same shape of finding as
+"Why the two tiled rows report bandwidths a factor of two apart" — a column that
+looked like the largest deficit in the table was an artefact of its denominator
+— met on the one kernel that had not yet had its denominator checked.
+
+**What the block costs by existing is 0.4% of a prefill's device time**, and it
+is measured rather than waved at: over four alternating pairs at 2048 tokens,
+every pair moving the same way and the ranges apart, the device's own clock is
+10671.7 ms against 10710.7 and the wall is 12629.6 against 12697.5 with the
+ranges across each other and no claim. At a height of one the kernel is the
+kernel that was there — the same tiles, the same bound, the same grid, the same
+splits — and what the 40 ms buys is that the largest premise this repo has
+carried is falsifiable in the tree rather than in a paragraph. A decode step did
+not move at all: 19.463 ms against 19.475 over seven pairs, ranges across, three
+of the seven falling the other way.
 
 ### What this leaves for whoever caps the spans
 
@@ -1522,33 +1629,47 @@ counts and buys no microsecond of this section's.
 
 ### What did not move, which is everything
 
-Nothing here touches a dispatch. `Kernel::under` renames a row, the byte count is
-an integer computed while encoding and only reaches the profile when the device
-is sampling, and the two new tables are tables. So the list below is a check on
-that claim rather than a comparison, and it is what says so:
+The block ships at a height of one, so the kernel a call dispatches walks the
+same tiles under the same bound over the same grid with the same split count.
+The list below is a check on that claim rather than a comparison, and it is what
+says so:
 
-    context     e7168ce      here
-       97         19.99     19.98
-      385         21.34     22.21
-      769         21.91     22.08
-     2048         24.85     24.81
-     4096         26.09     26.09
-     8192         28.65     28.92
+    context     e7168ce     3e41885      here
+       97         19.99       19.98     19.97
+      385         21.34       22.21     21.36
+      769         21.91       22.08     22.08
+     2048         24.85       24.81     24.91
+     4096         26.09       26.09     26.06
+     8192         28.65       28.92     29.02
 
-One sitting each and unpaired, which is the standard the column beside it was
-taken to. The eight-token figures on the packed heads are **19.44 ms at k = 0
-against 19.414 and 15.96 at k = 2 against 16.078**, and `k = 4` is 1.002× where
-A1 left it at 1.003 — still not comfortably worth running, and no further from it.
+One sitting each and unpaired, which is the standard the two columns beside it
+were taken to. The eight-token figures on the packed heads are **19.47 ms at
+k = 0 against 19.44 and 15.96 at k = 2 against 15.96**, and `k = 4` is 1.011×
+against 1.002 — still not comfortably worth running. The per-kernel prefill
+table at 16384 tokens reads 44.06 s of global attention against A2's 43.74,
+14.14 s of windowed against 13.99, 38.15 s of `packed_matmul_grouped` against
+38.15 and 133.47 s of passes against 132.97 — a different sitting on a host that
+drifts 1.7%, and the same table. The reads either side of it are the same reads:
+30792198.52 MB issued by the 7 global layers against a 134 MB span apiece, at
+699 GB/s. A block of four would have made that 7.7 TB; nothing shipped does.
+
+**The prefill wall, one sitting a length, against the four lengths this file
+records:** 12.83, 25.57, 54.32 and 134.42 s against 12.66, 25.36, 54.25 and
+133.63 — 0.6 to 1.3% on a host with 1.7% of drift and a paired 2048 reading that
+puts the device's own clock 0.4% up and the wall inside its own spread. **The
+reference was not re-measured**: nothing here changes what mlx-vlm does, so its
+34.31 s at 16384 and the ×3.89 beside it stand as A2 took them, and a paired
+cross-engine sitting was not spent to re-prove an arm that did not change.
 
 **No token changed.** The recorded continuation is `[656, 13, 623, 180069,
 86333, 60500, 220, 23]` and is what the device generates; the speculating cases
 write the text one-at-a-time decoding writes at every depth they drive; and
 acceptance is unmoved to the digit — **85% at k = 1, 87/78% at k = 2**, 85/65/55%
 and 82/65/53/47% below that — the packed heads' own recorded row, digit for
-digit. The bfloat16 heads reproduce theirs in the same way: 85%, 91/74%,
-84/74/63%, 82/65/53/47%. `the_bounded_loop_is_the_unbounded_one_bit_for_bit`
-and `a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` pass
-unrelaxed, and so do all 585 tests of the run against a real checkpoint.
+digit. `the_bounded_loop_is_the_unbounded_one_bit_for_bit`,
+`a_query_row_walks_the_keys_its_window_and_its_position_leave_it` and
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` pass
+unrelaxed, and so do all 589 tests of the run against a real checkpoint.
 
 ## The tail of a step
 
