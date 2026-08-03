@@ -2377,7 +2377,10 @@ ranking it produced is what the list is for.
 - **The dequantisation table**, 30% of both matmul rows then and about 36% of
   them now — 21.7 s of the 59.69 by that arithmetic, and the largest term nobody
   has attacked. Two gathers into a 16-entry constant array per packed byte, whose
-  replacement would have to produce the same sixteen floats and could.
+  replacement would have to produce the same sixteen floats and could. *Attacked
+  since, and the answer is no: "What each way of decoding a packed byte costs"
+  below measures two replacements that produce exactly those floats, and both are
+  slower than the gather.*
 - **The tile's two serial reductions**, 23 to 29% of the attention rows. Every
   one of 256 threads walks a tile's 32 scores twice for two scalars. Bit-safety
   is available — one thread reducing in the same order and broadcasting is the
@@ -2392,6 +2395,65 @@ bank conflicts are unmeasured. The U is still a finding without a mechanism — 
 this milestone added a row to it rather than explaining it: at six threadgroups a
 core a walk that stages any part of a tile is 63% slower than one that stages
 none, at the same declaration, and nothing here says why.
+
+### What each way of decoding a packed byte costs
+
+**The largest untouched term is not a memory access, and the way to find that out
+was to try to remove it.** A4 priced the decode by ablation — an integer-to-float
+conversion where the two gathers were is 70 and 71% of the kernel — and read the
+30% as the table's own latency, "a memory access nobody counts". That reading
+licenses a replacement: MXFP4's sixteen values are one exact table, so any method
+producing those bit patterns is the same decode, and one computed in registers
+would owe nothing to memory at all.
+`what_each_way_of_decoding_a_packed_byte_costs` compiles three that do, over the
+same two shapes A4's limiter table is read across:
+
+    the decode                            q_proj, tiled   a routed bank, grouped
+    two gathers into a table — shipped           5.35ms                  16.52ms
+    the field its bits assemble                  5.94ms                  18.77ms
+    one gather into a table of pairs             5.75ms                  16.87ms
+
+**The gather is the cheapest of the three and the arithmetic is the dearest**, by
+11.0 and 13.6% — reproducible to the hundredth of a millisecond over two
+sittings. E2M1 is f32's own layout an exponent field apart, so a code's value is
+its three low bits laid where an f32 keeps its own and counted up from `0.5`:
+about six integer operations, against one load of 64 bytes that every lane of a
+simdgroup indexes separately. **A table of whole bytes is not the answer either.**
+One gather into 256 pairs is half the loads the shipped decode issues and it is
+7.5 and 2.1% slower — so what the 64-byte table costs is not the load, and 2 KiB
+is already enough to lose whatever holds it.
+
+**Measured end to end before it was withdrawn**, because a sweep over two
+dispatches is not a prefill: the arithmetic decode was shipped and paired against
+the commit before it over a 2048-token prompt, and it is **6.4% of the wall and
+7.4% of the device clock** — 12076 ms against 11350, and 9798 ms of device time
+against 9127, every pair the same way and the ranges apart. So A4's 30% is the
+decode's dependency chain and the issue slots it takes, not the table it reads
+through, and **the largest term on A4's list is not available this way.** What
+ships out of it is the instrument and one inline function: `element` is the one
+reading of the format the two entries now share, and it is free — 9126.6 ms of
+device time against 9125.4 at the same prompt, ranges across, no claim.
+
+**Bit-safety was proven before either number was taken and it is proven on the
+bits.** The two arms that decode a *code* answer the sixteen floats through an
+entry point of their own:
+`every_way_of_decoding_a_code_answers_the_tables_sixteen_floats_bit_for_bit`
+compares what the device wrote against `inkling_core::quant::ELEMENTS` as `u32`
+patterns, which is what catches code 8's `-0.0` where `==` would call it code 0's
+`+0.0`. The third decodes a *byte* and has no such entry point to give — a table
+of pairs is indexed by both codes at once — so what stands in for it is the arm
+every one of the three also passes:
+`every_way_of_decoding_a_byte_multiplies_to_the_same_bits` puts each through a
+whole multiply on both entries and compares the outputs the same way.
+
+**And that is where a form this file would otherwise have shipped was caught.**
+The arithmetic decode's first version needed no comparison at all: laying the
+code's bits into an f32 and multiplying by `2^126` is exact for all sixteen,
+because the code E2M1 calls subnormal lands on the f32 subnormal `2^-127`, which
+is `0.5` under the same factor. **This device flushes f32 subnormals to zero.**
+That form answered `0.0` for code 1 and `-0.0` for code 9 and was bit-exact for
+the other fourteen — a decode wrong in one code of sixteen, on the two codes a
+tolerance would never have found, caught by a probe that costs a dispatch.
 
 ## The tail of a step
 
