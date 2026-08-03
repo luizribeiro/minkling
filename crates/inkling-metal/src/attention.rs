@@ -4696,6 +4696,121 @@ mod tests {
         }
     }
 
+    /// The step accumulated in f64 and offline: every score written down, the
+    /// row shifted by its own largest, and the values weighted in one pass.
+    ///
+    /// **Neither entry's arithmetic and deliberately so.** Both of them stream —
+    /// a running peak that every tile rescales what came before it by — because
+    /// the tensor of scores is as quadratic as the mask and neither is formed.
+    /// This one forms it, in a wider type, so that what the two are measured
+    /// against is the answer rather than each other. It is what
+    /// [`crate::testing::drift`] is to the matmul's two orders.
+    fn exactly(case: &Case) -> Vec<f64> {
+        let AttentionConfig {
+            heads,
+            kv_heads,
+            head_dim,
+            d_rel,
+            sliding,
+            ..
+        } = case.config;
+        let rel_extent = case.proj.len() / d_rel;
+        let mut out = vec![0.0; case.queries * heads * head_dim];
+        for head in 0..heads {
+            let kv = head / (heads / kv_heads);
+            for i in 0..case.queries {
+                let position = i + case.q_offset;
+                let q = &case.q[(head * case.queries + i) * head_dim..][..head_dim];
+                let rel = &case.rel[(i * heads + head) * d_rel..][..d_rel];
+                let scored: Vec<f64> = (0..case.keys)
+                    .map(|j| {
+                        let key = &case.k[(kv * case.keys + j) * head_dim..][..head_dim];
+                        let dot: f64 = (0..head_dim)
+                            .map(|d| f64::from(q[d]) * f64::from(key[d]))
+                            .sum();
+                        let back = position.checked_sub(j);
+                        let entry = match back {
+                            None => f64::from(MASKED),
+                            Some(back) if sliding > 0 && back >= sliding => f64::from(MASKED),
+                            Some(back) if back >= rel_extent => 0.0,
+                            // `[d_rel, rel_extent]`, which is the layout the
+                            // checkpoint stores and `by_distance` gathers out
+                            // of — a distance is a column here and a row there.
+                            Some(back) => (0..d_rel)
+                                .map(|c| {
+                                    f64::from(rel[c]) * f64::from(case.proj[c * rel_extent + back])
+                                })
+                                .sum(),
+                        };
+                        dot / head_dim as f64 + entry
+                    })
+                    .collect();
+                let peak = scored.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                let weights: Vec<f64> = scored.iter().map(|s| (s - peak).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                let row = &mut out[(i * heads + head) * head_dim..][..head_dim];
+                for (j, weight) in weights.iter().enumerate() {
+                    let value = &case.v[(kv * case.keys + j) * head_dim..][..head_dim];
+                    for d in 0..head_dim {
+                        row[d] += weight * f64::from(value[d]);
+                    }
+                }
+                for slot in row.iter_mut() {
+                    *slot /= total;
+                }
+            }
+        }
+        out
+    }
+
+    /// **What the block's order costs in conditioning, against context.**
+    ///
+    /// A softmax accumulates over the whole key span, which at a long context is
+    /// a longer chain than any reduction the matmul carries — so the question
+    /// A7 answered for one reduction has to be asked again of a chain the
+    /// context decides the length of. Both entries stream, so the online
+    /// rescaling is common to them; what differs is that the block's scores come
+    /// out of a fragment accumulator over `head_dim` where the entry's come out
+    /// of a lane-strided walk under a `simd_sum`, and that the block
+    /// exponentiates with `fast::exp2` where the entry uses `precise::exp`.
+    ///
+    /// **Four heads rather than the checkpoint's thirty-two**, because the f64
+    /// oracle is a scalar pass over every query-key pair and the shape that
+    /// answers the question is the key span rather than the head count.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_the_blocks_order_drifts_by_as_the_context_grows() {
+        let Some(device) = device() else { return };
+        let reference = FusedAttention::new(&device).expect("the kernel compiles");
+        let production =
+            FusedAttention::compiling(&device, Numerics::Production).expect("the block compiles");
+
+        eprintln!(
+            "  {:>10}{:>14}{:>14}{:>16}",
+            "keys", "the entry", "the block", "between them"
+        );
+        for keys in [512, 2048, 8192, 16384] {
+            let mut case = blocked(keys, 0, MMA_ROWS_A_BLOCK);
+            case.config.heads = 4;
+            case.config.kv_heads = 1;
+            case.config.hidden = 4 * 128;
+            case.q = values(case.queries * 4 * 128, 1);
+            case.k = values(keys * 128, 2);
+            case.v = values(keys * 128, 3);
+            case.rel = values(case.queries * 4 * 16, 5);
+
+            let exact = exactly(&case);
+            let entry = case.on_the_device(&device, &reference);
+            let block = case.on_the_device(&device, &production);
+            eprintln!(
+                "  {keys:>10}{:>14}{:>14}{:>16}",
+                format!("{:.1e}", crate::testing::drift(&entry, &exact)),
+                format!("{:.1e}", crate::testing::drift(&block, &exact)),
+                format!("{:.1e}", deviation(&block, &entry)),
+            );
+        }
+    }
+
     /// **What a block of query rows is worth at each height, which is the
     /// measurement that had to land before any other.**
     ///
