@@ -112,6 +112,11 @@ const MOST_SIMDGROUPS: usize = 32;
 /// and not a bandwidth.** The reads a walk issues are not the traffic it makes:
 /// 32 query heads and their neighbouring rows walk almost the same keys at
 /// almost the same time, so a tile fetched for one is in cache for the rest.
+/// `whether_a_prefills_attention_is_waiting_on_the_keys_it_reads` prices that
+/// directly — the same kernel reading every key and value from slot zero, whose
+/// whole working set is one 16 KB tile, is **81 to 85%** of reading the span —
+/// so the memory is fifteen to nineteen per cent of this kernel, and a lever
+/// that divides its reads by four is worth at most three quarters of that.
 /// Swept, a block of two is ×0.95 and a block of four ×0.72; eight does not
 /// compile, the arrays a block carries being 3 KB a row against the 32 KB an
 /// Apple GPU allows. See
@@ -3987,6 +3992,105 @@ mod tests {
                     against(window, best[1]),
                     format!("{stack:.2?}"),
                     attention.global.max_threads_per_group(),
+                );
+            }
+        }
+    }
+
+    /// **Whether a prefill's attention is waiting on the keys it reads**, which
+    /// is the premise under every version of this milestone and is the one thing
+    /// a bandwidth column computed from a *declared* byte count cannot say.
+    ///
+    /// The declared figure is the reads the walk issues: at 16384 tokens one
+    /// global layer issues 4.4 TB against a span of 134 MB, which over its
+    /// device time is 704 GB/s against this machine's 819. Read as a bandwidth
+    /// that says the kernel is at the memory and the only lever is reading less.
+    /// Read as an amplification it says nothing at all — 32 query heads and
+    /// their neighbouring rows walk almost the same keys at almost the same
+    /// time, so a tile fetched for one is in cache for the rest, and 704 GB/s of
+    /// *issued* reads can sit on far less traffic. **This is the same
+    /// distinction `PackedBank::moves` forced on the matmul rows**, met on the
+    /// other kernel.
+    ///
+    /// So it is settled by a mutation rather than by an argument: the same
+    /// kernel with every key and every value read from slot zero. It walks the
+    /// same tiles, scores the same number of keys, takes the same barriers and
+    /// does the same arithmetic — and its whole working set is one 16 KB tile
+    /// that never leaves the cache. **What separates the two is the memory and
+    /// nothing else.**
+    ///
+    /// The answer it gives is wrong, and the case asserts that it is: a mutation
+    /// that read the right keys after all would report the walk costs nothing
+    /// and be measuring the shipped kernel twice.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn whether_a_prefills_attention_is_waiting_on_the_keys_it_reads() {
+        let Some(device) = device() else { return };
+        const ROUNDS: usize = 2;
+        const TOKENS: [usize; 3] = [2048, 4096, 8192];
+
+        let from_one_slot = |rows| {
+            source(rows)
+                .replace(
+                    "values_of + (ulong)first * shape.head_dim",
+                    "values_of + (ulong)0 * shape.head_dim",
+                )
+                .replace(
+                    "keys_of + (ulong)j * shape.head_dim",
+                    "keys_of + (ulong)0 * shape.head_dim",
+                )
+        };
+        assert_ne!(
+            from_one_slot(QUERIES_A_BLOCK),
+            source(QUERIES_A_BLOCK),
+            "the mutation changed nothing"
+        );
+        let walking = FusedAttention::new(&device).expect("the kernel compiles");
+        let cached = FusedAttention::from_source(&device, from_one_slot).expect("it compiles");
+        assert_ne!(
+            blocked(97, 0, 97).on_the_device(&device, &walking),
+            blocked(97, 0, 97).on_the_device(&device, &cached),
+            "reading one slot answered what reading the span answers"
+        );
+
+        let cost = |attention: &FusedAttention, tokens: usize, sliding: usize| -> Duration {
+            let case = blocked(tokens, sliding, tokens);
+            let layer = case.wrapped(&device, attention);
+            layer.hold(0, tokens).expect("the span reserves");
+            layer.span().appended(tokens);
+            let mut q = device.buffer(&case.q).expect("the queries upload");
+            let mut rel = device.buffer(&case.rel).expect("the features upload");
+            let mut span = layer.span();
+            let mut held = None;
+            let mut taken = Duration::MAX;
+            for round in 0..=ROUNDS {
+                let each = crate::testing::device_time(&device, 1, |batch| {
+                    held = Some(
+                        layer
+                            .encode_over(batch, &mut span, &mut q, &mut rel, None, 0)
+                            .expect("the prefill encodes"),
+                    );
+                });
+                taken = if round == 0 { taken } else { taken.min(each) };
+            }
+            taken
+        };
+
+        eprintln!(
+            "{:>7}{:>14}{:>12}{:>12}{:>10}",
+            "tokens", "layer", "the span", "one slot", "of it"
+        );
+        for tokens in TOKENS {
+            for (what, sliding) in [("global", 0), ("window 512", SLIDING_WINDOW)] {
+                let (span, slot) = (
+                    cost(&walking, tokens, sliding),
+                    cost(&cached, tokens, sliding),
+                );
+                eprintln!(
+                    "{tokens:>7}{what:>14}{:>12}{:>12}{:>10}",
+                    format!("{span:.2?}"),
+                    format!("{slot:.2?}"),
+                    format!("{:.0}%", 1e2 * slot.as_secs_f64() / span.as_secs_f64()),
                 );
             }
         }
