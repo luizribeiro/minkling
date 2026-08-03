@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **619 of the 663 tests, no
+`just test` is the one to run while iterating: **622 of the 669 tests, no
 checkpoint, ten seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,7 +32,7 @@ a crate's tests in one process: opening a Metal device costs a second, so the 16
 kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 663 against a
+`just test-full` is what has to pass at the ends of a series: **all 669 against a
 real checkpoint, ten minutes.** The 52 gated tests — the 37 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the forty-four tests whose result *is* a number — a duration
+`just test-timing` is the forty-seven tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -184,12 +184,21 @@ print a command line saying something other than what it did.
     just bench-numerics prefill --tokens 2048     # the two paired, alternating, out of one build
     INKLINGRS_NUMERICS=production just test-timing  # the per-kernel table on the other side
 
-**What is behind the flag today is the packed matmul's two tiled entries**, and
-what they are worth is under "What the matmul costs on the other side of the
-line": 2.85× on the two matmul rows at 16384 tokens, 37 to 45% off a prefill's
-wall, nothing at all on a decode step, and no token moved over 384 sampled
-argmaxes. **It is not the default and the recommendation is that it should not
-be** — the reasoning is in that section, kept apart from the numbers.
+**What is behind the flag today is the packed matmul's two tiled entries and the
+attention step's block of query rows**, which are the two kernels the profile's
+own share column puts at 96.7% of a long prefill's passes between them. What the matmul's are worth is under "What
+the matmul costs on the other side of the line": 2.85× on the two matmul rows at
+16384 tokens, 37 to 45% off a prefill's wall, nothing at all on a decode step.
+What the attention block is worth is under "What the attention step costs on the
+other side of the line": **19.4× on the two attention rows at 16384 tokens**, a
+prefill of that length at 33.33 s against 109.11, and again nothing at all on a
+decode step. **No token has moved over 384 sampled argmaxes with both of them
+behind the flag.**
+
+**It is not the default and the recommendation is still that it should not be**,
+and the reasoning is in that second section, kept apart from the numbers — but it
+is a closer question than it was, because what is now on the other side of the
+line is most of the engine rather than one half of it.
 
 **Nothing is copied onto the device.** The forty layers' banks are 137 GB, which
 is the whole checkpoint but for its two ends, and they are handed to the GPU
@@ -2788,6 +2797,13 @@ read. `k = 4` reads 0.983× under the reference and 1.031× under the production
 path in this sitting, one unpaired reading each, against A6's 0.972: **it has not
 fallen further.**
 
+**Two of those acceptance figures no longer reproduce, and A8 is where that is
+taken up.** The same sweep run against a commit after this one reads
+91.3-73.9% at `k = 2` and 84.2-73.7-63.2% at `k = 3`, with 3.048 tokens a round
+where this line says 2.909 — under both words and on the commit before A8's
+block, so nothing either milestone did moved them. See "What did not move, which
+is the whole decode path", which is the run that says so.
+
 **With the flag at its default nothing moved at all.** A paired decode step is
 19.765 against 19.946 ms at 385 keys and 27.420 against 27.384 at 8192, ranges
 across and no claim at either — which is what the untiled entry never being
@@ -2921,7 +2937,9 @@ attention rows at 88 to 95% are.
 
 **Attention was not built, and Part 2 justifies building it.** The brief made it
 conditional on the matmul result and the matmul result is 2.85× on its two rows,
-so the condition is met and the work is not done here. What it needs is not the
+so the condition is met and the work is not done here. (A8 did it — see "What the
+attention step costs on the other side of the line", where the two rows this
+paragraph leaves at 43.15 s read 2.25 s.) What it needs is not the
 matmul's shape: `steel_attention.h`'s structure is a block of query rows through
 fragments with the online softmax kept in registers and reduced by two
 `simd_shuffle_xor` steps, and putting that on this kernel means rebuilding the
@@ -2992,6 +3010,503 @@ with the reduction. **Two of those three are measurements and one is four lines
 of kernel.** Until then the default is the reference, `--numerics production` is a
 word anyone can type, and this section is the number the decision belongs to
 whoever owns the claim.
+
+### What the attention step costs on the other side of the line
+
+**A8 built the kernel A7's conclusion asked for, and the answer is that the two
+attention rows are nineteen times faster.** Nothing below is a default — see
+"Two numerics behind one flag" for what `--numerics` is and why the reference is
+what a caller gets who does not ask. **Every figure here is the production path
+against the reference path, in this engine, at these shapes.**
+
+The entry is `mma_attention`, and what it is is a threadgroup carrying a *block*
+of query rows rather than one. The shipped entry gives a threadgroup one query
+row of one head and scores a key with a lane-strided dot under a `simd_sum` —
+one multiply-add a lane a channel, and a cross-lane reduction behind every
+score. The block makes both of the step's multiplies matrix instructions: the
+scores of 64 query rows against 32 keys, and the values weighted by them, so an
+instruction carries 512 multiply-adds where the other carries one.
+
+**What the block buys beyond the instruction is that a lane's query row does not
+move.** The row is its simdgroup and its position inside an 8×8 fragment, and
+neither term changes for the whole walk — so `tau`, the position and the
+relative-feature row are read once and held, the online softmax is two registers
+rather than threadgroup memory, and its two reductions are two
+`simd_shuffle_xor` steps over the four lanes that share a row. The entry above
+writes a tile's 32 scores to threadgroup memory and takes **four barriers a
+tile** to reduce them; the block takes none.
+
+**And the band is derived per score exactly as it always was.** What changed is
+who derives it: the entry above computes it on lane 0 of a simdgroup while the
+other 31 wait, which is why "the band it derives" is 28 to 34% of that kernel by
+its own ablation. Here every lane derives the entries of its own two elements,
+so the same `d_rel` multiplies a query-key pair are spread across the simdgroup
+instead of serialised on a lane of it. `banded_entry` itself is one function
+both entries call, which is what the flag's rule asks of everything that is not
+the accumulate.
+
+**Per kernel at 16384 tokens, one sampled prefill a column:**
+
+    kernel                  reference   production   change
+    global attention          32.06s        1.51s      21.2x
+    windowed attention        11.44s      734.98ms     15.6x
+    the grouped matmul        33.18s       11.81s       2.81x
+    the row-tiled matmul      26.50s        9.63s       2.75x
+    every pass               102.02s       24.68s       4.13x
+
+**The last row is the command buffers' own clock and the four above it sum past
+it**, by the 4.7% of over-reporting the sampling costs and the table's own footer
+states — so the shares here are read against the summed passes and the ratios
+against each other, which is what makes the columns comparable at all.
+
+**The two attention rows are 43.50 s and are 2.25 s**, which is 19.4× and 94.8%
+off them. **It generalised to the windowed layers and by a factor within 27% of
+the global one's** — 15.6× against 21.2× — which is the answer to the
+question A4 left open about whether a block is a global-layer lever. It is not:
+35 of this checkpoint's 42 layers stop at a 512-key window, and a block of query
+rows amortises a key read across its rows whether the span it walks is the
+prompt or the window.
+
+**The two matmul rows did not move the way A7 left them**, and that is worth
+stating because it is the same two entries: 2.81× and 2.75× here against A7's
+2.88× and 2.83× on the same dispatches at the same length. They are the flag's
+other half and this milestone did not touch them.
+
+**The wall a user waits, one sitting a length**, against the reference engine's
+column, which is A2's and was not re-measured:
+
+    tokens   reference   production    mlx-vlm   gap before   gap after
+     2048     11.27 s      5.68 s      2.66 s      ×4.24        ×2.14
+     4096     22.10 s      9.35 s      5.61 s      ×3.94        ×1.67
+     8192     46.37 s     17.20 s     13.05 s      ×3.55        ×1.32
+    16384    109.11 s     33.33 s     34.31 s      ×3.18        ×0.97
+
+**At 16384 tokens this engine is faster than the runtime it has been measured
+against since A2**, by 3%, and that is the first line of this file of which
+anything like it is true. It should be read with two things attached: the
+mlx-vlm column is A2's and nothing here re-measured it, and the reference column
+is what a caller gets. What the row says without either caveat is that the gap
+closes as the prompt grows, which is the shape a quadratic term coming off
+produces and is the opposite of every earlier row here.
+
+**Paired and alternating, in-model, the order flipped each pair:**
+
+    prefill        reference   production   change   pairs
+     2048, wall     11319ms       5680ms    -49.8%   5 of 5, ranges apart
+     2048, device    9126ms       3385ms    -62.9%   5 of 5, ranges apart
+     8192, wall     46347ms      17260ms    -62.8%   3 of 3, ranges apart
+     8192, device   40808ms      12194ms    -70.1%   3 of 3, ranges apart
+
+The reference arm of those pairs reads 11.32 and 46.35 s against the 11.24 and
+46.58 this file records, which is 0.7% and 0.5% — so the arm that must not have
+moved did not.
+
+### What the block is refused, and the measurement that drew the line
+
+**A decode step is one query row and a block computes sixty-four**, so the
+predicate mattered more here than it did on the matmul and it was landed before
+any timing was taken. A7's warning is the reason: the same two matmul entries
+were 2.85× faster on a prefill and **2.2× slower on a speculative round**,
+because a verify block of four rows landed on a block of 32. A block here is
+sixty-four rows against a decode step's one.
+
+**Two things stand there and only one of them is new.** `splits_for` already
+cuts the span of any call whose grid is short of the machine, and the block is
+refused a cut call outright — so a decode step at any context somebody has is
+turned away before the floor is consulted. The floor is what catches the shapes
+`splits_for` leaves whole: a five-row verify block at 8192 keys is not cut, and
+without a floor it would land on a block.
+
+**What a block of query rows is worth at each height**, on the device's own
+clock, the block against the reference entry at four spans:
+
+    rows   n over n   over 385   over 2048   over 8192
+       1      0.45x      1.03x       1.00x       1.03x
+       2      0.46x      0.99x       1.02x       1.04x
+       4      0.47x      1.04x       1.01x       1.02x
+       5      0.48x      1.00x       1.13x       1.06x
+       8      0.52x      0.87x       1.16x       1.11x
+      12      0.71x      0.90x       1.19x       1.17x
+      16      0.87x      1.44x       2.15x       2.20x
+      20      1.09x      1.66x       2.32x       2.20x
+      32      1.27x      2.31x       3.06x       3.02x
+      64      1.95x      3.58x       4.92x       5.54x
+     128      3.79x      5.96x       8.61x       9.59x
+     385     11.06x      8.91x      11.69x      17.80x
+     769      8.92x     10.33x      12.19x      16.36x
+
+**The line is drawn at 32 rows, which is half a block, and it is drawn where
+every shape agrees rather than where the first one turns.** The column that
+turns latest is the one whose span is no longer than its own rows — a prompt of
+twenty tokens — and every span a real prompt gives the kernel turns at eight to
+sixteen. Under 32 the call stays on the reference entry, which is a rate and
+never an answer.
+
+**The first column is what the floor is for**, and it says the same thing A7's
+speculative round said at eight times the block height: at one query row the
+block is 0.45×. The columns to its right say why one guard was not enough — at
+five rows over 8192 keys the block reads 1.06×, which is a shape that neither
+loses badly nor is worth having, and it is exactly the shape `splits_for` leaves
+whole.
+
+**And the rows above 385 are where the table stops being about the floor.** At
+769 rows over 8192 keys the block is 16.4× on one dispatch, which is the figure
+the in-model table above arrives at from the other end.
+
+### Whether the two paths' tokens part company with attention behind the flag too
+
+**They never did, over 384 sampled argmaxes, with both kernels behind the
+flag.** The corpus is A7's — six texts rather than six lengths, for the reason
+that section gives — and `just diverge` is the same instrument with one thing
+added: the gate that refuses a prompt too short to reach the flag now takes the
+**larger of the two floors** rather than the matmul's alone. A prompt that
+reaches one entry and not the other would report a thing agreeing with itself on
+the half it never reached.
+
+    prompt                          tokens   generated   agreed
+    enumeration, a chat turn            71          64       64
+    prose, mid-sentence                 68          64       64
+    code, mid-function                  77          64       64
+    a chat turn with four asks          83          64       64
+    a list of 573 primes              2123          64       64
+    a factual question                  64          64       64
+
+**And the gated tier passes under the production numerics**: 622 cases, 47
+skipped, `INKLINGRS_NUMERICS=production cargo nextest run`. What that variable
+reaches is what A7 stated exactly — the cases that stand a stack up on the GPU
+run the production entries and the ones that drive the binary as a subprocess do
+not. The recorded continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]`
+is in the first group and comes back off the device under either word.
+
+### What the block's order drifts by, which is what the reference entry's drifts by
+
+**A7's finding does not repeat here, and that is the most load-bearing number in
+this section.** The matmul's production order is the worse-conditioned of the
+two by a factor that grows with the reduction — 4.1e-6 against 1.4e-7 at 4096 —
+because one fragment accumulator carries all 512 steps. A softmax accumulates
+over the whole key span, which at 16384 is longer than 512, so the same question
+had to be asked of a chain the context decides the length of.
+
+Against an f64 accumulation that forms the whole score row and shifts it by its
+own largest in one pass — neither entry's arithmetic, deliberately, since both
+of them stream:
+
+    keys   the entry   the block   between them
+     512      9.4e-7      9.1e-7        5.8e-7
+    2048      3.0e-6      3.2e-6        1.2e-6
+    8192      1.3e-5      1.3e-5        2.4e-6
+   16384      3.2e-5      3.2e-5        4.3e-6
+
+**The drift grows with the context and it grows identically for both.** At 512
+keys the block is marginally the *better* of the two; at 2048 the entry is; at
+8192 and 16384 they are the same figure. So what the first two columns measure
+is not the block's order at all — it is the **streaming softmax**, which both
+entries run and which rescales a running total once per tile of keys. That term
+is common to the flag's two sides and grows about 34-fold over a 32-fold key
+span.
+
+**So the online algorithm's rescaling neither helps nor hurts the block relative
+to the entry**, and the fragment accumulator that cost the matmul a factor of
+thirty costs the attention step nothing measurable. The reason is in the shapes:
+the matmul's chain is the whole 4096-long reduction in one accumulator, where a
+score's chain is `head_dim` — 128 codes, sixteen accumulate steps — and the long
+chain in attention is the softmax's, which is not a matrix instruction's to
+carry. **A kernel behind this flag is worse-conditioned where the instruction
+owns the long chain and neither better nor worse where it does not**, which is
+one finding rather than two and is the sentence A7 could not have written.
+
+### What did not move, which is the whole decode path
+
+**Decode at every context, under both words, one sitting:**
+
+    context   reference   production      peak, reference   peak, production
+         97     20.05ms      19.99ms             0.25 GiB           0.25 GiB
+        385     21.41ms      21.19ms             1.27 GiB           1.27 GiB
+        769     21.91ms      21.66ms             1.28 GiB           1.28 GiB
+       2048     24.77ms      24.82ms             0.97 GiB           0.97 GiB
+       4096     26.29ms      26.08ms             2.74 GiB           2.74 GiB
+       8192     28.73ms      28.56ms             4.32 GiB           4.31 GiB
+
+Every cell is inside 1.2% and the peak resident set is the same figure at five of
+the six contexts and a hundredth of a gibibyte apart at the sixth — which is what
+a flag reaching no decode dispatch should read. The reference column is this file's own: 20.0 ms at
+97 keys and 28.7 at 8192, to the tenth.
+
+**Paired, the flag at each word:** a decode step at 385 keys is 20.080 against
+20.093 ms of device time over seven pairs, ranges across and four of seven
+falling the other way; at 8192 keys it is 27.606 against 27.629 over five pairs,
+ranges across and three of five the other way. No claim at either, which is the
+claim.
+
+**The wall is the one row worth a caveat.** At 8192 keys three pairs read the
+production side 3.9% slower with the ranges apart, and five pairs read 1.8% with
+the ranges across and no claim. The device's own clock is flat in both sittings,
+so whatever moved is not a dispatch; what it is is not attributed, and at five
+pairs it is not an effect by this file's own standard.
+
+**A speculative round is untouched at every block height**, which is what the
+floor was drawn for:
+
+    tokens a block    reference   production
+        1              24.34ms      25.03ms
+        3              37.69ms      37.22ms
+        5              55.35ms      54.98ms
+        9              80.81ms      80.19ms
+
+A7's failure mode was `k = 3` at 37.33 ms against 17.08 before its floor existed.
+Here the same depth reads 37.22 against 37.69 — the block never sees a verify
+block, because nine rows is under both floors.
+
+**Acceptance is digit for digit the same under both**: 84.8% at `k = 1`,
+91.3-73.9% at `k = 2`, 84.2-73.7-63.2% at `k = 3` and 82.4-64.7-52.9-47.1% at
+`k = 4`, with 1.829, 2.560, 3.048 and 3.368 tokens a round.
+
+**Two of those figures disagree with the line this file records above, and the
+disagreement predates this milestone.** The same sweep run against the commit
+before the block reads the same nine acceptance figures, so nothing here moved
+them; what moved is that the recorded line was last taken when `k = 2` read
+87.0-78.3% and `k = 3` read 85-65-55%. **The line above is stale and this is the
+run that says so** — which is the second time in this milestone a figure nobody
+re-ran turned out to have drifted, and the reason the debt paragraph below
+exists.
+
+**`k = 4` reads 0.843× under the reference and 0.844 under the production path**,
+against the 0.972 this file records. The commit before the block reads 0.858 in
+the same sitting, so this is the host and not the change — see the paragraph
+below on what this sitting's absolute figures are worth.
+
+### What this sitting's absolute figures are worth, which is less than its ratios
+
+**A decode step on this host today is 32.8 ms of wall against the 19.8 this file
+records, and the commit before this milestone reads 32.775.** Both arms of every
+pair above were taken in that state, so every *ratio* here is sound and every
+absolute decode figure is this sitting's rather than this file's. The device's
+own clock has moved less — 20.1 ms against 18.2 — which puts most of the drift
+on this side of the round trip.
+
+Nothing here diagnoses it. What is worth recording is the method: the figure was
+checked against the *unchanged* commit through the same paired harness before it
+was reported, which is the only thing that separates "the host drifted" from "the
+change regressed", and it is a check this file has not always made.
+
+### What the staging turned out to be worth, against the guidance
+
+**Apple's guidance for this family is that threadgroup memory used as a
+software-managed cache of a device buffer is slower than reading the buffer** —
+register, threadgroup and buffer data share one cache hierarchy, so a copy moves
+nothing nearer the multiply and what it adds is the copy, its barriers and a
+declaration that decides how many threadgroups a core will hold. The block has
+two such copies available to it and they are not the same copy, so both were
+measured rather than assumed.
+
+The values are the guidance's own case: the second multiply wants them
+`[key, channel]`, which is how they already lie. The keys are not: the score
+multiply's right operand wants them transposed, and read where they lie a lane's
+two elements are `head_dim` floats apart while the copy that lands them can be
+coalesced. On the device's own clock, four arms over one dispatch:
+
+    a call, staging          neither    the keys   the values      both
+    2048 tokens, global        1.00x       1.14x        1.13x     1.12x
+    2048 tokens, window 512    1.00x       1.08x        1.13x     1.08x
+    8192 tokens, global        1.00x       0.99x        1.04x     0.98x
+    8192 tokens, window 512    1.00x       1.03x        1.13x     1.07x
+    declared                    0 KiB      18 KiB       16 KiB    18 KiB
+
+**Staging nothing is the worst of the four arms at three cells of four, and
+staging the copy the guidance most clearly rules out is the best at three.** The
+exception is the same cell in both readings: at 8192 tokens on a global layer,
+staging the keys and staging both are 0.99× and 0.98× — the one place the
+guidance's own direction shows. The shipped block stages its values and reads its
+keys where they lie: 16 KiB declared, 1.04 to 1.13× over staging neither, better
+than staging both at every cell, and within a point of the best arm at the one
+cell it does not win.
+
+**What that does and does not say.** It does not overturn the guidance: the
+arms differ by at most 14 points where the block as a whole is 15 to 21× over the
+entry it replaces, so this is a tuning term and not the structure. What it says
+is that "read it where it lies" is a rule with an exception on the operand whose
+*layout* has to change, and that the exception here is the one the rule most
+clearly names. Why the value staging pays is unmeasured; the value block is read
+once per channel fragment and there are sixteen of them, so a copy read sixteen
+times is the shape a cache would help, and the same is true of the keys.
+
+### What the flag's surface grew to, which is one more file and 143 lines
+
+**Nine files mention `Numerics` where eight did**, and the ninth is
+`attention.rs`. `numerics.rs` is unchanged — 22 lines of mechanism and 20 of
+cases — and so is every refusal on the command line. `LayerKernels::compiling`
+is still the only constructor that takes the word, and it now hands it to two
+kernels rather than one.
+
+**What this milestone added to `attention.rs`, by role:**
+
+    the kernel source, in Metal            165 lines
+    the mechanism, in Rust                 143 lines
+    the cases and the sweeps               377 lines
+
+The 143 are the constants the fragment layout rests on, `FusedAttention::
+compiling` and its `blocked` predicate, the grid and the byte accounting the
+predicate also decides, and one `Cell` that only a sweep sets. Everything above
+the accumulate is shared and unchanged: `splits_for`, the two compiled regimes
+and their occupancy declaration, the band derivation, the KV span, the
+submission structure, the nine bindings and the encoder that fills them. The
+block takes the same `Shape` from the same encoder at the same shapes the same
+predicates chose, and the only thing about the dispatch that differs between the
+two words is how many threadgroups cover the call.
+
+**One entry point is public that would not otherwise be**:
+`FusedAttention::SHORTEST_BLOCKED_CALL`, for the reason
+`PackedMatmul::SHORTEST_BLOCKED_CALL` is — a differential corpus that cannot ask
+where the flag's line is would report perfect agreement between a thing and
+itself.
+
+### What this milestone did not reach
+
+**The block reuses no fragment, and that is the largest named lever left.** Every
+`simdgroup_multiply_accumulate` here is fed by a fragment loaded for it and used
+once: 16 channel fragments against 4 key fragments for the scores, and 4 against
+16 for the values, so the load-to-multiply ratio is 1:1 on both. A block twice as
+tall would hold two query-row fragments per lane and use each loaded key and
+value fragment twice, taking that ratio to 2:1 for 32 more registers a thread —
+and it would double the floor, which is the trade and is why it is not taken
+blind. mlx-vlm's own steel GEMM runs 2.7:1.
+
+**The block is float32 on both operands and the reference runtime ships no
+float32 attention kernel at all** — its element types are 16-bit with a float32
+accumulator, which halves both the staged footprint and the traffic. That is
+available behind this flag and was not taken, because it is a different claim:
+this flag's two sides sum the same exact products in different orders, and a
+16-bit operand rounds the product itself. It would have to be reported in the
+conditioning table above rather than beside it.
+
+**The threadgroup is 256 threads because the block is 64 query rows**, and
+mlx-vlm runs the same structure at 64 to 128. A narrower threadgroup is a
+shorter block and a lower floor, which is the direction the first column of the
+height sweep wants; it was not swept, because the width is a host-side constant
+as well as a source one and the sweep would have had to reach both.
+
+**The bandwidth column is divided by 819 GB/s and should be divided by 723.**
+819 is this part's specification and 723 is what a streaming read achieves on
+this machine, so every "of peak" figure in this file is about 12% low. Nothing
+here changed it, because changing it moves every such figure in this file at once
+and that is a commit of its own rather than a line of this one. The block's own
+rows read 322 and 254 GB/s at 16384 tokens, which is 39% and 31% of 819 and 45%
+and 35% of 723.
+
+**One row of the per-kernel table moved on a kernel the flag does not reach.**
+`rms_norm` is 427.93 ms of the reference's 16384-token prefill and 125.11 ms of
+the production one, over the same 168 calls moving the same 73295.31 MB. Nothing
+else under it moved — `short_conv` is within 16%, `dense_matmul`, `swiglu`,
+`moe_combine` and both routers within 1% — so it is not the clock. It is 0.4% of the reference pass and 0.5% of
+the production one, and it is unexplained here.
+
+**What was not measured, and why.** The paired prefill was taken at 2048 and
+8192 rather than at all four lengths, for A7's reason: 16384 is 109 s an arm on
+the reference side and a pair of it is three minutes, so the four-length table
+above is one sitting a length instead. The per-kernel table was taken at 8192 and
+16384 on both paths and only 16384 is quoted. The cross-engine column was not
+re-measured, for the reason A4, A5 and A7 gave: nothing here changes what mlx-vlm
+does — and it is the one column of the wall table that now decides a sign, so it
+is the first thing to re-measure before that sign is quoted anywhere.
+
+### Whether the production path should be the default, which is now a closer question
+
+**The numbers are above and the reasoning is here, kept apart on purpose.**
+
+**What A7 said would change the recommendation has happened, and it is the first
+of the three.** A7's answer was no, and it named three things in the order they
+would arrive: an attention kernel behind the same flag so that the choice is
+about the whole engine rather than one of its two halves; a corpus large enough
+to bound the disagreement rate; and the accumulator chain split so that the
+drift stops growing with the reduction. The first is built. The other two are
+not.
+
+**The recommendation is still no, and one of A7's two reasons has got weaker
+while the other has not.**
+
+The reason that got weaker is conditioning. A7 had to report that the production
+path was the worse-conditioned order by a factor of thirty at the reduction
+every projection in this checkpoint has, and could only say that 4.1e-6 was four
+decades under what would move a token. The attention block adds nothing to that:
+its drift is the reference entry's to a digit at every span, because the long
+chain in an attention step is the softmax's and the softmax is not a matrix
+instruction's to carry. So the flag's conditioning story is now "one of the two
+kernels behind it is worse-conditioned and the other is not", which is a better
+story than A7 could tell.
+
+**The reason that did not get weaker is the oracle, and it got heavier.** This
+engine's core claim is that a kernel's answer is the CPU path's bit for bit, and
+that claim is what has made five milestones' worth of mutations falsifiable —
+why `element` could be swapped for two other decodes and *proven* the same
+floats, why the occupancy turn could be taken on sixteen cases rather than on a
+tolerance, why `the_bounded_loop_is_the_unbounded_one_bit_for_bit` is a case
+rather than an argument. **Promoting the production path retires that instrument
+for both of the engine's dominant kernels rather than for one.** A7 gave up the
+oracle on 70% of a decode step's device time; this would give it up on 96.7% of a
+prefill's passes as well. What replaces it is still 384 argmaxes over six
+prompts, and that number has not moved while what it is being asked to cover has
+doubled.
+
+**And the third thing has changed the stakes rather than the argument.** At
+16384 tokens the production path is 33.33 s against a reference path's 109.11
+and against mlx-vlm's 34.31 — so what is behind the flag is no longer a
+tuning-grade win on one half of the engine, it is the difference between this
+project being three times slower than the runtime it copies and being level with
+it. **That is a reason to take the remaining measurements, not a reason to skip
+them.** A default is a claim about every prompt anyone will ever run; six
+prompts is what has been measured, and the cost of being wrong is now larger
+rather than smaller because more of the engine is on the other side of it.
+
+**What would change the recommendation**, in the order it would arrive: a
+differential corpus large enough to bound the disagreement rate rather than to
+fail to find one, which is the one item A7 named that neither milestone has
+done; the matmul's accumulator chain split, which is still four lines of kernel
+and would leave the flag with no worse-conditioned kernel behind it at all; and
+a re-measured mlx-vlm column, because the wall table above now turns on a figure
+taken three milestones ago. **Two of those three are measurements and one is
+four lines.** Until then the default is the reference, `--numerics production` is
+a word anyone can type, and this section is where the decision belongs to whoever
+owns the claim.
+
+### The debt this milestone cleared
+
+**`what_a_prefills_attention_is_bound_by` had been failing since A5 and it is
+fixed.** Its weighting arm anchored on a loop written once at one indentation;
+A5's staging rewrite made that loop two — one against threadgroup memory and one
+against the device, because a threadgroup pointer and a device pointer are
+different types and nothing can name both — so the anchor matched neither string,
+the arm asserted, and nextest's fail-fast cancelled the 36 cases queued behind
+it. A7 ran the tier with `--no-fail-fast` to get around it; the tier runs
+properly now.
+
+The arm was worth having: the term is **16 to 22% of the walk** on both kinds of
+layer at both lengths, which is a row this table had been missing rather than a
+row it had wrong. What keeps the pair from drifting apart again is a count
+check — a partial replacement is the one failure `instead_of` cannot see, since
+it asserts the anchor is there and replaces every match, so a re-indent of one
+writing alone would hold the term out of one entry, leave it in the other, and
+print a share for a kernel that has neither shape.
+
+**And A3's query block cannot be cheaply retested, which is recorded here so
+that nobody spends the afternoon again.** A7 tried: reverting the revert
+conflicts in eleven regions of `attention.rs`, structurally, because A3
+parameterises the source by block height where A5 parameterises it by staging
+and residency, and A5 compiles two kernels where A3 compiled one.
+
+**What this milestone answers of A3's question is most of it.** A3 asked whether
+carrying a block of query rows through one tile of keys pays, measured height
+four at ×0.72, and was refused. The block above is that question asked on A5's
+kernel rather than on A3's — the staging predicate, the two compiled regimes and
+the occupancy declaration kept, the query rows blocked on top, which is what A7
+said it would take. The answer is that a block of query rows pays enormously and
+that **A3's height was the wrong axis**: four rows is under every floor this
+milestone measured, and the sweep above reads 0.47× at four rows on the shape A3
+took. A3's refusal was correct at A3's height and says nothing about 64.
+
+What A3's question this does *not* answer is whether a block pays on the
+reference numerics, where the scores stay a `simd_sum`. Nothing here separates
+the block from the instruction — they arrived together and the flag is what let
+them.
 
 ## The tail of a step
 
