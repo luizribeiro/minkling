@@ -3235,6 +3235,104 @@ mod tests {
         }
     }
 
+    /// The prompt lengths a prefill's own attention is priced at, which are the
+    /// four a coding turn opens somewhere inside.
+    const PREFILL_CONTEXTS: [usize; 4] = [2048, 4096, 8192, 16384];
+
+    /// **What a prefill's attention costs on each kind of layer**, which is the
+    /// same question the sweep above asks of a decode step and is a different
+    /// shape entirely: there one query row walks a span, here `n` of them do.
+    ///
+    /// **What the two columns should be is arithmetic, and the point of the
+    /// table is whether they are.** A windowed layer's row `i` may read its last
+    /// 512 keys, so 35 of them are `n × 512` and linear in the prompt; a global
+    /// layer's row `i` may read `i + 1`, so 7 of them are `n²/2` and quadratic.
+    /// A prefill that walked full spans on all 42 would be about six times the
+    /// work at 16384 — and this is what says whether that is so rather than an
+    /// engine's whole prefill wall, which has a MoE and a hundred projections in
+    /// it as well.
+    ///
+    /// **The per-token and per-token² columns are what say which term a row
+    /// is.** A row whose cost divided by `n` is constant is linear; one whose
+    /// cost divided by `n²` is constant is quadratic. Neither is asserted — the
+    /// numbers go to stderr — because the shape is the finding and a bound on it
+    /// is a bound somebody would have to maintain.
+    ///
+    /// One dispatch a reading rather than the sweep above's several: a call at
+    /// this shape allocates `[n, heads × head_dim]` for its answer, which at
+    /// 16384 tokens is 268 MB that the command buffer holds until it completes.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_prefills_attention_costs_as_the_prompt_grows() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        const ROUNDS: usize = 3;
+
+        let cost = |tokens: usize, sliding: usize| -> Duration {
+            let case = blocked(tokens, sliding, tokens);
+            let layer = case.wrapped(&device, &attention);
+            layer.hold(0, tokens).expect("the span reserves");
+            layer.span().appended(tokens);
+
+            let mut q = device.buffer(&case.q).expect("the queries upload");
+            let mut rel = device.buffer(&case.rel).expect("the features upload");
+            let mut span = layer.span();
+            let mut held = None;
+            crate::testing::device_time(&device, 1, |batch| {
+                held = Some(
+                    layer
+                        .encode_over(batch, &mut span, &mut q, &mut rel, None, 0)
+                        .expect("the prefill encodes"),
+                );
+            })
+        };
+
+        let mut taken = PREFILL_CONTEXTS.map(|_| [const { Vec::new() }; 2]);
+        for round in 0..ROUNDS {
+            for (each, tokens) in taken.iter_mut().zip(PREFILL_CONTEXTS) {
+                for (readings, sliding) in each.iter_mut().zip([0, SLIDING_WINDOW]) {
+                    // Warm on the first round rather than beside every reading:
+                    // the first dispatch of a fresh pipeline pays for the
+                    // driver's first look at its buffers, and at this shape a
+                    // warming call is seconds rather than microseconds.
+                    let taken = cost(tokens, sliding);
+                    if round > 0 {
+                        readings.push(taken);
+                    }
+                }
+            }
+        }
+
+        let mean = |of: &Vec<Duration>| of.iter().sum::<Duration>() / of.len() as u32;
+        eprintln!(
+            "{:>7}{:>12}{:>11}{:>11}{:>12}{:>11}{:>11}{:>12}",
+            "tokens",
+            "global",
+            "a token",
+            "a token²",
+            "window 512",
+            "a token",
+            "a token²",
+            "the stack"
+        );
+        for (tokens, each) in PREFILL_CONTEXTS.iter().zip(&taken) {
+            let (global, window) = (mean(&each[0]), mean(&each[1]));
+            let stack = SLIDING_LAYERS as u32 * window + GLOBAL_LAYERS as u32 * global;
+            let a_token = |of: Duration| of.as_secs_f64() * 1e6 / *tokens as f64;
+            let a_square = |of: Duration| of.as_secs_f64() * 1e9 / (*tokens * *tokens) as f64;
+            eprintln!(
+                "{tokens:>7}{:>12}{:>11}{:>11}{:>12}{:>11}{:>11}{:>12}",
+                format!("{global:.2?}"),
+                format!("{:.2}µs", a_token(global)),
+                format!("{:.3}ns", a_square(global)),
+                format!("{window:.2?}"),
+                format!("{:.2}µs", a_token(window)),
+                format!("{:.3}ns", a_square(window)),
+                format!("{stack:.2?}"),
+            );
+        }
+    }
+
     /// A layer whose span grows past what it starts with, and a sequence long
     /// enough to make it: `LEAST_KEYS` slots and a few more.
     ///
