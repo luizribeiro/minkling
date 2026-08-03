@@ -297,6 +297,7 @@ impl<'a> Generator<'a> {
                 true => normed,
                 false => Vec::new(),
             },
+            picks: Self::picks(&logits, want.block),
             logits,
         }
     }
@@ -443,10 +444,11 @@ impl<'a> Generator<'a> {
                 },
                 weights,
             );
-            let picks = Self::picks(&tailed.logits, block);
+            let picks = &tailed.picks;
+            assert_eq!(picks.len(), block, "an id per row of the block");
             let agreed = guesses
                 .iter()
-                .zip(&picks)
+                .zip(picks)
                 .take_while(|(guess, pick)| guess == pick)
                 .count();
 

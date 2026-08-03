@@ -91,6 +91,17 @@ pub struct Tailed {
     pub normed: Vec<f32>,
     /// `[block, vocab]`, the muP divide and the projection behind that norm.
     pub logits: Vec<f32>,
+    /// The id a greedy sampler takes from each of those rows.
+    ///
+    /// **Beside the logits rather than derived from them by the caller**, and
+    /// the reason is where the argmax runs. On this side it is a pass over the
+    /// row that produced it and nothing is gained by naming it here; on a
+    /// backend that holds the tail it is a dispatch in the command buffer that
+    /// wrote the row, and what crosses back is four bytes where the row is
+    /// 800 KB. Both fill it, so the loop above reads one field rather than
+    /// asking which backend answered — see
+    /// [`Generator::picks`](crate::Generator::picks), which is this on the CPU.
+    pub picks: Vec<usize>,
 }
 
 /// `_logits_from_norm`: the muP divide, the projection, and the cut at the

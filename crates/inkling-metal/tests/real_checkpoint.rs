@@ -1048,23 +1048,39 @@ fn the_device_tail_takes_the_token_the_host_tail_takes() {
             .tailed(device_cache, &on_device, want, &held);
         let theirs = apart.generator().tailed(host_cache, &on_host, want, &apart);
 
-        let (ours_id, theirs_id) = (
-            inkling_core::Generator::picks(&ours.logits, 1)[0],
-            inkling_core::Generator::picks(&theirs.logits, 1)[0],
-        );
+        let (ours_id, theirs_id) = (ours.picks[0], theirs.picks[0]);
         assert_eq!(
             ours.logits.len(),
             theirs.logits.len(),
             "step {step}: the two tails answered different widths"
         );
 
+        // **The argmax on the device against the argmax on this side, over the
+        // one row both of them ranked** — which is exact rather than close, and
+        // is the only claim in this file of which that is true. The two tails'
+        // logits differ by ulps and the assertion below is about a margin; these
+        // two rank the same 200058 floats, so a disagreement would be the tie
+        // rule and nothing else.
+        assert_eq!(
+            ours_id,
+            inkling_core::Generator::picks(&ours.logits, 1)[0],
+            "step {step}: the device argmax and the host's disagree about one row"
+        );
+        assert_eq!(
+            theirs_id,
+            inkling_core::Generator::picks(&theirs.logits, 1)[0],
+            "step {step}: the host tail's own ids are not its logits'"
+        );
+
         // What the argmax had to survive: how far the two tails' logits are
         // apart, against how far the best logit is from the second best.
         let apartness = deviation(&ours.logits, &theirs.logits);
         let margin = margin(&theirs.logits);
+        let (at_the_top, longest) = tied(&theirs.logits);
         eprintln!(
             "step {step:>2}: token {theirs_id:>6}  logits apart {apartness:.3e}  \
-             margin {margin:.3e}  normed apart {:.3e}",
+             margin {margin:.3e}  normed apart {:.3e}  ids at the peak {at_the_top}  \
+             longest tied run {longest}",
             deviation(&ours.normed, &theirs.normed)
         );
         assert_eq!(
@@ -1087,6 +1103,29 @@ fn the_device_tail_takes_the_token_the_host_tail_takes() {
         worst < narrowest,
         "the two tails disagree by more than a token's margin"
     );
+}
+
+/// How many ids hold a row's largest logit, and the longest run of ids anywhere
+/// in it that agree bit for bit.
+///
+/// **Whether the tie rule is hypothetical is a measurement and not an opinion**,
+/// and this is the measurement. The first number is how many ways the argmax
+/// could have gone at that position; the second is how often 200058 float32
+/// logits collide at all, which is what says a rule about equal values is a rule
+/// this vocabulary reaches.
+fn tied(logits: &[f32]) -> (usize, usize) {
+    let mut sorted = logits.to_vec();
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    let at_the_top = sorted.iter().take_while(|x| **x == sorted[0]).count();
+    let (mut longest, mut run) = (1usize, 1usize);
+    for pair in sorted.windows(2) {
+        run = match pair[0].to_bits() == pair[1].to_bits() {
+            true => run + 1,
+            false => 1,
+        };
+        longest = longest.max(run);
+    }
+    (at_the_top, longest)
 }
 
 /// How far the best logit of a row is from the second best, relative to the
@@ -2659,6 +2698,7 @@ fn wrap_tail<'a>(
         device,
         kernels.norm(),
         kernels.matmul(),
+        kernels.argmax(),
         &TailWeights {
             norm: weights.final_norm().to_vec(),
             eps: config.rms_norm_eps,
@@ -2733,6 +2773,84 @@ impl Decoded {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// **A head's own argmax against the same argmax taken here**, which is the
+/// claim [`Guessed::guess`] rests on and the one the tail's own case cannot
+/// make: that case compares two tails behind the *stack*, and a head's guess
+/// comes out of the head's command buffer instead.
+///
+/// The same chain twice over the same round, differing in nothing but whether
+/// the heads were wrapped with the model's tail behind them. With it, each
+/// head's guess is a dispatch over the row `lm_head` just wrote; without it,
+/// the head answers with rows and `Generator::id_from_hidden` runs the same
+/// final norm, the same divide, the same projection and `top_k` back on this
+/// side. Every guess of every head has to be the same id — exactly, since what
+/// separates the two is an argmax and not an accumulation.
+///
+/// Eight heads and not one, because a chain guesses from its own guesses: a
+/// head whose guess moved would feed the next head a different token, so a
+/// single disagreement anywhere shows up here as every head after it
+/// disagreeing too.
+#[test]
+fn a_heads_own_argmax_takes_the_token_the_host_takes() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    let config = fixture::config(&dir);
+    let text = &config.text_config;
+    let mtp = config.mtp_config.as_ref().expect("an mtp_config");
+    let tokenizer = Tokenizer::open(&dir, &config).expect("the tokenizer opens");
+    let ids: Vec<usize> = tokenizer
+        .encode(STRUCTURED_PROMPT)
+        .expect("the prompt encodes")
+        .into_iter()
+        .map(|id| id as usize)
+        .collect();
+
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+    let held = gpu.wrap(&ckpt, text, 0);
+    let generator = held.generator();
+
+    // The row a round would chain from, which both chains are given.
+    let cache = &mut ModelCache::speculating(text, 0);
+    let hidden = generator
+        .tailed(
+            cache,
+            &ids,
+            Tail {
+                block: 1,
+                chained: true,
+            },
+            &held,
+        )
+        .normed;
+    let width = text.hidden_size;
+    let row = &hidden[hidden.len() - width..];
+
+    // The tail behind the heads, and no tail behind them — a loop rather than
+    // two spellings of a round, so that what differs between the two answers is
+    // the argument and not the code that produced them.
+    let mut guessed = Vec::new();
+    for tail in [gpu.tail(&held, text), None] {
+        let heads = gpu.heads(&ckpt, text, mtp, tail);
+        let mut proposer = MtpProposer::new(&heads, generator, &held, DEPTHS);
+        guessed.push(
+            proposer
+                .propose(Round {
+                    hidden: row,
+                    next: &ids[..1],
+                    depth: DEPTHS,
+                })
+                .to_vec(),
+        );
+    }
+
+    let (there, here) = (&guessed[0], &guessed[1]);
+    eprintln!("a chain of {DEPTHS} heads guessed {there:?}");
+    assert_eq!(there.len(), DEPTHS, "a guess a head");
+    assert_eq!(there, here, "a head's own argmax took a different token");
 }
 
 /// What `depth` heads cost to run over one row, which is what a round pays to

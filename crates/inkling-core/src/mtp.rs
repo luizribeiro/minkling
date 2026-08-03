@@ -60,7 +60,7 @@ use crate::attention::{
 };
 use crate::checkpoint::Checkpoint;
 use crate::config::{MtpConfig, TextConfig};
-use crate::generate::{Generator, Proposer, Round, greedy};
+use crate::generate::{Generator, Proposer, Round};
 use crate::layer::{
     DecoderCache, DecoderLayer, DecoderStep, DecoderWeights, Hidden, LayerMlp, NoExperts, Passed,
 };
@@ -185,7 +185,7 @@ impl<'a> MtpHead<'a> {
                     hidden: self
                         .block
                         .forward(head, cache, Hidden::Rows(&x), &NoExperts, None),
-                    logits: None,
+                    guess: None,
                 }
             }
         };
@@ -250,9 +250,17 @@ pub struct Guessed {
     /// — and always rows rather than a count, because the two norms in front of
     /// that head are on this side.
     pub hidden: Passed,
-    /// `[vocab]` for the last of those rows, and `None` where the backend
+    /// The id the last of those rows names, and `None` where the backend
     /// stopped at the rows.
-    pub logits: Option<Vec<f32>>,
+    ///
+    /// **The id and not the row of logits it came out of.** Nothing in a chain
+    /// reads a head's logits — the guess is fed to the head after this one and
+    /// verified by the model a round later — so a backend that ran the argmax
+    /// where the projection did hands over four bytes rather than the 800 KB it
+    /// ranked. A backend that stopped at the rows answers `None`, and
+    /// [`Generator::id_from_hidden`](crate::Generator::id_from_hidden) is the
+    /// same tail and the same argmax back on this side.
+    pub guess: Option<usize>,
 }
 
 /// Everything one head runs past the two norms in front of it, described rather
@@ -983,8 +991,8 @@ impl<W: ModelWeights> Proposer for MtpProposer<'_, W> {
             // The tail where the head ran it, and where it did not: a guess is
             // the same token either way, and what differs is whether reading it
             // cost a second submission.
-            let guess = match &guessed.logits {
-                Some(logits) => greedy(logits),
+            let guess = match guessed.guess {
+                Some(id) => id,
                 None => self
                     .generator
                     .id_from_hidden(&chained[(rows - 1) * hidden..]),
@@ -1325,7 +1333,7 @@ mod tests {
                 .set((step.block.queries, step.block.attention.x.len()));
             Some(Guessed {
                 hidden: Passed::Rows(self.answer.clone()),
-                logits: None,
+                guess: None,
             })
         }
     }

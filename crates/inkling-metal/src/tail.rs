@@ -1,11 +1,18 @@
-//! The back of the model, on the device: the final norm, the muP divide, and
-//! `lm_head` behind them.
+//! The back of the model, on the device: the final norm, the muP divide,
+//! `lm_head` behind them, and the argmax behind that.
 //!
 //! Everything else in this crate is an operation of a layer. This is the three
 //! lines `LanguageModel._logits_from_norm` is, put where the rows they read
 //! already are — so that the last thing a decode step does is not a round trip,
 //! and so that an MTP head's guess comes back out of the head's own command
 //! buffer rather than out of a second one behind it.
+//!
+//! **And the fourth line is here too.** What a caller wants of a row of logits
+//! is which id it names, and taking that on this side meant a row of 200058
+//! floats crossing back for a pass that produces four bytes. [`crate::argmax`]
+//! is that pass as two dispatches in the same command buffer, and what it had
+//! to buy first is the tie rule the engine's token identity rests on — see its
+//! own module documentation, where the exactness argument is made.
 //!
 //! # Why the divide is in the weight
 //!
@@ -46,6 +53,7 @@ use inkling_core::head::{Tail, Tailed};
 use inkling_core::profile::{self, Op};
 use inkling_core::weights::Packed;
 
+use crate::argmax::{GreedyArgmax, Vocabulary};
 use crate::buffer::Buffer;
 use crate::device::Device;
 use crate::kernel::Batch;
@@ -95,6 +103,13 @@ pub struct ModelTail<'a> {
     /// module documentation for why that is the same value and not a near one.
     divided: LayerNorm<'a>,
     head: PackedProjection<'a>,
+    /// The argmax over what the projection produced, which is the last thing
+    /// past the model — see [`crate::argmax`] for the tie rule it has to
+    /// reproduce before it may be here at all.
+    argmax: &'a GreedyArgmax,
+    /// The ids a row of this head's output holds, which is where the projection
+    /// was already cut and so where the argmax stops.
+    vocab: Vocabulary,
 }
 
 impl<'a> ModelTail<'a> {
@@ -111,6 +126,7 @@ impl<'a> ModelTail<'a> {
         device: &'a Device,
         rms: &'a RmsNorm,
         matmul: &'a PackedMatmul,
+        argmax: &'a GreedyArgmax,
         weights: &TailWeights<'a>,
     ) -> Result<Option<Self>, ProjectionError> {
         let Some(divided) = divided(&weights.norm, weights.mup) else {
@@ -120,6 +136,8 @@ impl<'a> ModelTail<'a> {
             norm: LayerNorm::new(device, rms, &weights.norm, weights.eps)?,
             divided: LayerNorm::new(device, rms, &divided, weights.eps)?,
             head: PackedProjection::wrap_packed(device, matmul, &weights.head, weights.vocab)?,
+            argmax,
+            vocab: Vocabulary::of(weights.vocab),
         }))
     }
 
@@ -148,8 +166,13 @@ impl<'a> ModelTail<'a> {
             false => None,
         };
         let mut block = self.divided.encode_last(batch, x, want.block)?;
-        let logits = self.head.encode_over(batch, &mut block)?.buffer();
-        Ok(Landed { chained, logits })
+        let mut logits = self.head.encode_over(batch, &mut block)?.buffer();
+        let picks = self.argmax.encode(batch, &mut logits, self.vocab)?;
+        Ok(Landed {
+            chained,
+            logits,
+            picks,
+        })
     }
 }
 
@@ -162,6 +185,8 @@ pub(crate) struct Landed {
     /// The undivided normed rows, where [`Tail::chained`] asked for them.
     chained: Option<Buffer<f32>>,
     logits: Buffer<f32>,
+    /// The id each row of the block names, taken where the row was written.
+    picks: Buffer<u32>,
 }
 
 impl Landed {
@@ -175,15 +200,27 @@ impl Landed {
                 .map(Buffer::to_vec)
                 .unwrap_or_default(),
             logits: self.logits.to_vec(),
+            picks: widened(&self.picks),
         })
     }
 
-    /// The logits alone, for the caller whose rows are not what the final norm
-    /// is for — a head is chained from its own state and not from the model's
-    /// normed one.
-    pub(crate) fn logits(&self) -> Vec<f32> {
-        profile::timed(Op::Readback, || self.logits.to_vec())
+    /// The id the block's last row names, for the caller that wants nothing
+    /// else of the tail — a head is chained from its own state and not from the
+    /// model's normed one, and nothing in a chain ever reads a head's logits.
+    ///
+    /// **Four bytes where [`Landed::read`] crosses a row of 800 KB**, which is
+    /// what the argmax being on the device is worth to a chain: eight heads are
+    /// eight rows of the vocabulary that stay where the projection wrote them.
+    pub(crate) fn guess(&self) -> usize {
+        profile::timed(Op::Readback, || {
+            *self.picks.as_slice().last().expect("a block names an id") as usize
+        })
     }
+}
+
+/// The ids a dispatch named, as the indices this side counts in.
+fn widened(picks: &Buffer<u32>) -> Vec<usize> {
+    picks.as_slice().iter().map(|id| *id as usize).collect()
 }
 
 /// The norm's weight with the muP multiplier divided into it, and `None` where

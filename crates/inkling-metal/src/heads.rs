@@ -215,9 +215,10 @@ impl HeadBackend for ModelHeads<'_> {
 ///
 /// Where a chain has to end one is the guess: a head's rows have to be a token
 /// before the head after it can embed it, and turning a hidden state into a
-/// token is `lm_head` and an argmax over 201024 logits. So a head waits once,
-/// and what it waits for is everything between the pair of normed rows it was
-/// handed and the `[rows, hidden]` it answers with.
+/// token is `lm_head` and an argmax over the vocabulary. Both are in this
+/// buffer, so a head waits once, and what it waits for is everything between the
+/// pair of normed rows it was handed and the `[rows, hidden]` and the four bytes
+/// of id it answers with.
 impl HeadDevice for ModelHeads<'_> {
     fn run(&self, head: usize, cache: &mut DecoderCache, step: HeadStep<'_>) -> Option<Guessed> {
         let held = self.heads.get(head)?;
@@ -270,7 +271,7 @@ impl WrappedHead<'_> {
         batch.wait()?;
         Ok(Guessed {
             hidden: Passed::Rows(profile::timed(Op::Readback, || rows.to_vec())),
-            logits: landed.as_ref().map(Landed::logits),
+            guess: landed.as_ref().map(Landed::guess),
         })
     }
 }

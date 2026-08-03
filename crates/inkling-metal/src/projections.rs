@@ -56,6 +56,7 @@ use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::profile::{self, Op};
 use inkling_core::weights::{LayerBackend, LayerBanks, LayerPacked, Packed, PackedMlp};
 
+use crate::argmax::GreedyArgmax;
 use crate::attention::{AttentionError, FusedAttention, KeyValues, LayerAttention, Step};
 use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
@@ -125,6 +126,7 @@ pub struct LayerKernels {
     norm: RmsNorm,
     conv: ShortConvolution,
     attention: FusedAttention,
+    argmax: GreedyArgmax,
 }
 
 impl LayerKernels {
@@ -134,6 +136,7 @@ impl LayerKernels {
             norm: RmsNorm::new(device)?,
             conv: ShortConvolution::new(device)?,
             attention: FusedAttention::new(device)?,
+            argmax: GreedyArgmax::new(device)?,
         })
     }
 
@@ -155,6 +158,17 @@ impl LayerKernels {
     /// same kernel over a different weight, which is all any of them are.
     pub fn norm(&self) -> &RmsNorm {
         &self.norm
+    }
+
+    /// The argmax, which is nothing of a layer at all.
+    ///
+    /// **Here because of what wraps the tail rather than what dispatches it.**
+    /// [`ModelTail`](crate::ModelTail) is stood up from these kernels at both
+    /// of its sites — the stack's last layer and every MTP head — and it needs
+    /// the norm and the packed matmul out of this struct already, so a third
+    /// compilation carried beside them is one pipeline rather than two.
+    pub fn argmax(&self) -> &GreedyArgmax {
+        &self.argmax
     }
 }
 

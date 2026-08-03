@@ -107,6 +107,7 @@ impl Gpu {
             &self.device,
             self.kernels.norm(),
             self.kernels.matmul(),
+            self.kernels.argmax(),
             weights,
         )?)
     }
