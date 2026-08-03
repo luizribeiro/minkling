@@ -66,6 +66,7 @@ three; the pre-commit hooks already skip clippy on those by config.
     just bench HEAD~1 HEAD decode
     just bench HEAD~1 .    prefill --tokens 769
     just bench v1 v2       sweep --depth 4
+    just bench-engines                        # this engine against mlx-vlm
 
 Every timed claim in this file is paired and alternating — build A, build B, run
 them in one sitting with the order flipped each pair, and report whether the
@@ -76,22 +77,32 @@ ref is built once into `target/bench/bin/<sha>` and kept, and the pairs are
 process launches against binaries that already exist. `.` is the working tree,
 which is the arm a change is measured from before it is a commit at all.
 
-The three things it measures are the three this file quotes: a decode step, a
-prefill at a given length, and the end-to-end `k` sweep with its acceptance and
-its speedups — the last of which are divided against *that run's* own `k = 0`,
+The four things it measures are the four this file quotes: a decode step, a
+prefill at a given length, the end-to-end `k` sweep with its acceptance and its
+speedups — the last of which are divided against *that run's* own `k = 0`,
 because a sweep whose speedup row comes from another sitting carries the drift
-between the two. What comes back is the per-arm mean, both ranges, whether they
-overlap, and how many pairs moved the way the means did, which is this file's own
-standard for an effect. It runs one arm at a time and opens one Metal device
-apiece, for the reason `.config/nextest.toml` gives.
+between the two — and what a prompt and its answer cost together. What comes back
+is the per-arm mean, both ranges, whether they overlap, and how many pairs moved
+the way the means did, which is this file's own standard for an effect. It runs
+one arm at a time and opens one Metal device apiece, for the reason
+`.config/nextest.toml` gives.
+
+**And the last of the four takes the other engine as its second arm.** Nothing in
+the protocol between the harness and an arm says which engine printed the
+readings, so `just bench-engines` puts mlx-vlm on one side and this engine on the
+other and alternates them the same way — which is what a cross-engine claim needs
+and what running one engine and then the other cannot give, since this host has
+drifted 1.7% inside a single sitting. See "Against the reference, end to end".
 
 Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 20 ms against mlx-vlm's 23 ms — 16.5 ms a token
-speculating two deep, which is 60.7 tokens a second — and the timings go to
-stderr so stdout stays pipeable. The prompt reaches the tokenizer as it stands,
+A decode step is about 20 ms — 16.5 ms a token speculating two deep, which is
+60.7 tokens a second — and the timings go to stderr so stdout stays pipeable.
+**Both of those are taken at an eight-token context and neither is what a user
+feels**; "Against the reference, end to end" below is the figure that is, and it
+does not read the same way at every prompt length. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
 rather than applied by a template this does not implement.
@@ -904,6 +915,123 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## Against the reference, end to end
+
+**This file had no defensible headline figure and that was a real gap.** Prefill
+was last measured against the reference two milestones ago; the decode figure
+quoted against it dated from before the run was pipelined, while our own number
+moved five times underneath it; and nothing here had ever measured the one number
+a user actually feels — a prompt and its answer, prefill and decode weighed
+against each other rather than quoted apart. `just bench-engines` is that
+measurement, and it is the first in this file whose other arm is not this engine:
+an arm is an executable that prints `name value unit` lines, so
+`reference/scripts/bench_engines` is mlx-vlm behind the same protocol,
+alternating with ours pair by pair.
+
+**Seven pairs, one sitting, the order flipped each pair**, on
+`models/Inkling-Small-mxfp4-mtp4` — the packed heads, which is where this
+engine's own best figure is and is not this repo's default checkpoint. Twenty-two
+of the twenty-four readings moved the same way in all seven pairs with the ranges
+apart; the two that did not are named where they fall. Both engines were given
+the same prompt tiled to the same length and asked for the same number of tokens,
+and **the two produced the same tokens**:
+`[3004, 49159, 13, 200010, 200001, 200008, 976, 1825]` at 97,
+`[2454, 402, 1617, 2316, 2543, 306, 9707, 290]` at 385 and
+`[3665, 478, 25, 478, 117867, 382, 391, 6120]` at 769, ours and mlx-vlm's alike.
+That is what makes this a comparison of two engines rather than of two workloads.
+
+**What a user waits, prompt and answer together:**
+
+    prompt × generated    ours k = 0   ours k = 2    mlx-vlm    k = 2 against it
+     97 × 128                3.551 s      2.723 s    3.209 s          1.18× ahead
+    385 × 128                7.584 s      6.377 s    3.673 s          0.58×
+    769 × 128               10.803 s      9.487 s    4.186 s          0.44×
+     97 × 512               15.531 s      9.703 s   12.131 s          1.25× ahead
+
+**So this engine wins the short prompt and loses the long one, and the crossover
+is a number rather than a direction.** At a 97-token prompt, speculating two
+deep, we start 299 ms behind at the first token and take 6.19 ms less per token
+after it — so the wall times cross at **about 49 generated tokens**, and both
+rows at that prompt are past it. At `k = 0` there is no crossover at any prompt
+length, and at 385 and 769 tokens there is none at any depth: our decode step at
+those contexts is already slower than the reference's, so every token generated
+widens the gap rather than closing it. **That is the finding this table was taken
+for**, and it is not the one the milestone expected.
+
+**The prefill, which is the first token and everything under it:**
+
+    tokens        ours    mlx-vlm     gap    ours at k = 2   the reference's stack
+       97       561 ms     283 ms   ×1.98          582 ms                  260 ms
+      385      2732 ms     707 ms   ×3.87         2786 ms                  680 ms
+      769      5396 ms    1171 ms   ×4.61         5457 ms                 1140 ms
+
+**The `k = 2` column is the control and it is meant to be dull**: a prompt takes
+one token out of its last position however many positions it had, so speculation
+cannot reach a prefill, and the three pairs agree to within 3.7%.
+
+**The reference did not move and the 97-token row did.** `just prefill-bench`
+reads 0.26, 0.68 and 1.14 s for the transformer stack on its own, the same three
+figures this file has quoted since P4, and the last column is there to say that
+the comparison was never unfair in mlx-vlm's favour: its full `[1, L, vocab]`
+projection and its argmax are 23 to 31 ms on top, so time-to-first-token and
+stack-only are the same measurement to within 3%. What changed is ours — 1.22 s
+to 0.56 s at 97 tokens — and it changed because the device argmax took the host
+round trip out. The ×4.7, ×4.7 and ×4.8 this file carried is now **×2.0, ×3.9 and
+×4.6**.
+
+**A decode step, and the column this file has never printed — what it costs at a
+context somebody might have:**
+
+    context      ours k = 0   ours k = 2    mlx-vlm      ours k = 2, tokens/s
+     97              23.54        16.86      23.04        59.3 against 43.4
+    385              38.21        28.28      23.36        35.4 against 42.8
+    769              42.58        31.73      23.74        31.5 against 42.1
+     97 → 609        29.30        17.87      23.19        55.9 against 43.1
+
+**The reference's decode step is flat in the context and ours is not**, and that
+is the whole of why the two long-prompt rows read as they do. 23.04 to 23.74 ms
+across an eight-fold context is mlx-vlm holding still; 23.54 to 42.58 is this
+engine walking the span. **The 20.59 ms this file quotes for a decode step is
+taken at an eight-token context**, and it is a true figure about a context nobody
+has — the same 42 `fused_attention` dispatches the table under "Speculating with
+the MTP heads" prices at 4.9 ms over 155 keys are 15.5 ms over 512, and that is
+the row moving. The shape fits: 35 of 42 layers cap at a 512-token window, so the
+median step grows by 9.1 ms between 97 and 385 keys and by 3.8 ms between 385 and
+769, where a linear walk would have grown by more the second time.
+
+**The one row that is not a claim is the honest one to name.** `97 × 128` at
+`k = 0` reads 23.54 ms against 23.04 with the ranges across each other and six of
+seven pairs agreeing — no claim by this file's own standard. So at a short
+context and without speculation **the two engines' decode steps are
+indistinguishable**, and every other decode row in the table is a claim. The
+other is that pair's wall time, which inherits it.
+
+**The mean is not the median at the two long prompts, and what separates them is
+one step.** Ours reads 38.21 ms a token at a 385-token context against a median
+of 32.62, and 42.58 against 36.44 at 769 — and the longest step of each
+generation is **step 1** at 736 ms and 783 ms, where at 97 tokens the longest is
+25.55 ms and falls at step 125. That is not a decode step: it is what the prefill
+deferred, arriving on the step after it, and a 769-token prefill retains 13741
+MiB over 1278 buffers that are released when its command buffer completes. The
+reference has no such step — its own maxima are 27.7, 33.3 and 35.1 ms against
+medians of 22.9, 23.1 and 23.6. So our steady-state step is 32.6 and 36.4 ms and
+the 0.7 to 0.8 s belongs to the prefill row above rather than to this one. It is
+in the wall time either way, which is why the end-to-end table is the one to read.
+
+**What this says about where the work is**, taken apart row by row rather than
+asserted. At 769 tokens in and 128 out we are 5.30 s behind at `k = 2`, and that
+divides exactly: **4.29 s of prefill and 1.01 s of decode**. At 97 in and 512 out
+we are 2.43 s ahead, and that divides too — **2.71 s won on the decode step
+against 0.29 s given away at the prefill**. And the same pair at `k = 0` is 3.40 s
+behind, of which 3.13 s is the decode step and 0.27 s the prefill: without
+speculation the context growth alone loses that row.
+
+**So prefill is not the whole remaining gap.** It is the whole of it only where
+the prompt is long against its answer; the moment a generation is long, the decode
+step's growth with the context is the larger number, and at `k = 0` it is the only
+number. Both are the same fact from two sides — a prefill reads the model once per
+token, and a decode step walks every key it has.
+
 ## The tail of a step
 
 **What a decode step did last was a round trip, and the only reason was that the
@@ -1613,58 +1741,29 @@ tests are necessary and how large a difference is remains the reader's**, and at
 three pairs on a figure this repeatable the ranges will sit apart over a
 rounding.
 
-**Against mlx-vlm, measured in one sitting on 2 August 2026.** Both engines were
-given the same 27-token prompt — the string mlx-vlm's own chat template renders
-for `just smoke`'s question — and both decoded 128 tokens from it. The two
-continuations are the same 128 tokens, byte for byte, which is what makes this a
-comparison of two engines rather than of two workloads. Six rounds, the order of
-the two halves flipped each round so that neither always ran on the other's warm
-page cache:
+**Against mlx-vlm, the cross-engine table is now its own section** — see
+"Against the reference, end to end", which is `just bench-engines` and supersedes
+the hand-run sitting this paragraph used to hold. What that sitting said, at a
+27-token prompt and 128 tokens out, was 22.66 ms a token for the reference
+against 22.07 for this engine unspeculated and 26.87 at `k = 2`, and the last of
+those three is the one worth carrying forward: **`k = 2` was a loss on that
+prompt**, worth 0.82× against this engine's own unspeculated step where the sweep
+prompt puts it at 1.25×. Nothing about the speculation changed between the two —
+the same 128 tokens come out at every depth — and what differs is the text: that
+prompt's first head is accepted 66% of the time against the sweep prompt's 85%.
+**Acceptance is the workload's and the depth worth running is the workload's**,
+which is the same finding the study's spread across regimes is and is why
+`--speculate` takes a number.
 
-    round                 1      2      3      4      5      6     mean
-    mlx-vlm ms/token  22.62  22.73  22.62  22.62  22.62  22.73    22.66
-    ours, k = 0       22.06  22.07  22.08  22.07  22.10  22.06    22.07
-    ours, k = 2       26.73  27.02  27.07  26.85  26.96  26.61    26.87
-
-**So this engine decodes at 0.97× the reference unspeculated, and it is ahead by
-about 3%.** The same sitting before the run was pipelined read 29.29 against
-22.77 — 1.29× and behind — and what closed a gap of six and a half milliseconds
-is that the device now runs a step's first layers while this process is still
-encoding its last. Every one of the six rounds falls the same way and the two
-ranges do not overlap, which at a 3% margin is the whole of what makes it a
-claim rather than a coin.
-
-**And `k = 2` was a loss on this prompt when that sitting was taken**, at 26.87
-against 22.07. It was never a win against the reference — 26.72 against 22.77 was
-1.17× behind — but it was worth 1.10× against this engine's own unspeculated
-step, and it was worth 0.82× against it there. Nothing about the speculation
-changed — the same 128 tokens come out at `k = 1`, `2` and `4` as at `k = 0`,
-byte for byte — and this prompt's first head is accepted 66% of the time against
-the sweep prompt's 85%, which was never enough to pay for a chain of heads at
-the step this engine had then.
-
-**That sitting predates the merged head above and has not been retaken**, which
-is what the `k = 2` row is worth reading as: the chain it paid for was 36 ms and
-is 17, and what that comes to at 66% acceptance on this prompt is not a number
-this file has, because a cross-engine claim needs both sides measured in one
-sitting and the reference has not been run since. The `k = 0` row is the one the
-merge cannot have moved, and the sweep above says it did not.
-
-**Both engines drifted over the sitting, and neither much.** The reference held
-at 22.62 to 22.73 ms and this engine at 22.06 to 22.10, where the sitting before
-this one had the reference 1.1% slower across its six rounds and this engine 1.7%
-faster. Two figures taken an hour apart would have carried the sum of those in
-whichever direction the order chose, which is the whole argument for alternating
-rather than measuring one engine and then the other. Swap was at zero and free
-memory at 138 GiB when the sitting opened, the GPU was idle before the first
-round, and the four vllm-mlx daemons `reference/results/prefill.md` already counts
-were resident at 41 GiB between them.
-The sitting before this one recorded two things about the reference that this one
-had no reason to disturb: two of its twelve runs prefilled their own 27-token
-prompt at 27.8 tok/s against 196–202 for the other ten, a 7× swing inside the
-process that never reached its decode rate; and its model load was 6.5–7.1 s
-while its pages were in the buffer cache and 20.7 s once the 8-bit checkpoint had
-evicted them.
+The reference's own figures were re-measured in the new sitting and had not
+moved. Swap was at zero and free memory at 310 GiB when it opened, the GPU was
+idle before the first pair, and the four vllm-mlx daemons
+`reference/results/prefill.md` already counts were resident between them. Two
+things an earlier sitting recorded about the reference this one had no reason to
+disturb: two of its twelve runs prefilled their own 27-token prompt at 27.8 tok/s
+against 196–202 for the other ten, a 7× swing inside the process that never
+reached its decode rate; and its model load was 6.5–7.1 s while its pages were in
+the buffer cache and 20.7 s once the 8-bit checkpoint had evicted them.
 
 **The reference never moved, and what looked like it moving was the checkpoint.**
 `reference/results/mtp_acceptance.md` records a 31.8 ms reference decode step, and
