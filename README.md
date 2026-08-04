@@ -23,17 +23,17 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **622 of the 669 tests, no
-checkpoint, ten seconds.** Everything a fixture can settle is here — the
+`just test` is the one to run while iterating: **624 of the 672 tests, no
+checkpoint, twelve seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
 37 that need weights report a skip and pass. It runs through libtest, which puts
-a crate's tests in one process: opening a Metal device costs a second, so the 168
-kernel tests are 8.0 s sharing a process and minutes with one each. Nothing in this
+a crate's tests in one process: opening a Metal device costs a second, so the 214
+kernel tests are 11.2 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 669 against a
-real checkpoint, ten minutes.** The 52 gated tests — the 37 above and fifteen
+`just test-full` is what has to pass at the ends of a series: **all 672 against a
+real checkpoint, nine minutes.** The 52 gated tests — the 37 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
@@ -43,7 +43,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the forty-seven tests whose result *is* a number — a duration
+`just test-timing` is the forty-eight tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -3608,8 +3608,13 @@ them.
 file's headline numbers rested on measurement that was stale, suspect, or taken
 in a state nobody had checked: a cross-engine column three milestones old, an
 occupancy turn whose effect is smaller than a known measurement artifact, and an
-acceptance figure a milestone had reported as no longer reproducing. Each is
-settled below, and the one that moved is not the one that was expected to.
+acceptance figure a milestone had reported as no longer reproducing.
+
+**The acceptance one is settled where it was recorded rather than here** — see
+"The gate is acceptance" and the two paragraphs correcting A7's and A8's readings
+of it, which is that both rows reproduce and the two runs were two checkpoints.
+The other two are below. **The one that moved is none of the three**: it is the
+reference's decode step, which nobody had listed because nobody had doubted it.
 
 ### That the host was settled, which is the first thing and was not free before
 
@@ -3639,9 +3644,10 @@ was in, it is not this one; nothing here diagnoses it either.
 **A2 took the cross-engine table and A4, A5, A7 and A8 all declined to re-take
 it**, each for the same defensible reason — nothing they changed reaches
 mlx-vlm — and the effect was that a column deciding the sign of a comparison
-went three milestones without being read. **The reference's arm was wrong about
-one row by a factor of three and nobody could have known**, because nobody
-looked.
+went three milestones without being read. **Everything in this section says they
+were right; the row that was wrong by a factor of three is three subsections
+down**, under "The reference's decode step", and nobody could have known because
+nobody looked.
 
 **Seven pairs, one sitting, the order flipped each pair**, on the packed heads,
 this engine at its default numerics: `just checkpoint=models/Inkling-Small-mxfp4-mtp4
@@ -3961,6 +3967,57 @@ paragraph under "What this milestone did not reach" already converted to 723, an
 those are within half a percent as they stand. The tables are not rewritten,
 because rewriting several hundred percentages by arithmetic is how a file
 acquires a figure nobody took.
+
+### What did not move, which is everything the engine does
+
+**No kernel changed and no default changed.** What this milestone touched is
+three measurement cases, one test-only denominator and this file. The flag stays
+defaulted to reference and A8's reasoning for that is untouched: promoting the
+production path retires bit-for-bit checkability for 96.7% of a prefill's passes
+against the same six prompts, and neither of the two things A7 named as
+prerequisites has been done.
+
+**All 672 cases pass against a real checkpoint** — 624 in the gated tier and the
+48 of the timing tier, which **runs to completion without `--no-fail-fast`**, so
+A8's re-anchored ablation arm is still anchored. **The gated tier passes under
+`INKLINGRS_NUMERICS=production` too**, at the same 624 and 48 and in the same
+532 s, which is what a milestone that changed no kernel should read as; one
+argument-parsing case reported a leaked handle under that word and passed, on a
+test that opens no device and reads no checkpoint. The recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what both backends write,
+`the_bounded_loop_is_the_unbounded_one_bit_for_bit`,
+`a_query_row_walks_the_keys_its_window_and_its_position_leave_it`,
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` and
+`a_call_splits_its_span_only_where_the_grid_is_short_of_the_machine` pass
+unrelaxed, and both shape floors are where they were.
+
+**What the discipline cost is one case and half the tier again.** The timing tier
+gained one measurement — the streaming read — and is forty-eight where it was
+forty-seven; the fast tier gained two ordinary cases holding `both_ways` to its
+ordering. The three sweeps that were rewritten are the same three that were
+already there, and running their arms twice after two seconds of warm-up is what
+takes the tier to 19.9 minutes where it was about 13.
+
+### What this milestone leaves
+
+**The reference's arm is the thing to keep re-measuring, and now there is a
+reason rather than a habit.** Four milestones declined to re-take it and each was
+right about the wall times and the prefill; what none of them could have known is
+the decode row above. **A column nobody re-reads is not stable, it is
+unobserved** — and the cost of finding out was one sitting.
+
+**Three things are named and sized rather than done.** The block's height as a
+property of the compiled entry rather than a constant, which unlocks both the
+taller block and the 64-to-128 thread width and is one piece of work; the
+differential corpus large enough to bound a disagreement rate, which is the item
+A7 named and no milestone since has done; and the matmul's accumulator chain
+split, still four lines. **The first is the one this milestone would have done
+had the premise it was given been right** — the floor was said to cost part of a
+speculative round and it costs none of one.
+
+**And the instrument grew a control it did not have.** A null pair through the
+paired harness — the same build against itself, reading no claim — is what says
+the harness is not inventing effects, and this file had never printed one.
 
 ## The tail of a step
 
