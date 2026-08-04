@@ -23,6 +23,27 @@ use crate::sampling::Sampled;
 /// it has to be caught on this side.
 const ARGUMENT_SLOTS: usize = 31;
 
+/// What this machine's memory will hand a kernel per second, as the ceiling
+/// every "of peak" figure in this tree is a fraction of.
+///
+/// **This part's specification is 819 GB/s and this is not that**, because a
+/// column dividing by a rate nothing reaches cannot say how close a kernel is to
+/// the machine. `what_a_streaming_read_achieves_on_this_machine` below is the
+/// friendliest shape this repo could arrange — 4 GiB read in order, four floats
+/// to a lane — and it reads **725 GB/s**, against 598 for the same read a float
+/// at a time and 682 for a copy. So 819 is the part's number and this is the
+/// memory system's, and what a row is a percentage of is something reached.
+///
+/// **The width of a lane's load is what decides it**, which is a fact about the
+/// kernels this describes and not only about the column: 127 GB/s of this part's
+/// ceiling is reachable only by a kernel that asks for four floats at once.
+///
+/// Here rather than beside either of the two tables that divide by it. The
+/// integration tier's per-kernel column and the block's own roofline are the
+/// same claim about the same machine, and two spellings of it would be two that
+/// can drift apart.
+pub const MEMORY_BANDWIDTH: f64 = 725e9;
+
 /// One compiled entry point, ready to dispatch.
 ///
 /// Compiling produces a whole library and then a pipeline for one function in

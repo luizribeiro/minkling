@@ -34,6 +34,12 @@ use inkling_core::{
     LayerStep, ModelCache, Packed as CorePacked, Projections, Sdpa, ShortConv, Tail, TensorView,
     Tokenizer, split_heads,
 };
+// The ceiling every "of peak" column here is a fraction of, read from the crate
+// rather than written down again: `what_a_prefills_blocked_matmul_is_bound_by`
+// divides its roofline by the same figure, and two spellings are two that can
+// drift. `what_a_streaming_read_achieves_on_this_machine` is what measures it,
+// on whatever host it runs on.
+use inkling_metal::kernel::MEMORY_BANDWIDTH;
 use inkling_metal::{
     DISPATCHES_A_SUBMISSION, DenseMatmul, DenseWeight, Device, ExpertGrouping, ExpertKernels,
     LayerKernels, LayerProjections, LayerRouter, MetalError, ModelHeads, ModelLayers, ModelTail,
@@ -1314,22 +1320,6 @@ struct Measured<'a> {
     profile: &'a Profile,
     round_trips: &'a [RoundTrip],
 }
-
-/// What this machine's memory will hand a kernel per second, as the ceiling the
-/// achieved column is a fraction of.
-///
-/// **This part's specification is 819 GB/s and this is not that**, because a
-/// column dividing by a rate nothing reaches cannot say how close a kernel is to
-/// the machine. `what_a_streaming_read_achieves_on_this_machine` is the
-/// friendliest shape this repo could arrange — 4 GiB read in order, four floats
-/// to a lane — and it reads **725 GB/s**, against 598 for the same read a float
-/// at a time and 682 for a copy. So 819 is the part's number and this is the
-/// memory system's, and what a row is a percentage of is something reached.
-///
-/// **The case measures it on whatever host it runs on** and refuses a reading
-/// outside what the part could plausibly stream, so a machine that is not this
-/// one fails rather than quietly reporting the wrong fraction.
-const MEMORY_BANDWIDTH: f64 = 725e9;
 
 /// A step's rows, and the kernels underneath them where the device was asked
 /// which of its dispatches owns which of the milliseconds.
