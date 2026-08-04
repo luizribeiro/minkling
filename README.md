@@ -116,12 +116,12 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 19 ms — 16.1 ms a token speculating two deep, which is
-62.2 tokens a second — and the timings go to stderr so stdout stays pipeable.
+A decode step is about 17.7 ms — 15.4 ms a token speculating two deep, which is
+64.9 tokens a second — and the timings go to stderr so stdout stays pipeable.
 **Both of those are taken at an eight-token context and neither is what a user
 feels**; "Against the reference, end to end" and "Where a decode step goes as the
 context grows" below are the figures that are, and they do not read the same way
-at every prompt length — 20.0 ms a token at a 97-token context and 28.7 at
+at every prompt length — 18.2 ms a token at a 97-token context and 27.2 at
 8192. The prompt reaches the tokenizer as it stands,
 so the model *continues* it rather than answering it. A chat turn is written out
 in full — `<|message_user|><|content_text|>…<|end_message|><|message_model|>` —
@@ -1174,6 +1174,408 @@ and 769 tokens cost 2.04, 5.45 and 10.1 s before the budget replaced the row
 count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
+
+## What a decode step waits on
+
+**A decode step reads the model once and the bus can do that in 8.15 ms. It took
+19.44 and it now takes 17.74** — device 18.63 to 16.93, seven alternating pairs,
+every pair the same way and the ranges apart, against a null pair that read −0.1%
+and a host settled to 0.39% on the wall before the sitting.
+
+**What was in the way was not the arithmetic and not the bytes. It was that a
+lane waited a memory round trip for four bytes before it asked for four more**,
+and that a decode step's dispatches are too narrow to hide that wait behind
+anything else.
+
+### The kernel a decode step actually runs, which nothing here had measured
+
+`which_kernels_own_a_decode_step` puts `packed_matmul` at 457 calls and 68% of
+the device's time in a step. **It is the untiled entry — one simdgroup an output
+element — and it is the one kernel in this crate no milestone has pointed an
+instrument at.** Both entries behind the numerics flag refuse a call
+shorter than 64 rows, `tiles` is false for every shape a step has, and the
+occupancy turn A5 took declares memory only on the tiled entries. A7's and A8's
+floors exclude a one-row dispatch by construction. What runs is the code this
+engine shipped before any of that work.
+
+`what_each_shape_of_a_decode_steps_packed_calls_costs` is that row divided up. A
+step's ten shapes, their call counts the engine's own, warm, swept both ways with
+the banks uploaded once and held across both passes:
+
+    shape               elements    weight     input    a call   achieved  of bus    a step
+    q_proj, o_proj          4096    8.9 MB     67 MB      23µs   388 GB/s     54%    1.93ms
+    k_proj, v_proj          1024    2.2 MB     17 MB      14µs   160 GB/s     22%    1.17ms
+    r_proj                   512    1.1 MB      8 MB      13µs    86 GB/s     12%  546.00µs
+    shared gate, up         4096    8.9 MB     67 MB      23µs   393 GB/s     54%    1.81ms
+    shared down             8192    8.9 MB     67 MB      21µs   431 GB/s     59%  827.08µs
+    routed gate, up        12288   26.7 MB    201 MB      49µs   550 GB/s     76%    3.89ms
+    routed down            24576   26.7 MB    201 MB      48µs   556 GB/s     77%    1.92ms
+    dense gate, up         16384   35.7 MB    268 MB      61µs   582 GB/s     80%  245.16µs
+    dense down              4096   35.7 MB    268 MB      75µs   475 GB/s     65%  150.23µs
+    lm_head               200058  435.3 MB   3278 MB     627µs   694 GB/s     96%  627.12µs
+
+**The `a step` column sums to 13.13 ms against the profile's 15.10**, which is
+what says the decomposition is of the row rather than beside it — the profile's
+figure carries the sampling bias its own table declares. The weight totals 5.91
+GB, which is the checkpoint's own arithmetic arriving from a dispatch's
+declaration: **at 725 GB/s that is 8.15 ms and it is the floor.**
+
+**The `elements` column is what the table turns on and the rate column follows
+it**, from 86 GB/s at 512 output elements to 694 at 200058. Every shape a step
+dispatches is in the first half of that range and the head is the only one in the
+second.
+
+### Whether a narrow dispatch is short of the machine, which is yes
+
+K2 left the hypothesis in one line and no milestone acted on it: *"the laggards
+are dispatches with 1024–4096 output elements, too few to fill 80 cores."* An
+output element is one simdgroup here, so
+`whether_a_decode_dispatch_is_short_of_the_machine` asks it directly — the same
+one-row call at nine widths, warm, both ways:
+
+    elements   weight    a call   achieved  of bus
+         512   1.1 MB      13µs    85 GB/s     12%
+        1024   2.2 MB      13µs   168 GB/s     23%
+        2048   4.5 MB      17µs   270 GB/s     37%
+        4096   8.9 MB      22µs   397 GB/s     55%
+        8192  17.8 MB      35µs   514 GB/s     71%
+       16384  35.7 MB      61µs   588 GB/s     81%
+       32768  71.3 MB     113µs   631 GB/s     87%
+       65536 142.6 MB     212µs   674 GB/s     93%
+      131072 285.2 MB     415µs   687 GB/s     95%
+
+**The kernel reaches 95% of the bus and a decode step never gives it a call wide
+enough to.** Its widest bank is 24576 elements and its narrowest projection is
+512, and the row above fits — to within the clock — to a fixed cost plus the
+bytes at 720 GB/s.
+
+**Every one of those figures is warm and both of those words are load-bearing.**
+The same sweep unwarmed reads 49, 93, 153, 223, 310, 350, 378, 393 and 683 GB/s —
+the same monotone shape and almost none of it the kernel. It is the third time
+`testing::warmed` has caught this in this repo and the first where the row it
+drew was the row the milestone was about.
+
+### What the fixed cost is, which is one simdgroup's own walk
+
+Two more sweeps, because a constant that comes out of a fit is a constant that
+has to be attributed. `what_a_decode_dispatch_costs_beside_more_of_its_own_kind`
+puts more dispatches in one command buffer, which divides a per-buffer cost away
+and leaves a per-dispatch one alone:
+
+    a buffer   a dispatch  achieved
+           1       16.8µs  133 GB/s
+           4       14.3µs  156 GB/s
+          16       13.4µs  167 GB/s
+          64       13.4µs  166 GB/s
+
+**A command buffer is 2.6 microseconds on the device and the rest does not
+divide away.** `what_a_decode_dispatchs_fixed_cost_is_made_of` then sweeps the
+reduction at a fixed width, so that what changes is how far one simdgroup walks
+and not how many of them there are:
+
+    reduction   steps   weight    a call  at the bus  the rest
+          512       2   0.3 MB     5.1µs       0.4µs     4.7µs
+         1024       4   0.6 MB     6.8µs       0.8µs     6.1µs
+         2048       8   1.1 MB     8.9µs       1.5µs     7.4µs
+         4096      16   2.2 MB    14.0µs       3.1µs    10.9µs
+         8192      32   4.5 MB    23.2µs       6.1µs    17.1µs
+        16384      64   8.9 MB    42.7µs      12.3µs    30.4µs
+
+**A dispatch costs 4.4 microseconds plus 0.41 a step, and 0.41 microseconds is a
+memory round trip.** A lane covers `BYTES_PER_LANE` bytes a step and a simdgroup
+32 of those, so a reduction of 4096 is sixteen steps whatever the call's width —
+and the walk's trip count is a runtime value, so nothing unrolls it. A lane
+issued four bytes, waited for them, added them and issued four more. **Across the
+457 calls a decode step makes that is 2.75 ms of an 18.6 ms step spent waiting
+rather than reading.**
+
+### What the walk waits on, one term at a time
+
+A4 gave the reference tile a limiter table and A9 gave the block one. Both are
+kernels a prefill dispatches and a decode step never reaches.
+`what_a_decode_steps_packed_matmul_is_bound_by` is the same instrument on the
+walk that runs 457 times a step — **two arms a term, because confining a walk to
+a kilobyte leaves every load issued and takes only the traffic off, where taking
+the load out prices the load as well:**
+
+    without                                q_proj        k_proj    a routed bank
+    nothing — the kernel                23µs  100%    14µs  100%    52µs  100%
+    the weight's traffic                23µs  100%    16µs  119%    50µs   96%
+    the weight's loads                  18µs   75%    11µs   79%    38µs   73%
+    the input's traffic                 18µs   77%    11µs   81%    37µs   71%
+    the input's loads                   16µs   67%    11µs   79%    30µs   57%
+    the table it decodes through        19µs   82%    11µs   79%    41µs   78%
+    the scale it walks to               23µs  100%    14µs  104%    48µs   91%
+    the cross-lane reduction            40µs  172%    24µs  178%    71µs  137%
+
+**Every term that is a load is worth a fifth to two fifths, and every term that
+is only bytes is worth nothing.** Confining the whole weight working set to one 2
+KB row is 96 to 119% — it is *slower*, because 4096 simdgroups then hammer one
+cache line — and the group scale is worth nothing at all. The input is the term
+this walk re-reads hardest: every output element is a simdgroup of its own and
+every one reads the whole input row, which is 7.5 bytes of input load issued for
+every byte of weight at every shape a step has. But confining that traffic buys
+23%, where removing the loads buys 33%. **The walk is waiting on loads and not on
+bandwidth**, and that is the same finding the width sweep makes from the outside.
+
+**The last row did not reproduce and is printed rather than dropped.** Two other
+sittings of the same arm put it at 100 and 101% on all three shapes, where this
+one has it 37 to 78% *slower* than the kernel it removes work from. What it
+prices is a compiler doing something else with a value nobody reduces; what the
+reduction itself is worth is nothing, which all three sittings agree on from
+opposite directions.
+
+### The two things this changes, and both keep the bits
+
+**A lane reads four chunks of its weight row before it adds any of them.** The
+chunks are read in the order the walk visits them and added in that order, so the
+sum is the same expression associated the same way — this is a constant and not a
+second numerics, which is what separates it from every other lever this module
+has taken on the innermost walk.
+`a_walk_that_holds_several_chunks_answers_the_bits_one_holding_one_answers` holds
+it against the shipped kernel's own bit patterns at five chunk counts, over every
+reduction the checkpoint has and two that divide neither the lane stride nor any
+count above one.
+
+**Four, and the sweep is in the model.** Seven alternating pairs of a decode step
+with the ranges apart at every arm: two held is 0.9% behind four and eight is
+1.8% behind, at both threadgroup widths this module has shipped.
+`what_a_packed_multiply_costs_at_each_chunk_a_lane_holds` asks it of one dispatch
+at a time and turns at the same place — 1.43× at `k_proj`, 1.19× at a shared
+bank, 1.08× at a routed one and **1.02× at a call wide enough to hide its own
+loads**. That last column is the finding rather than the first: what a held chunk
+buys is buying a narrow dispatch the latency hiding a wide one already had.
+
+**And an untiled dispatch gets a threadgroup of its own, which is 64 threads.** A
+threadgroup of this entry is that many independent simdgroups and nothing else —
+no threadgroup memory, no barrier, nothing shared — so its width reaches the grid
+and stops there, and every arm of a sweep over it answers the same bits. What it
+decides is how evenly a call's simdgroups land on 80 cores: at the shipped 256 a
+1024-element dispatch is 128 threadgroups of eight, so 48 cores take two and 32
+take one and the dispatch waits for the slower half.
+
+    a threadgroup      a decode step   the device
+     32 threads             -2.1%         -2.2%
+     64 threads             -2.3%         -2.3%
+    128 threads             -1.8%         -1.9%
+    256 threads, before         —             —
+    512 threads             +3.5%         +3.8%
+
+**The middle of a plateau rather than its edge**, which is the discipline
+`RESIDENCY` is sized under: seven pairs each of 64 against 32 and against 128
+read +0.1% and +0.2% with the ranges across and no claim, so the three are one
+arm. It is its own constant because `THREADS_PER_GROUP` is not free to move —
+that one is the tiled entries' as well and a block's shape is asserted against
+it, so a sweep that turned it turned the prefill's shape too, and the two want
+opposite widths.
+
+### The order three pipelines are created in, which is worth 2.4% of a prefill
+
+**This is the strangest thing this milestone found and it is a measurement rather
+than an explanation.** With the held walk in place, a 2048-token prefill cost
+2.4% of its device time and an 8192-token one 2.2% — on a kernel the sampled
+profile puts at one call and 0.0% of a prefill. The cost was proportional to the
+prompt, so it was the two *tiled* entries running slower, which are 87% of a
+prefill.
+
+It is not the source. Compiling the untiled entry from a string of its own, so
+that the tiled two never saw the walk it runs, left the 2.4% exactly where it
+was. **What moved it was which of the three pipelines was created first**: moving
+`packed_matmul`'s `device.compile` after the two tiled ones gives all of it back
+and 0.5% besides. Nothing about the three says this should be so — they are three
+libraries out of one source string, dispatched at different shapes with nothing
+shared between them. It is written down in `PackedMatmul::compiled` because the
+next edit to that function could undo it by accident.
+
+### What a decode step costs now, at every context
+
+`what_a_decode_step_costs_as_the_context_grows`, one sitting each side, the same
+build either way but for the two constants:
+
+    context     before      after   tokens/s   of floor   device before   device after
+       97      20.00ms    18.16ms  50.0→55.1   41%→45%         18.77ms        16.97ms
+      385      22.47ms    19.49ms  44.5→51.3   36%→42%         21.28ms        18.28ms
+      769      22.01ms    20.19ms  45.4→49.5   37%→40%         20.75ms        19.02ms
+     2048      24.89ms    23.01ms  40.2→43.5   33%→35%         23.69ms        21.74ms
+     4096      26.28ms    24.37ms  38.1→41.0   31%→33%         24.95ms        23.17ms
+     8192      28.91ms    27.20ms  34.6→36.8   28%→30%         27.65ms        25.95ms
+
+**`of floor` is 8.15 ms over the step**, so it is what a step would be if the
+weights arrived at the bus's own rate and everything else were free. The mean and
+the median agree to a tenth of a millisecond at every row, which is what says no
+row has a step in it that is not a decode step.
+
+The per-shape table re-taken through the same instrument on the same host:
+
+    shape               elements   before      after   of bus
+    q_proj, o_proj          4096  388 GB/s   484 GB/s  54%→67%
+    k_proj, v_proj          1024  160 GB/s   264 GB/s  22%→36%
+    r_proj                   512   86 GB/s   140 GB/s  12%→19%
+    shared gate, up         4096  393 GB/s   494 GB/s  54%→68%
+    shared down             8192  431 GB/s   502 GB/s  59%→69%
+    routed gate, up        12288  550 GB/s   621 GB/s  76%→86%
+    routed down            24576  556 GB/s   592 GB/s  77%→82%
+    dense gate, up         16384  582 GB/s   634 GB/s  80%→87%
+    dense down              4096  475 GB/s   602 GB/s  65%→83%
+    lm_head               200058  694 GB/s   469 GB/s  96%→65%
+
+**and the ten shapes are 13.13 ms of a decode step against 11.27** — 62% of the
+floor against 72%. **The head's row is the one not to read**: its two directions
+disagreed by 13% where eight of the ten agreed inside 6%, and
+`one_dispatch_does_an_lm_head_shaped_multiply_without_meeting_the_watchdog` —
+which dispatches the checkpoint's own head cold and times it on a wall clock —
+reads 303 GB/s before and 297 after. The head did not move.
+
+In the model, over the same 457 calls and the same declared 5932.36 MB:
+`packed_matmul` is **15.10 ms and 393 GB/s before, 13.66 ms and 434 GB/s
+after** — 54% of the bus against 60%. **Both of those carry the sampling bias
+that table declares** and are read against each other rather than absolutely: the
+passes sum to 20.09 ms where the same step unsampled is 16.93, so a row is about
+19% over. The floor arithmetic below divides the *share* into an unsampled step
+rather than quoting the row, which is 68.0% of 16.93 ms and 11.5.
+
+**And 5932.36 MB is not the 5.91 GB the floor divides.** A dispatch declares the
+rows it reads and writes beside the weight it walks, so the profile's figure is
+22 MB of activations more than the codes and scales a token must fetch. The floor
+is on the weight.
+
+### What speculation costs now, which is faster at every depth and narrower at all of them
+
+Five alternating pairs on the packed heads, every pair the same way and the
+ranges apart at every row:
+
+    depth    a token before   a token after   tokens/s   speedup before   speedup after
+    k = 0         19.439ms        17.736ms   51.4→56.4            1.000           1.000
+    k = 1         16.556ms        15.803ms   60.4→63.3            1.174           1.122
+    k = 2         16.010ms        15.418ms   62.5→64.9            1.214           1.150
+    k = 3         16.503ms        16.338ms   60.6→61.2            1.178           1.086
+    k = 4         19.462ms        18.793ms   51.4→53.2            0.999           0.944
+
+**Every depth is faster in tokens a second and every ratio is narrower, and the
+second of those is the first arriving as a denominator.** A speedup here divides
+by that run's own `k = 0`, and `k = 0` moved 8.8% — so a round that banks the
+same tokens for the same work reports a smaller multiple. The depth that pays
+best is still two and nothing about which one to run has changed.
+
+**Acceptance did not move and could not have**: 84.85 at `k = 1`; 86.96 and 78.26
+at two; 85.00, 65.00 and 55.00 at three; 82.35, 64.71, 52.94 and 47.06 at four —
+identical in both arms of every pair, which is what a change that moves no token
+has to read as.
+
+### Against the reference, one sitting
+
+`just bench-engines` on the packed heads, three pairs, both engines alternating,
+ranges apart at every row. **The mean and the median are both printed because
+they disagree and the reason is ours:**
+
+    prompt × answer   ours mean   ours p50   mlx-vlm mean   mlx-vlm p50   ahead on p50
+        97 × 128        17.83ms    17.83ms       22.96ms       22.82ms          1.28×
+       385 × 128        24.83ms    19.11ms       23.33ms       23.10ms          1.21×
+       769 × 128        26.10ms    20.00ms       23.72ms       23.55ms          1.18×
+        97 × 512        18.58ms    18.92ms       23.12ms       23.03ms          1.22×
+
+**What separates our mean from our median is one step of about 780 ms**, and it
+is the first step after a prefill of 385 or 769 tokens — work the prefill defers
+onto it. On the mean this engine loses those two rows by 6 and 9%; on the median
+it leads all four by 1.18 to 1.28×. Both are true and the deferred step is real
+work a user waits for; what it is not is a decode step, and a table that quoted
+only the mean would be reporting the deferral as the step's price. `Asked::settle`
+is what takes it out of every other decode figure in this file.
+
+Speculating two deep, the same sitting: **15.25 ms a token at 97 × 128 and 14.95
+at 97 × 512, against the reference's 22.96 and 23.12** — 1.51× and 1.55×. Both
+engines wrote the same first eight tokens at every one of the four prompts.
+
+### What did not move
+
+**No token changed.** All 645 gated cases pass against a real checkpoint and all
+60 of the timing tier pass after them, `--backend cpu` included; the recorded
+continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what both
+backends write. The numerics flag stays defaulted to reference and the production
+entries are untouched — this milestone changed the entry neither of them stands
+in front of.
+
+**Prefill did not move, and the compile order above is why it did not.** Paired
+against the commit before the kernel changed, three pairs each:
+
+    tokens    wall     device   ranges
+     2048    -0.5%      -0.5%   apart, 3 of 3
+     4096    -0.2%      -0.3%   across on the wall, apart on the device
+     8192    -0.2%      -0.0%   across, no claim
+
+**K1's kept cache is untouched.** A simulated coding session, three pairs: the
+whole session 72.49 s to 71.71 s (−1.1%, ranges apart), turn three −4.4%, and the
+per-turn bookkeeping **1.160 ms against 1.169** — ranges across, no claim, which
+is the flat-in-the-context figure that is this engine's one measured
+architectural advantage. Every turn prefilled the same 321 tokens in both arms.
+
+**Both MMA floors,
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert`,
+`the_bounded_loop_is_the_unbounded_one_bit_for_bit` and
+`a_call_splits_its_span_only_where_the_grid_is_short_of_the_machine` are where
+they were.**
+
+### The floor this stops at, and its arithmetic
+
+**A decode step reads 5.91 GB of packed weight — six of each MoE layer's 256
+experts and both shared ones, every layer's five projections, two dense feed-forward
+networks and the head — and it reads all of it once. At the 725 GB/s
+`what_a_streaming_read_achieves_on_this_machine` measures, that is 8.15 ms and
+nothing about how the kernel is written can go under it.**
+
+Where the 16.93 ms of device time in a step sits against that:
+
+    term                                        cost   what it is
+    the weights, at the bus                   8.15ms   the floor
+    the matmul above the floor                 3.4ms   see below
+    every other kernel in a step               5.4ms   attention, norms, conv, router, swiglu
+
+The second and third are the profile's own shares of an unsampled step:
+`packed_matmul` is 68.0% of the passes a step runs and 68% of 16.93 ms is 11.5,
+which is 8.15 of floor and 3.4 above it.
+
+**The matmul is at 71% of its floor and the step is at 48% of it.** The two are
+different numbers and the second is the one a user feels: a matmul that ran at
+the bus would leave a step at 13.5 ms of device time and 14.3 of wall, which is
+**1.24× from here and not 2.1×**.
+
+What the 3.4 ms above the floor is, priced rather than guessed:
+
+- **457 dispatches at about 4 microseconds of fixed cost each is 1.8 ms.** The
+  reduction sweep separates this from the walk and it does not fall with the
+  walk, so it is what a dispatch costs before it reads anything. **The only thing
+  that removes it is removing dispatches.**
+- **The rest is the walk still not fully hidden at the narrow shapes.** `r_proj`
+  is at 19% of the bus and `k_proj` at 36%; between them they are 1.04 ms of a
+  step where the bus would take 0.32.
+
+**What is worth trying next, and what it would cost:**
+
+- **Fusing each bank's `gate` and `up` into one dispatch.** They read the same
+  input against different weights, so they are two calls where one would do: 80
+  fewer dispatches a step (0.3 ms by the arithmetic above) and, more than that,
+  twice the output elements on the two shapes that carry 2.85 GB between them.
+  The width curve puts 4096 → 8192 elements at 487 → 580 GB/s and 12288 → 24576
+  at 621 → 660, which is another **0.5 to 0.8 ms**. It costs a change to how the
+  two tensors are laid out at load, which is the loader and `swiglu` rather than
+  the kernel. **A day, and it is the largest thing left.**
+- **The 623 dispatches a step that are not the matmul.** `rms_norm` is 169 of
+  them for 5.94 MB and `short_conv` 168 for 22.02; between them and the router's
+  80 they are 3.9 ms of device time for 2% of a step's bytes. The launch alone,
+  at the 1.4 to 2.0 microseconds `short_conv`'s own empty-dispatch table
+  measures, is about **1.1 ms**. Nothing here removes a launch but removing a
+  dispatch, and these are separate dispatches because they compute separate
+  things.
+- **Splitting one output element's walk across simdgroups**, which is the
+  medicine A1 gave decode's attention. It would hide the rest of the walk at any
+  width. **It changes the order the products are summed in**, so it is behind the
+  numerics flag or it is nothing — and this milestone's whole argument for
+  shipping by default is that neither of its two levers is.
+
+**What this does not license is a claim that decode is finished.** A step is at
+48% of a floor that is physics; the two priced items above are worth about 1.5 ms
+of the 8.8 between here and it, and the third is behind a flag this milestone
+deliberately did not reach for.
 
 ## What the matmul was actually running at
 
@@ -2299,6 +2701,16 @@ in this file not to survive being questioned and the first whose other half was
 another engine.** The sentence above about the effects being "2× to 6×" against a
 1.7% drift is exactly the reasoning that let it stand unpaired, and the effect it
 was protecting was not the engine's.
+
+**Our column has since moved and "What a decode step waits on" above is where.**
+It reads 18.16 ms at 97 keys and 27.20 at 8192 against the 19.99 and 28.65 here,
+which is 9.2% off the shortest row and 5.1% off the longest — a lane holding four
+chunks of its weight row and an untiled dispatch given a threadgroup of its own.
+**The slope is the one thing that got slightly steeper**: 1.12 µs a token of
+context against the 1.07 below, because what came off was the part of a step that
+does not grow with the context and the part that does is where it was. The
+reference's column here was not re-taken; the cross-engine table in that section
+is the side-by-side one, and it covers 97 to 769.
 
 **Linear, and the slope is the number to carry.** Ours is 19.99 ms at 97 keys
 and 28.65 at 8192, which is **1.07 µs a token of context** where before it was
