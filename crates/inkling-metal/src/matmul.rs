@@ -814,10 +814,26 @@ impl PackedMatmul {
                 block,
             )?),
         };
+        // **The two tiled entries are compiled before the untiled one, and the
+        // order is worth 2.4% of a prefill.** Nothing about the three kernels
+        // says it should be: they are three libraries out of one source string,
+        // dispatched at different shapes with nothing shared between them. But
+        // with the untiled entry created first — which is how this read since it
+        // was the only entry — a 2048-token prefill cost 2.4% of its device time
+        // and 8192 cost 2.2%, five and three alternating pairs, every pair the
+        // same way and the ranges apart, on the two tiled entries that are 87% of
+        // it. Swapping the two lines gives all of it back and takes 0.5% more.
+        //
+        // **What it is not is the source, and that was measured before this was
+        // written.** Compiling the untiled entry from a string of its own, so
+        // that the tiled two never saw the walk it runs, left the 2.4% exactly
+        // where it was. What moved it was which of the three was created first.
+        let tiled = device.compile(source, TILED_ENTRY)?;
+        let grouped = device.compile(source, GROUPED_ENTRY)?;
         Ok(Self {
             kernel: device.compile(source, ENTRY)?,
-            tiled: device.compile(source, TILED_ENTRY)?,
-            grouped: device.compile(source, GROUPED_ENTRY)?,
+            tiled,
+            grouped,
             mma,
             numerics,
             rows_a_tile,
