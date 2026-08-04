@@ -341,6 +341,9 @@ impl Block {
         // The block's expert list is read by one thread a row, so a threadgroup
         // narrower than the block is tall would leave part of it unread.
         assert!(self.threads >= self.rows);
+        // The answer is written over the two staged tiles, so a block whose
+        // answer were the larger of the two would write past them.
+        assert!(self.rows * self.answer_stride() <= (self.rows + self.cols) * MMA_STAGED_STRIDE);
     }
 
     /// The prelude the two production entries are written from, which is every
@@ -2464,9 +2467,17 @@ kernel void __ENTRY__(
     const uint scale_bytes = bytes / BYTES_PER_GROUP;
     const uint step_bytes = MMA_CODES_A_STEP / CODES_PER_BYTE;
 
-    threadgroup float staged_x[MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE];
-    threadgroup float staged_w[MMA_COLS_A_BLOCK * MMA_STAGED_STRIDE];
-    threadgroup float answered[MMA_ROWS_A_BLOCK * MMA_ANSWER_STRIDE];
+    // The answer is written over the staging, because the two are never both
+    // live: nothing reads a staged tile after the last multiply-accumulate and
+    // nothing writes the answer before it. What the overlap buys is not the
+    // memory but the occupancy — this part gives a core 80 KiB of threadgroup
+    // memory, so what a threadgroup declares decides how many of them it holds
+    // and how much of a barrier one waits at the others cover.
+    // `Block::holds` is where the answer is held to fitting inside the staging.
+    threadgroup float staged[(MMA_ROWS_A_BLOCK + MMA_COLS_A_BLOCK) * MMA_STAGED_STRIDE];
+    threadgroup float *staged_x = staged;
+    threadgroup float *staged_w = staged + MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE;
+    threadgroup float *answered = staged;
     threadgroup uint held[MMA_ROWS_A_BLOCK];
     threadgroup bool opens[MMA_ROWS_A_BLOCK];
 
@@ -2591,6 +2602,9 @@ kernel void __ENTRY__(
         }
     }
 
+    // Reached before the first fragment is stored, because the store lands on
+    // the staged tiles and another simdgroup may still be reading them.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
         for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
             simdgroup_store(
@@ -3493,10 +3507,10 @@ kernel void decoded_elements(
         }
         // **A case that skipped every shape would pass by comparing the shipped
         // block to itself**, which is the failure mode `a_block_of` opens by
-        // treating a refusal as a skip. Three of [`SWEPT_BLOCKS`] are the shipped
-        // 32×64 over another threadgroup and this part runs all of them; the
-        // taller one it refuses for threadgroup memory, and that is the only
-        // skip this may report.
+        // treating a refusal as a skip. This part runs every shape in
+        // [`SWEPT_BLOCKS`] — the four other than the shipped one included — so
+        // the slack below is for a part that is not this one rather than for a
+        // shape this one is known to decline.
         assert!(
             ran >= SWEPT_BLOCKS.len() - 2,
             "only {ran} shapes other than the shipped one ran, so this case is close to comparing \
@@ -3511,10 +3525,11 @@ kernel void decoded_elements(
     /// source that will not compile is a mistake in the prelude this file writes
     /// and it panics; a source that compiles into a pipeline this part refuses —
     /// too much threadgroup memory, too many threads — is the sweep finding its
-    /// own edge, and printing where that edge is *is* the measurement. The
-    /// taller block is where it bites: two staged tiles, an answer tile and the
-    /// block's expert list at twice the rows come to 36160 bytes against this
-    /// part's 32768.
+    /// own edge, and printing where that edge is *is* the measurement. A
+    /// threadgroup gets at most 32768 bytes of memory and at most the threads
+    /// the compiled function's register allocation leaves room for, and a shape
+    /// asking past either of those is the answer to what a sweep of it would
+    /// have said.
     ///
     /// The width is asked of the pipeline rather than of the device because it
     /// is a property of the compiled function — a kernel's register allocation
@@ -6215,10 +6230,15 @@ kernel void decoded_elements(
     fn through_sixteen_bit_operands(shipped: &str, stride: usize) -> String {
         let staged = crate::testing::instead_of(
             shipped,
-            "    threadgroup float staged_x[MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE];\n    \
-             threadgroup float staged_w[MMA_COLS_A_BLOCK * MMA_STAGED_STRIDE];",
-            "    threadgroup half staged_x[MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE];\n    \
-             threadgroup half staged_w[MMA_COLS_A_BLOCK * MMA_STAGED_STRIDE];",
+            "    threadgroup float staged[(MMA_ROWS_A_BLOCK + MMA_COLS_A_BLOCK) * \
+             MMA_STAGED_STRIDE];\n    threadgroup float *staged_x = staged;\n    \
+             threadgroup float *staged_w = staged + MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE;",
+            // The scratch stays the width the answer wants and the two staged
+            // tiles are read out of it narrow, so that what this arm changes is
+            // the operand and not how many threadgroups a core holds.
+            "    threadgroup float staged[(MMA_ROWS_A_BLOCK + MMA_COLS_A_BLOCK) * \
+             MMA_STAGED_STRIDE];\n    threadgroup half *staged_x = (threadgroup half *)staged;\n  \
+             \x20 threadgroup half *staged_w = staged_x + MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE;",
         );
         let staged = crate::testing::instead_of(
             &staged,
@@ -7310,7 +7330,13 @@ kernel void scalar_held(
     /// would pass by comparing a thing to itself.
     fn a_tiled_call_answers(device: &Device, matmul: &PackedMatmul) -> Vec<f32> {
         const EXPERTS: usize = 2;
-        const SOURCES: usize = 37;
+        // Rows enough that the tallest shape [`SWEPT_BLOCKS`] carries reaches
+        // the block rather than falling back to the reference tile: a block is
+        // dispatched only from `MMA_BLOCKS_A_CALL` of its own rows, so a run
+        // shorter than that answers the tile's bits and the sweep compares two
+        // different computations. Prime, so that no divisor of a swept shape
+        // lines up with it.
+        const SOURCES: usize = 71;
         let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, SOURCES);
         let bank = PackedBank::upload(
             device,
