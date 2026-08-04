@@ -175,27 +175,32 @@ bench-engines *args:
         "$bin" "$root/reference/scripts/bench_engines" \
         -- engines {{ args }} "{{ absolute_path(checkpoint) }}"
 
-# A simulated coding session with the conversation kept between turns and
-# without, in one sitting, out of one build:
+# A simulated coding session, two arms of it in one sitting:
 #
-#   just bench-session
-#   just bench-session --tokens 4096
+#   just bench-session                                  # ours, kept against not
+#   just bench-session cold kept --tokens 4096
+#   just bench-session reference-cold reference         # the other engine's own
+#   just bench-session kept-production reference        # both engines, both kept
 #
 # **The one measurement here whose subject is what happens between two
 # requests.** Every other figure in this file is one call, and a cache kept
-# across requests is worth exactly nothing on one of those — so the arms are a
+# across requests is worth exactly nothing on one of those — so an arm is a
 # session of several turns, each adding a question and each answered, which is
 # the shape a coding turn has and the shape nothing here had measured.
 #
-# The arm is a number rather than an executable, the way `bench-numerics`' is a
-# word: `--reuse-tokens 0` is the server as it was, and the default bound is the
-# server as it is. Same alternation, same report, one build.
+# An arm is a word rather than an executable, which is what lets the four
+# comparisons that matter come out of one recipe: this engine keeping against
+# not keeping, the reference doing the same with its own Automatic Prefix
+# Caching, and the two engines against each other with both of them keeping.
+# **`reference` is mlx-vlm behind the same `name value unit` contract**, for the
+# reason `bench-engines` gives: a cross-engine figure taken by running one engine
+# and then the other carries the drift of the machine between them.
 #
 # **Three pairs rather than seven, and `BENCH_PAIRS=7 just bench-session` if
-# seven are wanted.** A cold session is minutes an arm — the turns re-prefill
-# thousands of tokens each — and the effect is the kind the justfile's own note
-# says three pairs are enough for.
-bench-session *measurement:
+# seven are wanted.** A cold session is minutes an arm — its turns re-prefill
+# thousands of tokens each — and the effect is the kind this file's own note says
+# three pairs are enough for.
+bench-session a="cold" b="kept" *measurement:
     #!/usr/bin/env bash
     set -euo pipefail
     root="$(git rev-parse --show-toplevel)"
@@ -203,10 +208,25 @@ bench-session *measurement:
     bin="$root/target/bench/bin/working-tree"
     mkdir -p "$(dirname "$bin")"
     cp "$root/target/debug/bench" "$bin"
+
+    # A word, as the command line that measures it.
+    arm() {
+        case "$1" in
+            cold)           echo "$bin --reuse-tokens 0 {{ absolute_path(checkpoint) }}" ;;
+            kept)           echo "$bin {{ absolute_path(checkpoint) }}" ;;
+            # The arithmetic the cross-engine column is quoted under. A session
+            # against the other engine under the default word would be reading
+            # this engine's prefill at 4.8x the reference's, which is a
+            # measurement of the numerics rather than of the cache.
+            kept-production) echo "$bin --numerics production {{ absolute_path(checkpoint) }}" ;;
+            reference-cold) echo "$root/reference/scripts/bench_session --reuse-tokens 0 {{ absolute_path(checkpoint) }}" ;;
+            reference)      echo "$root/reference/scripts/bench_session {{ absolute_path(checkpoint) }}" ;;
+            *) echo "$1 is not one of cold, kept, reference-cold, reference" >&2; exit 2 ;;
+        esac
+    }
+
     "$root/target/debug/bench" alternate --pairs "${BENCH_PAIRS:-3}" \
-        "$bin --reuse-tokens 0 {{ absolute_path(checkpoint) }}" \
-        "$bin {{ absolute_path(checkpoint) }}" \
-        -- session {{ measurement }}
+        "$(arm '{{ a }}')" "$(arm '{{ b }}')" -- session {{ measurement }}
 
 # The two numerics against each other in one sitting, out of one build:
 #

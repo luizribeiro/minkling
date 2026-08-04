@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# The reference arm as `bench alternate` needs it: one executable.
+#
+# See `bench_engines` for why this is a shell wrapper rather than the script.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$here/../.venv/bin/python" "$here/bench_session.py" "$@"
