@@ -214,74 +214,52 @@ impl<'a> ExpertBanks<'a> {
         self.down_proj.encode_over(batch, chosen, &mut activated)
     }
 
-    /// The same bank over every row of `x`, once per expert `chosen` names in
-    /// turn — see [`PackedBank::encode_repeating`].
+    /// The shared bank's third projection, over rows the activation left.
     ///
-    /// **The shared bank's rows are not laid out either.** Every token goes
-    /// through every shared expert, so what the bank runs is the hidden state
-    /// read over again rather than a `[n_shared * tokens, hidden]` tensor
-    /// somebody built and copied over twice — once for `gate` and once for `up`.
-    /// What it reads instead is the buffer the router's gate and the routed bank
-    /// are already reading.
-    pub(crate) fn encode_repeated(
+    /// **The shared bank's rows are not laid out.** Every token goes through
+    /// every shared expert, so what the bank ran was the hidden state read over
+    /// again rather than a `[n_shared * tokens, hidden]` tensor somebody built
+    /// — see [`PackedPair::encode_repeating`] — and `down` reads what that
+    /// produced one row to a row.
+    pub(crate) fn down_repeated(
         &self,
         batch: &mut Batch<'_>,
         chosen: &[u32],
-        x: &mut Buffer<f32>,
+        activated: &mut Buffer<f32>,
     ) -> Result<Pending, MatmulError> {
-        let glu = self.glu.encode_repeating(batch, chosen, x)?;
-        let Some(mut activated) = self.activated(batch, glu)? else {
-            return Ok(Pending::empty());
-        };
-        self.down_proj.encode_over(batch, chosen, &mut activated)
+        self.down_proj.encode_over(batch, chosen, activated)
     }
 
-    /// The same bank over an expert list a dispatch already left on the device,
-    /// `per_source` of its rows reading each row of `x` — see
-    /// [`PackedBank::encode_picked`].
+    /// The routed bank's third projection, over rows the activation left.
     ///
     /// **The rows are never laid out.** `gate` and `up` read the hidden state
-    /// itself at the stride the routing implies, and only what they produced is
-    /// a tensor of this bank's own shape — which `down` then reads one row to a
-    /// row, the expert list being the same list either way.
-    pub(crate) fn encode_picked(
+    /// itself at the stride the routing implies — see
+    /// [`PackedPair::encode_picked`] — and only what they produced is a tensor
+    /// of this bank's own shape, which this reads one row to a row.
+    pub(crate) fn down_picked(
         &self,
         batch: &mut Batch<'_>,
         chosen: &mut Buffer<u32>,
-        x: &mut Buffer<f32>,
-        per_source: usize,
+        activated: &mut Buffer<f32>,
     ) -> Result<Pending, MatmulError> {
-        let glu = self.glu.encode_picked(batch, chosen, x, per_source)?;
-        let Some(mut activated) = self.activated(batch, glu)? else {
-            return Ok(Pending::empty());
-        };
-        self.down_proj
-            .encode_picked(batch, chosen, &mut activated, 1)
+        self.down_proj.encode_picked(batch, chosen, activated, 1)
     }
 
-    /// The same bank over rows a dispatch already laid out expert by expert,
-    /// `per_source` rows of the *ungrouped* call reading each row of `x`.
+    /// The same, over rows a dispatch already laid out expert by expert.
     ///
     /// **One sort serves all three dispatches and the rows are still never laid
     /// out.** `gate` and `up` read the hidden state at the stride the routing
     /// implies, through the order; the activation between them is elementwise
-    /// and inherits it; and `down` reads those rows where they lie and writes
-    /// each of them back to the row the router named. So what this answers with
-    /// is what [`ExpertBanks::encode_picked`] answers with, in the order it
-    /// answers it in — see `packed_matmul_grouped`.
-    pub(crate) fn encode_grouped(
+    /// and inherits it; and this reads those rows where they lie and writes each
+    /// of them back to the row the router named.
+    pub(crate) fn down_grouped(
         &self,
         batch: &mut Batch<'_>,
         grouped: &mut Grouped,
-        x: &mut Buffer<f32>,
-        per_source: usize,
+        activated: &mut Buffer<f32>,
     ) -> Result<Pending, MatmulError> {
-        let glu = self.glu.encode_grouped(batch, grouped, x, per_source)?;
-        let Some(mut activated) = self.activated(batch, glu)? else {
-            return Ok(Pending::empty());
-        };
         self.down_proj
-            .encode_grouped(batch, grouped, &mut activated, 1, Through::Scattered)
+            .encode_grouped(batch, grouped, activated, 1, Through::Scattered)
     }
 
     /// Whether a call of `rows` rows against this bank is worth sorting by
@@ -326,6 +304,55 @@ impl<'a> ExpertBanks<'a> {
     ) -> Result<[Pending; 2], MatmulError> {
         self.glu.encode(batch, chosen, rows)
     }
+}
+
+/// Which order the routed bank's rows were dispatched in, so that `down` reads
+/// them the way `gate` and `up` wrote them.
+///
+/// Carried between the two halves rather than decided twice: the sort is what
+/// makes a prefill's routed call worth tiling and a decode step never takes it,
+/// so which arm it is is a fact about the call and re-deriving it would be a
+/// second place for the predicate to live.
+enum RoutedRows {
+    Picked,
+    Grouped(Grouped),
+}
+
+/// **Both banks' activations as one dispatch**, and as the one dispatch a layer
+/// with an empty bank leaves.
+///
+/// A bank no row named dispatched neither half of its pair and has nothing to
+/// activate — see [`ExpertBanks::activated`], which is the same `None` — so this
+/// is a pair, a single, or nothing at all depending on what the router did.
+fn activated_pair(
+    batch: &mut Batch<'_>,
+    swiglu: &SwiGlu,
+    first: [Pending; 2],
+    second: [Pending; 2],
+) -> Result<[Option<Buffer<f32>>; 2], MatmulError> {
+    let halves = |[gate, up]: [Pending; 2]| match (gate.into_buffer(), up.into_buffer()) {
+        (Some(gate), Some(up)) => Some((gate, up)),
+        _ => None,
+    };
+    Ok(match (halves(first), halves(second)) {
+        (Some((mut first_gate, mut first_up)), Some((mut second_gate, mut second_up))) => {
+            swiglu.encode_pair(
+                batch,
+                (&mut first_gate, &mut first_up),
+                (&mut second_gate, &mut second_up),
+            )?;
+            [Some(first_gate), Some(second_gate)]
+        }
+        (Some((mut gate, mut up)), None) => {
+            swiglu.encode(batch, &mut gate, &mut up)?;
+            [Some(gate), None]
+        }
+        (None, Some((mut gate, mut up))) => {
+            swiglu.encode(batch, &mut gate, &mut up)?;
+            [None, Some(gate)]
+        }
+        (None, None) => [None, None],
+    })
 }
 
 /// The expert each row goes through, as the kernel indexes them.
@@ -513,10 +540,35 @@ impl<'a> LayerExperts<'a> {
     ) -> Result<Dispatched, MatmulError> {
         let mut logits = self.gate.encode_over(batch, x)?.buffer();
         let mut picked = self.router.encode(batch, &mut logits)?;
-        let shared = self
-            .shared
-            .encode_repeated(batch, &self.shared_chosen(tokens), x)?;
-        let routed = self.routed_rows(batch, &mut picked, x, tokens)?;
+
+        // **Both banks' pairs before either activation**, which is the whole of
+        // what lets the two activations be one dispatch. A bank finished before
+        // the other started put its `down` between them, and `down` reads what
+        // the activation wrote — so the order was what separated them, not the
+        // arithmetic. Nothing here reads anything the other bank writes.
+        let shared_chosen = self.shared_chosen(tokens);
+        let shared_glu = self.shared.glu.encode_repeating(batch, &shared_chosen, x)?;
+        let (routed_glu, mut rows) = self.routed_glu(batch, &mut picked, x, tokens)?;
+        let [shared_activated, routed_activated] =
+            activated_pair(batch, self.shared.swiglu, shared_glu, routed_glu)?;
+
+        let shared = match shared_activated {
+            None => Pending::empty(),
+            Some(mut activated) => {
+                self.shared
+                    .down_repeated(batch, &shared_chosen, &mut activated)?
+            }
+        };
+        let routed = match (routed_activated, &mut rows) {
+            (None, _) => Pending::empty(),
+            (Some(mut activated), RoutedRows::Picked) => {
+                self.routed
+                    .down_picked(batch, &mut picked, &mut activated)?
+            }
+            (Some(mut activated), RoutedRows::Grouped(grouped)) => {
+                self.routed.down_grouped(batch, grouped, &mut activated)?
+            }
+        };
         Ok(Dispatched {
             logits,
             picked,
@@ -537,21 +589,26 @@ impl<'a> LayerExperts<'a> {
     /// runs of one and a tile of them shares nothing, so [`ExpertBanks::groups`]
     /// is false for every shape a step or a speculative round dispatches and
     /// the two dispatches below are the same two they have always been.
-    fn routed_rows(
+    fn routed_glu(
         &self,
         batch: &mut Batch<'_>,
         picked: &mut Buffer<u32>,
         x: &mut Buffer<f32>,
         tokens: usize,
-    ) -> Result<Pending, MatmulError> {
+    ) -> Result<([Pending; 2], RoutedRows), MatmulError> {
         let top_k = self.router.config().top_k;
         if !self.routed.groups(self.router.assignments(tokens)) {
-            return self.routed.encode_picked(batch, picked, x, top_k);
+            let glu = self.routed.glu.encode_picked(batch, picked, x, top_k)?;
+            return Ok((glu, RoutedRows::Picked));
         }
         let mut grouped = self
             .grouping
             .encode(batch, picked, self.router.config().n_routed)?;
-        self.routed.encode_grouped(batch, &mut grouped, x, top_k)
+        let glu = self
+            .routed
+            .glu
+            .encode_grouped(batch, &mut grouped, x, top_k)?;
+        Ok((glu, RoutedRows::Grouped(grouped)))
     }
 
     /// The expert each of the shared bank's rows goes through, which is
@@ -1144,8 +1201,12 @@ mod tests {
             "a selection of one expert would say nothing about the stride: {picked:?}"
         );
 
-        assert_eq!(together.0, apart.0, "the same dispatches");
-        assert_eq!(together, (8, 1, 9), "the layer's own cost");
+        assert_eq!(
+            together.0,
+            apart.0 - 1,
+            "one dispatch fewer: the paired SwiGLU"
+        );
+        assert_eq!(together, (7, 1, 9), "the layer's own cost");
         assert_eq!(apart, (8, 4, 12), "what the four parts cost apart");
     }
 
@@ -1236,7 +1297,7 @@ mod tests {
             out.iter().any(|y| *y != 0.0),
             "an output of zeros would prove nothing"
         );
-        assert_eq!(whole.0, 10, "the layer's dispatches");
+        assert_eq!(whole.0, 9, "the layer's dispatches");
         assert_eq!(whole.1, 1, "the command buffers they went in");
     }
 
@@ -1295,16 +1356,41 @@ mod tests {
                 let mut picked = device.buffer(&chosen).expect("the selection uploads");
                 let mut hidden = device.buffer(&x).expect("the hidden state uploads");
                 let mut batch = device.batch().expect("a command buffer opens");
+                // Through the two halves the layer runs, rather than through a
+                // whole-bank call nothing dispatches: the activation between
+                // them is a layer's to place, since a layer pairs its two
+                // banks' activations into one dispatch.
+                let activated = |batch: &mut Batch<'_>, glu| {
+                    let [activated, _] = activated_pair(
+                        batch,
+                        &kernels.swiglu,
+                        glu,
+                        [Pending::empty(), Pending::empty()],
+                    )
+                    .expect("the activation encodes");
+                    activated.expect("the bank dispatched its pair")
+                };
                 let pending = match grouped {
-                    false => bank
-                        .encode_picked(&mut batch, &mut picked, &mut hidden, CONFIG.top_k)
-                        .expect("the bank encodes"),
+                    false => {
+                        let glu = bank
+                            .glu
+                            .encode_picked(&mut batch, &mut picked, &mut hidden, CONFIG.top_k)
+                            .expect("the pair encodes");
+                        let mut rows = activated(&mut batch, glu);
+                        bank.down_picked(&mut batch, &mut picked, &mut rows)
+                            .expect("the bank encodes")
+                    }
                     true => {
                         let mut sorted = kernels
                             .grouping
                             .encode(&mut batch, &mut picked, EXPERTS)
                             .expect("the grouping encodes");
-                        bank.encode_grouped(&mut batch, &mut sorted, &mut hidden, CONFIG.top_k)
+                        let glu = bank
+                            .glu
+                            .encode_grouped(&mut batch, &mut sorted, &mut hidden, CONFIG.top_k)
+                            .expect("the pair encodes");
+                        let mut rows = activated(&mut batch, glu);
+                        bank.down_grouped(&mut batch, &mut sorted, &mut rows)
                             .expect("the bank encodes")
                     }
                 };

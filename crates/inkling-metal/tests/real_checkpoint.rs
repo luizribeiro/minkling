@@ -548,26 +548,27 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// dispatches alone would watch the number that cannot change while the one
 /// that pays for it doubled underneath.
 ///
-/// **A whole layer is one submission**, and twenty-four dispatches on a layer
+/// **A whole layer is one submission**, and twenty-one dispatches on a layer
 /// that routes. Nine are its attention: the input layernorm, the four
 /// projections that consume what it produced, the one paired short convolution
 /// behind `k` and `v`, the one paired head norm over `q` and the convolved `k`,
 /// the attention step and `o_proj`. Three more are the two residual paths around the
 /// MLP — the layer's two short convolutions, each of which adds the value its
-/// block began with as it writes, and the second norm between them. The last ten
-/// are the MLP: the router's gate, the top-k over what it produced, each bank's
-/// pair, activation and down, the softmax over the eight logits that selection
-/// named, and both banks' rows weighted by it. A dense layer is sixteen, its
-/// feed-forward network four where a MoE layer's two banks and the router around
-/// them are ten. The head is one of each.
+/// block began with as it writes, and the second norm between them. The last
+/// nine are the MLP: the router's gate, the top-k over what it produced, each
+/// bank's pair and down, the one activation both banks share, the softmax over
+/// the eight logits that selection named, and both banks' rows weighted by it. A
+/// dense layer is sixteen, its feed-forward network four where a MoE layer's two
+/// banks and the router around them are nine. The head is one of each.
 ///
-/// **Three of those dispatches are a pair.** The banks' `gate` and `up` are one
+/// **Four of those dispatches are a pair.** The banks' `gate` and `up` are one
 /// where the call is untiled — [`PackedPair`](inkling_metal::PackedPair), and a
 /// dense layer's are two projections that were never a bank. The key and value
-/// convolutions are one, and so are the query norm and the key norm wherever
-/// they share a threadgroup. Every one of the three is two calls that read
-/// different rows against different weights into different places, and none of
-/// them reads what the other writes.
+/// convolutions are one; the query norm and the key norm are one wherever they
+/// share a threadgroup; and the two banks' activations are one, which is what
+/// the layer dispatching both pairs before either activation buys. Every one of
+/// the four is two calls that read different rows against different weights into
+/// different places, and none of them reads what the other writes.
 ///
 /// **Not one of them costs a round trip.** The whole chain from the hidden state
 /// a layer is handed to the one it passes on is buffers a next dispatch reads —
@@ -599,7 +600,7 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// did. This counts a decode step, whose forty-two layers are far under that
 /// budget.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
-    let width = |layer: u64| if layer < dense { 12 + 4 } else { 12 + 10 };
+    let width = |layer: u64| if layer < dense { 12 + 4 } else { 12 + 9 };
     let (mut dispatches, mut encoded, mut submissions) = (0, 0, 0);
     for layer in 0..layers {
         dispatches += width(layer);
