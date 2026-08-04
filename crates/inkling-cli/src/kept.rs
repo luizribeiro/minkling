@@ -47,8 +47,24 @@
 //! MiB at 8192 tokens where before it was freed when the request ended.
 
 use std::ops::ControlFlow;
+use std::time::{Duration, Instant};
 
 use inkling_core::{Ending, Generator, ModelCache, ModelWeights, Stop, TextConfig};
+
+/// What one turn came to, beside the reply it streamed.
+#[derive(Debug, Clone)]
+pub struct Served {
+    pub stop: Stop,
+    /// Tokens of the prompt the cache already held, and zero on a miss.
+    pub reused: usize,
+    /// **What the arrangement costs whether it hits or misses**, which is the
+    /// question a feature like this has to answer about its own bad case: the
+    /// matching, the mark, the resume and the recording. It does not include the
+    /// prefill or a single decode step, and it does include the fresh cache a
+    /// miss builds — which is what the server allocated on every request before
+    /// any of this existed.
+    pub bookkeeping: Duration,
+}
 
 /// The kept conversation: the tokens the cache was built from, and the cache
 /// sitting at the end of them.
@@ -159,21 +175,35 @@ impl<'a> Kept<'a> {
         ids: &[usize],
         ending: Ending,
         sink: impl FnMut(usize) -> ControlFlow<()>,
-    ) -> (Stop, usize) {
+    ) -> Served {
         assert!(!ids.is_empty(), "a turn over no tokens");
         let held = ids.len() - 1;
+
+        let at = Instant::now();
         let (cache, reused) = self.opened(ids);
+        let mut bookkeeping = at.elapsed();
         if reused < held {
             generator.prefill(cache, &ids[reused..held], weights);
         }
 
         // Where the next turn's prompt starts, taken before the generation moves
         // the cache past it and put back once the reply is done.
+        let at = Instant::now();
         let mark = weights.mark(cache);
+        bookkeeping += at.elapsed();
+
         let stop = generator.stream(cache, &ids[held..], ending, weights, sink);
+
+        let at = Instant::now();
         weights.resume(cache, &mark);
         self.keep(&ids[..held]);
-        (stop, reused)
+        bookkeeping += at.elapsed();
+
+        Served {
+            stop,
+            reused,
+            bookkeeping,
+        }
     }
 
     /// Keep nothing, and give the next request a cache that holds nothing.

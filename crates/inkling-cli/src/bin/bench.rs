@@ -720,11 +720,13 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 );
                 for (at, turn) in turns.iter().enumerate() {
                     eprintln!(
-                        "  turn {at}: {} tokens, {} reused, {:.2} s wall, {:.2} s to first",
+                        "  turn {at}: {} tokens, {} reused, {:.2} s wall, {:.2} s to first, \
+                         {:.2} ms bookkeeping",
                         turn.prompt,
                         turn.reused,
                         turn.wall.as_secs_f64(),
                         turn.first.as_secs_f64(),
+                        millis(turn.bookkeeping),
                     );
                     taken.push(Reading::new(
                         format!("turn{at}.wall"),
@@ -747,6 +749,17 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 taken.push(Reading::new(
                     "session",
                     millis(turns.iter().map(|turn| turn.wall).sum()),
+                    "ms",
+                ));
+                // **What the arrangement costs whether it hits or misses**, which
+                // is the question a feature like this owes about its own bad
+                // case. Per turn rather than for the session, because it is a
+                // per-request cost and the number a server is judged on is what
+                // one request pays.
+                taken.push(Reading::new(
+                    "bookkeeping",
+                    millis(turns.iter().map(|turn| turn.bookkeeping).sum())
+                        / turns.len().max(1) as f64,
                     "ms",
                 ));
             }

@@ -427,7 +427,7 @@ impl Engine<'_> {
         let mut channels = Channels::new(self.markers.iter().cloned());
 
         let (weights, generator) = (self.weights, self.generator);
-        let (stop, _) = self.kept.turn(&generator, weights, ids, ending, |id| {
+        let served = self.kept.turn(&generator, weights, ids, ending, |id| {
             match text.push(id as u32) {
                 Ok(decoded) => {
                     let (channel, decoded) = channels.route(id as u32, &decoded);
@@ -440,7 +440,7 @@ impl Engine<'_> {
         // Bytes the last token left half a character with, which a budget that
         // cut the reply off mid-character has and holding back would lose.
         let tail = text.finish();
-        out.close((channels.current(), &tail), finish(stop))
+        out.close((channels.current(), &tail), finish(served.stop))
     }
 }
 

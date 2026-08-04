@@ -35,6 +35,9 @@ pub struct Turn {
     /// The ids the model produced, which is what says a kept cache changed no
     /// answer.
     pub produced: Vec<usize>,
+    /// What the arrangement cost the turn whether it hit or missed — see
+    /// [`Served::bookkeeping`](crate::kept::Served::bookkeeping).
+    pub bookkeeping: Duration,
 }
 
 /// The whole session, turn by turn.
@@ -61,7 +64,7 @@ pub fn run(
         let started = Instant::now();
         let mut first = None;
         let mut reply = Vec::with_capacity(session.generated);
-        let (_, reused) = kept.turn(generator, weights, &prompt, ending, |id| {
+        let served = kept.turn(generator, weights, &prompt, ending, |id| {
             first.get_or_insert_with(|| started.elapsed());
             reply.push(id);
             std::ops::ControlFlow::Continue(())
@@ -69,10 +72,11 @@ pub fn run(
 
         turns.push(Turn {
             prompt: prompt.len(),
-            reused,
+            reused: served.reused,
             wall: started.elapsed(),
             first: first.unwrap_or_default(),
             produced: reply.clone(),
+            bookkeeping: served.bookkeeping,
         });
         produced.push(reply);
     }

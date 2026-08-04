@@ -85,27 +85,38 @@ def turn(model, ids, generated, manager):
     the Rust arm marks at, and for the same reason: what a client sends back next
     turn starts with this turn's prompt.
     """
+    opened = time.perf_counter()
     prompt_cache, prefix = (None, 0)
     if manager is not None:
         prompt_cache, prefix = manager.lookup_exact_cache(ids)
     if prompt_cache is None:
         prompt_cache = cache.make_prompt_cache(model.language_model)
         prefix = 0
+    bookkeeping = time.perf_counter() - opened
 
-    steps, tokens = [], []
+    tokens, first = [], None
     fed = mx.array([ids[prefix:]])
     with wired_limit(model, [generation_stream]):
-        at = time.perf_counter()
         for token, _ in generate_step(
             fed, model, None, None, max_tokens=generated, prompt_cache=prompt_cache
         ):
-            now = time.perf_counter()
-            steps.append(now - at)
+            if first is None:
+                first = time.perf_counter() - opened
             tokens.append(int(token))
             if len(tokens) == 1 and manager is not None:
+                # The snapshot, at the position the cache holds exactly the
+                # prompt. It is a copy of the whole KV rather than a count, and
+                # it lands inside the turn that takes it.
+                stored = time.perf_counter()
                 manager.store_exact_cache(ids, prompt_cache)
-            at = time.perf_counter()
-    return steps, tokens, len(ids) - prefix
+                bookkeeping += time.perf_counter() - stored
+    return {
+        "wall": time.perf_counter() - opened,
+        "first": first or 0.0,
+        "prefilled": len(ids) - prefix,
+        "bookkeeping": bookkeeping,
+        "tokens": tokens,
+    }
 
 
 def main():
@@ -138,21 +149,24 @@ def main():
             # The bound, as the other arm applies it: a conversation past it is
             # served and then forgotten.
             manager = APCManager()
-        steps, tokens, prefilled = turn(model, prompt, GENERATED, manager)
-        produced.append(tokens)
-
-        wall, first = sum(steps), steps[0]
-        walls.append(wall)
+        took = turn(model, prompt, GENERATED, manager)
+        produced.append(took["tokens"])
+        walls.append(took)
         print(
-            f"  turn {at}: {len(prompt)} tokens, {len(prompt) - prefilled} reused, "
-            f"{wall:.2f} s wall, {first:.2f} s to first",
+            f"  turn {at}: {len(prompt)} tokens, "
+            f"{len(prompt) - took['prefilled']} reused, "
+            f"{took['wall']:.2f} s wall, {took['first']:.2f} s to first, "
+            f"{took['bookkeeping'] * 1e3:.2f} ms bookkeeping",
             file=sys.stderr,
         )
-        print(f"turn{at}.wall {wall * 1e3:.4f} ms")
-        print(f"turn{at}.first {first * 1e3:.4f} ms")
-        print(f"turn{at}.prefilled {prefilled}.0000 tokens")
+        print(f"turn{at}.wall {took['wall'] * 1e3:.4f} ms")
+        print(f"turn{at}.first {took['first'] * 1e3:.4f} ms")
+        print(f"turn{at}.prefilled {took['prefilled']}.0000 tokens")
 
-    print(f"session {sum(walls) * 1e3:.4f} ms")
+    print(f"session {sum(t['wall'] for t in walls) * 1e3:.4f} ms")
+    print(
+        f"bookkeeping {sum(t['bookkeeping'] for t in walls) / len(walls) * 1e3:.4f} ms"
+    )
     print(
         f"session: {TURNS} turns keeping {args.reuse_tokens}, "
         f"first eight {produced[0][:8]}",
