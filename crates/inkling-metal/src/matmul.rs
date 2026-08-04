@@ -5853,6 +5853,247 @@ kernel void decoded_elements(
     /// about the length that suits it best.
     const BLOCKED_LENGTHS: [usize; 3] = [2048, 4096, 8192];
 
+    /// The shipped production source with both staged tiles, and the fragments
+    /// loaded out of them, carried as 16-bit floats.
+    ///
+    /// **The accumulator stays `simdgroup_float8x8` and that is the whole of
+    /// what makes this arguable at all.** Metal's matrix instruction takes a
+    /// mixed form on this family — half operands into a float accumulator — so
+    /// what a 16-bit operand costs here is a rounding of the two *operands* and
+    /// nothing about the summation order, which is already the instruction's.
+    /// A half accumulator compiles too and is not what this is: 512 accumulate
+    /// steps into a 10-bit significand is a different claim and a much worse
+    /// one.
+    ///
+    /// **What is rounded is a product that used to be exact.** A code is one of
+    /// sixteen table values and a group scale is a power of two, so `element ×
+    /// by` is exact in f32 and every MXFP4 element is exactly representable in
+    /// half — but their product carries eleven bits of significand where it had
+    /// twenty-four, and that rounding is what the table below prices.
+    ///
+    /// `stride` is what a staged row is padded to, and it is a parameter here
+    /// for one reason: [`MMA_STAGED_STRIDE`]'s padding argument is derived
+    /// against 32 banks of *four* bytes and a staged element that is four bytes
+    /// wide. At two bytes the same 36 puts a fragment's eight rows on banks 0,
+    /// 18, 4, 22, 8, 26, 12 and 30 — still eight distinct ones, so the argument
+    /// survives — but "survives by arithmetic" is what this repo's own history
+    /// says to distrust, and a second stride measured beside the first is what
+    /// says the clock below is about the operand width rather than about a bank
+    /// conflict.
+    fn through_sixteen_bit_operands(shipped: &str, stride: usize) -> String {
+        let staged = crate::testing::instead_of(
+            shipped,
+            "    threadgroup float staged_x[MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE];\n    \
+             threadgroup float staged_w[MMA_COLS_A_BLOCK * MMA_STAGED_STRIDE];",
+            "    threadgroup half staged_x[MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE];\n    \
+             threadgroup half staged_w[MMA_COLS_A_BLOCK * MMA_STAGED_STRIDE];",
+        );
+        let staged = crate::testing::instead_of(
+            &staged,
+            &format!("constant uint MMA_STAGED_STRIDE = {MMA_STAGED_STRIDE};"),
+            &format!("constant uint MMA_STAGED_STRIDE = {stride};"),
+        );
+        let filled = crate::testing::instead_of(
+            &staged,
+            "staged_x[x_row * MMA_STAGED_STRIDE + x_at + i] = live ? values[i] : 0.0f;",
+            "staged_x[x_row * MMA_STAGED_STRIDE + x_at + i] = live ? (half)values[i] : 0.0h;",
+        );
+        let decoded = crate::testing::instead_of(
+            &filled,
+            "staged_w[at] = element(code & CODE_MASK) * by;\n                staged_w[at + 1] = \
+             element((code >> BITS) & CODE_MASK) * by;",
+            "staged_w[at] = (half)(element(code & CODE_MASK) * by);\n                staged_w[at + \
+             1] = (half)(element((code >> BITS) & CODE_MASK) * by);",
+        );
+        crate::testing::instead_of(
+            &decoded,
+            "                simdgroup_float8x8 lhs[MMA_FRAGMENTS_DOWN];\n                \
+             simdgroup_float8x8 rhs[MMA_FRAGMENTS_ACROSS];",
+            "                simdgroup_half8x8 lhs[MMA_FRAGMENTS_DOWN];\n                \
+             simdgroup_half8x8 rhs[MMA_FRAGMENTS_ACROSS];",
+        )
+    }
+
+    /// Both of [`BOUND_SHAPES`] at a prompt of `tokens`, which is what a column
+    /// of either of the block's tables is.
+    fn shapes_at(tokens: usize) -> Vec<Blocked> {
+        BOUND_SHAPES
+            .iter()
+            .map(|&shape| Blocked::at(tokens, shape))
+            .collect()
+    }
+
+    /// The reductions the conditioning table below is taken across, which are
+    /// `a_block_answers_the_reference_tile_where_neither_extent_divides_it`'s
+    /// own — so a third column can be read straight down beside the two that
+    /// case already records.
+    const CONDITIONING_REDUCTIONS: [usize; 5] = [32, 128, 512, 2048, 4096];
+
+    /// **What 16-bit operands cost and what they give up** — the lever Apple's
+    /// guidance for this hardware is most emphatic about, and the one mlx-vlm
+    /// takes so completely that it ships no fp32 steel kernel at all.
+    ///
+    /// A8 declined it and named the reason to respect: "this flag's two sides
+    /// sum the same exact products in different orders, and a 16-bit operand
+    /// **rounds the product itself**. It would have to move into the
+    /// conditioning table, not sit beside it." So it is here, in the
+    /// conditioning table, with the clock beside it rather than instead of it.
+    ///
+    /// **What is given up is exactness of the operand, not of the sum.** The
+    /// accumulator stays `simdgroup_float8x8` — the instruction takes that mixed
+    /// form on this family — so the summation order is the one the block already
+    /// has and nothing about the chain moves. What moves is that `element × by`
+    /// stops being exact: it carries eleven bits of significand where it carried
+    /// twenty-four.
+    ///
+    /// **Which is why the shape of the drift column is the finding and not its
+    /// size.** The block's own drift grows with the reduction, because its
+    /// fragment accumulator is one running sum and a longer chain is a worse
+    /// one. A drift that is *flat* in the reduction is not a chain at all — it
+    /// is the operand, arriving already rounded and staying that far off however
+    /// few products are summed. That is the column this prints, and it is what
+    /// separates "16-bit operands are worse here" from "this arm has a bug".
+    ///
+    /// **Both halves of the question in one case, because either alone would be
+    /// misread.** A drift with no clock beside it cannot say whether the
+    /// accuracy was worth anything, and a clock with no drift beside it is the
+    /// claim A8 refused.
+    ///
+    /// The clock is warm and swept both ways, for the reason
+    /// [`what_a_prefills_blocked_matmul_is_bound_by`] gives: the arms it
+    /// separates are a few percent apart, and an arm measured always second is
+    /// an arm measured on whatever clock the one before it left.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_sixteen_bit_operands_cost_and_what_they_give_up() {
+        let Some(device) = device() else { return };
+
+        let reference = matmul(&device);
+        let shipped =
+            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
+        // Three strides rather than one, and the reason turned out to matter.
+        // The shipped padding is derived against a *four*-byte staged element;
+        // at two bytes 36, 40 and 44 all land a fragment's eight rows on eight
+        // distinct banks, so on the argument alone they should read alike. They
+        // do not — which is what says a single-stride reading of this arm would
+        // have been a measurement of the padding rather than of the operand
+        // width, and why the refusal is stated against the best of them.
+        let halved: Vec<(usize, PackedMatmul)> = [
+            MMA_STAGED_STRIDE,
+            MMA_STAGED_STRIDE + 4,
+            MMA_STAGED_STRIDE + 8,
+        ]
+        .into_iter()
+        .map(|stride| {
+            let arm = PackedMatmul::compiled(
+                &device,
+                &through_sixteen_bit_operands(&source_under(Numerics::Production), stride),
+                ROWS_A_TILE,
+                COLS_A_TILE,
+                Numerics::Production,
+            )
+            .expect("the 16-bit arm compiles");
+            (stride, arm)
+        })
+        .collect();
+
+        // The conditioning table first, because it is what decides whether the
+        // clock is worth reading at all. The padding reaches no arithmetic, so
+        // one arm answers for both.
+        eprintln!(
+            "  {:<14}{:>16}{:>16}{:>18}",
+            "a reduction", "the reference", "the block", "16-bit operands"
+        );
+        let mut worst = 0.0f64;
+        for reduction in CONDITIONING_REDUCTIONS {
+            let case = Case::noisy(reduction, OUT_DIM, 77);
+            let exact = case.exactly();
+            let through = |matmul: &PackedMatmul| {
+                drift(
+                    &case
+                        .upload(&device, matmul)
+                        .multiply(&case.x)
+                        .expect("the dispatch completes"),
+                    &exact,
+                )
+            };
+            let (theirs, block, half) = (
+                through(&reference),
+                through(&shipped),
+                through(&halved[0].1),
+            );
+            worst = worst.max(half);
+            eprintln!(
+                "  {reduction:<14}{:>16}{:>16}{:>18}",
+                format!("{theirs:.1e}"),
+                format!("{block:.1e}"),
+                format!("{half:.1e}")
+            );
+        }
+
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        eprintln!(
+            "  {:<8}{:<24}{:>16}{:>14}{:>10}{:>10}",
+            "at",
+            "",
+            "the block",
+            format!("16-bit at {}", halved[0].0),
+            format!("at {}", halved[1].0),
+            format!("at {}", halved[2].0)
+        );
+        let mut slowest = f64::MAX;
+        for tokens in BLOCKED_LENGTHS {
+            let shapes = shapes_at(tokens);
+            let arms: Vec<&PackedMatmul> = std::iter::once(&shipped)
+                .chain(halved.iter().map(|(_, arm)| arm))
+                .collect();
+            crate::testing::warmed(|| {
+                shapes[0].costs(&device, &shipped, &grouping);
+            });
+            let listed: Vec<usize> = (0..arms.len()).collect();
+            let (up, down) = crate::testing::both_ways(&listed, |at| {
+                shapes
+                    .iter()
+                    .map(|shape| shape.costs(&device, arms[at], &grouping))
+                    .collect::<Vec<Duration>>()
+            });
+
+            for (shape, at) in shapes.iter().zip(0..) {
+                // The slower of the two passes per arm, so that what is reported
+                // is not whichever direction the clock happened to favour.
+                let taken = |arm: usize| up[arm][at].max(down[arm][at]).as_secs_f64();
+                let block = taken(0);
+                let against = |arm: usize| taken(arm) / block;
+                slowest = (1..arms.len()).fold(slowest, |least, arm| least.min(against(arm)));
+                eprintln!(
+                    "  {tokens:<8}{:<24}{:>16}{:>14}{:>10}{:>10}",
+                    shape.what,
+                    format!("{:.2}ms", 1e3 * block),
+                    format!("{:+.0}%", 1e2 * (against(1) - 1.0)),
+                    format!("{:+.0}%", 1e2 * (against(2) - 1.0)),
+                    format!("{:+.0}%", 1e2 * (against(3) - 1.0))
+                );
+            }
+        }
+
+        // **Both halves of the refusal are asserted, because either could turn
+        // on its own and the table would still print.** The drift bound is the
+        // one with teeth; the clock bound is loose on purpose — the best padding
+        // reads one to three percent the wrong way, and what this refuses is a
+        // reading that has changed sign by more than any noise on this host.
+        assert!(
+            worst > f64::from(MMA_TOLERANCE),
+            "16-bit operands drift {worst:e}, which is inside the block's own {MMA_TOLERANCE:e} — \
+             the reason this arm is refused has changed and the table above wants re-reading"
+        );
+        assert!(
+            slowest > 0.95,
+            "16-bit operands came back {:.0}% of the block at some shape, so the clock half of \
+             this refusal has changed and the table above wants re-reading",
+            1e2 * slowest
+        );
+    }
+
     /// **Whether the matmul is bandwidth-bound now that it is 2.85× faster, and
     /// what it is waiting on if it is not** — the first question of this
     /// milestone, because every closed door in this repo was closed by a
@@ -5912,10 +6153,7 @@ kernel void decoded_elements(
             .collect();
 
         for tokens in BLOCKED_LENGTHS {
-            let shapes: Vec<Blocked> = BOUND_SHAPES
-                .iter()
-                .map(|&shape| Blocked::at(tokens, shape))
-                .collect();
+            let shapes = shapes_at(tokens);
 
             eprintln!("\n  a prefill of {tokens} tokens");
             eprintln!(
