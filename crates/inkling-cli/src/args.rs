@@ -11,6 +11,8 @@ use std::path::PathBuf;
 
 use inkling_metal::Numerics;
 
+use crate::kept::DEFAULT_BOUND;
+
 /// What to run, and what against.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -109,6 +111,10 @@ pub struct Serve {
     pub backend: Backend,
     /// Which arithmetic the device's innermost accumulation uses.
     pub numerics: Numerics,
+    /// The most positions a conversation is kept at between requests, and zero
+    /// for a server that keeps nothing — which is the arm every figure for this
+    /// is measured against.
+    pub reuse_tokens: usize,
 }
 
 /// How many tokens `generate` decodes when the caller names no budget.
@@ -138,7 +144,8 @@ pub const USAGE: &str = "usage:\n  \
     inklingrs generate <checkpoint-dir> --prompt <text> [--max-tokens <n>] \
         [--backend cpu|metal] [--numerics reference|production] [--speculate <k>]\n  \
     inklingrs serve <checkpoint-dir> [--address <host:port>] [--max-tokens <n>] \
-        [--backend cpu|metal] [--numerics reference|production]";
+        [--backend cpu|metal] [--numerics reference|production] \
+        [--reuse-tokens <n>]";
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ArgError {
@@ -165,6 +172,9 @@ pub enum ArgError {
 
     #[error("{0} is not a depth, which is zero or more")]
     NotADepth(String),
+
+    #[error("{0} is not a count of positions to keep, which is zero or more")]
+    NotABound(String),
 
     #[error("{0} is not a backend, which is cpu or metal")]
     UnknownBackend(String),
@@ -221,12 +231,21 @@ fn count(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize, A
     }
 }
 
-/// A depth, which is a count that may be zero: `--speculate 0` is a generation
-/// that decodes one token at a time, which is exactly what the flag's absence
-/// asks for and is the one number [`count`] refuses.
-fn depth(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize, ArgError> {
-    let depth = value(flag, args)?;
-    depth.parse().map_err(|_| ArgError::NotADepth(depth))
+/// A count that may be zero, which is the one number [`count`] refuses and which
+/// two flags mean something by: `--speculate 0` is a generation that decodes one
+/// token at a time, and `--reuse-tokens 0` is a server that keeps nothing. Both
+/// are exactly what the flag's absence asks for in one case and the arm a
+/// measurement is taken against in the other.
+///
+/// `wrong` is the refusal, because the two say different things about what a
+/// number that would not parse was meant to be.
+fn zeroable(
+    flag: &str,
+    args: &mut impl Iterator<Item = String>,
+    wrong: fn(String) -> ArgError,
+) -> Result<usize, ArgError> {
+    let number = value(flag, args)?;
+    number.parse().map_err(|_| wrong(number))
 }
 
 fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
@@ -244,7 +263,7 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
             "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
             "--numerics" => asked = Some(numerics(&arg, &mut args)?),
-            "--speculate" | "-k" => speculate = depth(&arg, &mut args)?,
+            "--speculate" | "-k" => speculate = zeroable(&arg, &mut args, ArgError::NotADepth)?,
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
             _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),
             _ => return Err(ArgError::Unexpected(arg)),
@@ -288,11 +307,13 @@ fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
     let mut max_tokens = DEFAULT_SERVE_MAX_TOKENS;
     let mut backend = Backend::default();
     let mut asked = None;
+    let mut reuse_tokens = DEFAULT_BOUND;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--address" | "-a" => address = value(&arg, &mut args)?,
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
+            "--reuse-tokens" => reuse_tokens = zeroable(&arg, &mut args, ArgError::NotABound)?,
             "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
             "--numerics" => asked = Some(numerics(&arg, &mut args)?),
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
@@ -310,6 +331,7 @@ fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
         max_tokens,
         backend,
         numerics: on_device(backend, asked)?,
+        reuse_tokens,
     }))
 }
 
@@ -769,7 +791,24 @@ mod tests {
                 max_tokens: 3,
                 backend: Backend::Metal,
                 numerics: Numerics::Reference,
+                reuse_tokens: DEFAULT_BOUND,
             })
+        );
+    }
+
+    /// The one number `--max-tokens` refuses and this one means something by: a
+    /// server that keeps nothing between requests, which is the arm every figure
+    /// for the kept cache is measured against.
+    #[test]
+    fn serve_takes_no_positions_to_keep_as_keeping_nothing() {
+        assert_eq!(
+            serving(&["serve", "models/small", "--reuse-tokens", "0"])
+                .map(|serve| serve.reuse_tokens),
+            Ok(0)
+        );
+        assert_eq!(
+            serving(&["serve", "models/small", "--reuse-tokens", "many"]),
+            Err(ArgError::NotABound("many".to_string()))
         );
     }
 

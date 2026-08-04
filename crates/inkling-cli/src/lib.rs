@@ -20,6 +20,7 @@ pub mod inspect;
 pub mod kept;
 pub mod openai;
 pub mod serve;
+pub mod session;
 
 /// The width a report's labels are padded to.
 ///

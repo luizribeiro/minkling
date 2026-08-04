@@ -46,7 +46,9 @@
 //! there the keys are the cache's own vectors, so a kept cache is a kept 2688
 //! MiB at 8192 tokens where before it was freed when the request ended.
 
-use inkling_core::{ModelCache, TextConfig};
+use std::ops::ControlFlow;
+
+use inkling_core::{Ending, Generator, ModelCache, ModelWeights, Stop, TextConfig};
 
 /// The kept conversation: the tokens the cache was built from, and the cache
 /// sitting at the end of them.
@@ -136,6 +138,42 @@ impl<'a> Kept<'a> {
             }
             false => self.forget(),
         }
+    }
+
+    /// One turn served against what this holds: the part of `ids` it does not
+    /// already have prefilled, the reply streamed to `sink`, and the cache put
+    /// back at the end of the prompt. Answers with the stop and how many of
+    /// `ids` it did not have to prefill.
+    ///
+    /// **The whole of the arrangement is here rather than at the server**, so
+    /// that what a measurement of this drives is what a request drives. The
+    /// three things it has to get right are the three lines: the last token of
+    /// the prompt is fed by the generation rather than the prefill, because a
+    /// forward pass over no tokens is not one; the mark is taken where the
+    /// prompt ends and not where the reply does; and what is recorded is what
+    /// the cache was resumed to.
+    pub fn turn(
+        &mut self,
+        generator: &Generator<'_>,
+        weights: &impl ModelWeights,
+        ids: &[usize],
+        ending: Ending,
+        sink: impl FnMut(usize) -> ControlFlow<()>,
+    ) -> (Stop, usize) {
+        assert!(!ids.is_empty(), "a turn over no tokens");
+        let held = ids.len() - 1;
+        let (cache, reused) = self.opened(ids);
+        if reused < held {
+            generator.prefill(cache, &ids[reused..held], weights);
+        }
+
+        // Where the next turn's prompt starts, taken before the generation moves
+        // the cache past it and put back once the reply is done.
+        let mark = weights.mark(cache);
+        let stop = generator.stream(cache, &ids[held..], ending, weights, sink);
+        weights.resume(cache, &mark);
+        self.keep(&ids[..held]);
+        (stop, reused)
     }
 
     /// Keep nothing, and give the next request a cache that holds nothing.

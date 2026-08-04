@@ -19,13 +19,22 @@
 //! finished. At 0.055 s a token that is a wait a client can sit through, and at
 //! the CPU path's 9.0 s it is a long one — honest either way.
 //!
-//! # Each request prefills its whole prompt
+//! # A request prefills what the last one did not
 //!
-//! Nothing is carried between requests. The loop leaves a cache a caller *could*
-//! carry — that is what `generate`'s own tests establish — but reusing one across
-//! requests means deciding whether the conversation a client sent is the one the
-//! cache holds, and getting that wrong answers from another client's context. A
-//! fresh cache per request is the slow answer and the one that cannot be wrong.
+//! A conversation comes back turn after turn with a little added each time, so a
+//! server that keeps nothing re-prefills the whole of it every turn. Whether the
+//! conversation a client sent is the one the cache holds is
+//! [`Kept`](crate::kept::Kept)'s decision — one conversation, and an exact
+//! extension of it — and this loop is what follows from it: prefill the part
+//! that is new, mark the cache where the prompt ends, generate, and put the
+//! cache back at the mark.
+//!
+//! **The mark is what keeps that decision honest.** A generation moves the cache
+//! past the prompt, and the reply cannot be recorded in its place: what a client
+//! sends back is not what the model streamed, because the turn structure renders
+//! a thinking channel as a message of its own where the model emits it inside
+//! one. A cache that had recorded the reply would match a position in the middle
+//! of it that no mark stands at.
 //!
 //! # Why `tiny_http`
 //!
@@ -58,13 +67,12 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use inkling_core::{
-    Checkpoint, CheckpointWeights, Ending, Generator, ModelCache, Stop, TextConfig, Tokenizer,
-};
+use inkling_core::{Checkpoint, CheckpointWeights, Ending, Generator, Stop, Tokenizer};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::args::Serve;
 use crate::chat::{self, Channel, Channels, MARKERS};
+use crate::kept::Kept;
 use crate::openai::{ChatRequest, Completion, Finish, RequestError};
 use crate::{backend, config};
 
@@ -320,13 +328,15 @@ impl<W: Write> Body<W> {
 /// Everything a request is answered against, loaded once.
 struct Engine<'a> {
     tokenizer: Tokenizer,
-    config: &'a TextConfig,
     weights: &'a CheckpointWeights<'a>,
     generator: Generator<'a>,
     markers: Vec<(u32, String, Option<Channel>)>,
     model: String,
     max_tokens: usize,
     served: u64,
+    /// The conversation the last request left behind, which the next one either
+    /// extends or replaces.
+    kept: Kept<'a>,
 }
 
 impl Engine<'_> {
@@ -399,10 +409,12 @@ impl Engine<'_> {
         )
     }
 
-    /// The loop: the prompt prefilled, then a token at a time into `out` until
-    /// the model ends its turn, the budget runs out, or the client hangs up.
+    /// The loop: what the last request did not already hold of the prompt
+    /// prefilled — which is [`Kept::turn`] — then a token at a time into `out`
+    /// until the model ends its turn, the budget runs out, or the client hangs
+    /// up.
     fn generate(
-        &self,
+        &mut self,
         asked: &ChatRequest,
         ids: &[usize],
         mut out: Body<impl Write>,
@@ -414,18 +426,16 @@ impl Engine<'_> {
         let mut text = self.tokenizer.stream();
         let mut channels = Channels::new(self.markers.iter().cloned());
 
-        let mut cache = ModelCache::new(self.config);
-        let stop = self
-            .generator
-            .stream(&mut cache, ids, ending, self.weights, |id| {
-                match text.push(id as u32) {
-                    Ok(decoded) => {
-                        let (channel, decoded) = channels.route(id as u32, &decoded);
-                        out.push(channel, &decoded)
-                    }
-                    Err(err) => out.fail(err),
+        let (weights, generator) = (self.weights, self.generator);
+        let (stop, _) = self.kept.turn(&generator, weights, ids, ending, |id| {
+            match text.push(id as u32) {
+                Ok(decoded) => {
+                    let (channel, decoded) = channels.route(id as u32, &decoded);
+                    out.push(channel, &decoded)
                 }
-            });
+                Err(err) => out.fail(err),
+            }
+        });
 
         // Bytes the last token left half a character with, which a budget that
         // cut the reply off mid-character has and holding back would lose.
@@ -464,13 +474,13 @@ pub fn run(args: &Serve) -> Result<()> {
 
     let mut engine = Engine {
         tokenizer,
-        config: &config.text_config,
         weights: &weights,
         generator,
         markers,
         model: model_name(&args.checkpoint),
         max_tokens: args.max_tokens,
         served: 0,
+        kept: Kept::new(&config.text_config, args.reuse_tokens),
     };
 
     let server = Server::http(&args.address)

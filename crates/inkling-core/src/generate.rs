@@ -312,6 +312,33 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// `ids` into `cache`, with no token taken back out of it.
+    ///
+    /// **What [`Generator::stream`] does not leave room for**: a prompt whose
+    /// keys are wanted without the token that follows them. A server keeping a
+    /// conversation across requests wants exactly that — the cache at the end of
+    /// the prompt, marked there, and the generation after the mark — and a
+    /// stream that prefills and samples in one pass has no seam to mark at.
+    ///
+    /// The block of one is the seam **and it is not free of purpose**: a backend
+    /// that carried the last layer's rows has a run still open, and the tail is
+    /// what closes it. Marking a window a dispatch has not written is reading
+    /// whatever was there before. So this asks for the cheapest tail there is —
+    /// one row, no logits handed back, nothing chained — and drops the id it
+    /// names.
+    pub fn prefill(&self, cache: &mut ModelCache, ids: &[usize], weights: &impl ModelWeights) {
+        self.tailed(
+            cache,
+            ids,
+            Tail {
+                block: 1,
+                chained: false,
+                logits: false,
+            },
+            weights,
+        );
+    }
+
     /// The ids a greedy sampler takes from `rows` rows of logits.
     ///
     /// Every row of a speculative block is a question — "what does the model

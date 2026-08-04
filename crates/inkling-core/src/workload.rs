@@ -39,6 +39,76 @@ pub const REALISTIC: [(usize, usize); 4] = [(97, 128), (385, 128), (769, 128), (
 /// sweep decodes.
 pub const DECODED: usize = 64;
 
+/// The simulated coding session every figure for a kept cache is taken over.
+///
+/// **This is the workload the architectural win is a claim about**, and it is
+/// not a microbenchmark: a prefill of a given length says what one prompt costs,
+/// where what a user feels is the same conversation coming back turn after turn
+/// with a little added each time. A figure taken on a single prompt cannot say
+/// anything at all about keeping one between requests, because there is no
+/// "between".
+///
+/// The shape is a coding session's: an opening that is already thousands of
+/// tokens — a file, a task, a directory listing — and then turns that each add a
+/// question and are each answered.
+///
+/// [`Session::OPENING`] is where the sitting's length is decided. A prefill here
+/// is 5.4 ms a token, so a session opening at 16384 would be four minutes an arm
+/// before a token is decoded, and the effect this measures does not need the
+/// length to be visible: 2048 is the shortest opening at which the re-prefill
+/// already dominates a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Session {
+    /// Tokens the conversation opens at, before any turn is taken.
+    pub opening: usize,
+    /// Turns, each of them a prompt and a generation.
+    pub turns: usize,
+    /// Tokens the user adds at the start of every turn after the first.
+    pub added: usize,
+    /// Tokens the model produces in each turn, which the next turn's prompt
+    /// carries back — a client that sends the conversation back sends the reply
+    /// with it.
+    pub generated: usize,
+}
+
+impl Session {
+    pub const OPENING: usize = 2048;
+
+    /// The default session: 2048 tokens opened with, five turns, a few hundred
+    /// tokens added and decoded each.
+    pub const fn new(opening: usize) -> Self {
+        Self {
+            opening,
+            turns: 5,
+            added: 256,
+            generated: 64,
+        }
+    }
+
+    /// The prompt of turn `turn`, given what the model produced in the turns
+    /// before it.
+    ///
+    /// **A turn's prompt is the last one, the reply to it, and what the user
+    /// added** — which is what makes a coding turn an exact extension of the
+    /// turn before it, and is the whole reason a kept cache pays here. The added
+    /// tokens come from a different place in `ids` each turn, so that no two
+    /// turns add the same text and the routing sees a real spread of tokens.
+    pub fn prompt(&self, ids: &[usize], turn: usize, produced: &[Vec<usize>]) -> Vec<usize> {
+        let mut prompt = tiled(ids, self.opening);
+        for (at, reply) in produced.iter().enumerate().take(turn) {
+            prompt.extend_from_slice(reply);
+            prompt.extend(
+                ids.iter()
+                    .copied()
+                    .cycle()
+                    .skip(self.opening + at * self.added)
+                    .take(self.added),
+            );
+        }
+        prompt
+    }
+}
+
 /// The speculation depth this repo's own sweep says pays best, and so the depth
 /// a cross-engine table quotes beside `k = 0`.
 ///
@@ -242,6 +312,59 @@ mod tests {
             assert!(
                 !CORPUS[..at].contains(prompt),
                 "prompt {at} is one of the ones before it"
+            );
+        }
+    }
+
+    /// The property the whole of a kept cache rests on, stated about the
+    /// workload rather than about the engine: **turn `n + 1`'s prompt starts
+    /// with turn `n`'s.** A session that did not have it would measure a cache
+    /// that never matched, and would report the miss path as the feature.
+    #[test]
+    fn each_turn_of_the_session_is_an_exact_extension_of_the_turn_before_it() {
+        let session = Session::new(64);
+        let ids: Vec<usize> = (1..=7).collect();
+        let produced: Vec<Vec<usize>> = (0..session.turns)
+            .map(|turn| vec![900 + turn; session.generated])
+            .collect();
+
+        let prompts: Vec<Vec<usize>> = (0..session.turns)
+            .map(|turn| session.prompt(&ids, turn, &produced))
+            .collect();
+        for (turn, pair) in prompts.windows(2).enumerate() {
+            let [before, after] = [&pair[0], &pair[1]];
+            assert!(after.starts_with(before), "turn {turn} is not extended");
+            assert_eq!(
+                after.len() - before.len(),
+                session.generated + session.added,
+                "turn {turn} added something other than a reply and a question"
+            );
+        }
+        assert_eq!(prompts[0].len(), session.opening);
+    }
+
+    /// Two turns that added the same tokens would put the same text in front of
+    /// the model twice, which is a session of one distribution measured five
+    /// times — the mistake [`CORPUS`] exists to avoid on the other axis.
+    #[test]
+    fn no_two_turns_of_the_session_add_the_same_tokens() {
+        let session = Session::new(64);
+        let ids: Vec<usize> = (1..=7).collect();
+        let produced: Vec<Vec<usize>> = (0..session.turns).map(|_| vec![900]).collect();
+
+        let added: Vec<Vec<usize>> = (1..session.turns)
+            .map(|turn| {
+                let (before, after) = (
+                    session.prompt(&ids, turn - 1, &produced),
+                    session.prompt(&ids, turn, &produced),
+                );
+                after[before.len() + produced[turn - 1].len()..].to_vec()
+            })
+            .collect();
+        for (at, tokens) in added.iter().enumerate() {
+            assert!(
+                !added[..at].contains(tokens),
+                "turn {at} repeats a question"
             );
         }
     }
