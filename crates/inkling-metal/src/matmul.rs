@@ -5832,6 +5832,12 @@ kernel void decoded_elements(
         /// it: the bytes a kernel with an infinite cache would still have to
         /// fetch, and so the only denominator against which "bandwidth-bound"
         /// means bound by the machine rather than by the kernel's own re-reading.
+        /// The multiply-adds this call performs, twice over, which is what a
+        /// rate against the instruction's own ceiling divides.
+        fn flops(&self) -> f64 {
+            2.0 * self.rows as f64 * self.in_dim as f64 * self.out_dim as f64
+        }
+
         fn compulsory(&self) -> usize {
             let elements = self.experts * self.out_dim * self.in_dim;
             elements * BITS / u8::BITS as usize
@@ -6582,6 +6588,288 @@ kernel void decoded_elements(
              {ratio:.2}× — so what every block table in this file reports is not a dispatch of the \
              shape its row names"
         );
+    }
+
+    /// The matrix instruction and the scalar one, each over registers alone.
+    ///
+    /// **What a ceiling has to have none of is memory.** Every entry loads its
+    /// operands once, before the loop, and none reads or writes anything inside
+    /// it — so what the clock divides is the issue rate of the instruction and
+    /// nothing around it. The stores are under `at == 0xffffffffu`, which no
+    /// thread of any grid dispatched here satisfies and no compiler can prove
+    /// it does not: `thread_position_in_grid` is settled at the dispatch and
+    /// not at the compile.
+    ///
+    /// **Each accumulator lands somewhere of its own**, which is the difference
+    /// between four chains and one. Four `simdgroup_store`s to one address are
+    /// three dead stores, and a dead store is licence to drop the chain that
+    /// fed it — so a ceiling written that way could quietly be the single-chain
+    /// figure under the four-chain name.
+    ///
+    /// `mma_held` carries the shipped block's own inner shape — four
+    /// accumulators against two `lhs` and two `rhs` fragments — so the ceiling is
+    /// the one this kernel could reach rather than the one some other
+    /// arrangement could. `mma_chained` is the same loop down to a single
+    /// accumulator, which is what the kernel reads as if every multiply waits on
+    /// the last: the gap between the two is what independent accumulators are
+    /// worth and it is the only thing here a block shape can change.
+    const CEILING: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void mma_held(
+    device const float *seed [[buffer(0)]],
+    constant uint &rounds [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint at [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    simdgroup_float8x8 a0 = make_filled_simdgroup_matrix<float, 8, 8>(seed[lane]);
+    simdgroup_float8x8 a1 = make_filled_simdgroup_matrix<float, 8, 8>(seed[lane] + 1.0f);
+    simdgroup_float8x8 b0 = make_filled_simdgroup_matrix<float, 8, 8>(seed[lane] + 2.0f);
+    simdgroup_float8x8 b1 = make_filled_simdgroup_matrix<float, 8, 8>(seed[lane] + 3.0f);
+    simdgroup_float8x8 s00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 s01 = s00, s10 = s00, s11 = s00;
+
+    for (uint r = 0; r < rounds; ++r) {
+        simdgroup_multiply_accumulate(s00, a0, b0, s00);
+        simdgroup_multiply_accumulate(s01, a0, b1, s01);
+        simdgroup_multiply_accumulate(s10, a1, b0, s10);
+        simdgroup_multiply_accumulate(s11, a1, b1, s11);
+    }
+
+    if (at == 0xffffffffu) {
+        simdgroup_store(s00, out, 8);
+        simdgroup_store(s01, out + 64, 8);
+        simdgroup_store(s10, out + 128, 8);
+        simdgroup_store(s11, out + 192, 8);
+    }
+}
+
+kernel void mma_chained(
+    device const float *seed [[buffer(0)]],
+    constant uint &rounds [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint at [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    simdgroup_float8x8 a0 = make_filled_simdgroup_matrix<float, 8, 8>(seed[lane]);
+    simdgroup_float8x8 b0 = make_filled_simdgroup_matrix<float, 8, 8>(seed[lane] + 2.0f);
+    simdgroup_float8x8 s00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint r = 0; r < rounds; ++r) {
+        simdgroup_multiply_accumulate(s00, a0, b0, s00);
+    }
+
+    if (at == 0xffffffffu) {
+        simdgroup_store(s00, out, 8);
+    }
+}
+
+kernel void mma_half_held(
+    device const float *seed [[buffer(0)]],
+    constant uint &rounds [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint at [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    simdgroup_half8x8 a0 = make_filled_simdgroup_matrix<half, 8, 8>((half)seed[lane]);
+    simdgroup_half8x8 a1 = make_filled_simdgroup_matrix<half, 8, 8>((half)seed[lane] + 1.0h);
+    simdgroup_half8x8 b0 = make_filled_simdgroup_matrix<half, 8, 8>((half)seed[lane] + 2.0h);
+    simdgroup_half8x8 b1 = make_filled_simdgroup_matrix<half, 8, 8>((half)seed[lane] + 3.0h);
+    simdgroup_float8x8 s00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 s01 = s00, s10 = s00, s11 = s00;
+
+    for (uint r = 0; r < rounds; ++r) {
+        simdgroup_multiply_accumulate(s00, a0, b0, s00);
+        simdgroup_multiply_accumulate(s01, a0, b1, s01);
+        simdgroup_multiply_accumulate(s10, a1, b0, s10);
+        simdgroup_multiply_accumulate(s11, a1, b1, s11);
+    }
+
+    if (at == 0xffffffffu) {
+        simdgroup_store(s00, out, 8);
+        simdgroup_store(s01, out + 64, 8);
+        simdgroup_store(s10, out + 128, 8);
+        simdgroup_store(s11, out + 192, 8);
+    }
+}
+
+kernel void scalar_held(
+    device const float *seed [[buffer(0)]],
+    constant uint &rounds [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint at [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    float4 a = float4(seed[lane]);
+    float4 b = float4(seed[lane] + 1.0f);
+    float4 c0 = float4(0.0f), c1 = c0, c2 = c0, c3 = c0;
+    for (uint r = 0; r < rounds; ++r) {
+        c0 = fma(a, b, c0);
+        c1 = fma(a, b, c1);
+        c2 = fma(a, b, c2);
+        c3 = fma(a, b, c3);
+    }
+    if (at == 0xffffffffu) {
+        out[0] = dot(c0 + c1, c2 + c3);
+    }
+}
+"#;
+
+    /// The four ceiling entries, with the multiply-adds one round of each
+    /// performs per simdgroup: an 8×8×8 fragment is 512 of them, and a `float4`
+    /// fused multiply-add is four across each of 32 lanes.
+    const CEILING_ENTRIES: [(&str, &str, usize); 4] = [
+        ("the matrix instruction, four held", "mma_held", 4 * 512),
+        ("the same chain held once", "mma_chained", 512),
+        ("the same four on 16-bit operands", "mma_half_held", 4 * 512),
+        ("scalar fused multiply-adds", "scalar_held", 4 * 4 * 32),
+    ];
+
+    /// Rounds of the ceiling loop one dispatch runs, chosen so that the dispatch
+    /// is tens of milliseconds — the same decade as the calls it is a ceiling
+    /// for, so neither is being read at a resolution the other is not.
+    const CEILING_ROUNDS: u32 = 20_000;
+
+    /// Simdgroups a ceiling dispatch runs, which is eight threadgroups of 256 on
+    /// each of this part's 80 cores — enough that the part is covered several
+    /// times over and no core is idle at the end.
+    const CEILING_THREADS: usize = 640 * 256;
+
+    /// **What the matrix instruction issues at on this part, and what the block
+    /// reaches against it.**
+    ///
+    /// Every "of peak" figure this file has ever recorded about the matmul
+    /// divides by a *bandwidth*: `what_a_streaming_read_achieves_on_this_machine`
+    /// measures 725 GB/s and the roofline in
+    /// [`what_a_prefills_blocked_matmul_is_bound_by`] reads the compulsory
+    /// traffic against it. **That denominator says nothing about a kernel this
+    /// far from memory.** The block moves 2.35 GB in 54 ms, which is 43 GB/s —
+    /// six percent of what the bus does — so what bounds it is on the other side
+    /// of the arithmetic, and the arithmetic has a ceiling of its own that
+    /// nothing here had measured.
+    ///
+    /// **It is not a specification figure.** This part is quoted at about 28
+    /// TFLOP/s of fp32 fused multiply-add, and what a `simdgroup_matrix` op does
+    /// against that is a question the vendor does not answer: the instruction
+    /// could be a wide datapath of its own, in which case a kernel carrying 512
+    /// multiply-adds an instruction has a much higher ceiling than a scalar one,
+    /// or it could be the same lanes under another name. The scalar row is what
+    /// answers it.
+    ///
+    /// **The assertion is that the block is under its own ceiling**, which is
+    /// weak as a claim about the kernel and strong as one about the clock: a
+    /// dispatch reading above the rate its own instruction issues at is a
+    /// measurement error, and it is exactly the measurement error
+    /// `the_device_clock_counts_every_dispatch_it_is_given` was written for.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_the_matrix_instruction_issues_at() {
+        let Some(device) = device() else { return };
+
+        let seed: Vec<f32> = (0..64).map(|i| i as f32 / 64.0).collect();
+        let mut seed = device.buffer(&seed).expect("the seed uploads");
+        let mut rounds = device.buffer(&[CEILING_ROUNDS]).expect("the count uploads");
+        let mut out = device.zeroed::<f32>(4 * 64).expect("the sink allocates");
+        let grid = Grid::new(CEILING_THREADS, THREADS_PER_GROUP);
+
+        let kernels: Vec<Kernel> = CEILING_ENTRIES
+            .iter()
+            .map(|(_, entry, _)| {
+                device
+                    .compile(CEILING, entry)
+                    .expect("the ceiling kernel compiles")
+            })
+            .collect();
+        let mut taken_by = |kernel: &Kernel| {
+            crate::testing::device_time(&device, 3, |batch| {
+                batch
+                    .add(kernel, &[seed.arg(), rounds.arg(), out.arg()], grid, 0)
+                    .expect("the ceiling dispatch encodes");
+            })
+        };
+        // A ceiling read cold is one taken inside this part's boost window
+        // rather than at the clock a prefill runs at, and three of these four
+        // arms sit within a tenth of each other — which is inside what a ramp
+        // over a four-row sweep manufactures.
+        crate::testing::warmed(|| {
+            taken_by(&kernels[0]);
+        });
+
+        let mut rates = Vec::new();
+        eprintln!("\n  {:<38}{:>10}{:>16}", "what issues", "device", "rate");
+        for ((what, _, per_round), kernel) in CEILING_ENTRIES.iter().zip(&kernels) {
+            let mut taken = Duration::MAX;
+            for _ in 0..5 {
+                taken = taken.min(taken_by(kernel));
+            }
+            let simds = (CEILING_THREADS / NARROWEST_SIMD) as f64;
+            let flops = 2.0 * simds * f64::from(CEILING_ROUNDS) * *per_round as f64;
+            let rate = flops / taken.as_secs_f64();
+            rates.push(rate);
+            eprintln!(
+                "  {what:<38}{:>10}{:>16}",
+                format!("{:.2}ms", 1e3 * taken.as_secs_f64()),
+                format!("{:.1} TFLOP/s", 1e-12 * rate),
+            );
+        }
+        let ceiling = rates[0];
+
+        // **The four rows are one rate, and that is both the finding and the
+        // check.** A part whose matrix instruction were a datapath of its own
+        // would put the first row a multiple above the last, and a loop that
+        // collapsed to a closed form — the scalar one is the reassociable
+        // shape — would put its own row orders above the rest. Neither is what
+        // an issue-limited part reading one rate four ways looks like.
+        let (fastest, slowest) = rates.iter().fold((0.0f64, f64::MAX), |(hi, lo), rate| {
+            (hi.max(*rate), lo.min(*rate))
+        });
+        assert!(
+            fastest / slowest < 2.0,
+            "the four ways of asking this part for arithmetic span {:.1}× ({:.1} to {:.1} \
+             TFLOP/s), where they have read within a quarter of each other — either something \
+             here is issuing on a datapath of its own or one of these loops is no longer being \
+             run, and the ceiling below divides by the first of them",
+            fastest / slowest,
+            1e-12 * slowest,
+            1e-12 * fastest,
+        );
+
+        let shipped =
+            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        for tokens in BLOCKED_LENGTHS {
+            let shapes = shapes_at(tokens);
+            crate::testing::warmed(|| {
+                shapes[0].costs(&device, &shipped, &grouping);
+            });
+            eprintln!("\n  a prefill of {tokens} tokens");
+            eprintln!(
+                "  {:<38}{:>10}{:>16}{:>22}",
+                "", "device", "achieved", "of the instruction"
+            );
+            for shape in &shapes {
+                let taken = shape.costs(&device, &shipped, &grouping);
+                let rate = shape.flops() as f64 / taken.as_secs_f64();
+                assert!(
+                    rate < ceiling,
+                    "{} at {tokens} tokens reads {:.1} TFLOP/s against a matrix instruction that \
+                     issues at {:.1} — a kernel cannot outrun the instruction it is made of, so \
+                     the clock is measuring something other than this dispatch",
+                    shape.what,
+                    1e-12 * rate,
+                    1e-12 * ceiling,
+                );
+                eprintln!(
+                    "  {:<38}{:>10}{:>16}{:>22}",
+                    shape.what,
+                    format!("{:.2}ms", 1e3 * taken.as_secs_f64()),
+                    format!("{:.1} TFLOP/s", 1e-12 * rate),
+                    format!("{:.0}%", 1e2 * rate / ceiling),
+                );
+            }
+        }
     }
 
     /// **Whether the matmul is bandwidth-bound now that it is 2.85× faster, and
