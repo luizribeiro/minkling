@@ -5218,6 +5218,11 @@ kernel void decoded_elements(
     /// one is the shared bank's. The third arm is the grouped layout, which is
     /// two dispatches by construction and is here so that the pair's answer is
     /// held at the layout it does *not* fuse as well as at the two it does.
+    ///
+    /// **And what the pair costs the pipeline is asserted beside what it
+    /// answers**, because the two together are what say a fused dispatch is
+    /// worth the launch it saves: a merge that halved the threadgroup would be
+    /// giving width back on the axis it was taken for.
     #[test]
     fn a_paired_dispatch_answers_what_the_two_dispatches_it_replaces_answer() {
         let Some(device) = device() else { return };
@@ -5238,6 +5243,26 @@ kernel void decoded_elements(
             )
             .expect("the bank's shapes pair")
         };
+        // **What the second bank costs the pipeline, which is nothing.** A
+        // threadgroup of either entry is that many independent simdgroups with
+        // no threadgroup memory between them, and what the paired one adds is
+        // four bindings and two selections above the walk — so the widest
+        // threadgroup the device gives it is the widest it gives the entry it is
+        // a second emission of. A pair that had cost occupancy would say so
+        // here, and would have to be weighed against the launch it saves rather
+        // than simply taken.
+        assert_eq!(
+            (
+                matmul.paired.max_threads_per_group(),
+                matmul.paired.threadgroup_memory()
+            ),
+            (
+                matmul.kernel.max_threads_per_group(),
+                matmul.kernel.threadgroup_memory()
+            ),
+            "a paired dispatch is not the threadgroup an untiled one is"
+        );
+
         let gate_case = Case::seeded(0x9a1e_0001, IN_DIM, EXPERTS * OUT_DIM, ROWS);
         let up_case = Case::seeded(0x9a1e_0002, IN_DIM, EXPERTS * OUT_DIM, ROWS);
         let pair =

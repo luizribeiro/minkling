@@ -59,7 +59,7 @@ pub use experts::{ExpertBanks, ExpertKernels, LayerExperts};
 pub use grouping::{ExpertGrouping, Grouped};
 pub use heads::ModelHeads;
 pub use kernel::{Batch, Grid, Kernel, Submitted};
-pub use matmul::{MatmulError, Multiply, PackedBank, PackedMatmul, PackedProjection};
+pub use matmul::{MatmulError, Multiply, PackedBank, PackedMatmul, PackedPair, PackedProjection};
 pub use norm::{LayerNorm, RmsNorm};
 pub use numerics::Numerics;
 pub use projections::{

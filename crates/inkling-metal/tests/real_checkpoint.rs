@@ -553,12 +553,18 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// `k` and `v`, the two head norms over `q` and the convolved `k`, the attention
 /// step and `o_proj`. Three more are the two residual paths around the MLP — the
 /// layer's two short convolutions, each of which adds the value its block began
-/// with as it writes, and the second norm between them. The last twelve are the
-/// MLP: the router's gate, the top-k over what it produced, each bank's gate,
-/// up, activation and down, the softmax over the eight logits that selection
-/// named, and both banks' rows weighted by it. A dense layer is eighteen, its
+/// with as it writes, and the second norm between them. The last ten are the
+/// MLP: the router's gate, the top-k over what it produced, each bank's pair,
+/// activation and down, the softmax over the eight logits that selection named,
+/// and both banks' rows weighted by it. A dense layer is eighteen, its
 /// feed-forward network four where a MoE layer's two banks and the router around
-/// them are twelve. The head is one of each.
+/// them are ten. The head is one of each.
+///
+/// **A bank's pair is one dispatch and a dense network's is two**, which is the
+/// whole of the difference between the two widths below and is
+/// [`PackedPair`](inkling_metal::PackedPair): the banks' `gate` and `up` are
+/// fused where the call is untiled and a dense layer's are two projections that
+/// were never a bank.
 ///
 /// **Not one of them costs a round trip.** The whole chain from the hidden state
 /// a layer is handed to the one it passes on is buffers a next dispatch reads —
@@ -590,7 +596,7 @@ const RESIDENT_BOUND: u64 = 1 << 30;
 /// did. This counts a decode step, whose forty-two layers are far under that
 /// budget.
 fn per_step(layers: u64, dense: u64) -> (u64, u64) {
-    let width = |layer: u64| if layer < dense { 14 + 4 } else { 14 + 12 };
+    let width = |layer: u64| if layer < dense { 14 + 4 } else { 14 + 10 };
     let (mut dispatches, mut encoded, mut submissions) = (0, 0, 0);
     for layer in 0..layers {
         dispatches += width(layer);
