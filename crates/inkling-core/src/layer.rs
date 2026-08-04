@@ -33,11 +33,13 @@
 
 use std::borrow::Cow;
 
-use crate::attention::{Attention, AttentionCache, AttentionConfig, AttentionWeights, LayerStep};
+use crate::attention::{
+    Attention, AttentionCache, AttentionConfig, AttentionMark, AttentionWeights, LayerStep,
+};
 use crate::moe::{BankRows, Gathered, Routed, Rows, SparseMoe};
 use crate::ops::{DenseMlp, rms_norm};
 use crate::profile::{self, Op};
-use crate::sconv::{ConvState, ShortConv};
+use crate::sconv::{ConvMark, ConvState, ShortConv};
 
 /// Where a whole decoder layer runs, when it is not here.
 ///
@@ -377,6 +379,60 @@ impl DecoderCache {
         self.attention.rewind(rows);
         self.attn_sconv.rewind(rows);
         self.mlp_sconv.rewind(rows);
+    }
+
+    /// Where this layer is now, as something that can put it back here later.
+    ///
+    /// One method for the four places a layer holds a sequence, for the reason
+    /// [`DecoderCache::rewind`] is one: a mark that carried three of the four
+    /// would resume a layer that still runs, over a position its keys and its
+    /// convolutions disagreed about.
+    pub fn mark(&self) -> LayerMark {
+        LayerMark::new(
+            self.attention.mark(),
+            self.attn_sconv.mark(),
+            self.mlp_sconv.mark(),
+        )
+    }
+
+    /// The state this layer had when `mark` was taken.
+    pub fn resume(&mut self, mark: &LayerMark) {
+        self.attention.resume(&mark.attention);
+        self.attn_sconv.resume(&mark.attn_sconv);
+        self.mlp_sconv.resume(&mark.mlp_sconv);
+    }
+}
+
+/// Where one layer was: its attention's keys and two windows, and the windows of
+/// the two convolutions outside it.
+///
+/// The same four fields [`DecoderCache`] has, and named apart for the same
+/// reason: a slot cannot be miscounted, and which convolution a window belongs
+/// to is what these fields' tests drive.
+#[derive(Debug, Clone)]
+pub struct LayerMark {
+    attention: AttentionMark,
+    attn_sconv: ConvMark,
+    mlp_sconv: ConvMark,
+}
+
+impl LayerMark {
+    /// A mark over state whoever holds it has read out — which for a layer that
+    /// runs on a device is that device's own span and its own four windows.
+    pub fn new(attention: AttentionMark, attn_sconv: ConvMark, mlp_sconv: ConvMark) -> Self {
+        Self {
+            attention,
+            attn_sconv,
+            mlp_sconv,
+        }
+    }
+
+    pub fn attention(&self) -> &AttentionMark {
+        &self.attention
+    }
+
+    pub fn convolutions(&self) -> (&ConvMark, &ConvMark) {
+        (&self.attn_sconv, &self.mlp_sconv)
     }
 }
 

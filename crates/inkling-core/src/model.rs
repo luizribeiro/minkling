@@ -79,7 +79,7 @@ use crate::attention::AttentionConfig;
 use crate::config::TextConfig;
 use crate::embed::Embed;
 use crate::head::{Tail, Tailed};
-use crate::layer::{DecoderCache, Hidden, Passed};
+use crate::layer::{DecoderCache, Hidden, LayerMark, Passed};
 use crate::ops::rms_norm;
 
 /// The model's weights, reached through an index rather than held as slices.
@@ -104,6 +104,30 @@ pub trait ModelWeights {
     /// another there, and which still answers.
     fn rewind(&self, cache: &mut ModelCache, rows: usize) {
         cache.rewind(rows);
+    }
+
+    /// Where the sequence in flight is now, everywhere its state lives, as
+    /// something [`ModelWeights::resume`] can put it back to.
+    ///
+    /// **What this buys that [`ModelWeights::rewind`] does not is a distance.**
+    /// A rewind is bounded by the slack a cache was built with, which is sized
+    /// for the handful of tokens a speculative round takes back; a mark reaches
+    /// back over a whole generation for the cost of four windows a layer,
+    /// because it carries the windows rather than shifting them. That is what
+    /// lets a conversation's prompt be kept across a request while the reply
+    /// that followed it is dropped.
+    ///
+    /// **Between runs, and this is where that has to be said.** Whatever wrote
+    /// the state has to have finished writing it, which on a device means the
+    /// command buffer has completed — see
+    /// [`LayerBackend::mark`](crate::weights::LayerBackend::mark).
+    fn mark(&self, cache: &ModelCache) -> Mark {
+        Mark::new(cache.mark(), None)
+    }
+
+    /// The state the sequence had when `mark` was taken, everywhere it lives.
+    fn resume(&self, cache: &mut ModelCache, mark: &Mark) {
+        cache.resume(mark.cache());
     }
 
     /// Layer `index` over `[tokens, hidden]`, continuing from `cache` and
@@ -198,12 +222,93 @@ impl ModelCache {
         }
     }
 
+    /// Where this sequence is now, as something that can put it back here later.
+    ///
+    /// **What this can do that [`ModelCache::rewind`] cannot is reach past the
+    /// slack**, and what it costs is the difference: a rewind gives back
+    /// timesteps a cache was built holding room for, and a mark carries the
+    /// windows themselves — `kernel_size - 1` timesteps of each of a layer's
+    /// four convolutions, whatever the distance being reached back over. The
+    /// keys are not carried at all, because a key is addressed by its position;
+    /// see [`AttentionCache::mark`](crate::AttentionCache::mark).
+    ///
+    /// Every layer or none, for the reason [`ModelCache::rewind`] is: a stack
+    /// resumed unevenly would attend over a different number of keys per layer
+    /// for the same position, and would still answer.
+    pub fn mark(&self) -> CacheMark {
+        CacheMark::new(self.layers.iter().map(DecoderCache::mark).collect())
+    }
+
+    /// The state this sequence had when `mark` was taken.
+    pub fn resume(&mut self, mark: &CacheMark) {
+        assert_eq!(
+            mark.layers.len(),
+            self.layers.len(),
+            "a mark per layer of the cache"
+        );
+        for (layer, mark) in self.layers.iter_mut().zip(&mark.layers) {
+            layer.resume(mark);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.layers.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
+    }
+}
+
+/// Where a run of layers was, one [`LayerMark`] apiece.
+///
+/// A list rather than a map from layer index, because both ends of it walk the
+/// layers they hold in order and a mark that landed on the wrong layer is one
+/// whose widths would not fit. The layers a *backend* holds are a subset of the
+/// stack's, so a mark taken there is shorter than one taken here — which is why
+/// the two are counted against whoever they came from and not against each
+/// other.
+#[derive(Debug, Clone)]
+pub struct CacheMark {
+    layers: Vec<LayerMark>,
+}
+
+impl CacheMark {
+    pub fn new(layers: Vec<LayerMark>) -> Self {
+        Self { layers }
+    }
+
+    pub fn layers(&self) -> &[LayerMark] {
+        &self.layers
+    }
+}
+
+/// Where a sequence was, in both of the places its state lives.
+///
+/// **One value rather than two, for the reason
+/// [`ModelWeights::rewind`] is one call rather than two.** A sequence's state is
+/// in a [`ModelCache`] and in whatever backend ran its layers, and a caller that
+/// marked one and resumed the other would leave a sequence whose position is one
+/// thing here and another there — and which still answers.
+#[derive(Debug, Clone)]
+pub struct Mark {
+    cache: CacheMark,
+    backend: Option<CacheMark>,
+}
+
+impl Mark {
+    pub fn new(cache: CacheMark, backend: Option<CacheMark>) -> Self {
+        Self { cache, backend }
+    }
+
+    pub fn cache(&self) -> &CacheMark {
+        &self.cache
+    }
+
+    /// The backend's own half, and `None` where the backend held no state to
+    /// mark — which is every backend that holds only weights.
+    pub fn backend(&self) -> Option<&CacheMark> {
+        self.backend.as_ref()
     }
 }
 
@@ -549,6 +654,69 @@ mod tests {
             let want = model.forward(clean, &sequence[split..], &stack).rows();
             assert_eq!(after, want, "{taken} tokens taken back at {split}");
         }
+    }
+
+    /// The property the whole of a prefix cache rests on, and it is the rewind
+    /// test's said over a distance no slack was bought for: a stack marked, fed
+    /// tokens, and resumed is the stack that was marked.
+    ///
+    /// **The cache keeps no slack at all here**, which is what separates this
+    /// from [`ModelCache::rewind`]: every one of these resumes is a reach a
+    /// rewind would refuse. That is the whole reason a mark exists — a
+    /// conversation's reply is hundreds of tokens and a speculative round's
+    /// slack is eight.
+    ///
+    /// Exact equality, for the reason the rewind test demands it: both sides
+    /// multiply the same numbers in the same order, so what a resumed pass
+    /// leaves behind is not close to what a fresh one does, it is the same.
+    #[test]
+    fn resuming_a_mark_leaves_the_stack_where_the_mark_was_taken() {
+        let stack = Stack::load();
+        let sequence = stack.sequence();
+        let model = stack.model();
+
+        for split in 1..sequence.len() {
+            let wrong: Vec<usize> = sequence[split..]
+                .iter()
+                .map(|id| (id + 1) % stack.config.vocab_size)
+                .collect();
+            assert_ne!(wrong, sequence[split..], "tokens a resume has to undo");
+
+            let cache = &mut ModelCache::new(&stack.config);
+            model.forward(cache, &sequence[..split], &stack);
+            let mark = cache.mark();
+            model.forward(cache, &wrong, &stack);
+            cache.resume(&mark);
+            let after = model.forward(cache, &sequence[split..], &stack).rows();
+
+            let clean = &mut ModelCache::new(&stack.config);
+            model.forward(clean, &sequence[..split], &stack);
+            let want = model.forward(clean, &sequence[split..], &stack).rows();
+            assert_eq!(
+                after,
+                want,
+                "a mark at {split} resumed over {}",
+                wrong.len()
+            );
+        }
+    }
+
+    /// A mark says where a sequence *was*. Asking to be put somewhere it has not
+    /// reached is asking for keys nothing has computed, and is refused rather
+    /// than answered out of a span whose count would then outrun its keys.
+    #[test]
+    #[should_panic(expected = "a mark at")]
+    fn resuming_a_mark_the_sequence_has_not_reached_is_refused() {
+        let stack = Stack::load();
+        let model = stack.model();
+        let ahead = &mut ModelCache::new(&stack.config);
+        model.forward(ahead, &stack.ids, &stack);
+        let mark = ahead.mark();
+
+        // A sequence one token in, asked to be put back where a longer one was.
+        let behind = &mut ModelCache::new(&stack.config);
+        model.forward(behind, &stack.ids[..1], &stack);
+        behind.resume(&mark);
     }
 
     /// A stack that never speculates asks for no slack, and asking one that did

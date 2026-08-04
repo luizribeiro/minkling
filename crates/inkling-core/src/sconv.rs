@@ -97,6 +97,12 @@ impl Held {
         self.slack * self.channels
     }
 
+    /// The width of a timestep, which is what says two windows of the same
+    /// float count are still not each other's.
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
     /// How many timesteps may still be taken back, which is what the slack
     /// bought and what a rewind spends.
     pub fn rewindable(&self) -> usize {
@@ -129,6 +135,43 @@ impl Held {
         assert_eq!(timesteps.len(), self.floats(), "the rows this holds");
         timesteps.copy_within(..self.floats() - rows * self.channels, rows * self.channels);
         self.kept -= rows;
+    }
+}
+
+/// A convolution's rows as they stood at one position, and the bookkeeping that
+/// says which of them the convolution was reading.
+///
+/// **A rewind is bounded and this is not, and the difference is what is
+/// carried.** [`Held::rewind`] shifts the rows a sequence still holds and so can
+/// only reach back as far as the slack behind them; this holds the rows
+/// themselves, so putting a sequence back where they were is a copy of a fixed
+/// size however far back "there" is. What that costs is `window + slack`
+/// timesteps a convolution — three at this checkpoint's kernel and no slack —
+/// against the `held` timesteps a rewind would have had to keep.
+///
+/// The floats are the whole of what a convolution carries, which is why nothing
+/// here is a position: a window holds no positions. See [`ConvState`] for why
+/// that is the thing about it worth saying twice.
+#[derive(Debug, Clone)]
+pub struct ConvMark {
+    held: Held,
+    timesteps: Vec<f32>,
+}
+
+impl ConvMark {
+    /// A mark over rows whoever holds them has read out — which on a device is a
+    /// buffer and here is a vector.
+    pub fn new(held: Held, timesteps: Vec<f32>) -> Self {
+        assert_eq!(timesteps.len(), held.floats(), "the rows this holds");
+        Self { held, timesteps }
+    }
+
+    pub fn held(&self) -> Held {
+        self.held
+    }
+
+    pub fn timesteps(&self) -> &[f32] {
+        &self.timesteps
     }
 }
 
@@ -184,6 +227,23 @@ impl ConvState {
     /// Take back the last `rows` inputs — see [`Held::rewind`].
     pub fn rewind(&mut self, rows: usize) {
         self.held.rewind(rows, &mut self.history);
+    }
+
+    /// The rows this holds now, as something that can put them back later.
+    pub fn mark(&self) -> ConvMark {
+        ConvMark::new(self.held, self.history.clone())
+    }
+
+    /// The window this had when `mark` was taken, whatever has gone through it
+    /// since.
+    pub fn resume(&mut self, mark: &ConvMark) {
+        assert_eq!(
+            (self.held.channels, self.history.len()),
+            (mark.held.channels, mark.timesteps.len()),
+            "a mark of another convolution's width"
+        );
+        self.held = mark.held;
+        self.history.copy_from_slice(&mark.timesteps);
     }
 }
 
@@ -498,12 +558,72 @@ mod tests {
         }
     }
 
+    /// The same property over a distance no slack was bought for, which is the
+    /// whole of what a mark buys: a state marked, fed rows, and resumed is the
+    /// state that was marked.
+    ///
+    /// **No slack at all here**, so every one of these resumes is a reach the
+    /// rewind above would refuse — and the mark that reaches it is three
+    /// timesteps whatever the distance, where a rewind would have had to hold
+    /// one per row it might give back.
+    #[test]
+    fn resuming_a_mark_leaves_the_window_the_mark_was_taken_over() {
+        let fx = Synthetic::load();
+        let (weight, input) = (fx.tensor("weight"), fx.tensor("input"));
+        let conv = ShortConv::new(fx.channels, &weight);
+        let sequence = fx.sequence(&input, 0);
+        let rows = sequence.len() / fx.channels;
+        let wrong: Vec<f32> = sequence.iter().map(|value| -3.0 * value).collect();
+
+        for split in 1..rows {
+            let mut state = ConvState::new(fx.channels, fx.kernel_size);
+            conv.forward(&mut state, &sequence[..split * fx.channels], None);
+            let mark = state.mark();
+            assert_eq!(state.rewindable(), 0, "a rewind could have done this");
+            conv.forward(&mut state, &wrong[split * fx.channels..], None);
+            state.resume(&mark);
+            let after = conv.forward(&mut state, &sequence[split * fx.channels..], None);
+
+            let mut clean = ConvState::new(fx.channels, fx.kernel_size);
+            conv.forward(&mut clean, &sequence[..split * fx.channels], None);
+            let want = conv.forward(&mut clean, &sequence[split * fx.channels..], None);
+
+            assert_eq!(after, want, "{} rows resumed over at {split}", rows - split);
+            assert_eq!(state.history(), clean.history(), "the window at {split}");
+        }
+    }
+
+    /// A mark is the rows themselves, so it is the same size however far back it
+    /// reaches — which is what makes it affordable where a slack sized for a
+    /// whole reply would not be.
+    #[test]
+    fn a_mark_is_the_window_and_not_the_distance_it_reaches_back_over() {
+        let weight = vec![0.5; 8 * 4];
+        let conv = ShortConv::new(8, &weight);
+        let mut state = ConvState::new(8, 4);
+        let mark = state.mark();
+        assert_eq!(mark.timesteps().len(), 3 * 8);
+
+        conv.forward(&mut state, &vec![1.0; 8 * 4096], None);
+        assert_eq!(state.mark().timesteps().len(), mark.timesteps().len());
+    }
+
     /// A rewind is bounded by what the slack bought, and asking for more is
     /// refused rather than answered out of rows that belong to nobody.
     #[test]
     #[should_panic(expected = "a rewind of 3 against 2")]
     fn a_rewind_past_the_slack_is_refused() {
         ConvState::with_slack(4, 4, 2).rewind(3);
+    }
+
+    /// A mark carries the rows a state holds, so one from a state of another
+    /// width is floats that would land in the wrong channels — refused rather
+    /// than copied in.
+    #[test]
+    #[should_panic(expected = "another convolution's width")]
+    fn resuming_a_mark_of_another_width_is_refused() {
+        let mark = ConvState::new(4, 4).mark();
+        ConvState::new(8, 4).resume(&mark);
     }
 
     /// A sequence that never speculates asks for no slack and holds what it

@@ -60,7 +60,7 @@ use crate::layer::{
     DecoderCache, DecoderDevice, DecoderLayer, DecoderWeights, Experts, Hidden, LayerMlp,
     NoExperts, Passed,
 };
-use crate::model::{Model, ModelCache, ModelWeights};
+use crate::model::{CacheMark, Mark, Model, ModelCache, ModelWeights};
 use crate::moe::{ExpertBank, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
 use crate::ops::{DenseMlp, MlpProjections, Projection, linear};
 use crate::profile::{self, Op};
@@ -667,6 +667,27 @@ pub trait LayerBackend {
         let _ = rows;
     }
 
+    /// Where the sequence in flight is in whatever state this backend holds, as
+    /// something [`LayerBackend::resume`] can put it back to — and `None` from a
+    /// backend that holds nothing a sequence lives in.
+    ///
+    /// **A mark per layer this holds, in the order it holds them**, which is the
+    /// order [`LayerBackend::resume`] walks them in again. A backend answers for
+    /// some layers and not others, so this is shorter than the stack's own
+    /// [`CacheMark`] and is not indexed by layer.
+    ///
+    /// Between runs, for the reason [`LayerBackend::rewind`] is: what this reads
+    /// is a window a dispatch wrote, so the command buffer that wrote it has to
+    /// have completed.
+    fn mark(&self) -> Option<CacheMark> {
+        None
+    }
+
+    /// The state this backend held when `mark` was taken.
+    fn resume(&self, mark: &CacheMark) {
+        let _ = mark;
+    }
+
     /// The whole of layer `layer` in one command buffer, or `None` where this
     /// backend holds only some of it — see [`DecoderDevice`].
     ///
@@ -1143,6 +1164,23 @@ impl ModelWeights for CheckpointWeights<'_> {
         cache.rewind(rows);
         if let Some(backend) = self.backend.as_deref() {
             backend.rewind(rows);
+        }
+    }
+
+    fn mark(&self, cache: &ModelCache) -> Mark {
+        Mark::new(cache.mark(), self.backend.as_deref().and_then(|b| b.mark()))
+    }
+
+    fn resume(&self, cache: &mut ModelCache, mark: &Mark) {
+        cache.resume(mark.cache());
+        // A mark whose backend half is missing against weights that have one is
+        // half a sequence put back: the counts on this side move and the spans
+        // they are counts of do not. The backend refuses it by layer.
+        if let Some(backend) = self.backend.as_deref() {
+            match mark.backend() {
+                Some(theirs) => backend.resume(theirs),
+                None => backend.resume(&CacheMark::new(Vec::new())),
+            }
         }
     }
 

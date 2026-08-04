@@ -41,7 +41,7 @@
 use std::cell::{Cell, RefCell};
 
 use inkling_core::profile::{self, Op};
-use inkling_core::sconv::Held;
+use inkling_core::sconv::{ConvMark, Held};
 
 use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
@@ -218,6 +218,40 @@ impl<'a> LayerConv<'a> {
     /// it out.
     pub fn window(&self) -> Vec<f32> {
         self.windows.borrow()[self.reading.get()].as_slice()[self.held.get().reading()..].to_vec()
+    }
+
+    /// The rows this holds now, as something that can put them back later — the
+    /// device's half of [`ConvState::mark`](inkling_core::ConvState::mark).
+    ///
+    /// **Between runs, and for the reason [`LayerConv::rewind`] says it**: what
+    /// this reads is a window a dispatch wrote, so the command buffer that wrote
+    /// it has to have completed.
+    pub fn mark(&self) -> ConvMark {
+        let held = self.held.get();
+        ConvMark::new(
+            held,
+            self.windows.borrow()[self.reading.get()]
+                .as_slice()
+                .to_vec(),
+        )
+    }
+
+    /// The window this had when `mark` was taken, whatever has gone through it
+    /// since.
+    ///
+    /// The window the *next* call reads and not the other, which is the one
+    /// [`LayerConv::restart`] clears and [`LayerConv::rewind`] shifts: the other
+    /// is written before it is read, so what is in it is memory nobody indexes.
+    pub fn resume(&self, mark: &ConvMark) {
+        let mut windows = self.windows.borrow_mut();
+        let window = windows[self.reading.get()].as_mut_slice();
+        assert_eq!(
+            (self.channels, window.len()),
+            (mark.held().channels(), mark.timesteps().len()),
+            "a mark of another convolution's width"
+        );
+        window.copy_from_slice(mark.timesteps());
+        self.held.set(mark.held());
     }
 
     /// `[rows, channels]` in and out, submitted on its own.

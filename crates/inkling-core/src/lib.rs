@@ -22,7 +22,7 @@ pub mod workload;
 pub mod fixture;
 
 pub use attention::{
-    Attention, AttentionCache, AttentionConfig, AttentionProjections, AttentionStep,
+    Attention, AttentionCache, AttentionConfig, AttentionMark, AttentionProjections, AttentionStep,
     AttentionWeights, Convolved, DecodedProjections, LayerStep, LogScaling, Projections, Sdpa,
     merge_heads, split_heads,
 };
@@ -32,9 +32,11 @@ pub use detokenize::{Utf8Stream, char_byte, piece_bytes};
 pub use embed::Embed;
 pub use generate::{Ending, Generator, Stop, greedy};
 pub use head::{LmHead, Tail, Tailed};
-pub use layer::{DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMlp, NoExperts};
+pub use layer::{
+    DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMark, LayerMlp, NoExperts,
+};
 pub use mask::{BandedMask, MASKED, is_masked};
-pub use model::{Model, ModelCache, ModelWeights};
+pub use model::{CacheMark, Mark, Model, ModelCache, ModelWeights};
 pub use moe::{
     ExpertBank, ExpertBatch, GateWeights, Gathered, MoeConfig, MoeOutput, Routed, Routing,
     SparseMoe,
@@ -45,7 +47,7 @@ pub use ops::{
 };
 pub use profile::{Op, Profile};
 pub use quant::{Dequantized, QuantError, Scratch};
-pub use sconv::{ConvState, ShortConv};
+pub use sconv::{ConvMark, ConvState, Held, ShortConv};
 pub use tokenizer::{Detokenizer, Tokenizer, TokenizerError};
 pub use weights::{
     Bf16, CheckpointWeights, LayerBackend, LayerBanks, LayerPacked, Packed, PackedAttention,

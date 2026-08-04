@@ -47,11 +47,15 @@
 use std::cell::RefCell;
 
 use inkling_core::attention::{
-    AttentionCache, AttentionConfig, AttentionStep, LayerStep, Projections, Qkvr, Sdpa,
+    AttentionCache, AttentionConfig, AttentionMark, AttentionStep, LayerStep, Projections, Qkvr,
+    Sdpa,
 };
 use inkling_core::head::{Tail, Tailed};
-use inkling_core::layer::{DecoderCache, DecoderDevice, DecoderStep, Experts, LayerMlp, Passed};
+use inkling_core::layer::{
+    DecoderCache, DecoderDevice, DecoderStep, Experts, LayerMark, LayerMlp, Passed,
+};
 use inkling_core::mask::BandedMask;
+use inkling_core::model::CacheMark;
 use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::profile::{self, Op};
 use inkling_core::weights::{LayerBackend, LayerBanks, LayerPacked, Packed, PackedMlp};
@@ -313,6 +317,26 @@ impl<'a> LayerProjections<'a> {
         self.attention.rewind(rows);
         self.k_sconv.rewind(rows);
         self.v_sconv.rewind(rows);
+    }
+
+    /// Where this layer's attention is now, as something that can put it back
+    /// here later — the device's half of
+    /// [`AttentionCache::mark`](inkling_core::AttentionCache::mark).
+    pub fn mark(&self) -> AttentionMark {
+        AttentionMark::new(
+            self.attention.held(),
+            self.k_sconv.mark(),
+            self.v_sconv.mark(),
+        )
+    }
+
+    /// The keys and the two windows this had when `mark` was taken. All three or
+    /// none, for the reason [`LayerProjections::rewind`] moves all three.
+    pub fn resume(&self, mark: &AttentionMark) {
+        let (k, v) = mark.convolutions();
+        self.attention.resume(mark.seen());
+        self.k_sconv.resume(k);
+        self.v_sconv.resume(v);
     }
 
     /// That the step being asked for is over the shape this layer was wrapped
@@ -1193,12 +1217,43 @@ impl LayerBackend for ModelLayers<'_> {
     /// asks: what closes one is the last layer of the stack, whose rows every
     /// caller reads back before it can know there is anything to take back.
     fn rewind(&self, rows: usize) {
-        assert!(
-            self.carried.borrow().is_none() && self.flight.borrow().is_empty(),
-            "a rewind while a run of layers is still being encoded or still in flight"
-        );
+        self.settled("a rewind");
         for layer in self.layers.iter().flatten() {
             layer.rewind(rows);
+        }
+    }
+
+    /// Every layer this holds, in the order it holds them, which is the order
+    /// [`ModelLayers::resume`] walks them in again.
+    ///
+    /// A layer the CPU kept is not here, for the reason it is not in
+    /// [`ModelLayers::rewind`]: its state is the cache, which the caller has
+    /// already marked. So this is shorter than the stack's own mark and lines up
+    /// with it only by both being walked in layer order.
+    ///
+    /// **Between runs**, and for the reason [`ModelLayers::rewind`] gives at
+    /// length: what this reads is a window a dispatch wrote.
+    fn mark(&self) -> Option<CacheMark> {
+        self.settled("a mark");
+        Some(CacheMark::new(
+            self.layers
+                .iter()
+                .flatten()
+                .map(LayerDevice::mark)
+                .collect(),
+        ))
+    }
+
+    fn resume(&self, mark: &CacheMark) {
+        self.settled("a resume");
+        let layers = self.layers.iter().flatten();
+        assert_eq!(
+            mark.layers().len(),
+            layers.clone().count(),
+            "a mark of a stack this backend does not hold the layers of"
+        );
+        for (layer, mark) in layers.zip(mark.layers()) {
+            layer.resume(mark);
         }
     }
 }
@@ -1217,9 +1272,44 @@ impl LayerDevice<'_> {
         self.attn_sconv.rewind(rows);
         self.mlp_sconv.rewind(rows);
     }
+
+    /// Where this layer is now, as something that can put it back here later —
+    /// the device's half of
+    /// [`DecoderCache::mark`](inkling_core::DecoderCache::mark), and the same
+    /// four places [`LayerDevice::rewind`] moves.
+    pub(crate) fn mark(&self) -> LayerMark {
+        LayerMark::new(
+            self.attention.mark(),
+            self.attn_sconv.mark(),
+            self.mlp_sconv.mark(),
+        )
+    }
+
+    /// The state this layer had when `mark` was taken.
+    pub(crate) fn resume(&self, mark: &LayerMark) {
+        let (attn_sconv, mlp_sconv) = mark.convolutions();
+        self.attention.resume(mark.attention());
+        self.attn_sconv.resume(attn_sconv);
+        self.mlp_sconv.resume(mlp_sconv);
+    }
 }
 
 impl<'a> ModelLayers<'a> {
+    /// That no run of layers is still being encoded or still in flight, which
+    /// every reach into a layer's held state needs of its caller.
+    ///
+    /// A run part way through is a command buffer with dispatches in it that
+    /// have not written the windows this would read or overwrite the values this
+    /// would put back. There is no such run when a caller asks: what closes one
+    /// is the last layer of the stack, whose rows every caller reads back before
+    /// it can know there is anything to reach for.
+    fn settled(&self, what: &str) {
+        assert!(
+            self.carried.borrow().is_none() && self.flight.borrow().is_empty(),
+            "{what} while a run of layers is still being encoded or still in flight"
+        );
+    }
+
     /// Layer `layer` where this holds the whole of it.
     fn whole(&self, layer: usize) -> Option<&LayerDevice<'a>> {
         let held = self.layer(layer)?;
@@ -2603,23 +2693,97 @@ mod tests {
     /// floats and the only thing a rewind changes is which call wrote a window.
     #[test]
     fn rewinding_a_run_of_layers_that_ran_on_the_device_leaves_them_where_it_found_them() {
-        let Some(device) = device() else { return };
-        let kernels = LayerKernels::compile(&device).expect("the kernels compile");
-        let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
-        let weights = NarrowWeights::new();
-        let (x, more) = (hidden_rows(1), hidden_rows(1));
-        let wrong: Vec<f32> = more.iter().map(|value| -3.0 * value).collect();
+        let Some(taken) = TakenBack::open() else {
+            return;
+        };
+        assert_eq!(
+            taken.run(1, Back::Rewind),
+            taken.run(1, Back::Nothing),
+            "a row taken back"
+        );
+        assert_eq!(
+            taken.run(0, Back::Nothing),
+            taken.run(1, Back::Nothing),
+            "windows that kept slack"
+        );
+    }
 
-        let run = |slack: usize, rejected: Option<&[f32]>| {
+    /// **The same property over a distance no slack was bought for**, which is
+    /// what a mark buys a stack that ran on the device: the four windows a layer
+    /// holds carried out and put back, rather than shifted along inside
+    /// themselves.
+    ///
+    /// The slack is zero in both arms, so the rewind above could not have
+    /// reached this at all — and the rows resumed over are the same rows it
+    /// rejects one of, which is what makes the two comparable.
+    #[test]
+    fn resuming_a_mark_of_a_run_of_layers_leaves_it_where_the_mark_was_taken() {
+        let Some(taken) = TakenBack::open() else {
+            return;
+        };
+        assert_eq!(
+            taken.run(0, Back::Resume),
+            taken.run(0, Back::Nothing),
+            "rows resumed over"
+        );
+    }
+
+    /// How rows a stack was fed are taken back out of it again.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Back {
+        /// Nothing was fed, which is the arm the other two are held against.
+        Nothing,
+        /// Shifted out of the windows that hold them, bounded by the slack.
+        Rewind,
+        /// Put back out of windows carried away beforehand, bounded by nothing.
+        Resume,
+    }
+
+    /// The stack the two properties above are driven through, opened once so
+    /// that neither pays for a second set of kernels.
+    struct TakenBack {
+        device: Device,
+        kernels: LayerKernels,
+        swiglu: SwiGlu,
+        weights: NarrowWeights,
+        x: Vec<f32>,
+        more: Vec<f32>,
+        wrong: Vec<f32>,
+    }
+
+    impl TakenBack {
+        /// `None` where this machine has no device, which is the skip every
+        /// kernel test here takes.
+        fn open() -> Option<Self> {
+            let device = device()?;
+            let kernels = LayerKernels::compile(&device).expect("the kernels compile");
+            let swiglu = SwiGlu::new(&device).expect("the swiglu compiles");
+            let (x, more) = (hidden_rows(1), hidden_rows(1));
+            let wrong: Vec<f32> = more.iter().map(|value| -3.0 * value).collect();
+            Some(Self {
+                device,
+                kernels,
+                swiglu,
+                weights: NarrowWeights::new(),
+                x,
+                more,
+                wrong,
+            })
+        }
+
+        fn run(&self, slack: usize, back: Back) -> Vec<f32> {
+            let (device, kernels, swiglu, weights) =
+                (&self.device, &self.kernels, &self.swiglu, &self.weights);
+            let (x, more, wrong) = (&self.x, &self.more, &self.wrong);
             let narrow = Narrow {
-                device: &device,
-                kernels: &kernels,
-                swiglu: &swiglu,
+                device,
+                kernels,
+                swiglu,
                 slack,
             };
             let stack = stack(
-                &device,
-                vec![narrow.layer(&weights, 0), narrow.layer(&weights, 0x99)],
+                device,
+                vec![narrow.layer(weights, 0), narrow.layer(weights, 0x99)],
                 RETAINED_BUDGET,
             );
             let layers: Vec<DecoderLayer<'_>> = (0..2)
@@ -2651,20 +2815,30 @@ mod tests {
                 h.rows()
             };
 
-            through(&x, caches);
-            if let Some(rejected) = rejected {
-                through(rejected, caches);
-                let rows = rejected.len() / NARROW.hidden;
-                for cache in caches.iter_mut() {
-                    cache.rewind(rows);
+            through(x, caches);
+            let marks: Vec<_> = caches.iter().map(DecoderCache::mark).collect();
+            let theirs = LayerBackend::mark(&stack);
+            if back != Back::Nothing {
+                through(wrong, caches);
+                let rows = wrong.len() / NARROW.hidden;
+                match back {
+                    Back::Nothing => unreachable!("nothing was fed"),
+                    Back::Rewind => {
+                        for cache in caches.iter_mut() {
+                            cache.rewind(rows);
+                        }
+                        LayerBackend::rewind(&stack, rows);
+                    }
+                    Back::Resume => {
+                        for (cache, mark) in caches.iter_mut().zip(&marks) {
+                            cache.resume(mark);
+                        }
+                        LayerBackend::resume(&stack, theirs.as_ref().expect("a device mark"));
+                    }
                 }
-                LayerBackend::rewind(&stack, rows);
             }
-            through(&more, caches)
-        };
-
-        assert_eq!(run(1, Some(&wrong)), run(1, None), "a row taken back");
-        assert_eq!(run(0, None), run(1, None), "windows that kept slack");
+            through(more, caches)
+        }
     }
 
     /// A stack of layers this backend holds whole, which is what a merged run is

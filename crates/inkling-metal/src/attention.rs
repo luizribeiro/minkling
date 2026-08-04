@@ -1400,6 +1400,28 @@ impl<'a> LayerAttention<'a> {
     pub fn rewind(&self, rows: usize) {
         self.span.borrow_mut().rewind(rows);
     }
+
+    /// Unwant every key past the `keys` the sequence had when a mark was taken.
+    ///
+    /// **[`LayerAttention::held`] is the whole of what a mark of a span is**,
+    /// and the reason a mark of a window is floats: a key is addressed by its
+    /// position and the kernel's loop bound is how many the sequence has, so
+    /// where a span was is the number it held there and every key before it is
+    /// still where it was.
+    ///
+    /// Backwards only, for the reason
+    /// [`AttentionCache::resume`](inkling_core::AttentionCache::resume) is: a
+    /// mark says where a sequence *was*, and a span asked to claim keys past
+    /// what it holds would be counting slots no dispatch wrote.
+    pub fn resume(&self, keys: usize) {
+        let mut span = self.span.borrow_mut();
+        assert!(
+            keys <= span.held,
+            "a mark at {keys} keys against a span holding {}",
+            span.held
+        );
+        span.held = keys;
+    }
 }
 
 /// What the dispatch reads, once both callers have put it where it is.

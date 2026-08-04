@@ -25,7 +25,7 @@ use crate::config::TextConfig;
 use crate::mask::{BandedMask, is_masked};
 use crate::ops::{DenseProjection, Projection, rms_norm, softmax};
 use crate::profile::{self, Op};
-use crate::sconv::{ConvState, ShortConv};
+use crate::sconv::{ConvMark, ConvState, ShortConv};
 
 /// The softmax attention step, over `[heads, queries, head_dim]` queries and
 /// `[kv_heads, keys, head_dim]` keys and values.
@@ -827,18 +827,89 @@ impl AttentionCache {
             "a rewind of {rows} against a sequence that has seen {}",
             self.cached
         );
-        self.cached -= rows;
+        self.cut(self.cached - rows);
         for state in [&mut self.k_sconv, &mut self.v_sconv] {
             state.rewind(rows);
         }
+    }
 
-        // Empty where a backend holds the span, and the sequence's whole state
-        // where it does not — see `AttentionCache::keys`.
-        let (seen, left) = (self.cached + rows, self.cached);
+    /// The sequence's keys and values cut to its first `left`, and `cached` with
+    /// them.
+    ///
+    /// **Empty where a backend holds the span, and the sequence's whole state
+    /// where it does not** — see [`AttentionCache::keys`] — which is why the
+    /// stride is read off the vector rather than derived from the shape: on the
+    /// backend's path there is no stride to derive, and a division by the keys a
+    /// sequence has seen answers zero either way.
+    fn cut(&mut self, left: usize) {
         for values in [&mut self.keys, &mut self.values] {
-            let stride = values.len() / seen.max(1);
+            let stride = values.len() / self.cached.max(1);
             values.truncate(left * stride);
         }
+        self.cached = left;
+    }
+
+    /// Where this layer's attention is now, as something that can put it back
+    /// here later.
+    ///
+    /// **The keys are not in it and the windows are**, which is the same split
+    /// [`AttentionCache::rewind`] turns on: a key is addressed by its position,
+    /// so where a sequence had `n` of them is the number `n`, and every key
+    /// before it is still where it was. A window holds no positions and is
+    /// overwritten by whatever ran next, so putting one back means having kept
+    /// it — see [`ConvMark`].
+    pub fn mark(&self) -> AttentionMark {
+        AttentionMark::new(self.cached, self.k_sconv.mark(), self.v_sconv.mark())
+    }
+
+    /// The keys and windows this had when `mark` was taken.
+    ///
+    /// Backwards only: a mark says where a sequence *was*, and every key past it
+    /// is one the sequence has since gone on to make. Asking to be put forward
+    /// is asking for keys nothing has computed.
+    pub fn resume(&mut self, mark: &AttentionMark) {
+        assert!(
+            mark.seen <= self.cached,
+            "a mark at {} keys against a sequence that has seen {}",
+            mark.seen,
+            self.cached
+        );
+        self.cut(mark.seen);
+        self.k_sconv.resume(&mark.k_sconv);
+        self.v_sconv.resume(&mark.v_sconv);
+    }
+}
+
+/// Where one layer's attention was: how many keys the sequence had, and the two
+/// convolution windows inside it as they stood there.
+///
+/// The keys themselves are wherever they were — this side's vectors or a
+/// backend's span — and neither needs them carried: a resume shortens a count.
+#[derive(Debug, Clone)]
+pub struct AttentionMark {
+    seen: usize,
+    k_sconv: ConvMark,
+    v_sconv: ConvMark,
+}
+
+impl AttentionMark {
+    /// A mark over state whoever holds it has read out, which for a backend
+    /// running this layer is its own span and its own two windows.
+    pub fn new(seen: usize, k_sconv: ConvMark, v_sconv: ConvMark) -> Self {
+        Self {
+            seen,
+            k_sconv,
+            v_sconv,
+        }
+    }
+
+    /// Keys the sequence had here, which is also where its next query would sit.
+    pub fn seen(&self) -> usize {
+        self.seen
+    }
+
+    pub fn convolutions(&self) -> (&ConvMark, &ConvMark) {
+        (&self.k_sconv, &self.v_sconv)
     }
 }
 
