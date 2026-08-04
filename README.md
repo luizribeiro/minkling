@@ -1175,7 +1175,431 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## What the matmul was actually running at
+
+**The kernel was never at 24% of anything, and the instrument that said so was
+dividing by four.** This milestone opened to make the matmul structurally faster
+against an existence proof — mlx at 63.5% of peak where this engine sat at 24%.
+Neither number survived. The 24% was a bandwidth roofline over a clock that
+under-reported by its own call count; the 63.5% is mlx's *dense* GEMM, and mlx's
+quantised MoE matmul — the kernel that is actually this one's counterpart —
+turns out to be 1.26× ahead of this one rather than 2.6×.
+
+**What this ships is a correct clock, a denominator that means something, four
+percent of kernel, and a floor with arithmetic under it.**
+
+### The clock every table in this crate was read off
+
+`crate::testing::device_time` puts `calls` dispatches in one command buffer and
+returns what **one** of them cost — it has already divided. Six places in the
+matmul's tests divided by their own `CALLS` a second time, and one multiplied a
+bandwidth by it instead. So every absolute figure the block's tables carry is
+four times too fast, and the two GB/s columns in the height and width sweeps
+disagree with the µs printed beside them.
+
+**Every ratio in those tables stands and none of the absolutes do.** Each arm of
+a sweep divided by the same four, so which arm is fastest and what a term is
+worth as a percentage are exactly what they were — which is why it survived: a
+table read the way a sweep is read looks right. The figures it moves are the ones
+a roofline, a percent-of-peak or a cross-engine column divides by, which are the
+figures this milestone is about. One dispatch of the routed bank at 8192 tokens
+is **54.3 ms and not 13.6**, and `a_blocks_table_reports_one_dispatch_of_the
+_shape_it_names` compares against a dispatch measured on its own rather than
+against another arm.
+
+#### Which figures in this file inherited it
+
+**Five cases carried it**, and every table in this file that quotes one of them
+carries a device time four times too small — and, wherever a rate was formed by
+dividing bytes by that time, a bandwidth four times too large:
+
+- `Blocked::costs`, which is the fixture every block table and both of the
+  tile's per-shape tables measure through. It reaches **the roofline and limiter
+  table, the threadgroup sweep and the 16-bit table** in "The four levers the
+  matmul had left", and **the nine packed shapes table** in "Why the two tiled
+  rows report bandwidths a factor of two apart".
+- `what_separates_a_tiled_call_from_a_grouped_one`, which divided its three time
+  columns and *multiplied* its two rate columns — **the expert-count table** in
+  that same section, whose µs and GB/s are therefore out by sixteen against each
+  other.
+- `whether_the_tile_height_turns_at_four_on_a_bank_too_big_to_cache` — **the
+  run-length table** in "Whether a long prefill reads one expert's weight more
+  than it must".
+- `what_a_packed_multiply_costs_at_each_height_a_tile_reads` and
+  `..._at_each_width_a_tile_spans`, whose µs was divided and whose GB/s was not.
+  Neither table is quoted here.
+
+**There is a rule a reader can apply without the list**, and this file supplies
+its own evidence for it: `what_a_streaming_read_achieves_on_this_machine`
+measures the bus at **725 GB/s**, and earlier at 819. Every `achieved` column in
+this file that reads *above* that — 1079 to 2151 GB/s across the two tables in
+"Why the two tiled rows report bandwidths a factor of two apart" — is this bug.
+That section diagnosed those rates as denominators inflated by
+`PackedBank::moves` charging a whole weight per tile, and that diagnosis is
+right and is not the whole of it: **a factor of four of the excess is the
+clock.** Divide those rates by four and the amplification argument stands with
+nothing physically impossible left in it.
+
+**What is safe, and why:**
+
+- **Every ratio, every percentage and every "which arm won" in every affected
+  table.** All the arms divided by the same four.
+- **The per-kernel prefill tables** — `kernel / calls / device / moved /
+  achieved / of peak`, the ones reading 201 to 666 GB/s. Those come off a
+  *sampled* prefill, where the device timestamps each dispatch in its own pass,
+  and never through `device_time`.
+- **Everything `just bench` reports** — the prefill wall, the decode step, the
+  session, the sweep, the cross-engine columns. Those are wall clocks around
+  whole processes.
+- **Everything in `attention`, `norm`, `dense`, `sconv` and `argmax`.** The
+  double division was six expressions in one module; `norm` carries its own copy
+  of the arrangement and divides once.
+
+### What the instruction the block is made of issues at
+
+Every "of peak" figure this file has recorded about the matmul divides by a
+bandwidth. **That denominator says nothing about this kernel.** The block moves
+2.35 GB in 52 ms, which is 45 GB/s against a bus that streams 725 — six percent —
+so what bounds it is on the far side of the arithmetic, and the arithmetic has a
+ceiling of its own nobody here had measured.
+
+Four ways of asking this part for it, all in registers, no load and no barrier
+inside the loop, 640 threadgroups of 256, warm and best of five:
+
+    what issues                            device            rate
+    the matrix instruction, four held     16.56ms    25.3 TFLOP/s
+    the same chain held once               4.76ms    22.0 TFLOP/s
+    the same four on 16-bit operands      15.87ms    26.4 TFLOP/s
+    scalar fused multiply-adds             4.56ms    23.0 TFLOP/s
+
+**This part has one arithmetic rate.** The matrix instruction is not a datapath
+of its own — it is within a tenth of the scalar one — so a kernel carrying 512
+multiply-adds an instruction has the same ceiling as one carrying four. Two
+things fall out of that and both were on somebody's list:
+
+- **16-bit operands buy four percent of issue rate**, not a doubling. Apple's
+  guidance for this hardware is most emphatic about them and mlx's quantised
+  kernels take it completely, and on this part the instruction does not go
+  faster for it.
+- **A serial accumulator costs thirteen percent.** The brief's leading
+  hypothesis was that the inner loop is serial per fragment and wants software
+  pipelining; four independent accumulators against one is 25.3 against 22.0, so
+  the whole prize for breaking that dependency is 1.15× and the block already
+  holds four.
+
+Against that ceiling, the shipped block, at the shapes its tables are read
+across — the same sitting as the four rows above, so that what divides and what
+is divided were measured on one clock:
+
+    a prefill of              device     achieved   of the instruction
+     2048  q_proj, tiled     3.87ms   17.8 TFLOP/s      70%
+     2048  a routed bank    17.00ms   12.1 TFLOP/s      48%
+     4096  q_proj, tiled     7.63ms   18.0 TFLOP/s      71%
+     4096  a routed bank    26.31ms   15.7 TFLOP/s      62%
+     8192  q_proj, tiled    15.16ms   18.1 TFLOP/s      72%
+     8192  a routed bank    52.41ms   15.7 TFLOP/s      62%
+
+**What is left is a third to a half, not the factor of four the roofline
+suggested.**
+
+### Where the block's time goes, now that the clock is right
+
+The same limiter arms as before, since the ratios were never wrong, plus the one
+term no ablation across the bus can reach. At 8192 tokens, warm, swept both ways
+and agreeing to a hundredth of a millisecond at every arm:
+
+    without                                       q_proj, tiled   a routed bank
+    nothing — the kernel                         15.16ms  100%    52.42ms  100%
+    the weight it reads                          14.70ms   97%    50.93ms   97%
+    the input rows it walks                      14.68ms   97%    50.91ms   97%
+    the table it decodes through                 14.80ms   98%    51.32ms   98%
+    three of every four fragment loads           14.18ms   94%    49.35ms   94%
+    three quarters of the multiply-accumulates    7.87ms   52%    30.88ms   59%
+    the two barriers a step                      13.50ms   89%    47.38ms   90%
+
+**The barriers are ten percent and they are the largest thing here that is not
+the instruction.** A step is one group of codes wide, so a reduction of 4096 is
+128 steps and **256 barriers a pass**, every one of which stops all eight
+simdgroups until the slowest arrives. The arm removes them and races — same
+loads, same decode, same multiply-accumulates, none of the waiting — so what it
+prints is an upper bound and not an estimate.
+
+**And the accounting closes to about a fifth.** Cutting three of four
+multiply-accumulates takes 41%, which by arithmetic puts the instruction near 55%
+of the kernel if the term is linear in its count; the barriers are 10%, the
+fragment loads 6%, and the three byte-count terms 8% between them where they do
+not overlap. The two thirds that used to be unattributed is now a fifth, and the
+fifth is the staging stores, the address arithmetic and the loop.
+
+### What mlx's quantised matmul costs at these same shapes
+
+**Nobody here had ever dispatched it.** Every cross-engine reading in this file
+is a whole prefill or mlx's dense kernels; the closer question is what its
+*quantised* MoE matmul costs at the two shapes this file's tables are read
+across, and `just qmm-probe` is what asks it. MXFP4 at group 32, four bits,
+float32 — this checkpoint's own format and this engine's own dtype — one dispatch
+each, best of three:
+
+                              ours       mlx    behind   mlx, nothing quantised
+     2048  q_proj, tiled     3.87ms    3.51ms    1.10×                   3.28ms
+     4096  q_proj, tiled     7.63ms    6.86ms    1.11×                   6.41ms
+     8192  q_proj, tiled    15.16ms   13.29ms    1.14×                  12.27ms
+     2048  a routed bank    17.00ms   10.70ms    1.59×                        —
+     4096  a routed bank    26.31ms   21.07ms    1.25×                        —
+     8192  a routed bank    52.41ms   41.47ms    1.26×                        —
+
+**The existence proof the brief was written from does not exist for this
+problem.** 63.5% of peak is a dense GEMM figure, and mlx's dense fp32 GEMM here
+is 22.4 TFLOP/s — 89% of the ceiling above, which is the strongest corroboration
+that ceiling has. Its *quantised* kernels run 19.3 to 20.7 TFLOP/s, which is 76
+to 82%. This engine runs 48 to 72%. **The gap is real and it is 1.1 to 1.3× at
+every length but the shortest, not 2.6×**, and at 8192 it is the 1.28× the
+end-to-end session shows.
+
+**The row that is worse than the rest is the routed bank at 2048**, at 1.59×.
+That is the shape where this arrangement is weakest rather than where the kernel
+is: 12288 rows over 256 experts is 48 rows an expert, and 32 does not divide 48,
+so **one block in three straddles an expert boundary** and every straddle runs
+the whole reduction twice — once per expert its rows name, with the rows that are
+not that pass's zeroed. mlx cuts the same block at the run boundaries and
+computes each side once. At 8192 the runs are 192 rows, 32 divides that, no block
+straddles anything, and the row closes to 1.26×.
+
+One column in that table is not about this engine at all. mlx reaches
+`gather_qmm_rhs` — one expert per row of a plain `[M, K]` input — only when the
+indices are declared sorted; unsorted, the same call takes 127.75 ms at 8192
+against 41.47. **Three times, for exactly the arrangement `ExpertGrouping`
+already pays for on this side.**
+
+### What `gather_qmm` does that this kernel does not
+
+`fp_quantized.h` over `steel/gemm/mma.h`, and the metallib in `reference/.venv`
+at mlx 0.32.0 carries it at this checkpoint's format:
+`mxfp4_gather_qmm_rhs_nt_float_gs_32_b_4_bm_16_bn_32_bk_32_wm_1_wn_2`.
+
+**Its shape is smaller and its inner loop is the same one.** 16 rows by 32
+columns over 1 × 2 simdgroups — 64 threads where this runs 256 — with `BK` of 32,
+which is this kernel's step; and its `k` loop is barrier, fill both tiles,
+barrier, multiply `BK / 8` times, barrier for barrier what this does. `TM` and
+`TN` are both 2, so **a simdgroup there holds four accumulators against four
+fragment loads, which is 1:1** — the ratio a taller block was wanted for here,
+run by the kernel that was the reason to want it.
+
+Three things it does differently, and none of them is the shape:
+
+- **It never calls `simdgroup_load`.** `BaseMMAFrag::load` reads the two elements
+  each lane owns straight out of threadgroup memory through a static
+  lane-to-coordinate map, and takes the transpose by swapping the two strides it
+  indexes with. This kernel issues a `simdgroup_load` a fragment and a
+  *transposing* one for the weight.
+- **It has no answer tile.** `store_result` writes fragments to device memory
+  where they lie and `store_result_slice` is how it refuses a ragged edge.
+- **It walks runs rather than passes.** A block whose rows name several experts
+  is cut at the sorted index list's boundaries and each run gets its own gemm and
+  its own slice of the store, where this kernel runs the whole reduction once per
+  distinct expert and zeroes the rows that are not that pass's.
+
+**And one of the three claims about mlx this file has carried since A8 is
+false.** Its steel GEMM does run 64 to 128 threads and its dense 64×64 tile does
+reuse fragments 2.7:1, both read off that metallib. But mlx **does** ship fp32
+quantised matmuls — `mxfp4_qmm_t_float_gs_32_b_4` is in the same binary, and all
+four of its quantised families are instantiated at `float` beside `float16_t` and
+`bfloat16_t`. That claim is what the 16-bit arm was argued from.
+
+### What the generated code says, and what Apple will not let you read
+
+The toolchain is installed off the nix PATH: `xcodebuild -showComponent
+MetalToolchain` gives the asset and `Metal.xctoolchain/usr/bin` holds `metal`,
+`metallib`, `metal-objdump` and `applegpu-nt`, the AIR-to-native translator.
+Three readings come out of it and the one everybody wants does not.
+
+- **The pipeline reports this part's own maximum 1024 threads a threadgroup for
+  both production entries**, so nothing about the block's occupancy is decided by
+  its register allocation.
+- **The AIR the frontend emits keeps every fragment loop rolled**, with `lhs`,
+  `rhs` and `sums` in `alloca`s indexed by the loop variable rather than in
+  registers. That is not what runs — the unrolling and the allocation are the AGX
+  backend's, and a full-unroll pragma on all four loops changes the emitted
+  metallib by one line. **So the metallib is not evidence about the inner loop's
+  schedule**, which is exactly the reading a source-level intuition would most
+  like to take from it.
+- **The native object builds and does not disassemble.** `applegpu-nt -arch
+  applegpu_g15d` translates it into a Mach-O for this part — `mma_matmul_rows` is
+  4736 bytes of `__compute` against `packed_matmul_rows` at 7136 — but the
+  toolchain ships no instruction printer for the `agx` targets
+  (`metal-objdump: no instruction printer for target agx3---macho`).
+
+**A ceiling measured in registers is what replaced that reading**, and it answers
+the question the listing was wanted for — how many of this kernel's cycles are
+the instruction — without needing a model of what the part does with what it is
+issued.
+
+### The one thing that changed, which is four percent
+
+**The block writes its answer over the staging it has finished with.** The two
+are never both live: nothing reads a staged tile after the last
+multiply-accumulate of the last pass and nothing writes the answer before it. The
+threadgroup's declaration goes from 22688 bytes to 13984, and a barrier one
+threadgroup waits at is covered by whatever else the core is holding. **How many
+that is, is arithmetic off somebody else's measurement**: `RESIDENCY`'s sweep put
+four threadgroups a core at a declaration of 20 KiB, three from just above it to
+26.67, and two past that — a core holding 80 KiB, which puts this block at three
+before and five after.
+
+One barrier is added, before the first fragment store, because the store lands
+where another simdgroup may still be reading.
+
+**Four percent at every shape and every length, answering bit for bit** — which
+it must, since what moved is only where a fragment is parked between the last
+multiply and the write-out. Paired, alternating, order reversed, seven pairs,
+against the commit before it:
+
+    at 8192, --numerics production      before      after   change   ranges
+    prefill wall                      17233.9ms  16844.6ms   -2.3%   apart, 7 of 7
+    prefill device                    12190.6ms  11794.9ms   -3.2%   apart, 7 of 7
+
+    at 2048
+    prefill wall                       5687.9ms   5641.3ms   -0.8%   across, no claim
+    prefill device                     3386.3ms   3286.7ms   -2.9%   apart, 7 of 7
+
+### Two doors that closed on arithmetic and are now closed on a measurement
+
+**The taller block fits.** "A block twice as tall does not fit — 36160 bytes
+against the 32768 limit" was the reason the height was closed; with the answer
+tile aliased it is 18752 and the sweep runs it. At 8192 it is worth **nothing**
+(101% on both shapes) and at 2048 it costs **twice** the routed bank, because a
+routing's runs do not fill 64 rows at that length. Same door, better reason.
+
+That shape also exposed a hole in its own sweep: the fixture had 74 rows where a
+64-row block needs 128 before a call reaches it at all, so it would have answered
+the *reference tile's* bits under the swept block's name and passed. It is 142
+rows now.
+
+**And 16-bit operands are refused again, this time at equal occupancy.** The arm
+now reads its narrow tiles out of a scratch the width the answer wants, so what
+it changes is the operand and not how many threadgroups a core holds:
+
+    at                            the block   at 36    at 40    at 44
+    2048   q_proj, tiled             3.87ms     +8%      +9%      +5%
+    2048   a routed bank, grouped   17.00ms     +9%      +9%      +5%
+    8192   q_proj, tiled            15.15ms     +9%      +9%      +5%
+    8192   a routed bank, grouped   52.39ms     +8%      +8%      +4%
+
+Drift is flat at 1.5 to 2.1e-4 across reductions 32 to 4096, two decades above the
+block's own, which is the operand rounding and not a chain. **Slower and less
+accurate**, and the ceiling table above says why it could not have been faster:
+the instruction issues at the same rate on both.
+
+### The threadgroup sweep, re-taken on the kernel that ships
+
+At 8192 tokens, warm, both ways, every arm answering the shipped block bit for
+bit:
+
+    a threadgroup                reuse     q_proj, tiled     a routed bank
+     64 threads, 1×2 simdgroups  2.0:1  348.71ms  2302%   1053.61ms  2008%
+    128 threads, 2×2 simdgroups  1.3:1   15.67ms   103%     54.01ms   103%
+    256 threads, 2×4 simdgroups  1.0:1   15.15ms   100%     52.46ms   100%
+    512 threads, 2×8 simdgroups  0.7:1   25.33ms   167%     85.53ms   163%
+    256 threads, 4×2, 64 rows    1.3:1   15.33ms   101%     52.77ms   101%
+
+The shipped width is still the best of them and the reuse column still runs
+backwards against the clock. **What mlx's quantised kernel does at 64 threads is
+not what this one does at 64 threads**, and the sweep says why: a block's
+threadgroup memory is a property of the block, so 64 threads here buys the same
+14 KiB with a quarter of the work to hide a load behind. mlx's is 16 by 32 rather
+than 32 by 64, so its 64 threads carry a quarter of the memory too.
+
+### What did not move
+
+**No token changed and no default changed.** The flag stays defaulted to
+reference, the reference path is byte-identical, and the recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what both backends write.
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` and both MMA
+floors are where they were, and the acceptance rows on the packed heads are
+unmoved.
+
+**A decode step is untouched**, which it has to be: the block is not dispatched
+at any shape a decode step has. Paired against the commit before the kernel
+change, seven pairs: 19.446 against 19.429 ms, device 18.615 against 18.617,
+ranges across, no claim. **The null pair was run and read −0.0%**, ranges across —
+`just bench HEAD HEAD decode`, same binary both arms, seven pairs — and the host
+was settled to 0.76% on the wall and 0.37% on the device before the sitting.
+
+**K1's kept-cache advantage is untouched.** Both openings, both engines, one
+sitting each, three pairs, ours under `--numerics production`:
+
+    opening        ours kept   mlx-vlm kept   behind
+    2048            19.49 s       14.35 s     1.36×
+    8192            32.75 s       25.49 s     1.28×
+
+    the per-turn bookkeeping inside it
+    2048             1.024 ms     31.449 ms
+    8192             1.115 ms     66.687 ms
+
+Ours flat in the context where theirs is linear, exactly as K1 measured it.
+
+**Our own prefill wall, unsampled, under the production flag**:
+
+    tokens    wall      device
+     2048    5.51 s     3.29 s
+     4096    8.98 s     6.06 s
+     8192   16.79 s    11.80 s
+
+### The floor this stops at, and its arithmetic
+
+**A stopping condition is a floor you can prove, and this is one.**
+
+The instruction this kernel is made of issues at 25.3 TFLOP/s on this part, and
+that is the same rate its scalar fused multiply-add issues at — so no arrangement
+of this arithmetic goes faster, whatever it is written in and whatever width its
+operands are. The routed bank at 8192 runs 824.6 GFLOP in 52.41 ms, which is 15.7
+TFLOP/s, which is **62% of that**.
+
+What the remaining 38% is, priced rather than guessed: barriers 10%, fragment
+loads 6%, the three byte-count terms 8% between them, and about a fifth
+unattributed. **Removing every one of the priced terms entirely — which no kernel
+can, they are the mechanism and not an overhead — would put the call at 39.8 ms
+and 82% of the instruction.** mlx's quantised kernel is at 79%. So the whole gap
+to the other engine is inside the terms this table has now priced, and there is
+at most **1.6× between here and a kernel that is nothing but its instruction.**
+
+**What is worth trying next, and what it would cost:**
+
+- **A step of 64 codes instead of 32**, which halves the barrier count. The
+  measured upper bound is the barrier arm's **10%**. It costs the staging
+  doubling to 26 KiB, which takes the core back to three threadgroups from five,
+  and it moves the scale read inside the staging loop because a step would then
+  span two groups. Half a day, and the two effects run opposite ways, so it is a
+  sweep rather than a change.
+- **Fragment loads through a lane-to-coordinate map instead of
+  `simdgroup_load`**, which is what mlx's own quantised kernel does and is the
+  one structural difference between the two inner loops. The measured upper bound
+  is the fragment-load arm's **6%**, and the transposing load on the weight is the
+  one most likely to be paying more than the two element reads it owes. A day,
+  and it needs the lane-to-coordinate map verified against this part rather than
+  inherited from mlx's header.
+- **Both at their ceilings is 16%**, which is 52.41 ms to 44.0 and 74% of the
+  instruction. **That closes about two thirds of the distance to mlx and does not
+  close it**, so a third thing would still be wanted — and the honest reading of
+  the fifth that is unattributed is that it is where the third thing is.
+
+**What this does not license is a claim that the engine is finished.** It is
+1.28× behind at the 8192 opening and 1.36× at 2048, and the gap is real. What
+this milestone says is that the gap is a third rather than a factor of four, that
+the ceiling it is measured against is now a measured number rather than a
+bandwidth that never applied, and that the two terms worth taking next are priced
+before anyone spends a day on them.
+
 ## The four levers the matmul had left
+
+**The three tables below that were taken on the device's clock read four times
+too fast, and every ratio in them stands** — the roofline and limiter table, the
+threadgroup sweep, and the 16-bit one. See "The clock every table in this crate
+was read off" above, which is where the corrected ones are; each arm divided by
+the same four, so what this section concluded about each lever is what it
+concluded. **The per-kernel table, the prefill wall and the session are not
+affected**: those come off a sampled prefill and a wall clock rather than off
+`device_time`.
 
 **Every one of them was measured and every one of them is refused, and the
 measurement that did it is one cheap question asked first.** This milestone
