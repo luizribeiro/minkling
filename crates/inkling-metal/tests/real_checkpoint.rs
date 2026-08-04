@@ -40,6 +40,7 @@ use inkling_core::{
 // drift. `what_a_streaming_read_achieves_on_this_machine` is what measures it,
 // on whatever host it runs on.
 use inkling_metal::kernel::MEMORY_BANDWIDTH;
+use inkling_metal::trace::{self, Difference, Encoded};
 use inkling_metal::{
     DISPATCHES_A_SUBMISSION, DenseMatmul, DenseWeight, Device, ExpertGrouping, ExpertKernels,
     LayerKernels, LayerProjections, LayerRouter, MetalError, ModelHeads, ModelLayers, ModelTail,
@@ -635,6 +636,9 @@ struct Asked {
     settle: usize,
     /// Whether the device times each dispatch.
     sampling: bool,
+    /// Whether every dispatch a step encodes is written down, so that two steps
+    /// can be held against each other — see [`inkling_metal::trace`].
+    tracing: bool,
 }
 
 impl Asked {
@@ -646,6 +650,7 @@ impl Asked {
             generated: GENERATED,
             settle: 0,
             sampling: false,
+            tracing: false,
         }
     }
 
@@ -668,12 +673,20 @@ impl Asked {
             generated: 1,
             settle: 0,
             sampling: false,
+            tracing: false,
         }
     }
 
     fn sampled(self) -> Self {
         Self {
             sampling: true,
+            ..self
+        }
+    }
+
+    fn traced(self) -> Self {
+        Self {
+            tracing: true,
             ..self
         }
     }
@@ -755,6 +768,9 @@ struct OnTheDevice {
     /// a decode step's two are 1076 dispatches and one and the wait means
     /// something different in each.
     round_trips: Vec<RoundTrip>,
+    /// What each step encoded, dispatch by dispatch, where the run was asked to
+    /// write it down. One entry a step, the prefill's first.
+    traces: Vec<Vec<Encoded>>,
 }
 
 impl OnTheDevice {
@@ -860,8 +876,10 @@ impl OnTheDevice {
             got: Vec::new(),
             profile: Profile::default(),
             round_trips: Vec::new(),
+            traces: Vec::new(),
         };
         device.record_round_trips(true);
+        trace::record(asked.tracing);
 
         // Once, before the loop rather than inside it — though "once" is now 6
         // ms for 137 GB, so what that used to be defending against is gone.
@@ -883,6 +901,9 @@ impl OnTheDevice {
             &weights,
             |id| {
                 run.steps.push(step.elapsed());
+                if asked.tracing {
+                    run.traces.push(trace::take());
+                }
                 read(&mut run);
                 run.peak = run.peak.max(fixture::resident_bytes());
                 run.got.push(id);
@@ -897,6 +918,7 @@ impl OnTheDevice {
         run.profile = profile::take().per_step(run.charged_steps());
         run.round_trips = device.round_trips();
         device.record_round_trips(false);
+        trace::record(false);
         run
     }
 
@@ -1790,6 +1812,7 @@ fn what_the_step_after_a_prefill_is_paying_for() {
                 generated: 1 + STEPS_AFTER_A_PREFILL,
                 settle: 0,
                 sampling: false,
+                tracing: false,
             },
         );
         let (.., bytes) = since(run.submitted[0], run.submitted[1]);
@@ -1825,6 +1848,7 @@ fn what_the_step_after_a_prefill_is_paying_for() {
             generated: 2,
             settle: 0,
             sampling: false,
+            tracing: false,
         },
     );
     eprintln!("{}", step_table(&alone.measured()));
@@ -1903,6 +1927,115 @@ fn what_a_decode_step_costs_as_the_context_grows() {
             format!("{:.2?}", run.profile.gpu()),
             format!("{:.1}", 1.0 / step.as_secs_f64()),
             format!("{:.2} GiB", run.peak as f64 / (1u64 << 30) as f64),
+        );
+    }
+}
+
+/// The contexts the sequence question is asked at: the recorded prompt's own,
+/// one in the middle, and the longest this file measures.
+///
+/// **Three rather than one because the answer may depend on the context and
+/// that is the whole risk.** A decode step's attention reads every key there is,
+/// so a grid that followed the span would make the sequence a different sequence
+/// at every step — which is exactly what a table taken at one length could not
+/// see.
+const TRACED_CONTEXTS: [usize; 3] = [97, 2048, 8192];
+
+/// **What actually changes between one decode step and the next**, which every
+/// claim about encoding a step's dispatches once and reusing them rests on and
+/// which nothing in this repo had asked.
+///
+/// A step writes down each dispatch it encodes — the entry, the pipeline, the
+/// grid, and what filled every argument slot — and consecutive steps are held
+/// against each other. What comes back is three numbers that mean three
+/// different things:
+///
+/// - **commands changed** is a dispatch that is not the same command at all:
+///   another entry, another pipeline, another grid. Any of those and the
+///   sequence has to be written rather than patched, and a *count* that moved
+///   means there is no one sequence to reuse.
+/// - **bound** is a slot naming a different allocation, which is a patch —
+///   `setKernelBuffer:` on one command.
+/// - **inline** is a slot whose bytes changed. An indirect command has no
+///   inline binding at all, so each of these is an allocation the engine does
+///   not currently make, and their count is what that would cost.
+///
+/// The last column is the other half: what the Metal calls encoding a step cost
+/// against what the profile charges the whole `dispatch encode` row. **A
+/// sequence encoded once removes the first and not the second**, so the two
+/// figures are what any projection has to be built on.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn what_changes_between_two_decode_steps() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    eprintln!(
+        "{:>8}{:>12}{:>10}{:>10}{:>9}{:>9}{:>13}{:>12}",
+        "context", "dispatches", "commands", "slots", "bound", "inline", "metal encode", "the row"
+    );
+    for context in TRACED_CONTEXTS {
+        let run = OnTheDevice::running(&dir, &device, Asked::decoding_at(context).traced());
+        // The prefill is the first trace and is a different sequence from every
+        // step behind it; the steps this is about are the ones the profile
+        // charges.
+        let steps = &run.traces[run.charged_from()..];
+        assert!(steps.len() >= 2, "two steps to hold against each other");
+
+        let differences: Vec<Difference> = steps
+            .windows(2)
+            .map(|pair| Difference::between(&pair[0], &pair[1]))
+            .collect();
+        let worst =
+            |of: fn(&Difference) -> usize| differences.iter().map(of).max().unwrap_or_default();
+        let metal: Duration = steps
+            .iter()
+            .map(|step| {
+                step.iter()
+                    .map(|dispatch| dispatch.encoding)
+                    .sum::<Duration>()
+            })
+            .sum::<Duration>()
+            / steps.len() as u32;
+
+        eprintln!(
+            "{context:>8}{:>12}{:>10}{:>10}{:>9}{:>9}{:>13}{:>12}",
+            steps[0].len(),
+            worst(|difference| difference.commands_changed.len()),
+            worst(|difference| difference.slots),
+            worst(|difference| difference.bound_changed.len()),
+            worst(|difference| difference.inline_changed.len()),
+            format!("{metal:.2?}"),
+            format!("{:.2?}", run.profile.elapsed(Op::Encode)),
+        );
+
+        // Which kernels the patches fall on, since what a patch costs is one
+        // `setKernelBuffer:` and what an inline argument costs is an allocation
+        // the engine does not make today.
+        let mut inline: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut bound: BTreeMap<&str, usize> = BTreeMap::new();
+        let last = differences.last().expect("a pair");
+        for (at, _) in &last.inline_changed {
+            *inline.entry(steps[0][*at].entry.as_str()).or_default() += 1;
+        }
+        for (at, _) in &last.bound_changed {
+            *bound.entry(steps[0][*at].entry.as_str()).or_default() += 1;
+        }
+        for (what, rows) in [("inline", &inline), ("bound", &bound)] {
+            let named: Vec<String> = rows
+                .iter()
+                .map(|(entry, count)| format!("{entry} {count}"))
+                .collect();
+            eprintln!("  {what:>6} slots that changed: {}", named.join(", "));
+        }
+
+        assert_eq!(
+            differences
+                .iter()
+                .filter(|difference| difference.reusable())
+                .count(),
+            differences.len(),
+            "at {context} tokens some pair of steps is not the same sequence: {differences:?}"
         );
     }
 }

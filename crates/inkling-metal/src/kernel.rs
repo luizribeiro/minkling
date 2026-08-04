@@ -239,6 +239,9 @@ impl<'a> Batch<'a> {
         }
 
         let encoder = self.encoder(kernel)?;
+        // Read before the encoding rather than around it, so that a run nobody
+        // is tracing pays a branch and not a clock. See [`crate::trace`].
+        let described = crate::trace::recording().then(std::time::Instant::now);
         encoder.setComputePipelineState(&kernel.pipeline);
         for (slot, arg) in args.iter().enumerate() {
             // SAFETY: the memory outlives the encoding through `Arg`'s borrow,
@@ -266,6 +269,17 @@ impl<'a> Batch<'a> {
             one_dimensional(grid.groups()),
             one_dimensional(grid.threads_per_group),
         );
+        if let Some(opened) = described {
+            let encoding = opened.elapsed();
+            crate::trace::encoded(|| crate::trace::Encoded {
+                entry: kernel.label.clone(),
+                pipeline: Retained::as_ptr(&kernel.pipeline) as usize,
+                slots: args.iter().map(crate::trace::Slot::of).collect(),
+                threads: grid.threads,
+                threads_per_group: grid.threads_per_group,
+                encoding,
+            });
+        }
 
         self.entry.get_or_insert_with(|| kernel.entry.clone());
         self.dispatches += 1;

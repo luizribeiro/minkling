@@ -45,6 +45,7 @@ pub mod sampling;
 pub mod sconv;
 pub mod swiglu;
 pub mod tail;
+pub mod trace;
 
 #[cfg(test)]
 mod testing;
