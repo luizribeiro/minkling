@@ -6063,10 +6063,13 @@ kernel void decoded_elements(
     const BOUND_TOKENS: usize = 4096;
 
     fn bound_header() -> String {
-        BOUND_SHAPES
-            .iter()
-            .map(|(what, ..)| format!("{:>26}", *what))
-            .collect()
+        header(BOUND_SHAPES.iter().map(|(what, ..)| *what), 26)
+    }
+
+    /// The column headings of a limiter table, which is the shapes it is read
+    /// across at whatever width its cells are printed at.
+    fn header<'a>(shapes: impl Iterator<Item = &'a str>, width: usize) -> String {
+        shapes.map(|what| format!("{what:>width$}")).collect()
     }
 
     /// What one dispatch of a bank of this shape costs `matmul` on the device,
@@ -6623,6 +6626,226 @@ kernel void decoded_elements(
             let mutant = PackedMatmul::from_source(&device, &written).expect("the mutant compiles");
             assert_ne!(
                 a_tiled_call_answers(&device, &mutant),
+                want,
+                "{what}: the mutation answered what the kernel answers"
+            );
+            row(what, &cost(&mutant));
+        }
+    }
+
+    /// The shapes the decode limiter table is read across: the projection that
+    /// carries most of a step's projection bytes, the narrowest dispatch a step
+    /// makes, and the bank that carries most of everything.
+    ///
+    /// `(what, rows, in_dim, out_dim, experts)`, and the experts are each shape's
+    /// own — one for a projection and 256 for a routed bank, whose six rows are
+    /// spread across it the way a router spreads them.
+    const DECODE_BOUND_SHAPES: [(&str, usize, usize, usize, usize); 3] = [
+        ("q_proj", 1, 4096, 4096, 1),
+        ("k_proj", 1, 4096, 1024, 1),
+        ("a routed bank", 6, 4096, 2048, 256),
+    ];
+
+    /// One arm of the decode limiter table: a name, and the shipped source with
+    /// one term of [`ENTRY`]'s walk replaced by something that costs an
+    /// instruction over the same operands and cannot be folded away.
+    ///
+    /// **The same discipline as [`without_each_term_of_a_tile`], on the entry
+    /// beside it.** Every "this is not bandwidth-bound" finding in this file was
+    /// taken on a *tile* — A3's re-read, A4's limiter table, A9's on the block —
+    /// and a tile is dispatched by a prefill and by nothing else. This is the
+    /// walk a decode step runs, and no milestone has asked it anything.
+    ///
+    /// **Two arms a term where the tile's tables have one**, because the two
+    /// answers are different levers. Confining a walk to a kilobyte leaves every
+    /// load issued and takes the traffic off, so it prices the memory; taking the
+    /// load out and forming the same value from the index it was at prices the
+    /// load as well. A term whose traffic is free and whose loads are not is a
+    /// term that wants fewer instructions rather than fewer bytes, and the tile's
+    /// tables could not tell the two apart.
+    fn without_each_term_of_the_untiled_walk() -> Vec<(&'static str, String)> {
+        let shipped = source();
+        vec![
+            // The weight, confined the way A3's slot-zero mutation confines it:
+            // every element of every call walks expert zero's first row, so the
+            // whole weight working set is one 2 KB row and its scales. `* 0u`
+            // rather than a constant, so nothing the kernel computed goes unused.
+            (
+                "the weight's traffic",
+                crate::testing::instead_of(
+                    &shipped,
+                    "        codes + shape.code_base + (ulong)expert * shape.code_stride + \
+                     (ulong)col * bytes,\n        scales + shape.scale_base + (ulong)expert * \
+                     shape.scale_stride\n            + (ulong)col * (bytes / BYTES_PER_GROUP),",
+                    "        codes + shape.code_base + (ulong)(expert * 0u) * shape.code_stride + \
+                     (ulong)(col * 0u) * bytes,\n        scales + shape.scale_base + (ulong)(expert \
+                     * 0u) * shape.scale_stride\n            + (ulong)(col * 0u) * (bytes / \
+                     BYTES_PER_GROUP),",
+                ),
+            ),
+            // The same term with the load itself gone: the code is the index it
+            // would have been read from, so every mask, every gather and every
+            // multiply-add downstream of it stays where it was.
+            (
+                "the weight's loads",
+                crate::testing::instead_of(
+                    &shipped,
+                    "            const uint code = packed[b + i];",
+                    "            const uint code = b + i;",
+                ),
+            ),
+            // **The input, which is the term this walk re-reads hardest.** Every
+            // output element is a simdgroup of its own and every one of them
+            // reads the whole input row, so a call of `out_dim` columns reads it
+            // that many times — 7.5 bytes of input load issued per byte of
+            // weight, at every shape a decode step has. Confined to eight floats,
+            // so the two loads are issued from the same place and land in a cache
+            // line.
+            (
+                "the input's traffic",
+                crate::testing::instead_of(
+                    &shipped,
+                    "            device const float *v = values + (b + i) * CODES_PER_BYTE;",
+                    "            device const float *v = values + (((b + i) * CODES_PER_BYTE) & \
+                     7u);",
+                ),
+            ),
+            // The same term with both loads gone and the two multiply-adds left,
+            // fed by the indices the loads were at.
+            (
+                "the input's loads",
+                crate::testing::instead_of(
+                    &shipped,
+                    "            dot += element(low) * v[0] + element(high) * v[1];",
+                    "            dot += element(low) * (float)b + element(high) * (float)i;",
+                ),
+            ),
+            // The dequantisation, which is two gathers into a 16-entry constant
+            // array per packed byte and the one term whose cost is a memory
+            // access nobody counts.
+            (
+                "the table it decodes through",
+                crate::testing::instead_of(
+                    &shipped,
+                    "            dot += element(low) * v[0] + element(high) * v[1];",
+                    "            dot += (float)low * v[0] + (float)high * v[1];",
+                ),
+            ),
+            // The group scale, which is a byte read and a shift per chunk.
+            // Reading the row's first scale leaves the load in the kernel and
+            // takes it out of the walk.
+            (
+                "the scale it walks to",
+                crate::testing::instead_of(
+                    &shipped,
+                    "        sum += dot * as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << \
+                     EXPONENT_SHIFT);",
+                    "        sum += dot * as_type<float>(uint(scale[0]) << EXPONENT_SHIFT);",
+                ),
+            ),
+            // The cross-lane reduction, which is one per output element at the
+            // end of a walk a thousand bytes long — and which a call with few
+            // elements pays as often as a call with many.
+            (
+                "the cross-lane reduction",
+                crate::testing::instead_of(
+                    &shipped,
+                    "    sum = simd_sum(sum);\n    if (lane == 0) {",
+                    "    if (lane == 0) {",
+                ),
+            ),
+        ]
+    }
+
+    /// What one untiled call answers, which is the oracle every arm of the decode
+    /// limiter table has to disagree with.
+    ///
+    /// One row, so that [`tiles`] is false and the call reaches [`ENTRY`] — the
+    /// same predicate a decode step's own projections go through.
+    fn an_untiled_call_answers(device: &Device, matmul: &PackedMatmul) -> Vec<f32> {
+        let case = Case::noisy(IN_DIM, OUT_DIM, 1);
+        case.upload(device, matmul)
+            .multiply(&case.x)
+            .expect("the dispatch runs")
+    }
+
+    /// **What a decode step's packed matmul is bound by, one term at a time** —
+    /// 70% of the device's time in a step, the largest untuned number in this
+    /// engine, and a kernel this file has never pointed an instrument at.
+    ///
+    /// The prefill tables above are all about tiles, and a tile is what a decode
+    /// step is refused: [`PackedMatmul::blocks`] excludes a call this short and
+    /// [`tiles`] is false for every shape in [`DECODE_SHAPES`]. So what runs is
+    /// [`ENTRY`], one simdgroup an output element, and the questions A4 asked of
+    /// the tile have never been asked of it.
+    ///
+    /// **The two arms a term are what makes this readable.** A decode step's
+    /// weight is compulsory — a token reads the model once — so an arm that takes
+    /// the traffic off is not a lever, it is a measurement of how far the call is
+    /// from being about its own bytes. The input is the opposite: it is 16 KB read
+    /// once per output element, which is traffic this kernel invents and a tile
+    /// would not.
+    ///
+    /// Every arm answers wrongly and the case asserts that it does.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_decode_steps_packed_matmul_is_bound_by() {
+        let Some(device) = device() else { return };
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        let shipped = matmul(&device);
+        let want = an_untiled_call_answers(&device, &shipped);
+        let shapes: Vec<Blocked> = DECODE_BOUND_SHAPES
+            .iter()
+            .map(|&(what, rows, in_dim, out_dim, experts)| {
+                Blocked::of(what, rows, in_dim, out_dim, experts, false)
+            })
+            .collect();
+
+        eprintln!(
+            "  {:<32}{}",
+            "without",
+            header(DECODE_BOUND_SHAPES.iter().map(|(what, ..)| *what), 22)
+        );
+        // **Warmed inside the arm rather than once before them all.** Compiling
+        // a mutant and uploading its banks is a second or more with the device
+        // idle, and an arm measured on the clock that leaves reads 70% slower
+        // than the same arm measured warm — larger than any term this table
+        // prices. See [`crate::testing::warmed`].
+        let cost = |matmul: &PackedMatmul| -> Vec<Duration> {
+            let banks: Vec<PackedBank<'_>> = shapes
+                .iter()
+                .map(|shape| shape.upload(&device, matmul))
+                .collect();
+            crate::testing::warmed(|| {
+                shapes[0].costs_on(&device, &banks[0], &grouping);
+            });
+            shapes
+                .iter()
+                .zip(&banks)
+                .map(|(shape, bank)| shape.costs_on(&device, bank, &grouping))
+                .collect()
+        };
+        let whole = cost(&shipped);
+        let row = |what: &str, taken: &[Duration]| {
+            let cells: String = taken
+                .iter()
+                .zip(&whole)
+                .map(|(each, whole)| {
+                    format!(
+                        "{:>14}{:>8}",
+                        format!("{:.0}µs", 1e6 * each.as_secs_f64()),
+                        format!("{:.0}%", 1e2 * each.as_secs_f64() / whole.as_secs_f64()),
+                    )
+                })
+                .collect();
+            eprintln!("  {what:<32}{cells}");
+        };
+        row("nothing — the kernel", &whole);
+
+        for (what, written) in without_each_term_of_the_untiled_walk() {
+            let mutant = PackedMatmul::from_source(&device, &written).expect("the mutant compiles");
+            assert_ne!(
+                an_untiled_call_answers(&device, &mutant),
                 want,
                 "{what}: the mutation answered what the kernel answers"
             );
