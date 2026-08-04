@@ -3034,6 +3034,21 @@ mod tests {
     use crate::kernel::MEMORY_BANDWIDTH;
     use crate::testing::{device, drift, entries_dispatched};
 
+    /// The better of a sweep's two directions, arm by arm.
+    ///
+    /// **A slower reading is contamination and never the kernel being faster**,
+    /// which is the argument [`Blocked::costs`] already takes best-of-three
+    /// rounds on — met again one level up. What the two directions are for is
+    /// saying how far apart they were, which is what the `disagreed` column
+    /// prints: a sweep whose arms agree is one whose ranking is about the arms,
+    /// and one whose arms do not is a sweep that has to say so.
+    fn better(up: &[Duration], down: &[Duration]) -> Vec<Duration> {
+        up.iter()
+            .zip(down)
+            .map(|(up, down)| *up.min(down))
+            .collect()
+    }
+
     /// What a count of packed codes weighs on the wire: half a byte a code and
     /// one scale byte a group of [`GROUP_SIZE`].
     ///
@@ -5791,9 +5806,10 @@ kernel void decoded_elements(
             cost(0);
         });
         let (up, down) = crate::testing::both_ways(&at, cost);
+        let taken = better(&up, &down);
 
         eprintln!(
-            "  {:<18}{:>10}{:>10}{:>10}{:>10}{:>11}{:>8}{:>10}{:>12}",
+            "  {:<18}{:>10}{:>10}{:>10}{:>10}{:>11}{:>8}{:>10}{:>11}",
             "shape",
             "elements",
             "weight",
@@ -5802,20 +5818,20 @@ kernel void decoded_elements(
             "achieved",
             "of bus",
             "a step",
-            "the other way"
+            "disagreed"
         );
         let (mut step, mut weight) = (Duration::ZERO, 0.0);
         for (shape, (what, rows, in_dim, out_dim, _, calls)) in
             DECODE_SHAPES.into_iter().enumerate()
         {
-            let call = up[shape];
+            let call = taken[shape];
             let codes = rows * out_dim * in_dim;
             let moved = packed_bytes(codes);
             let achieved = moved / call.as_secs_f64();
             step += call * calls as u32;
             weight += moved * calls as f64;
             eprintln!(
-                "  {what:<18}{:>10}{:>10}{:>10}{:>10}{:>11}{:>8}{:>10}{:>12}",
+                "  {what:<18}{:>10}{:>10}{:>10}{:>10}{:>11}{:>8}{:>10}{:>11}",
                 rows * out_dim,
                 format!("{:.1} MB", moved / 1e6),
                 format!("{:.0} MB", (codes * size_of::<f32>()) as f64 / 1e6),
@@ -5823,7 +5839,10 @@ kernel void decoded_elements(
                 format!("{:.0} GB/s", achieved / 1e9),
                 format!("{:.0}%", 1e2 * achieved / MEMORY_BANDWIDTH),
                 format!("{:.2?}", call * calls as u32),
-                format!("{:.0} GB/s", moved / down[shape].as_secs_f64() / 1e9),
+                format!(
+                    "{:.0}%",
+                    1e2 * (up[shape].max(down[shape]).as_secs_f64() / call.as_secs_f64() - 1.0)
+                ),
             );
         }
         eprintln!(
@@ -5887,23 +5906,27 @@ kernel void decoded_elements(
             cost(arms.len() / 2);
         });
         let (up, down) = crate::testing::both_ways(&arms, cost);
+        let taken = better(&up, &down);
 
         eprintln!(
-            "  {:>10}{:>14}{:>10}{:>10}{:>11}{:>8}{:>10}",
-            "elements", "threadgroups", "weight", "a call", "achieved", "of bus", "the other way"
+            "  {:>10}{:>14}{:>10}{:>10}{:>11}{:>8}{:>11}",
+            "elements", "threadgroups", "weight", "a call", "achieved", "of bus", "disagreed"
         );
         for (at, out_dim) in WIDTHS.into_iter().enumerate() {
             let codes = out_dim * IN_DIM;
             let moved = packed_bytes(codes);
-            let achieved = moved / up[at].as_secs_f64();
+            let achieved = moved / taken[at].as_secs_f64();
             eprintln!(
-                "  {out_dim:>10}{:>14}{:>10}{:>10}{:>11}{:>8}{:>10}",
+                "  {out_dim:>10}{:>14}{:>10}{:>10}{:>11}{:>8}{:>11}",
                 out_dim * NARROWEST_SIMD / THREADS_AN_ELEMENTS_GROUP,
                 format!("{:.1} MB", moved / 1e6),
-                format!("{:.0}µs", 1e6 * up[at].as_secs_f64()),
+                format!("{:.0}µs", 1e6 * taken[at].as_secs_f64()),
                 format!("{:.0} GB/s", achieved / 1e9),
                 format!("{:.0}%", 1e2 * achieved / MEMORY_BANDWIDTH),
-                format!("{:.0} GB/s", moved / down[at].as_secs_f64() / 1e9),
+                format!(
+                    "{:.0}%",
+                    1e2 * (up[at].max(down[at]).as_secs_f64() / taken[at].as_secs_f64() - 1.0)
+                ),
             );
         }
     }
