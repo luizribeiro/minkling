@@ -63,7 +63,7 @@ use crate::dense::{DenseMatmul, DenseWeight};
 use crate::device::Device;
 use crate::grouping::{ExpertGrouping, Grouped};
 use crate::kernel::Batch;
-use crate::matmul::{MatmulError, PackedBank, PackedMatmul, Pending, Through};
+use crate::matmul::{MatmulError, PackedBank, PackedMatmul, PackedPair, Pending, Through};
 use crate::router::{LayerRouter, Router, RouterWeights};
 use crate::swiglu::SwiGlu;
 
@@ -77,8 +77,10 @@ use crate::swiglu::SwiGlu;
 /// and what changes is that no weight is ever decoded to memory.
 #[derive(Debug)]
 pub struct ExpertBanks<'a> {
-    gate_proj: PackedBank<'a>,
-    up_proj: PackedBank<'a>,
+    /// The gate and up projections, which are one dispatch wherever the call is
+    /// untiled — see [`PackedPair`], and the module note above, which asked for
+    /// this before there was a kernel that could do it.
+    glu: PackedPair<'a>,
     down_proj: PackedBank<'a>,
     /// The activation between the first two and the third, which is not a
     /// weight and belongs to no bank — one pipeline serves the whole model.
@@ -110,21 +112,10 @@ impl<'a> ExpertBanks<'a> {
                 got,
             }),
         };
-        pair("experts of up_proj", up_proj.experts(), gate_proj.experts())?;
         pair(
             "experts of down_proj",
             down_proj.experts(),
             gate_proj.experts(),
-        )?;
-        pair(
-            "the width up_proj maps from",
-            up_proj.in_dim(),
-            gate_proj.in_dim(),
-        )?;
-        pair(
-            "the width up_proj maps to",
-            up_proj.out_dim(),
-            gate_proj.out_dim(),
         )?;
         pair(
             "the width down_proj maps from",
@@ -138,8 +129,11 @@ impl<'a> ExpertBanks<'a> {
         )?;
 
         Ok(Self {
-            gate_proj,
-            up_proj,
+            // The three checks `up_proj` owes are [`PackedPair::new`]'s, which
+            // is where they have to be: a fused dispatch describes both banks
+            // with one shape, so a pair that disagreed about the experts or
+            // either width would be one shape over two different calls.
+            glu: PackedPair::new(gate_proj, up_proj)?,
             down_proj,
             swiglu,
         })
@@ -168,17 +162,17 @@ impl<'a> ExpertBanks<'a> {
     }
 
     pub fn experts(&self) -> usize {
-        self.gate_proj.experts()
+        self.glu.gate().experts()
     }
 
     /// The width in and out, which is the layer's hidden size.
     pub fn dim(&self) -> usize {
-        self.gate_proj.in_dim()
+        self.glu.gate().in_dim()
     }
 
     /// The width between, which is `moe_intermediate_size`.
     pub fn hidden_dim(&self) -> usize {
-        self.gate_proj.out_dim()
+        self.glu.gate().out_dim()
     }
 
     /// Every gathered row through the expert it named, as the SwiGLU MLP an
@@ -235,10 +229,7 @@ impl<'a> ExpertBanks<'a> {
         chosen: &[u32],
         x: &mut Buffer<f32>,
     ) -> Result<Pending, MatmulError> {
-        let glu = [
-            self.gate_proj.encode_repeating(batch, chosen, x)?,
-            self.up_proj.encode_repeating(batch, chosen, x)?,
-        ];
+        let glu = self.glu.encode_repeating(batch, chosen, x)?;
         let Some(mut activated) = self.activated(batch, glu)? else {
             return Ok(Pending::empty());
         };
@@ -260,10 +251,7 @@ impl<'a> ExpertBanks<'a> {
         x: &mut Buffer<f32>,
         per_source: usize,
     ) -> Result<Pending, MatmulError> {
-        let glu = [
-            self.gate_proj.encode_picked(batch, chosen, x, per_source)?,
-            self.up_proj.encode_picked(batch, chosen, x, per_source)?,
-        ];
+        let glu = self.glu.encode_picked(batch, chosen, x, per_source)?;
         let Some(mut activated) = self.activated(batch, glu)? else {
             return Ok(Pending::empty());
         };
@@ -288,12 +276,7 @@ impl<'a> ExpertBanks<'a> {
         x: &mut Buffer<f32>,
         per_source: usize,
     ) -> Result<Pending, MatmulError> {
-        let glu = [
-            self.gate_proj
-                .encode_grouped(batch, grouped, x, per_source, Through::Gathered)?,
-            self.up_proj
-                .encode_grouped(batch, grouped, x, per_source, Through::Gathered)?,
-        ];
+        let glu = self.glu.encode_grouped(batch, grouped, x, per_source)?;
         let Some(mut activated) = self.activated(batch, glu)? else {
             return Ok(Pending::empty());
         };
@@ -307,11 +290,11 @@ impl<'a> ExpertBanks<'a> {
     /// Asked of `gate_proj` because [`ExpertBanks::new`] is what says the three
     /// banks hold the same experts, so any of them answers for the bank.
     pub(crate) fn groups(&self, rows: usize) -> bool {
-        self.gate_proj.groups(rows)
+        self.glu.gate().groups(rows)
     }
 
     pub fn device(&self) -> &'a Device {
-        self.gate_proj.device()
+        self.glu.gate().device()
     }
 
     /// `silu(gate) * up`, encoded over the pair's own outputs and left in the
@@ -341,10 +324,7 @@ impl<'a> ExpertBanks<'a> {
         chosen: &[u32],
         rows: &[f32],
     ) -> Result<[Pending; 2], MatmulError> {
-        Ok([
-            self.gate_proj.encode(batch, chosen, rows)?,
-            self.up_proj.encode(batch, chosen, rows)?,
-        ])
+        self.glu.encode(batch, chosen, rows)
     }
 }
 
@@ -952,13 +932,17 @@ mod tests {
     /// composition together rather than one at a time.
     ///
     /// **What it costs is asserted beside what it answers**, because the two
-    /// move independently and only one of them is visible in the values. Four
-    /// dispatches in one command buffer, and five allocations for them: the rows
-    /// copied over for `gate` and again for `up`, an output each for the three
+    /// move independently and only one of them is visible in the values. Three
+    /// dispatches in one command buffer, and four allocations for them: the rows
+    /// copied over once for the pair to read, an output each for the three
     /// multiplies, and nothing at all for the activation — which writes into the
     /// buffer `gate` produced and hands it to `down`. A path that read the pair
     /// back and copied the product over again is the same four values and six
     /// allocations in two command buffers.
+    ///
+    /// **`gate` and `up` are one of those three dispatches** — see
+    /// [`PackedPair`] — which is what a fused pair reads as from outside: one
+    /// fewer launch and one fewer copy of the rows, and the same values.
     #[test]
     fn three_banks_and_a_swiglu_are_the_expert_the_cpu_decodes() {
         let Some(device) = device() else { return };
@@ -982,7 +966,7 @@ mod tests {
         assert_eq!(got.len(), chosen.len() * DIM);
         assert_eq!(
             spent,
-            (4, 1, 5),
+            (3, 1, 4),
             "the bank's dispatches, buffers and memory"
         );
 
@@ -1089,11 +1073,13 @@ mod tests {
     /// waits for this side, so over forty MoE layers that is 120 round trips a
     /// decode step does not take.
     ///
-    /// Five fewer buffers, too: the hidden state is uploaded once for the gate,
-    /// both of the routed bank's halves and both of the shared bank's to read,
-    /// where the parts apart copy it over for each of them — and the shared
-    /// bank's copies are `n_shared` times the size, being every token once per
-    /// shared expert.
+    /// Three fewer buffers, too: the hidden state is uploaded once for the gate,
+    /// the routed bank's pair and the shared bank's pair to read, where the
+    /// parts apart copy it over for each of them — and the shared bank's copies
+    /// are `n_shared` times the size, being every token once per shared expert.
+    /// It was five before the pair became one dispatch: a fused pair reads one
+    /// copy of the rows where two dispatches were handed one each, so the two
+    /// arms each gave a buffer back and the gap between them narrowed.
     #[test]
     fn the_whole_layer_costs_three_fewer_submissions_than_its_four_parts_apart() {
         let Some(device) = device() else { return };
@@ -1159,8 +1145,8 @@ mod tests {
         );
 
         assert_eq!(together.0, apart.0, "the same dispatches");
-        assert_eq!(together, (10, 1, 9), "the layer's own cost");
-        assert_eq!(apart, (10, 4, 14), "what the four parts cost apart");
+        assert_eq!(together, (8, 1, 9), "the layer's own cost");
+        assert_eq!(apart, (8, 4, 12), "what the four parts cost apart");
     }
 
     /// The selection as the layer hands it over, which is how a device index
@@ -1183,10 +1169,10 @@ mod tests {
     /// does, but Metal may contract each `w * y` into an FMA. Worst observed
     /// when this landed: 7.5e-8.
     ///
-    /// **Twelve dispatches where the parts are ten**, and still one submission.
-    /// That is the whole of what the weighting cost: two more dispatches in a
-    /// command buffer that was already open, against four values that no longer
-    /// cross back.
+    /// **Ten dispatches where the banks alone are eight**, and still one
+    /// submission. That is the whole of what the weighting cost: two more
+    /// dispatches in a command buffer that was already open, against four values
+    /// that no longer cross back.
     #[test]
     fn the_whole_layer_weights_its_own_rows_and_answers_with_their_sum() {
         let Some(device) = device() else { return };
@@ -1250,12 +1236,12 @@ mod tests {
             out.iter().any(|y| *y != 0.0),
             "an output of zeros would prove nothing"
         );
-        assert_eq!(whole.0, 12, "the layer's dispatches");
+        assert_eq!(whole.0, 10, "the layer's dispatches");
         assert_eq!(whole.1, 1, "the command buffers they went in");
     }
 
     /// **The routed bank's rows through a grouping are the routed bank's rows,
-    /// bit for bit** — and one dispatch more, in the same command buffer.
+    /// bit for bit** — and two dispatches more, in the same command buffer.
     ///
     /// Both halves are the change. That the values agree says the sort moved
     /// the rows and nothing else: every row still goes through the expert the
@@ -1264,6 +1250,13 @@ mod tests {
     /// move is M8's constraint met — the sort reads what the top-k wrote and
     /// writes what the bank reads, so putting it between them costs a dispatch
     /// and no round trip.
+    ///
+    /// **The second of the two is the pair a grouped call does not fuse.** An
+    /// untiled call runs `gate` and `up` in one dispatch — see [`PackedPair`] —
+    /// and a grouped one runs them in two, so what a grouping costs at this
+    /// height is the sort and the fusion it gives up. Both are dispatches in a
+    /// command buffer that was already open, and the length this is asked at is
+    /// far below the one a grouping is dispatched at in the model.
     ///
     /// Exact rather than within a tolerance, for the reason
     /// `a_grouped_dispatch_answers_what_the_dispatch_it_reorders_answers` is:
@@ -1330,8 +1323,8 @@ mod tests {
         );
         assert_eq!(
             (together.0 - apart.0, together.1),
-            (1, apart.1),
-            "the sort cost a dispatch and no submission"
+            (2, apart.1),
+            "the sort and the unfused pair cost two dispatches and no submission"
         );
     }
 

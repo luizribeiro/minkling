@@ -82,6 +82,19 @@ const TILED_ENTRY: &str = "packed_matmul_rows";
 /// rows that do name one weight.
 const GROUPED_ENTRY: &str = "packed_matmul_grouped";
 
+/// The fourth: [`ENTRY`]'s walk over the two banks a SwiGLU reads one set of
+/// rows through, in one dispatch of twice the output elements.
+///
+/// **The two are a dispatch each because they are two tensors, and for no other
+/// reason.** A bank's `gate` and `up` read the same rows of the same input
+/// through the same expert list and never read each other, so what separates
+/// them is which weight a simdgroup walks — and that is an index rather than a
+/// submission. Fusing them halves the dispatches the banks of a decode step
+/// cost and doubles the output elements each of the survivors covers, which is
+/// the axis `whether_a_decode_dispatch_is_short_of_the_machine` measured this
+/// kernel's rate along: 12288 elements read 621 GB/s where 24576 read 660.
+const PAIRED_ENTRY: &str = "packed_matmul_pair";
+
 /// The two entries behind [`Numerics::Production`], which are the two above with
 /// the reduction carried by `simdgroup_matrix` instead of by a lane-strided walk.
 ///
@@ -645,6 +658,9 @@ pub enum MatmulError {
 #[derive(Debug)]
 pub struct PackedMatmul {
     kernel: Kernel,
+    /// `kernel`'s walk over both banks of a [`PackedPair`] at once, which is the
+    /// entry every untiled call against a SwiGLU's two halves goes through.
+    paired: Kernel,
     tiled: Kernel,
     grouped: Kernel,
     /// The two entries that stand in front of `tiled` and `grouped` where the
@@ -828,10 +844,17 @@ impl PackedMatmul {
         // written.** Compiling the untiled entry from a string of its own, so
         // that the tiled two never saw the walk it runs, left the 2.4% exactly
         // where it was. What moved it was which of the three was created first.
+        //
+        // **The paired entry is created after them too**, which is where the
+        // untiled entry it is a second emission of is created. Nothing was
+        // measured about the paired one's own position — what was measured is
+        // that a prefill did not move when it was added, which is the row this
+        // order exists to protect.
         let tiled = device.compile(source, TILED_ENTRY)?;
         let grouped = device.compile(source, GROUPED_ENTRY)?;
         Ok(Self {
             kernel: device.compile(source, ENTRY)?,
+            paired: device.compile(source, PAIRED_ENTRY)?,
             tiled,
             grouped,
             mma,
@@ -899,9 +922,6 @@ impl PackedMatmul {
         out_dim: usize,
         experts: usize,
     ) -> (&Kernel, Grid) {
-        let simdgroups = |kernel: &Kernel, elements: usize, threads: usize| {
-            Grid::new(elements * kernel.simd_width(), threads)
-        };
         // Off the entry that will run rather than off this module, which is the
         // whole of what makes the block's shape sweepable — see [`Block`].
         let blocks = |mma: &Mma| {
@@ -925,6 +945,26 @@ impl PackedMatmul {
             (Some(mma), Layout::Tiled) => (&mma.tiled, blocks(mma)),
             (Some(mma), Layout::Grouped { .. }) => (&mma.grouped, blocks(mma)),
         }
+    }
+
+    /// The paired entry and the grid that covers both halves of one call, which
+    /// is twice the elements of [`PackedMatmul::entry`]'s [`Layout::Each`] arm
+    /// over the same threadgroup.
+    ///
+    /// **Only the untiled layout has one.** A tiled or grouped call is a
+    /// prefill's, where a dispatch already has output elements enough to fill
+    /// the machine and what a tile carries is registers rather than a launch —
+    /// so the pair there is two dispatches and stays two. See
+    /// [`PackedPair::listed`].
+    fn paired(&self, rows: usize, out_dim: usize) -> (&Kernel, Grid) {
+        (
+            &self.paired,
+            simdgroups(
+                &self.paired,
+                2 * rows * out_dim,
+                self.threads_an_elements_group,
+            ),
+        )
     }
 
     /// The production entries, where this call's shape is one they should run.
@@ -1144,6 +1184,30 @@ enum Layout<'a> {
 /// False for every shape a decode step dispatches, which is what says this
 /// cannot cost one: a decode step's projections are a single row, its shared
 /// bank is two rows naming two experts, and its routed bank is six naming six.
+/// The grid that covers `elements` output elements at a simdgroup each, which is
+/// how every entry in front of the numerics flag counts a call.
+///
+/// One reading for the untiled entry and for the paired one, because a pair is
+/// the untiled entry over twice the elements and nothing else — a second copy of
+/// this would be a second place for the simdgroup width to be left out.
+fn simdgroups(kernel: &Kernel, elements: usize, threads: usize) -> Grid {
+    Grid::new(elements * kernel.simd_width(), threads)
+}
+
+/// How a call over an expert list this side holds is cut up, which is the tile
+/// where the runs are long enough for one and an element apiece where they are
+/// not.
+///
+/// One reading for a bank and for a [`PackedPair`], because it is the same
+/// question about the same list: what a pair fuses is the two dispatches an
+/// untiled call is, and which calls those are cannot be decided twice.
+fn laid_out<'a>(experts: &[u32], matmul: &PackedMatmul) -> Layout<'a> {
+    match tiles(experts, matmul.rows_a_tile) {
+        false => Layout::Each,
+        true => Layout::Tiled,
+    }
+}
+
 fn tiles(experts: &[u32], rows_a_tile: usize) -> bool {
     if rows_a_tile < 2 || experts.len() < rows_a_tile {
         return false;
@@ -1510,6 +1574,19 @@ impl<'a> PackedBank<'a> {
         ]
     }
 
+    /// Where this bank's bytes start, which is everything the second half of a
+    /// [`PackedPair`] differs from the first in — the other eight fields of
+    /// [`PackedBank::shape`] are the call's rather than the bank's, and
+    /// [`PackedPair::new`] is what says the two banks agree about the three that
+    /// are not.
+    fn bases(&self) -> [u32; PAIR_FIELDS] {
+        let resident = self.resident.borrow();
+        [
+            extent(resident.codes.offset(), "where a bank's codes start"),
+            extent(resident.scales.offset(), "where a bank's scales start"),
+        ]
+    }
+
     /// `[rows, in_dim]` in, `[rows, out_dim]` out, row `i` multiplied against
     /// expert `experts[i]`.
     ///
@@ -1537,14 +1614,7 @@ impl<'a> PackedBank<'a> {
         experts: &[u32],
         x: &[f32],
     ) -> Result<Pending, MatmulError> {
-        assert_eq!(
-            self.sources(x.len()),
-            experts.len(),
-            "{} values are not {} rows of {}",
-            x.len(),
-            experts.len(),
-            self.in_dim
-        );
+        self.a_row_each(experts, x.len());
         if experts.is_empty() {
             return Ok(Pending::empty());
         }
@@ -1604,18 +1674,7 @@ impl<'a> PackedBank<'a> {
     ) -> Result<Pending, MatmulError> {
         let _timed = profile::scope(Op::Encode);
         let rows = chosen.len();
-        assert!(
-            per_source > 0,
-            "a row of a call reads some row of the input"
-        );
-        assert_eq!(
-            self.sources(x.len()),
-            rows.div_ceil(per_source),
-            "{} values are not {} rows of {}",
-            x.len(),
-            rows.div_ceil(per_source),
-            self.in_dim
-        );
+        self.rows_a_source(rows, per_source, x.len());
         // Untiled, because what the list holds is a token's `per_source`
         // experts one after another — the one layout no tile can share a weight
         // across, and the one [`PackedBank::encode_grouped`] moves the rows of.
@@ -1647,18 +1706,7 @@ impl<'a> PackedBank<'a> {
     ) -> Result<Pending, MatmulError> {
         let _timed = profile::scope(Op::Encode);
         let rows = grouped.order.len();
-        assert!(
-            per_source > 0,
-            "a row of a call reads some row of the input"
-        );
-        assert_eq!(
-            self.sources(x.len()),
-            rows.div_ceil(per_source),
-            "{} values are not {} rows of {}",
-            x.len(),
-            rows.div_ceil(per_source),
-            self.in_dim
-        );
+        self.rows_a_source(rows, per_source, x.len());
         let layout = Layout::Grouped {
             order: grouped.order.arg(),
             through,
@@ -1666,17 +1714,75 @@ impl<'a> PackedBank<'a> {
         self.dispatch(batch, rows, per_source, grouped.experts.arg(), x, layout)
     }
 
+    /// That a call of `rows` rows reads whole rows of the input, `per_source` of
+    /// them apiece — the check [`PackedBank::encode_picked`] and
+    /// [`PackedBank::encode_grouped`] each make of a list a dispatch wrote, and
+    /// [`PackedPair`] makes of the same list on behalf of both its banks.
+    fn rows_a_source(&self, rows: usize, per_source: usize, values: usize) {
+        assert!(
+            per_source > 0,
+            "a row of a call reads some row of the input"
+        );
+        assert_eq!(
+            self.sources(values),
+            rows.div_ceil(per_source),
+            "{values} values are not {} rows of {}",
+            rows.div_ceil(per_source),
+            self.in_dim
+        );
+    }
+
+    /// That a call's rows are its input's, one each.
+    fn a_row_each(&self, experts: &[u32], values: usize) {
+        assert_eq!(
+            self.sources(values),
+            experts.len(),
+            "{values} values are not {} rows of {}",
+            experts.len(),
+            self.in_dim
+        );
+    }
+
+    /// That a call's rows are the input read over whole times, which is the
+    /// shared bank's shape.
+    fn whole_passes(&self, experts: &[u32], values: usize) {
+        let sources = self.sources(values);
+        assert!(
+            experts.is_empty() || (sources > 0 && experts.len() % sources == 0),
+            "{} rows are not whole passes over {sources} rows of input",
+            experts.len()
+        );
+    }
+
+    /// That every expert `experts` names is one this bank holds.
+    ///
+    /// The range *is* checked on this side, and it has to be: the kernel cannot,
+    /// because an index past the bank is an offset past the buffer and a GPU
+    /// read answers that with whatever is there rather than with a fault. A list
+    /// a dispatch wrote is past this side, which is why
+    /// [`PackedBank::encode_picked`] is not public.
+    fn holds(&self, experts: &[u32]) -> Result<(), MatmulError> {
+        match experts
+            .iter()
+            .find(|expert| **expert as usize >= self.experts)
+        {
+            Some(past) => Err(MatmulError::NoSuchExpert {
+                expert: *past as usize,
+                experts: self.experts,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// The same multiply over rows a dispatch already left on the device, every
     /// one of them read once per expert `experts` names in turn.
     ///
-    /// **This is the shared bank's shape, and it is the same gather nobody
-    /// gathered.** Every token goes through every shared expert, so the rows the
-    /// bank runs are the input laid end to end after itself once per expert —
-    /// `[n_shared * tokens, in_dim]` of which every row is already `[tokens,
-    /// in_dim]` somewhere. Read at a modulo it is not laid out at all, and the
-    /// input can be the buffer the router's gate and the routed bank are reading
-    /// in the same command buffer.
-    ///
+    /// **The shared bank's shape against one of its two banks**, which is what
+    /// the cases about the modulo hold the kernel to. Only they: the model
+    /// repeats both banks at once — see [`PackedPair::encode_repeating`], which
+    /// is the same gather over the pair the shared bank is — so a caller with
+    /// half a pair in hand is a case and nothing else.
+    #[cfg(test)]
     pub(crate) fn encode_repeating(
         &self,
         batch: &mut Batch<'_>,
@@ -1684,12 +1790,7 @@ impl<'a> PackedBank<'a> {
         x: &mut Buffer<f32>,
     ) -> Result<Pending, MatmulError> {
         let _timed = profile::scope(Op::Encode);
-        let sources = self.sources(x.len());
-        assert!(
-            experts.is_empty() || (sources > 0 && experts.len() % sources == 0),
-            "{} rows are not whole passes over {sources} rows of input",
-            experts.len()
-        );
+        self.whole_passes(experts, x.len());
         self.listed(batch, experts, x)
     }
 
@@ -1701,25 +1802,12 @@ impl<'a> PackedBank<'a> {
         experts: &[u32],
         x: &mut Buffer<f32>,
     ) -> Result<Pending, MatmulError> {
-        assert_eq!(
-            self.sources(x.len()),
-            experts.len(),
-            "{} values are not {} rows of {}",
-            x.len(),
-            experts.len(),
-            self.in_dim
-        );
+        self.a_row_each(experts, x.len());
         self.listed(batch, experts, x)
     }
 
     /// A dispatch over an expert list this side holds, which is every one but
     /// [`PackedBank::encode_picked`]'s.
-    ///
-    /// The range *is* checked here, and it has to be: the kernel cannot, because
-    /// an index past the bank is an offset past the buffer and a GPU read
-    /// answers that with whatever is there rather than with a fault. A list a
-    /// dispatch wrote is past this side and is why that one method is not
-    /// public.
     ///
     /// `per_source` is 1 for both callers. What separates them is only how many
     /// rows of input the same list is spread over, which is
@@ -1730,25 +1818,20 @@ impl<'a> PackedBank<'a> {
         experts: &[u32],
         x: &mut Buffer<f32>,
     ) -> Result<Pending, MatmulError> {
-        if let Some(past) = experts
-            .iter()
-            .find(|expert| **expert as usize >= self.experts)
-        {
-            return Err(MatmulError::NoSuchExpert {
-                expert: *past as usize,
-                experts: self.experts,
-            });
-        }
+        self.holds(experts)?;
         if experts.is_empty() {
             return Ok(Pending::empty());
         }
 
         let mut chosen = self.device.inline(experts)?;
-        let layout = match tiles(experts, self.matmul.rows_a_tile) {
-            false => Layout::Each,
-            true => Layout::Tiled,
-        };
-        self.dispatch(batch, experts.len(), 1, chosen.arg(), x, layout)
+        self.dispatch(
+            batch,
+            experts.len(),
+            1,
+            chosen.arg(),
+            x,
+            laid_out(experts, self.matmul),
+        )
     }
 
     /// How many rows of this bank's input width `values` is, which is what the
@@ -1910,6 +1993,245 @@ impl<'a> PackedBank<'a> {
         weight
             + size_of::<f32>() * (values + rows * self.out_dim)
             + size_of::<u32>() * indices * rows
+    }
+}
+
+/// How many `uint`s the kernel's `Pair` struct declares.
+const PAIR_FIELDS: usize = 2;
+
+/// The two banks a SwiGLU multiplies one set of rows against, as the one
+/// dispatch they can be.
+///
+/// **`gate` and `up` were two dispatches because they are two tensors and for
+/// no other reason.** They read the same rows of the same input through the
+/// same expert list, they read nothing either of them writes, and the
+/// activation between them is what finally puts them together. So the only
+/// thing that separates them inside a dispatch is which weight a simdgroup
+/// walks — an index — and a decode step was paying a launch and half a
+/// dispatch's worth of output elements for it, 82 times a step.
+///
+/// **What it buys is on two axes and the second is the larger.** Eighty-two
+/// launches at about 4 microseconds is 0.35 ms of a step; doubling the output
+/// elements of what remains moves each of them along the rate curve
+/// `whether_a_decode_dispatch_is_short_of_the_machine` measured — a routed
+/// bank's 12288 elements to 24576, a shared bank's 4096 to 8192 — and every
+/// shape a decode step has is on the steep part of it.
+///
+/// **The two banks agree about everything but their bytes, and this is where
+/// that is settled.** [`PackedBank::shape`] describes the call rather than the
+/// weight in eight of its ten fields, so one shape serves both halves and what
+/// the second half needs beside it is where its codes and scales start — see
+/// [`PackedBank::bases`] and the kernel's `Pair`. A pair whose banks disagreed
+/// about the experts, the width in or the width out would be one shape
+/// describing two different calls, which is why those three are refused here.
+#[derive(Debug)]
+pub struct PackedPair<'a> {
+    gate: PackedBank<'a>,
+    up: PackedBank<'a>,
+}
+
+impl<'a> PackedPair<'a> {
+    /// The two halves of one SwiGLU, checked to be each other's.
+    pub fn new(gate: PackedBank<'a>, up: PackedBank<'a>) -> Result<Self, MatmulError> {
+        let pair = |what, got, expected| match got == expected {
+            true => Ok(()),
+            false => Err(MatmulError::MismatchedBanks {
+                what,
+                expected,
+                got,
+            }),
+        };
+        pair("experts of up_proj", up.experts(), gate.experts())?;
+        pair("the width up_proj maps from", up.in_dim(), gate.in_dim())?;
+        pair("the width up_proj maps to", up.out_dim(), gate.out_dim())?;
+        // A fused dispatch runs the gate's pipeline over the up's bytes, so two
+        // banks wrapped against different compilations would be one of them
+        // walked by the other's kernel. Not a shape and so not a
+        // `MismatchedBanks`: every bank of a model is wrapped against the one
+        // `PackedMatmul` its device compiled, and a caller that reached two is
+        // a caller that built the model wrong.
+        assert!(
+            std::ptr::eq(gate.matmul, up.matmul),
+            "a pair's two banks were wrapped against different compilations"
+        );
+        Ok(Self { gate, up })
+    }
+
+    /// The first half, which is what a caller asking a pair its shape asks —
+    /// [`PackedPair::new`] is what says the second answers the same.
+    pub(crate) fn gate(&self) -> &PackedBank<'a> {
+        &self.gate
+    }
+
+    /// Both halves of [`PackedBank::encode`], over rows this side holds.
+    pub fn encode(
+        &self,
+        batch: &mut Batch<'_>,
+        experts: &[u32],
+        x: &[f32],
+    ) -> Result<[Pending; 2], MatmulError> {
+        self.gate.a_row_each(experts, x.len());
+        if experts.is_empty() {
+            return Ok([Pending::empty(), Pending::empty()]);
+        }
+        let _timed = profile::scope(Op::Encode);
+        let mut x = self.gate.device.buffer(x)?;
+        self.listed(batch, experts, &mut x)
+    }
+
+    /// Both halves over rows a dispatch already left on the device, every one of
+    /// them read once per expert `experts` names in turn.
+    ///
+    /// **This is the shared bank's shape, and it is the same gather nobody
+    /// gathered.** Every token goes through every shared expert, so the rows the
+    /// bank runs are the input laid end to end after itself once per expert —
+    /// `[n_shared * tokens, in_dim]` of which every row is already `[tokens,
+    /// in_dim]` somewhere. Read at a modulo it is not laid out at all, and the
+    /// input can be the buffer the router's gate and the routed bank are reading
+    /// in the same command buffer.
+    pub(crate) fn encode_repeating(
+        &self,
+        batch: &mut Batch<'_>,
+        experts: &[u32],
+        x: &mut Buffer<f32>,
+    ) -> Result<[Pending; 2], MatmulError> {
+        let _timed = profile::scope(Op::Encode);
+        self.gate.whole_passes(experts, x.len());
+        self.listed(batch, experts, x)
+    }
+
+    /// Both halves of [`PackedBank::encode_picked`], which is the routed bank's
+    /// shape at a decode step and the one call that is untiled whatever its
+    /// rows.
+    pub(crate) fn encode_picked(
+        &self,
+        batch: &mut Batch<'_>,
+        chosen: &mut Buffer<u32>,
+        x: &mut Buffer<f32>,
+        per_source: usize,
+    ) -> Result<[Pending; 2], MatmulError> {
+        let _timed = profile::scope(Op::Encode);
+        let rows = chosen.len();
+        self.gate.rows_a_source(rows, per_source, x.len());
+        self.fused(batch, rows, per_source, chosen.arg(), x)
+    }
+
+    /// Both halves of [`PackedBank::encode_grouped`], which is **two dispatches
+    /// and stays two**.
+    ///
+    /// A grouped call is a prefill's routed bank: hundreds of rows sorted by
+    /// expert, dispatched through a tile that carries a running sum and an input
+    /// offset per row per column. There is no launch to save that is worth
+    /// noticing beside the walk, and no width to win — a 769-token prefill's
+    /// routed gate is 9.4 million output elements and past the top of the rate
+    /// curve twice over. What a fused tile would cost is registers, on the entry
+    /// where they are already the binding constraint.
+    pub(crate) fn encode_grouped(
+        &self,
+        batch: &mut Batch<'_>,
+        grouped: &mut Grouped,
+        x: &mut Buffer<f32>,
+        per_source: usize,
+    ) -> Result<[Pending; 2], MatmulError> {
+        Ok([
+            self.gate
+                .encode_grouped(batch, grouped, x, per_source, Through::Gathered)?,
+            self.up
+                .encode_grouped(batch, grouped, x, per_source, Through::Gathered)?,
+        ])
+    }
+
+    /// Both halves over an expert list this side holds: one dispatch where the
+    /// call is untiled, and the two the tile has always been where it is not.
+    ///
+    /// **The tiled arm is a prefill's shared bank** — its rows are the input
+    /// laid end to end once per shared expert, so they run long — and the reason
+    /// it is not fused is [`PackedPair::encode_grouped`]'s.
+    fn listed(
+        &self,
+        batch: &mut Batch<'_>,
+        experts: &[u32],
+        x: &mut Buffer<f32>,
+    ) -> Result<[Pending; 2], MatmulError> {
+        // Asked of the gate alone because [`PackedPair::new`] is what says the
+        // two banks hold the same experts.
+        self.gate.holds(experts)?;
+        if experts.is_empty() {
+            return Ok([Pending::empty(), Pending::empty()]);
+        }
+        if let Layout::Tiled = laid_out(experts, self.gate.matmul) {
+            return Ok([
+                self.gate.listed(batch, experts, x)?,
+                self.up.listed(batch, experts, x)?,
+            ]);
+        }
+
+        let mut chosen = self.gate.device.inline(experts)?;
+        self.fused(batch, experts.len(), 1, chosen.arg(), x)
+    }
+
+    /// The dispatch itself: one grid of twice the call's output elements, the
+    /// first half of it against `gate` and the second against `up`.
+    ///
+    /// **What each half declares is what it declared apart.** Both banks read
+    /// the whole input — every output element is a simdgroup that walks one
+    /// weight row against all of it — so the bytes a fused call moves are the
+    /// two calls' summed, and a bandwidth column over this dispatch reads what
+    /// the same column read over the pair it replaces.
+    fn fused(
+        &self,
+        batch: &mut Batch<'_>,
+        rows: usize,
+        per_source: usize,
+        chosen: Arg<'_>,
+        x: &mut Buffer<f32>,
+    ) -> Result<[Pending; 2], MatmulError> {
+        if rows == 0 {
+            return Ok([Pending::empty(), Pending::empty()]);
+        }
+        let device = self.gate.device;
+        let out_dim = self.gate.out_dim;
+        // Both are read out of `resident` and so are built before either bank is
+        // borrowed mutably for the binding below.
+        let fields = self
+            .gate
+            .shape(rows, per_source, self.gate.sources(x.len()), &Layout::Each);
+        let mut shape = device.inline(&fields)?;
+        let bases = self.up.bases();
+        let mut beside = device.inline(&bases)?;
+        let mut gate = self.gate.resident.borrow_mut();
+        let mut up = self.up.resident.borrow_mut();
+        let (gate, up) = (&mut *gate, &mut *up);
+        let mut out = device.zeroed::<f32>(rows * out_dim)?;
+        let mut beside_out = device.zeroed::<f32>(rows * out_dim)?;
+
+        let (kernel, grid) = self.gate.matmul.paired(rows, out_dim);
+        let moves = self.gate.moves(rows, x.len(), &Layout::Each)
+            + self.up.moves(rows, x.len(), &Layout::Each);
+        batch.add(
+            kernel,
+            &[
+                shape.arg(),
+                chosen,
+                x.arg(),
+                gate.codes.arg(),
+                gate.scales.arg(),
+                out.arg(),
+                beside.arg(),
+                up.codes.arg(),
+                up.scales.arg(),
+                beside_out.arg(),
+            ],
+            grid,
+            moves,
+        )?;
+
+        Ok([
+            Pending { out: Some(out) },
+            Pending {
+                out: Some(beside_out),
+            },
+        ])
     }
 }
 
@@ -2075,9 +2397,11 @@ constant uint ROWS_A_TILE = {ROWS_A_TILE};
 constant uint COLS_A_TILE = {COLS_A_TILE};
 constant uint RESIDENCY = {RESIDENCY};
 constant float ELEMENTS[] = {{ {} }};
-{BODY}{}{}",
+{BODY}{}{}{}{}",
         (1u32 << BITS) - 1,
         elements.join(", "),
+        element_entry(ENTRY, false),
+        element_entry(PAIRED_ENTRY, true),
         tiled_entry(TILED_ENTRY, false),
         tiled_entry(GROUPED_ENTRY, true),
     )
@@ -2232,6 +2556,98 @@ struct Shape {
     uint scatters;
 };
 
+/// Where the second half of a pair's weight begins, which is everything the two
+/// banks of one SwiGLU differ in — see `PackedPair`, which is what says the
+/// shape above describes both of them.
+struct Pair {
+    uint code_base;
+    uint scale_base;
+};
+
+/// Where a row of the input the tile's `r`th row multiplies begins.
+inline uint tile_source(constant Shape &shape, uint row) {
+    return ((row / shape.per_source) % shape.sources) * shape.in_dim;
+}
+
+"#;
+
+/// The untiled kernel, which is emitted twice: once against one bank and once
+/// against the two a SwiGLU reads the same rows through.
+///
+/// **Written once and compiled twice**, for the reason [`tiled_entry`] gives.
+/// The two differ in what a simdgroup's element index is taken modulo, and in
+/// nothing else at all — the same walk, the same reduction, the same one output
+/// element a simdgroup. So the paired entry's answer is the plain one's bit for
+/// bit by construction rather than within a tolerance, and
+/// `a_paired_dispatch_answers_what_the_two_dispatches_it_replaces_answer` is
+/// where that is held.
+fn element_entry(entry: &str, paired: bool) -> String {
+    let (beside, picks) = match paired {
+        false => ("", ALONE),
+        true => (BESIDE, BOTH),
+    };
+    substituted(
+        ELEMENT,
+        &[
+            ("__ENTRY__", entry),
+            ("__BESIDE__", beside),
+            ("__PICKS__", picks),
+        ],
+    )
+}
+
+/// `walk` with each placeholder replaced by what it stands for.
+///
+/// Each substitution replaces every occurrence, so what keeps them from reaching
+/// into each other is that none of them writes a placeholder — which is a
+/// property of the values rather than of the mechanism, and so is asserted
+/// rather than read off them.
+fn substituted(walk: &str, written: &[(&str, &str)]) -> String {
+    assert!(
+        !written.iter().any(|(_, value)| value.contains("__")),
+        "a substitution that writes a placeholder would be substituted again"
+    );
+    written
+        .iter()
+        .fold(walk.to_string(), |walk, (placeholder, value)| {
+            walk.replace(placeholder, value)
+        })
+}
+
+/// The four bindings the second half of a pair arrives in, which the entry that
+/// runs one bank is handed none of.
+const BESIDE: &str = "
+    constant Pair &beside [[buffer(6)]],
+    device const uchar *beside_codes [[buffer(7)]],
+    device const uchar *beside_scales [[buffer(8)]],
+    device float *beside_out [[buffer(9)]],";
+
+/// Which weight a simdgroup of the plain entry walks, which is the only one it
+/// was given.
+const ALONE: &str = "    const uint index = element;
+    device const uchar *packed = codes;
+    device const uchar *scaled = scales;
+    device float *written = out;
+    const uint code_base = shape.code_base;
+    const uint scale_base = shape.scale_base;";
+
+/// Which of a pair's two weights a simdgroup walks, which is the first for the
+/// call's own elements and the second for the elements after them.
+///
+/// **A simdgroup is one output element, so this is uniform across every lane of
+/// one** and costs no divergence: the whole simdgroup takes one side of it,
+/// and which side is a comparison against a value the dispatch's shape fixes.
+const BOTH: &str = "    const bool second = element >= elements;
+    const uint index = element - (second ? elements : 0);
+    device const uchar *packed = second ? beside_codes : codes;
+    device const uchar *scaled = second ? beside_scales : scales;
+    device float *written = second ? beside_out : out;
+    const uint code_base = second ? beside.code_base : shape.code_base;
+    const uint scale_base = second ? beside.scale_base : shape.scale_base;";
+
+/// The untiled kernel with the three expressions [`element_entry`] decides
+/// written as placeholders.
+const ELEMENT: &str = r#"
 /// `out[i] = x[(i / per_source) % sources] @ w[experts[i]]^T` over an
 /// `[experts, out_dim, in_dim]` bank.
 ///
@@ -2250,31 +2666,41 @@ struct Shape {
 ///
 /// A dispatch whose rows are its own input's takes `per_source` of 1 and
 /// `sources` of `rows`, which makes the divide and the modulo both the identity.
-kernel void packed_matmul(
+///
+/// **`packed_matmul_pair` is the same call against two banks**, which is what a
+/// SwiGLU's gate and up are to each other: they read the same rows of the same
+/// input through the same expert list against different weights, so one grid of
+/// twice the output elements computes both and the second half of it is the
+/// first half's element index over again. Nothing about a lane's walk moves —
+/// which weight it walks is decided once, above the loop, out of an index a
+/// simdgroup shares.
+kernel void __ENTRY__(
     constant Shape &shape [[buffer(0)]],
     device const uint *experts [[buffer(1)]],
     device const float *x [[buffer(2)]],
     device const uchar *codes [[buffer(3)]],
     device const uchar *scales [[buffer(4)]],
-    device float *out [[buffer(5)]],
+    device float *out [[buffer(5)]],__BESIDE__
     uint position [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint width [[threads_per_simdgroup]]
 ) {
     const uint element = position / width;
-    if (element >= shape.rows * shape.out_dim) {
+    const uint elements = shape.rows * shape.out_dim;
+__PICKS__
+    if (index >= elements) {
         return;
     }
 
-    const uint row = element / shape.out_dim;
-    const uint col = element % shape.out_dim;
+    const uint row = index / shape.out_dim;
+    const uint col = index % shape.out_dim;
     const uint expert = experts[row];
     const uint source = (row / shape.per_source) % shape.sources;
     const uint bytes = shape.in_dim / CODES_PER_BYTE;
 
     float sum = weight_dot(
-        codes + shape.code_base + (ulong)expert * shape.code_stride + (ulong)col * bytes,
-        scales + shape.scale_base + (ulong)expert * shape.scale_stride
+        packed + code_base + (ulong)expert * shape.code_stride + (ulong)col * bytes,
+        scaled + scale_base + (ulong)expert * shape.scale_stride
             + (ulong)col * (bytes / BYTES_PER_GROUP),
         x + (ulong)source * shape.in_dim,
         bytes,
@@ -2284,15 +2710,9 @@ kernel void packed_matmul(
 
     sum = simd_sum(sum);
     if (lane == 0) {
-        out[element] = sum;
+        written[index] = sum;
     }
 }
-
-/// Where a row of the input the tile's `r`th row multiplies begins.
-inline uint tile_source(constant Shape &shape, uint row) {
-    return ((row / shape.per_source) % shape.sources) * shape.in_dim;
-}
-
 "#;
 
 /// The tiled kernel, which is emitted twice: once over the rows as the caller
@@ -2344,19 +2764,15 @@ fn over_the_rows(walk: &str, entry: &str, grouped: bool) -> String {
             "shape.scatters ? order[row] : row",
         ),
     };
-    // Each substitution replaces every occurrence, so what keeps the four from
-    // reaching into each other is that none of them writes a placeholder — which
-    // is a property of these four values rather than of the mechanism, and so is
-    // asserted rather than read off them.
-    let written = [entry, order, reads, writes];
-    assert!(
-        !written.iter().any(|value| value.contains("__")),
-        "a substitution that writes a placeholder would be substituted again"
-    );
-    walk.replace("__ENTRY__", entry)
-        .replace("__ORDER__", order)
-        .replace("__READS__", reads)
-        .replace("__WRITES__", writes)
+    substituted(
+        walk,
+        &[
+            ("__ENTRY__", entry),
+            ("__ORDER__", order),
+            ("__READS__", reads),
+            ("__WRITES__", writes),
+        ],
+    )
 }
 
 /// The tiled kernel with the three expressions [`tiled_entry`] decides written
@@ -4781,6 +5197,156 @@ kernel void decoded_elements(
         );
     }
 
+    /// **A fused pair answers what the two dispatches it replaces answered, bit
+    /// for bit**, at each of the three layouts a pair is dispatched in.
+    ///
+    /// This is the claim the fusion rests on and it is the same shape of claim
+    /// `a_tiled_dispatch_answers_row_for_row_what_the_untiled_one_answers`
+    /// makes: an output element is still one simdgroup's `simd_sum` over lanes
+    /// that still walk one weight row in the same chunks from the same byte in
+    /// the same stride. What moved is which weight the walk is pointed at, which
+    /// is decided once above the loop. So a tolerance here would be hiding the
+    /// one mistake this can make — pointing half the grid at the wrong bank —
+    /// and the check is exact.
+    ///
+    /// **Two banks that differ, because against one weight read twice every
+    /// arm agrees.** The two cases are seeded apart and the case asserts they
+    /// disagree before it compares anything.
+    ///
+    /// **The picked layout is the one a decode step takes** — a token's `TOP_K`
+    /// slots naming different experts, which no tile reaches — and the repeating
+    /// one is the shared bank's. The third arm is the grouped layout, which is
+    /// two dispatches by construction and is here so that the pair's answer is
+    /// held at the layout it does *not* fuse as well as at the two it does.
+    #[test]
+    fn a_paired_dispatch_answers_what_the_two_dispatches_it_replaces_answer() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const EXPERTS: usize = 3;
+        const ROWS: usize = TOKENS * TOP_K;
+
+        let upload = |case: &Case| {
+            PackedBank::upload(
+                &device,
+                &matmul,
+                EXPERTS,
+                IN_DIM,
+                OUT_DIM,
+                &case.packed(),
+                &case.scales,
+            )
+            .expect("the bank's shapes pair")
+        };
+        let gate_case = Case::seeded(0x9a1e_0001, IN_DIM, EXPERTS * OUT_DIM, ROWS);
+        let up_case = Case::seeded(0x9a1e_0002, IN_DIM, EXPERTS * OUT_DIM, ROWS);
+        let pair =
+            PackedPair::new(upload(&gate_case), upload(&up_case)).expect("the pair's shapes pair");
+        let (gate, up) = (upload(&gate_case), upload(&up_case));
+
+        let alone = |bank: &PackedBank<'_>, chosen: &[u32], x: &[f32], per_source: usize| {
+            let mut selection = device.buffer(chosen).expect("the selection uploads");
+            let mut x = device.buffer(x).expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let pending = bank
+                .encode_picked(&mut batch, &mut selection, &mut x, per_source)
+                .expect("the dispatch encodes");
+            batch.wait().expect("the dispatch completes");
+            pending.take()
+        };
+        let together = |chosen: &[u32], x: &[f32], per_source: usize| {
+            let mut selection = device.buffer(chosen).expect("the selection uploads");
+            let mut x = device.buffer(x).expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let pending = pair
+                .encode_picked(&mut batch, &mut selection, &mut x, per_source)
+                .expect("the dispatch encodes");
+            batch.wait().expect("the dispatch completes");
+            pending.map(Pending::take)
+        };
+
+        // The routed bank's layout: a token's row read once per slot, the slots
+        // naming different experts.
+        let chosen = routing(EXPERTS);
+        assert!(
+            !tiles(&chosen, ROWS_A_TILE),
+            "a routing a tile could reach is not the layout a decode step has"
+        );
+        let tokens = &gate_case.x[..TOKENS * IN_DIM];
+        let [fused_gate, fused_up] = together(&chosen, tokens, TOP_K);
+        let want_gate = alone(&gate, &chosen, tokens, TOP_K);
+        let want_up = alone(&up, &chosen, tokens, TOP_K);
+        assert_ne!(
+            want_gate, want_up,
+            "two banks that agreed would prove nothing"
+        );
+        assert_eq!(fused_gate, want_gate, "the pair's first half");
+        assert_eq!(fused_up, want_up, "the pair's second half");
+        assert_eq!(fused_gate.len(), ROWS * OUT_DIM);
+
+        // The shared bank's layout: every row of the input read once per expert
+        // in turn, which is what the modulo is for. Short enough that no run
+        // reaches a tile, which is what keeps this the arm that fuses — a
+        // decode step's shared bank is one token through two experts, so its
+        // runs are one row.
+        const REPEATED_TOKENS: usize = ROWS_A_TILE - 1;
+        let repeated: Vec<u32> = (0..EXPERTS * REPEATED_TOKENS)
+            .map(|row| (row / REPEATED_TOKENS) as u32)
+            .collect();
+        assert!(
+            !tiles(&repeated, ROWS_A_TILE),
+            "a repeat a tile could reach is not the arm that fuses"
+        );
+        let repeated_x = &gate_case.x[..REPEATED_TOKENS * IN_DIM];
+        let repeat_alone = |bank: &PackedBank<'_>| {
+            let mut x = device.buffer(repeated_x).expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let pending = bank
+                .encode_repeating(&mut batch, &repeated, &mut x)
+                .expect("the dispatch encodes");
+            batch.wait().expect("the dispatch completes");
+            pending.take()
+        };
+        let mut x = device.buffer(repeated_x).expect("the rows upload");
+        let mut batch = device.batch().expect("a command buffer opens");
+        let fused = pair
+            .encode_repeating(&mut batch, &repeated, &mut x)
+            .expect("the dispatch encodes");
+        batch.wait().expect("the dispatch completes");
+        let [fused_gate, fused_up] = fused.map(Pending::take);
+        assert_eq!(fused_gate, repeat_alone(&gate), "the repeated gate");
+        assert_eq!(fused_up, repeat_alone(&up), "the repeated up");
+        assert_eq!(fused_gate.len(), EXPERTS * REPEATED_TOKENS * OUT_DIM);
+
+        // And the layout the pair does not fuse, which still has to answer the
+        // same two tensors.
+        let mut selection = device.buffer(&chosen).expect("the selection uploads");
+        let mut x = device.buffer(tokens).expect("the rows upload");
+        let mut batch = device.batch().expect("a command buffer opens");
+        let mut sorted = grouping
+            .encode(&mut batch, &mut selection, EXPERTS)
+            .expect("the grouping encodes");
+        let grouped = pair
+            .encode_grouped(&mut batch, &mut sorted, &mut x, TOP_K)
+            .expect("the dispatches encode");
+        batch.wait().expect("the dispatches complete");
+        let [grouped_gate, grouped_up] = grouped.map(Pending::take);
+        let order = grouping
+            .group(&device, &chosen, EXPERTS)
+            .expect("the dispatch completes")
+            .0;
+        let row = |rows: &[f32], i: usize| rows[i * OUT_DIM..][..OUT_DIM].to_vec();
+        for (at, from) in order.iter().enumerate() {
+            let from = *from as usize;
+            assert_eq!(
+                row(&grouped_gate, at),
+                row(&want_gate, from),
+                "gate row {at}"
+            );
+            assert_eq!(row(&grouped_up, at), row(&want_up, from), "up row {at}");
+        }
+    }
+
     /// The one argument a real call sends past the inline threshold.
     ///
     /// A shape is a few dozen bytes and always travels in the command buffer;
@@ -7090,15 +7656,22 @@ kernel void decoded_elements(
             // every element of every call walks expert zero's first row, so the
             // whole weight working set is one 2 KB row and its scales. `* 0u`
             // rather than a constant, so nothing the kernel computed goes unused.
+            //
+            // **Both emissions of the walk are mutated and only one is
+            // dispatched here.** The untiled entry and the paired one are one
+            // template — see [`element_entry`] — so the text below occurs twice
+            // and `instead_of` writes both; what this table times is the
+            // untiled arm, and a paired dispatch it never makes would have been
+            // mutated the same way.
             (
                 "the weight's traffic",
                 crate::testing::instead_of(
                     &shipped,
-                    "        codes + shape.code_base + (ulong)expert * shape.code_stride + \
-                     (ulong)col * bytes,\n        scales + shape.scale_base + (ulong)expert * \
+                    "        packed + code_base + (ulong)expert * shape.code_stride + \
+                     (ulong)col * bytes,\n        scaled + scale_base + (ulong)expert * \
                      shape.scale_stride\n            + (ulong)col * (bytes / BYTES_PER_GROUP),",
-                    "        codes + shape.code_base + (ulong)(expert * 0u) * shape.code_stride + \
-                     (ulong)(col * 0u) * bytes,\n        scales + shape.scale_base + (ulong)(expert \
+                    "        packed + code_base + (ulong)(expert * 0u) * shape.code_stride + \
+                     (ulong)(col * 0u) * bytes,\n        scaled + scale_base + (ulong)(expert \
                      * 0u) * shape.scale_stride\n            + (ulong)(col * 0u) * (bytes / \
                      BYTES_PER_GROUP),",
                 ),
