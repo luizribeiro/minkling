@@ -5666,6 +5666,183 @@ kernel void decoded_elements(
         );
     }
 
+    /// **Whether a decode dispatch is short of the machine**, which is the
+    /// hypothesis on record for this kernel and has never been measured.
+    ///
+    /// K2 left it in one line — "the laggards are dispatches with 1024–4096
+    /// output elements, too few to fill 80 cores" — and every shape a decode step
+    /// has is in or near that range. An output element is one simdgroup and a
+    /// threadgroup is [`THREADS_PER_GROUP`] threads, so 1024 elements is 128
+    /// threadgroups on a part with 80 cores and 4096 is 512.
+    ///
+    /// The same one-row call at every width from a quarter of that to fifty times
+    /// it, so the curve says whether what a narrow dispatch is short of is
+    /// threadgroups. **If the rate climbs with the width and keeps climbing, the
+    /// kernel wants more of the machine; if it flattens well under the bus, what
+    /// bounds it is inside a simdgroup and no amount of them helps.**
+    ///
+    /// Nothing asserts a rate. What is asserted is that the widths span the ones
+    /// a decode step actually dispatches.
+    ///
+    /// **Warm and swept both ways**, because a row ordered by how much work it
+    /// does is exactly the row a clock ramp draws by itself — see
+    /// [`crate::testing::warmed`], which is on record for a 1.7× effect that was
+    /// entirely the clock. The two passes are printed beside each other so that
+    /// an arm which reads differently up the list and down it says so.
+    ///
+    /// **The narrow arms are flattered and the wide ones are not**, which is the
+    /// direction that makes the reading safe: four dispatches share a command
+    /// buffer, so a 512-column weight is 1 MB read four times out of cache where
+    /// a 65536-column one is 143 MB and cannot be.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn whether_a_decode_dispatch_is_short_of_the_machine() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const WIDTHS: [usize; 9] = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+
+        for width in [1024, 2048, 4096] {
+            assert!(
+                WIDTHS.contains(&width),
+                "{width} is a width a decode step dispatches and is not swept"
+            );
+        }
+        let shapes: Vec<Blocked> = WIDTHS
+            .iter()
+            .map(|&out_dim| Blocked::of("", 1, IN_DIM, out_dim, 1, false))
+            .collect();
+        let arms: Vec<usize> = (0..WIDTHS.len()).collect();
+        let cost = |at: usize| shapes[at].costs(&device, &matmul, &grouping);
+        crate::testing::warmed(|| {
+            cost(arms.len() / 2);
+        });
+        let (up, down) = crate::testing::both_ways(&arms, cost);
+
+        eprintln!(
+            "  {:>10}{:>14}{:>10}{:>10}{:>11}{:>8}{:>10}",
+            "elements", "threadgroups", "weight", "a call", "achieved", "of bus", "the other way"
+        );
+        for (at, out_dim) in WIDTHS.into_iter().enumerate() {
+            let codes = out_dim * IN_DIM;
+            let moved = packed_bytes(codes);
+            let achieved = moved / up[at].as_secs_f64();
+            eprintln!(
+                "  {out_dim:>10}{:>14}{:>10}{:>10}{:>11}{:>8}{:>10}",
+                out_dim * NARROWEST_SIMD / THREADS_PER_GROUP,
+                format!("{:.1} MB", moved / 1e6),
+                format!("{:.0}µs", 1e6 * up[at].as_secs_f64()),
+                format!("{:.0} GB/s", achieved / 1e9),
+                format!("{:.0}%", 1e2 * achieved / MEMORY_BANDWIDTH),
+                format!("{:.0} GB/s", moved / down[at].as_secs_f64() / 1e9),
+            );
+        }
+    }
+
+    /// **What a decode dispatch's fixed cost is made of**, which is the length of
+    /// one output element's own walk.
+    ///
+    /// The width sweep fits to a constant plus the bytes at the bus, and a
+    /// constant that is really one simdgroup's *latency* would grow with how far
+    /// that simdgroup has to walk — a lane covers [`BYTES_PER_LANE`] bytes a step
+    /// and a simdgroup covers 32 of those, so a reduction of `in_dim` is
+    /// `in_dim / 256` steps whatever the call's width. Sweeping the reduction at a
+    /// fixed width is what says whether the constant is a launch or a walk.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_decode_dispatchs_fixed_cost_is_made_of() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const REDUCTIONS: [usize; 6] = [512, 1024, 2048, 4096, 8192, 16384];
+        const OUT_DIM: usize = 1024;
+
+        let shapes: Vec<Blocked> = REDUCTIONS
+            .iter()
+            .map(|&in_dim| Blocked::of("", 1, in_dim, OUT_DIM, 1, false))
+            .collect();
+        let arms: Vec<usize> = (0..REDUCTIONS.len()).collect();
+        let cost = |at: usize| shapes[at].costs(&device, &matmul, &grouping);
+        crate::testing::warmed(|| {
+            cost(arms.len() / 2);
+        });
+        let (up, down) = crate::testing::both_ways(&arms, cost);
+
+        eprintln!(
+            "  {:>10}{:>8}{:>10}{:>10}{:>12}{:>10}{:>14}",
+            "reduction", "steps", "weight", "a call", "at the bus", "the rest", "the other way"
+        );
+        for (at, in_dim) in REDUCTIONS.into_iter().enumerate() {
+            let codes = OUT_DIM * in_dim;
+            let moved = packed_bytes(codes);
+            let compulsory = moved / MEMORY_BANDWIDTH;
+            eprintln!(
+                "  {in_dim:>10}{:>8}{:>10}{:>10}{:>12}{:>10}{:>14}",
+                in_dim / (NARROWEST_SIMD * BYTES_PER_LANE * CODES_PER_BYTE),
+                format!("{:.1} MB", moved / 1e6),
+                format!("{:.1}µs", 1e6 * up[at].as_secs_f64()),
+                format!("{:.1}µs", 1e6 * compulsory),
+                format!("{:.1}µs", 1e6 * (up[at].as_secs_f64() - compulsory)),
+                format!("{:.1}µs", 1e6 * down[at].as_secs_f64()),
+            );
+        }
+    }
+
+    /// **What a decode-shaped dispatch costs beside more of its own kind**,
+    /// which is what says whether the fixed cost the sweep above finds is the
+    /// dispatch's or the command buffer's.
+    ///
+    /// [`whether_a_decode_dispatch_is_short_of_the_machine`] fits to a fixed cost
+    /// plus the bytes at the bus, and [`crate::testing::device_time`] divides one
+    /// command buffer's device clock by the dispatches in it — so a cost that is
+    /// really the *buffer's* would arrive divided by that many and read as a
+    /// per-dispatch constant. Sweeping how many dispatches share a buffer
+    /// separates them: a per-buffer cost falls like `1/calls` and a per-dispatch
+    /// one does not move.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_decode_dispatch_costs_beside_more_of_its_own_kind() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        const CALLS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+        // `k_proj` and `v_proj` at a decode step, which are 168 of the 457 calls
+        // a step makes. `r_proj` is narrower at 512 elements and carries a
+        // twentieth of the bytes; this is the narrow shape a step is actually
+        // made of.
+        const OUT_DIM: usize = 1024;
+
+        let case = Case::seeded(1, IN_DIM, OUT_DIM, 1);
+        let projection = case.upload(&device, &matmul);
+        let mut x = device.buffer(&case.x).expect("the rows upload");
+        let codes = OUT_DIM * IN_DIM;
+        let moved = packed_bytes(codes);
+
+        let mut cost = |calls: usize| {
+            crate::testing::device_time(&device, calls, |batch| {
+                projection
+                    .encode_over(batch, &mut x)
+                    .expect("the dispatch encodes");
+            })
+        };
+        crate::testing::warmed(|| {
+            cost(16);
+        });
+        let (up, down) = crate::testing::both_ways(&CALLS, cost);
+
+        eprintln!(
+            "  {:>8}{:>12}{:>12}{:>12}",
+            "a buffer", "a dispatch", "achieved", "the other way"
+        );
+        for (at, calls) in CALLS.into_iter().enumerate() {
+            eprintln!(
+                "  {calls:>8}{:>12}{:>12}{:>12}",
+                format!("{:.1}µs", 1e6 * up[at].as_secs_f64()),
+                format!("{:.0} GB/s", moved / up[at].as_secs_f64() / 1e9),
+                format!("{:.1}µs", 1e6 * down[at].as_secs_f64()),
+            );
+        }
+    }
+
     /// **Whether the tile height still turns at four once the bank is too big to
     /// cache**, which is the one thing [`ROWS_A_TILE`]'s own sweep could not ask.
     ///
