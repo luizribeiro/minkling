@@ -1735,6 +1735,106 @@ fn which_kernels_own_a_decode_step_at_each_context() {
     }
 }
 
+/// **What the step after a prefill is paying for**, which every decode figure in
+/// this file takes out and none of them has ever priced.
+///
+/// [`Asked::settle`] discards it and says in one line what it is; the
+/// cross-engine table records it at 736 and 783 ms and loses two rows of its
+/// mean to it. **A user waits for it either way**, so what it is made of decides
+/// whether it can be moved off the path a token is on — and a sentence in a doc
+/// comment is not a measurement.
+///
+/// **What it is not is work.** It dispatches what the step behind it dispatches,
+/// submits what it submits and allocates what it allocates — the first table
+/// below is those three columns beside the wall — and the device executes for
+/// 19 ms of the 845. It is not a compilation either: every pipeline this engine
+/// has was created before the prefill ran.
+///
+/// **What it is, is scheduling.** The round-trip table divides a submission into
+/// what the driver took to turn a committed buffer into work the GPU can start,
+/// what it then spent queued, and what it executed for — and at a 769-token
+/// prompt the twelve middle submissions of this one step are **741 ms
+/// scheduled against 19 ms executed**, where the same twelve of the step behind
+/// it are 1.9 ms scheduled. Making a step's buffers ready to run is what costs,
+/// and a long prefill is what leaves them needing it.
+///
+/// **It is a threshold and not a slope**, which is the second table's finding
+/// and the reason the cross-engine figures at 385 and 769 tokens are so nearly
+/// equal: what the step pays for is the step's own residency being re-taken,
+/// and that is the model's size rather than the prompt's.
+///
+/// **`settle` is zero here**, which is what makes this the one case in the file
+/// that sees the step. Nothing else does and nothing else should.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn what_the_step_after_a_prefill_is_paying_for() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    eprintln!(
+        "{:>8}{:>10}{:>11}{:>10}{:>10}{:>12}",
+        "context", "prefill", "step 1", "step 2", "step 3", "allocated"
+    );
+    for prompt in DEFERRED_CONTEXTS {
+        let run = OnTheDevice::running(
+            &dir,
+            &device,
+            Asked {
+                prompt: Some(prompt),
+                generated: 1 + STEPS_AFTER_A_PREFILL,
+                settle: 0,
+                sampling: false,
+            },
+        );
+        let (.., bytes) = since(run.submitted[0], run.submitted[1]);
+        eprintln!(
+            "{prompt:>8}{:>10}{:>11}{:>10}{:>10}{:>12}",
+            format!("{:.2?}", run.steps[0]),
+            format!("{:.2?}", run.steps[1]),
+            format!("{:.2?}", run.steps[2]),
+            format!("{:.2?}", run.steps[3]),
+            format!("{:.0} MiB", bytes as f64 / (1u64 << 20) as f64),
+        );
+
+        // **The step after a prefill is not a decode step, and this is the shape
+        // of that rather than its duration.** What it dispatches is what the
+        // step after it dispatches, so nothing it does is extra work — which is
+        // what makes the duration a question about waiting.
+        let (dispatches, ..) = since(run.submitted[1], run.submitted[2]);
+        let (after, ..) = since(run.submitted[2], run.submitted[3]);
+        assert_eq!(
+            dispatches, after,
+            "the step after a {prompt}-token prefill dispatched more than the step after it"
+        );
+    }
+
+    // The step alone, so that the profile and the trips describe it rather than
+    // a mean over it and the steps that are not paying for anything: one
+    // prefill, one decode step, nothing to divide the account by.
+    let alone = OnTheDevice::running(
+        &dir,
+        &device,
+        Asked {
+            prompt: Some(*DEFERRED_CONTEXTS.last().expect("the sweep has a longest")),
+            generated: 2,
+            settle: 0,
+            sampling: false,
+        },
+    );
+    eprintln!("{}", step_table(&alone.measured()));
+    eprintln!("{}", round_trip_table(&alone.measured()));
+}
+
+/// The prompts the deferred step is looked for at, which straddle the length it
+/// appears at: 97 tokens is the cross-engine table's shortest and has no such
+/// step, and the two longest are where it records 736 and 783 ms.
+const DEFERRED_CONTEXTS: [usize; 5] = [97, 193, 385, 769, 1537];
+
+/// Steps a generation runs past its prefill where the question is which of them
+/// is slow, which is three: the one that pays for the prefill, and two behind it
+/// to say what a step costs when nothing is paying for anything.
+const STEPS_AFTER_A_PREFILL: usize = 3;
+
 /// The contexts a decode step is priced at once the workload is a coding one.
 ///
 /// **Every decode figure this repo has ever taken tops out at 769 tokens** —
