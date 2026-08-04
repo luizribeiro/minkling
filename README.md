@@ -1169,6 +1169,14 @@ pair rather than what a prefill costs today — the prefill section above is.
 
 ## Against the reference, end to end
 
+**This is A2's sitting and it has been re-taken** — see "One clean cross-engine
+sitting", which is seven pairs at `42effa1` with all twenty-four readings claims
+where this one had two that were not. **The reference's four wall times agree
+across the three milestones to 0.5%** and ours are what A5 and A8 left, so what
+this section has right is everything about the shape and what it has stale is
+this engine's own column. It is kept as taken because the diagnosis under it was
+made against these rows.
+
 **This file had no defensible headline figure and that was a real gap.** Prefill
 was last measured against the reference two milestones ago; the decode figure
 quoted against it dated from before the run was pipelined, while our own number
@@ -1315,12 +1323,29 @@ discontinuity between 769 and 2048 with a plateau after it. **So flat to 769 was
 never an existence proof of flat at 8k**, and the thing it was being used to
 prove is one this engine now does better than the proof.
 
+**The reference's five long rows do not reproduce and this paragraph is
+withdrawn** — see "The reference's decode step, which is the figure that did not
+survive". Re-run on the same script, the same pinned mlx-vlm and the same default
+contexts, it reads 26.33 at 2048 and 43.01 at 32768 against the 77.85 and 91.27
+above, with the peak column identical to the digit at all eight rows. **There is
+no step and there is no plateau**; the reference is a shallow slope the whole way
+and always was.
+
 **This engine is ahead at every context measured**, where before the split it
 lost 385 and 769 and won the rest. It is 2.7× ahead at 8192 and its own row grew
 by 8.7 ms across an 84-fold context where it used to grow by 45. Both columns are
 one sitting apiece and neither is paired — what makes them readable is that the
 effects are 2× to 6× and this host drifts 1.7%. The eight-token figures under
 "Sampling on the device" are what is paired, and they are what moved least.
+
+**The 2.7× is withdrawn with the row it divides by, and the figure is 1.01×.**
+Our own column reproduces to a tenth of a millisecond at every context, so what
+this cost is the reference's arm and nothing about this engine — and the lead
+that is left runs 1.17× at 97 keys to 0.98× at 32768. **This is the fourth figure
+in this file not to survive being questioned and the first whose other half was
+another engine.** The sentence above about the effects being "2× to 6×" against a
+1.7% drift is exactly the reasoning that let it stand unpaired, and the effect it
+was protecting was not the engine's.
 
 **Linear, and the slope is the number to carry.** Ours is 19.99 ms at 97 keys
 and 28.65 at 8192, which is **1.07 µs a token of context** where before it was
@@ -1331,6 +1356,13 @@ out, that is about 55 ms a token at 32768 and 130 at 100k, against a reference
 measured at 91 ms at 32768. **Those two are arithmetic and are labelled as such**;
 what is measured stops at 8192, and what stopped it is that a prefill to 16384
 costs five minutes here and to 32768 fourteen.
+
+**Both ends of that comparison have since been measured and both were wrong.**
+Ours reads 33.92 and 43.74 ms of device time at 16384 and 32768 against the 55 ms
+the extrapolation put at 32768, so the line over-predicts; the reference reads
+43.01 at 32768 against the 91 quoted here. The extrapolation being 26% high and
+the figure it was held against being 2.1× high happened to cancel into the right
+sign, which is the argument for measuring the two rather than carrying either.
 
 **That last sentence is wrong and "Where a prefill's time goes as the prompt
 grows" below is where it is measured.** A prefill of 16384 tokens costs 133.63
@@ -1391,6 +1423,13 @@ lengths, which is 180.9 to 149.6 tokens a second and ×4.26 to ×3.19. It is kep
 here because everything the rest of this section diagnoses was diagnosed against
 it, and a table whose rows moved under the diagnosis that used them would be two
 sittings spliced.
+
+**Both columns have since been taken in one sitting and the reference's is
+unchanged** — 2.66, 5.62, 13.05 and 34.37 s against the 2.66, 5.61, 13.05 and
+34.31 above, which is the arm four milestones declined to re-measure being right
+to re-measure once. **The production path at 16384 is 33.12 s against that
+34.37**; see "What a prefill costs against the reference, both numerics, one
+sitting", which is where the four lengths are read under both words.
 
 The 769 row is the cross-engine table's, kept for continuity; the four below it
 are new. Ours is time to first token and the reference's is its transformer
@@ -3582,6 +3621,176 @@ working tree by test code alone:
 **A null pair reading no claim is what says the instrument is not inventing
 effects**, and it is the control this file has never printed. Whatever A8's host
 was in, it is not this one; nothing here diagnoses it either.
+
+### One clean cross-engine sitting, which is the column three milestones deferred
+
+**A2 took the cross-engine table and A4, A5, A7 and A8 all declined to re-take
+it**, each for the same defensible reason — nothing they changed reaches
+mlx-vlm — and the effect was that a column deciding the sign of a comparison
+went three milestones without being read. **The reference's arm was wrong about
+one row by a factor of three and nobody could have known**, because nobody
+looked.
+
+**Seven pairs, one sitting, the order flipped each pair**, on the packed heads,
+this engine at its default numerics: `just checkpoint=models/Inkling-Small-mxfp4-mtp4
+bench-engines`. **All twenty-four readings are claims** — every pair the same way
+with the ranges apart — where A2's sitting had two that were not.
+
+    prompt × generated    ours k = 0   ours k = 2    mlx-vlm    k = 2 against it
+     97 × 128                3.030 s      2.549 s    3.210 s          1.26× ahead
+    385 × 128                5.880 s      5.647 s    3.675 s          0.65×
+    769 × 128                8.419 s      8.225 s    4.189 s          0.51×
+     97 × 512               10.923 s      8.474 s   12.193 s          1.44× ahead
+
+**The reference did not move and that is now measured rather than assumed**:
+3.210 against A2's 3.209, 3.675 against 3.673, 4.189 against 4.186 and 12.193
+against 12.131 — four wall times three milestones apart, agreeing to 0.5%. So
+every milestone that declined to re-measure this arm was right about the arm, and
+the cost of being right about it is in the decode section below.
+
+**The crossover moved in and the sign of every row is A2's.** At 97 tokens
+speculating two deep we start 262 ms behind at the first token and take 7.27 ms
+less per token after it, so the wall times cross at **about 36 generated
+tokens** where A2 read 49; the `97 × 512` row puts it at 35 the same way. At 385
+and 769 there is still no crossover at any depth, for A2's reason — our decode
+step at those contexts is slower than the reference's, so every token widens the
+gap.
+
+**The prefill and the decode step out of the same seven pairs:**
+
+    tokens        ours    mlx-vlm     gap      context   ours k=0  ours k=2  mlx-vlm
+       97       541 ms     283 ms   ×1.91          97      19.60     15.78    23.05
+      385      2481 ms     706 ms   ×3.51         385      26.76     24.33    23.38
+      769      4858 ms    1170 ms   ×4.15         769      28.05     27.04    23.78
+                                              97 → 609      20.32     15.50    23.31
+
+A2 read ×1.98, ×3.87 and ×4.61 on the left; the reference's three figures are
+within 0.4% of A2's and ours are what A5 and A8 left.
+
+### What a prefill costs against the reference, both numerics, one sitting
+
+**The long prefill is where this engine's last two milestones went and it had
+never been weighed against a reference column taken in the same sitting.** Ours
+one sitting a length, warm, `bench prefill`; the reference's
+`just prefill-bench` in the same sitting. Not paired — the effects are decades
+and this host drifts 1.7%, which is the standard the four-length table has always
+been taken to:
+
+    tokens    ours reference   ours production    mlx-vlm    production against it
+     2048          11.206 s          5.563 s      2.66 s                  ×2.09
+     4096          21.962 s          9.374 s      5.62 s                  ×1.67
+     8192          45.685 s         17.145 s     13.05 s                  ×1.31
+    16384         108.989 s         33.120 s     34.37 s          **×0.96 ahead**
+
+The device's own clock under each: 9.126, 18.935, 40.753 and 100.371 s on the
+reference path, and 3.385, 6.257, 12.174 and 24.600 on the production one.
+
+**At 16384 tokens the production path is ahead of mlx-vlm, and this is the first
+sitting in this file entitled to say so.** A8 reported 33.33 s against a
+reference column of 34.31 that was A2's and flagged it as the first thing to
+re-take; re-taken, the reference reads 34.37 s and the claim survives with the
+sign it was reported at. **It is one sitting a length and not a paired one**, and
+4% is inside what a paired sitting exists to settle — so what this says is that
+the two are level at 16384 and that the direction is ours, not that a 4% win is
+established.
+
+**Ours reproduces both of the last two milestones' rows**: 11.21, 21.96, 45.68
+and 108.99 s against A5's 11.32, 22.56, 46.77 and 109.51 on the reference path,
+and 33.12 against A8's 33.33 at 16384 on the production one. **The reference
+reproduces A2's to the hundredth** — 2.66, 5.62, 13.05 and 34.37 against 2.66,
+5.61, 13.05 and 34.31.
+
+**The gap closes with length on the production path and opens with it on the
+reference one**, which is the whole of what the flag is now worth: ×2.09 to ×0.96
+across an eightfold prompt, against ×4.21 to ×3.17 on the default path in the
+same rows.
+
+### The reference's decode step, which is the figure that did not survive
+
+**"The reference takes a threefold step at 2048 and plateaus near 78 ms" does not
+reproduce, and it is the largest correction this milestone makes.** Same script,
+same default context list, same pinned mlx-vlm — `reference/uv.lock` has not
+changed since the sitting that recorded it — and the peak-memory column comes
+back **identical to the digit at all eight contexts**, which is what says the two
+runs did the same work:
+
+    context     recorded    now     peak recorded    peak now
+       97          23.58   23.38        130.99 GiB   130.99 GiB
+      385          23.67   23.88        131.94 GiB   131.94 GiB
+      769          24.52   24.86        132.97 GiB   132.97 GiB
+     2048          77.85   26.33        135.86 GiB   135.86 GiB
+     4096          74.93   26.68        136.70 GiB   136.64 GiB
+     8192          78.70   29.03        138.60 GiB   138.60 GiB
+    16384          79.36   34.02        142.44 GiB   142.48 GiB
+    32768          91.27   43.01        150.18 GiB   150.18 GiB
+
+**The first three rows reproduce and the last five are two to three times
+lower.** Identical allocations at every row and identical prefills, so the
+workload was the same and the clock was not. Nothing here diagnoses what the
+earlier host was doing; what can be said is that it is not reproducible on this
+one, with 293 GiB free and swap at zero, over two runs an hour apart.
+
+**So the reference is a gentle slope and not a discontinuity**: 23.38 ms at 97
+keys to 43.01 at 32768, which is 0.60 µs a token of context over a 340-fold
+range. It was never flat and it never took a step.
+
+### Where the two engines' decode steps actually sit
+
+**Both on their own recorded instruments, one sitting** — ours by
+`what_a_decode_step_costs_as_the_context_grows`, the reference by
+`context_sweep.py`, unspeculated:
+
+    context      ours   ours device   mlx-vlm   ours ahead
+       97       20.05         18.88     23.38        1.17×
+      385       21.35         20.15     23.88        1.12×
+      769       22.10         20.90     24.86        1.12×
+     2048       24.91         23.67     26.33        1.06×
+     4096       26.31         25.09     26.68        1.01×
+     8192       28.69         27.42     29.03        1.01×
+    16384           —         33.92     34.02        1.00×
+    32768           —         43.74     43.01        0.98×
+
+**"This engine is 2.7× ahead at 8192" is withdrawn and the honest figure is
+1.01×.** Ours reproduces its recorded row to a tenth — 20.05, 21.35, 22.10,
+24.91, 26.31 and 28.69 against 19.99, 21.34, 21.91, 24.85, 26.09 and 28.65 — so
+what moved is the column beside it and nothing about this engine.
+
+**The lead is real at a short context and it is gone by 4096.** 1.17× at 97 keys
+narrows monotonically, the two are indistinguishable from 4096 to 16384, and at
+32768 the reference is 1.7% ahead. **Both engines walk the span and both slopes
+are shallow**; what this file had was one slope measured against a plateau that
+was not there.
+
+The last two rows are ours on the device's own clock against the reference's
+wall, which flatters us by the 1.3 ms of host term the 8192 row shows between our
+two columns — **so ours is if anything read generously out there and is still not
+ahead**. Extending the recorded instrument past 8192 is what would make those two
+rows a claim rather than a reading.
+
+### What the peak resident set measures, which is not the same thing on both sides
+
+**This file has implied a 32× memory win and the number is about right and the
+sentence is wrong.** Sampled from outside by the same `ps -o rss` at an
+8192-token context, in the same sitting: **ours peaks at 3.25 GiB and mlx-vlm's
+at 131.54 GiB**, and MLX's own `get_peak_memory` reports 138.60 GiB for that run
+— so the allocator figure this file quotes for the reference is its process's
+too, to 5%, and the comparison is not an accounting artifact in the direction it
+was feared to be.
+
+**What it is not is 40× less memory to run in.** Ours is a resident set over a
+checkpoint that is **mmap'd**: the weights are clean, file-backed pages the
+kernel reclaims at will, and a decode step reads 5.9 GB of them. So 3.25 GiB is
+what happened to be resident when `ps` looked, not the working set — the engine
+touches far more than that every step and gives it straight back. The
+reference's 131.54 GiB is anonymous allocation it holds for the process's life.
+
+**The claim worth making is about where the weights live rather than how many
+there are.** Both engines read the same 140 GB checkpoint; this one leaves it on
+disk and lets the page cache decide what is resident, and mlx-vlm materialises it
+in its allocator. On a machine with less memory than the checkpoint, that is the
+difference between running slowly and not running — which is a real property and
+is not a 40× smaller footprint. **The two columns of the sweep above are not the
+same quantity and should not be divided.**
 
 ### Whether the occupancy turn survives a warm, order-reversed re-run
 
