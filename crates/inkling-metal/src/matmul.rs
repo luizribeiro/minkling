@@ -2865,6 +2865,17 @@ mod tests {
     use crate::kernel::MEMORY_BANDWIDTH;
     use crate::testing::{device, drift, entries_dispatched};
 
+    /// What a count of packed codes weighs on the wire: half a byte a code and
+    /// one scale byte a group of [`GROUP_SIZE`].
+    ///
+    /// **One reading of it, because every table here divides by it.** A rate is
+    /// this over a duration, and a second spelling of the numerator is a second
+    /// place for a factor to go missing — which is the shape of the bug commit
+    /// 504e6fe left across six tables.
+    fn packed_bytes(codes: usize) -> f64 {
+        (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64
+    }
+
     /// The reduction the checkpoint's projections are: `lm_head`, every
     /// attention projection and every expert reduce over 4096.
     const IN_DIM: usize = 4096;
@@ -4860,7 +4871,7 @@ kernel void decoded_elements(
                 }
 
                 let codes = rows * out_dim * in_dim;
-                let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+                let moved = packed_bytes(codes);
                 line.push_str(&format!(
                     "{:>10}",
                     format!("{:.0} GB/s", moved / best.as_secs_f64() / 1e9)
@@ -4942,7 +4953,7 @@ kernel void decoded_elements(
                 }
 
                 let codes = rows.div_ceil(height) * out_dim * in_dim;
-                let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+                let moved = packed_bytes(codes);
                 line.push_str(&format!(
                     "{:>16}",
                     format!(
@@ -5020,7 +5031,7 @@ kernel void decoded_elements(
                 }
 
                 let codes = rows.div_ceil(ROWS_A_TILE) * out_dim * in_dim;
-                let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+                let moved = packed_bytes(codes);
                 line.push_str(&format!(
                     "{:>16}",
                     format!(
@@ -5397,17 +5408,14 @@ kernel void decoded_elements(
             let tiles = ROWS.div_ceil(ROWS_A_TILE);
             let rate = |read: usize, taken: Duration| {
                 let codes = read * OUT * IN;
-                let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+                let moved = packed_bytes(codes);
                 format!("{:.0} GB/s", moved / taken.as_secs_f64() / 1e9)
             };
             let held = experts * OUT * IN;
             eprintln!(
                 "  {experts:<10}{:>10}{:>11}{:>11}{:>12}{:>12}{:>13}{:>13}",
                 format!("{}", ROWS / experts),
-                format!(
-                    "{:.0} MB",
-                    (held / CODES_PER_BYTE + held / GROUP_SIZE) as f64 / 1e6
-                ),
+                format!("{:.0} MB", packed_bytes(held) / 1e6),
                 format!("{:.0}µs", 1e6 * best[0].as_secs_f64()),
                 format!("{:.0}µs", 1e6 * best[1].as_secs_f64()),
                 format!("{:.0}µs", 1e6 * best[2].as_secs_f64()),
@@ -5504,13 +5512,12 @@ kernel void decoded_elements(
                 false => tiles,
                 true => rows.min(tiles + (ROWS_A_TILE - 1) * tiles.min(experts - 1)),
             };
-            let bytes = |codes: usize| (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
-            let moved = bytes(read * out_dim * in_dim);
+            let moved = packed_bytes(read * out_dim * in_dim);
             // What the call could read at most, which is the bank itself. The
             // ratio between the two is how many times over a dispatch is charged
             // for a weight it may still have in cache, and it is the column that
             // says whether `achieved` is a bandwidth or an amplification.
-            let held = bytes(experts * out_dim * in_dim);
+            let held = packed_bytes(experts * out_dim * in_dim);
             totals[usize::from(groups)] += call * calls as u32;
             eprintln!(
                 "  {what:<18}{rows:>8}{:>10}{:>10}{:>8}{:>10}{:>12}{:>12}",
@@ -5525,6 +5532,137 @@ kernel void decoded_elements(
         eprintln!(
             "  the shapes on the tiled entry are {:.2?} of a prefill and the grouped ones {:.2?}",
             totals[0], totals[1]
+        );
+    }
+
+    /// The shapes a decode step gives this kernel, and how many calls a step
+    /// makes of each.
+    ///
+    /// **A decode step is one token of everything, and nothing here has ever
+    /// been tuned for it.** Both entries behind [`Numerics::Production`] refuse a
+    /// call this short — see [`PackedMatmul::blocks`] — [`tiles`] is false for
+    /// every row of this list, and [`RESIDENCY`] is declared by entries none of
+    /// them reach. So every shape below runs [`ENTRY`], one simdgroup an output
+    /// element, which is the kernel the engine shipped before any of that work.
+    ///
+    /// `(what, rows, in_dim, out_dim, experts, calls a step)`. The counts are the
+    /// engine's — 42 layers of five projections, 40 MoE layers of a shared bank's
+    /// three and a routed bank's three, two dense feed-forward networks and the
+    /// head — and they sum to the 457 `packed_matmul` calls
+    /// `which_kernels_own_a_decode_step` counts in a step.
+    const DECODE_SHAPES: [(&str, usize, usize, usize, usize, usize); 10] = [
+        ("q_proj, o_proj", 1, 4096, 4096, 1, 84),
+        ("k_proj, v_proj", 1, 4096, 1024, 1, 84),
+        ("r_proj", 1, 4096, 512, 1, 42),
+        ("shared gate, up", 2, 4096, 2048, 2, 80),
+        ("shared down", 2, 2048, 4096, 2, 40),
+        ("routed gate, up", 6, 4096, 2048, 256, 80),
+        ("routed down", 6, 2048, 4096, 256, 40),
+        ("dense gate, up", 1, 4096, 16384, 1, 4),
+        ("dense down", 1, 16384, 4096, 1, 2),
+        ("lm_head", 1, 4096, 200058, 1, 1),
+    ];
+
+    /// **What each shape a decode step gives this kernel actually costs**, which
+    /// is what the one `packed_matmul` row of the decode profile is made of.
+    ///
+    /// That row is 457 calls and 70% of the device's time, and it is ten shapes
+    /// rather than one — from a `[1, 4096] @ [512, 4096]ᵀ` router projection to
+    /// the head's `[200058, 4096]`. A row is only diagnosable once the shapes
+    /// under it are named, which is what
+    /// [`what_each_shape_of_a_prefills_packed_calls_costs`] does from the other
+    /// side.
+    ///
+    /// **The `a step` column is the check**: this shape's own device time times
+    /// how many of it a step dispatches, so the column sums to the profile's row
+    /// if the decomposition is right and does not if it is not.
+    ///
+    /// **`elements` is the column the diagnosis turns on.** An output element is
+    /// one simdgroup here, so it is also how many simdgroups the dispatch puts on
+    /// a part with 80 cores — and the `input` column beside it is what those
+    /// simdgroups read between them, which is every element re-reading the whole
+    /// input row. That ratio is `4 / (1/2 + 1/32)` — 7.5 bytes of input load
+    /// issued for every byte of weight — at every shape here, because it is a
+    /// property of the walk rather than of the call.
+    ///
+    /// **The rates rank the shapes and do not state a bandwidth**, the way
+    /// [`what_a_packed_multiply_costs_at_each_width_a_lane_reads`]'s do and for
+    /// the same reason: one weight is dispatched against four times in a row, so
+    /// a shape whose weight fits in cache is read once from memory and three
+    /// times from it. What the shapes carrying a step's bytes have is 27 MB a
+    /// call and 435, and what the cold figure is
+    /// `one_dispatch_does_an_lm_head_shaped_multiply_without_meeting_the_watchdog`
+    /// says.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_each_shape_of_a_decode_steps_packed_calls_costs() {
+        let Some(device) = device() else { return };
+        let matmul = matmul(&device);
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+
+        // **The fixtures are built before anything is timed and swept twice.**
+        // The shapes run from 512 output elements to 200058, which is the order
+        // a clock ramp would draw this table in by itself — and a fixture built
+        // between two measurements is a gigabyte of codes generated with the
+        // device idle, which is the same hazard arriving a second way. See
+        // [`crate::testing::warmed`] and [`crate::testing::both_ways`].
+        let shapes: Vec<Blocked> = DECODE_SHAPES
+            .iter()
+            .map(|&(what, rows, in_dim, out_dim, experts, _)| {
+                Blocked::of(what, rows, in_dim, out_dim, experts, false)
+            })
+            .collect();
+        let banks: Vec<PackedBank<'_>> = shapes
+            .iter()
+            .map(|shape| shape.upload(&device, &matmul))
+            .collect();
+        let at: Vec<usize> = (0..DECODE_SHAPES.len()).collect();
+        let cost = |shape: usize| shapes[shape].costs_on(&device, &banks[shape], &grouping);
+        crate::testing::warmed(|| {
+            cost(0);
+        });
+        let (up, down) = crate::testing::both_ways(&at, cost);
+
+        eprintln!(
+            "  {:<18}{:>10}{:>10}{:>10}{:>10}{:>11}{:>8}{:>10}{:>12}",
+            "shape",
+            "elements",
+            "weight",
+            "input",
+            "a call",
+            "achieved",
+            "of bus",
+            "a step",
+            "the other way"
+        );
+        let (mut step, mut weight) = (Duration::ZERO, 0.0);
+        for (shape, (what, rows, in_dim, out_dim, _, calls)) in
+            DECODE_SHAPES.into_iter().enumerate()
+        {
+            let call = up[shape];
+            let codes = rows * out_dim * in_dim;
+            let moved = packed_bytes(codes);
+            let achieved = moved / call.as_secs_f64();
+            step += call * calls as u32;
+            weight += moved * calls as f64;
+            eprintln!(
+                "  {what:<18}{:>10}{:>10}{:>10}{:>10}{:>11}{:>8}{:>10}{:>12}",
+                rows * out_dim,
+                format!("{:.1} MB", moved / 1e6),
+                format!("{:.0} MB", (codes * size_of::<f32>()) as f64 / 1e6),
+                format!("{:.0}µs", 1e6 * call.as_secs_f64()),
+                format!("{:.0} GB/s", achieved / 1e9),
+                format!("{:.0}%", 1e2 * achieved / MEMORY_BANDWIDTH),
+                format!("{:.2?}", call * calls as u32),
+                format!("{:.0} GB/s", moved / down[shape].as_secs_f64() / 1e9),
+            );
+        }
+        eprintln!(
+            "  the ten shapes are {step:.2?} of a decode step and {:.2} GB of weight, whose floor \
+             at {:.0} GB/s is {:.2?}",
+            weight / 1e9,
+            MEMORY_BANDWIDTH / 1e9,
+            Duration::from_secs_f64(weight / MEMORY_BANDWIDTH),
         );
     }
 
@@ -5599,7 +5737,7 @@ kernel void decoded_elements(
             let tiles = ROWS.div_ceil(height);
             let read = ROWS.min(tiles + (height - 1) * tiles.min(EXPERTS - 1));
             let codes = read * OUT * IN;
-            let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
+            let moved = packed_bytes(codes);
             eprintln!(
                 "  {height:<16}{:>10}{:>10}{:>12}{:>12}",
                 format!("{:.0}µs", 1e6 * call.as_secs_f64()),
@@ -5672,8 +5810,7 @@ kernel void decoded_elements(
             &case.scales,
         )
         .expect("the bank's shapes pair");
-        let bytes = |codes: usize| (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
-        let held = bytes(EXPERTS * OUT * IN);
+        let held = packed_bytes(EXPERTS * OUT * IN);
 
         eprintln!(
             "  {:<16}{:>10}{:>10}{:>12}{:>12}{:>12}",
@@ -5890,15 +6027,32 @@ kernel void decoded_elements(
             matmul: &PackedMatmul,
             grouping: &ExpertGrouping,
         ) -> Duration {
+            self.costs_on(device, &self.upload(device, matmul), grouping)
+        }
+
+        /// The same against a bank the caller made, which is what a sweep over
+        /// one kernel and many shapes wants.
+        ///
+        /// **An upload is a gigabyte of codes copied with the device idle**, and
+        /// a sweep that pays one between every two measurements is a sweep whose
+        /// arms each open on a colder machine than the one before — which reads
+        /// as a monotone row for the same reason
+        /// [`crate::testing::warmed`] exists. A caller that holds its banks
+        /// across the sweep pays none of them.
+        fn costs_on(
+            &self,
+            device: &Device,
+            bank: &PackedBank<'_>,
+            grouping: &ExpertGrouping,
+        ) -> Duration {
             const CALLS: usize = 4;
             const ROUNDS: usize = 3;
-            let bank = self.upload(device, matmul);
             let mut x = device.buffer(&self.case.x).expect("the rows upload");
 
             let mut best = Duration::MAX;
             for _ in 0..ROUNDS {
                 best = best.min(crate::testing::device_time(device, CALLS, |batch| {
-                    self.encode(batch, device, &bank, &mut x, grouping);
+                    self.encode(batch, device, bank, &mut x, grouping);
                 }));
             }
             best
