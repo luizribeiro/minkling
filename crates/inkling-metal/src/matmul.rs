@@ -4852,7 +4852,7 @@ kernel void decoded_elements(
                     "{:>16}",
                     format!(
                         "{:.0}µs {:.0} GB/s",
-                        1e6 * best.as_secs_f64() / CALLS as f64,
+                        1e6 * best.as_secs_f64(),
                         moved / best.as_secs_f64() / 1e9
                     )
                 ));
@@ -4930,7 +4930,7 @@ kernel void decoded_elements(
                     "{:>16}",
                     format!(
                         "{:.0}µs {:.0} GB/s",
-                        1e6 * best.as_secs_f64() / CALLS as f64,
+                        1e6 * best.as_secs_f64(),
                         moved / best.as_secs_f64() / 1e9
                     )
                 ));
@@ -5303,10 +5303,7 @@ kernel void decoded_elements(
             let rate = |read: usize, taken: Duration| {
                 let codes = read * OUT * IN;
                 let moved = (codes / CODES_PER_BYTE + codes / GROUP_SIZE) as f64;
-                format!(
-                    "{:.0} GB/s",
-                    moved / taken.as_secs_f64() * CALLS as f64 / 1e9
-                )
+                format!("{:.0} GB/s", moved / taken.as_secs_f64() / 1e9)
             };
             let held = experts * OUT * IN;
             eprintln!(
@@ -5316,9 +5313,9 @@ kernel void decoded_elements(
                     "{:.0} MB",
                     (held / CODES_PER_BYTE + held / GROUP_SIZE) as f64 / 1e6
                 ),
-                format!("{:.0}µs", 1e6 * best[0].as_secs_f64() / CALLS as f64),
-                format!("{:.0}µs", 1e6 * best[1].as_secs_f64() / CALLS as f64),
-                format!("{:.0}µs", 1e6 * best[2].as_secs_f64() / CALLS as f64),
+                format!("{:.0}µs", 1e6 * best[0].as_secs_f64()),
+                format!("{:.0}µs", 1e6 * best[1].as_secs_f64()),
+                format!("{:.0}µs", 1e6 * best[2].as_secs_f64()),
                 rate(tiles, best[1]),
                 rate(
                     ROWS.min(tiles + (ROWS_A_TILE - 1) * tiles.min(experts - 1)),
@@ -5503,7 +5500,7 @@ kernel void decoded_elements(
                 }));
             }
 
-            let call = best / CALLS as u32;
+            let call = best;
             let tiles = ROWS.div_ceil(height);
             let read = ROWS.min(tiles + (height - 1) * tiles.min(EXPERTS - 1));
             let codes = read * OUT * IN;
@@ -5788,6 +5785,10 @@ kernel void decoded_elements(
         /// submission costs 225 µs and the dispatches a sweep asks about are
         /// tens, so what the device's clock is divided by has to be the dispatch
         /// rather than the submission around it.
+        ///
+        /// **The division is [`crate::testing::device_time`]'s and this side
+        /// does not repeat it**, which is what
+        /// [`a_blocks_table_reports_one_dispatch_of_the_shape_it_names`] holds.
         fn costs(
             &self,
             device: &Device,
@@ -5805,7 +5806,7 @@ kernel void decoded_elements(
                     self.encode(batch, device, &bank, &mut x, grouping);
                 }));
             }
-            best / CALLS as u32
+            best
         }
 
         fn upload<'a>(&self, device: &'a Device, matmul: &'a PackedMatmul) -> PackedBank<'a> {
@@ -6531,6 +6532,56 @@ kernel void decoded_elements(
                 );
             }
         }
+    }
+
+    /// **What a table here reports has to be one dispatch of the shape it
+    /// names**, and the way it stops being one is silent.
+    ///
+    /// [`crate::testing::device_time`] takes a count of dispatches and returns
+    /// what one of them cost, so a caller that divides by its own count again
+    /// reports every arm of every table four times faster than it ran. **Nothing
+    /// in such a table looks wrong**: each arm is low by the same four, so the
+    /// ratios a sweep is read for are exactly right and only the absolute
+    /// figures — the ones a roofline and a cross-engine column divide by — are
+    /// not.
+    ///
+    /// Asked against a single dispatch measured on its own, and asked at a shape
+    /// small enough to be a case rather than a sitting. The bound is loose
+    /// because a dispatch shares a command buffer with three others in one arm
+    /// and has one to itself in the other; what it refuses is a factor.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn a_blocks_table_reports_one_dispatch_of_the_shape_it_names() {
+        let Some(device) = device() else { return };
+        let shipped =
+            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+
+        // The tiled shape at a narrow output, which is the smallest call that
+        // still reaches the block: many rows, one expert, a fixture of a
+        // megabyte rather than a gigabyte.
+        let shape = Blocked::of("q_proj, tiled", 2048, IN_DIM, 256, 1, false);
+        let bank = shape.upload(&device, &shipped);
+        let mut x = device.buffer(&shape.case.x).expect("the rows upload");
+        crate::testing::warmed(|| {
+            shape.costs(&device, &shipped, &grouping);
+        });
+
+        let mut alone = Duration::MAX;
+        for _ in 0..5 {
+            alone = alone.min(crate::testing::device_time(&device, 1, |batch| {
+                shape.encode(batch, &device, &bank, &mut x, &grouping);
+            }));
+        }
+        let table = shape.costs(&device, &shipped, &grouping);
+
+        let ratio = table.as_secs_f64() / alone.as_secs_f64();
+        assert!(
+            (0.75..1.35).contains(&ratio),
+            "the table reads {table:.2?} where one dispatch on its own reads {alone:.2?}, which is \
+             {ratio:.2}× — so what every block table in this file reports is not a dispatch of the \
+             shape its row names"
+        );
     }
 
     /// **Whether the matmul is bandwidth-bound now that it is 2.85× faster, and
