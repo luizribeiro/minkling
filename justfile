@@ -175,6 +175,39 @@ bench-engines *args:
         "$bin" "$root/reference/scripts/bench_engines" \
         -- engines {{ args }} "{{ absolute_path(checkpoint) }}"
 
+# A simulated coding session with the conversation kept between turns and
+# without, in one sitting, out of one build:
+#
+#   just bench-session
+#   just bench-session --tokens 4096
+#
+# **The one measurement here whose subject is what happens between two
+# requests.** Every other figure in this file is one call, and a cache kept
+# across requests is worth exactly nothing on one of those — so the arms are a
+# session of several turns, each adding a question and each answered, which is
+# the shape a coding turn has and the shape nothing here had measured.
+#
+# The arm is a number rather than an executable, the way `bench-numerics`' is a
+# word: `--reuse-tokens 0` is the server as it was, and the default bound is the
+# server as it is. Same alternation, same report, one build.
+#
+# **Three pairs rather than seven, and `BENCH_PAIRS=7 just bench-session` if
+# seven are wanted.** A cold session is minutes an arm — the turns re-prefill
+# thousands of tokens each — and the effect is the kind the justfile's own note
+# says three pairs are enough for.
+bench-session *measurement:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    cargo build --quiet --bin bench
+    bin="$root/target/bench/bin/working-tree"
+    mkdir -p "$(dirname "$bin")"
+    cp "$root/target/debug/bench" "$bin"
+    "$root/target/debug/bench" alternate --pairs "${BENCH_PAIRS:-3}" \
+        "$bin --reuse-tokens 0 {{ absolute_path(checkpoint) }}" \
+        "$bin {{ absolute_path(checkpoint) }}" \
+        -- session {{ measurement }}
+
 # The two numerics against each other in one sitting, out of one build:
 #
 #   just bench-numerics prefill --tokens 2048

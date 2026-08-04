@@ -39,11 +39,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use inkling_cli::args::Backend;
-use inkling_cli::{backend, config};
+use inkling_cli::kept::{DEFAULT_BOUND, Kept};
+use inkling_cli::{backend, config, session};
 use inkling_core::generate::{Proposer, Round};
 use inkling_core::mtp::{CheckpointHeads, MtpProposer};
 use inkling_core::workload::{
-    BEST, CORPUS, DECODED, DIFFERENTIAL, REALISTIC, STRUCTURED_PROMPT, SWEPT, tiled,
+    BEST, CORPUS, DECODED, DIFFERENTIAL, REALISTIC, STRUCTURED_PROMPT, SWEPT, Session, tiled,
 };
 use inkling_core::{
     Checkpoint, CheckpointWeights, Ending, ModelCache, TextConfig, Tokenizer, profile,
@@ -63,6 +64,7 @@ const USAGE: &str = "usage:\n  \
     bench prefill <checkpoint> [--tokens <n>] [--numerics <which>]\n  \
     bench sweep   <checkpoint> [--tokens <n>] [--depth <k>] [--numerics <which>]\n  \
     bench engines <checkpoint> [--depth <k>] [--numerics <which>]\n  \
+    bench session <checkpoint> [--tokens <n>] [--reuse-tokens <n>] [--numerics <which>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench diverge <checkpoint> [--tokens <n>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
@@ -143,6 +145,16 @@ enum What {
     /// (prompt, generated) pair. The one measurement here another engine can
     /// also report, which is what makes it the one taken against one.
     Engines,
+    /// A simulated coding session, turn by turn.
+    ///
+    /// **The one measurement here whose subject is what happens *between* two
+    /// requests**, which is why it is a session rather than a prompt: keeping a
+    /// cache is worth nothing on a measurement of one call, and a prefill of a
+    /// given length cannot be made to say otherwise.
+    ///
+    /// Its arms are the same binary told to keep a different number of
+    /// positions, which is the shape `bench-numerics` puts one word through.
+    Session,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -169,6 +181,9 @@ enum Job {
         /// a word rather than an executable — the same shape `bench-weights`
         /// puts two checkpoints through.
         numerics: Numerics,
+        /// Positions a session keeps between its turns, and zero for the arm
+        /// that keeps nothing — which is the server as it was.
+        reuse: usize,
     },
     /// The harness: two commands that already exist, run against each other.
     Alternate {
@@ -201,12 +216,13 @@ impl Job {
             Some("prefill") => Some(What::Prefill),
             Some("sweep") => Some(What::Sweep),
             Some("engines") => Some(What::Engines),
+            Some("session") => Some(What::Session),
             Some("alternate") => return Self::alternating(args),
             Some("diverge") => return Self::diverging(args),
             Some("guesses") => None,
             Some(word) => bail!(
-                "{word} is not one of decode, prefill, sweep, engines, guesses, diverge or \
-                 alternate"
+                "{word} is not one of decode, prefill, sweep, engines, session, guesses, \
+                 diverge or alternate"
             ),
             None => bail!("no measurement given"),
         };
@@ -218,6 +234,10 @@ impl Job {
         // is about whether the word was *given*, and a plain `Numerics` would
         // let `--numerics reference` through by being equal to the default.
         let mut numerics = None;
+        // An `Option` for the reason `context` is one: what the refusal below is
+        // about is whether the number was *given*, and zero is a number this
+        // measurement means something by.
+        let mut reuse = None;
         // A sweep runs every depth up to its own, where a cross-engine table
         // quotes one beside `k = 0` — so the default depth is what the flag
         // means to the measurement asking for it.
@@ -231,6 +251,7 @@ impl Job {
                 "--context" | "-c" => context = Some(count(&arg, &mut args)?),
                 "--depth" | "-k" => depth = count(&arg, &mut args)?,
                 "--numerics" => numerics = Some(which(&arg, &mut args)?),
+                "--reuse-tokens" => reuse = Some(positions(&arg, &mut args)?),
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
                 _ => checkpoints.push(PathBuf::from(arg)),
             }
@@ -281,16 +302,25 @@ impl Job {
         if what != What::Decode && context.is_some() {
             bail!("{what:?} takes no --context: only a decode step has one to be taken at");
         }
+        // **Only a session has a between-requests to keep anything across.**
+        // Every other measurement here is one call or a series of them against
+        // caches of its own, so a number of positions to keep could only be
+        // dropped — the same rule the two above are refused under.
+        if what != What::Session && reuse.is_some() {
+            bail!("{what:?} takes no --reuse-tokens: it makes one request");
+        }
         Ok(Self::Measure {
             what,
             checkpoint,
             tokens: tokens.unwrap_or(match what {
                 What::Prefill => PREFILLED,
+                What::Session => Session::OPENING,
                 _ => DECODED,
             }),
             context: context.unwrap_or(0),
             depth,
             numerics: numerics.unwrap_or_default(),
+            reuse: reuse.unwrap_or(DEFAULT_BOUND),
         })
     }
 
@@ -357,8 +387,16 @@ impl Job {
                 context,
                 depth,
                 numerics,
+                reuse,
             } => {
-                for reading in measure(*what, checkpoint, *tokens, *context, *depth, *numerics)? {
+                let asked = Asked {
+                    tokens: *tokens,
+                    context: *context,
+                    depth: *depth,
+                    numerics: *numerics,
+                    reuse: *reuse,
+                };
+                for reading in measure(*what, checkpoint, asked)? {
                     println!("{}", reading.line());
                 }
                 Ok(())
@@ -395,6 +433,17 @@ fn which(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<Numerics
 
 /// A count of at least one, which every number this takes is: no measurement is
 /// defined over zero tokens, zero pairs or a sweep of no depths.
+/// A count of positions to keep, which may be zero: keeping nothing is the arm
+/// a session is measured against, and it is the one number [`count`] refuses.
+fn positions(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize> {
+    let value = args
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("{flag} takes a value"))?;
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{value} is not a count of positions, after {flag}"))
+}
+
 fn count(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize> {
     let value = args
         .next()
@@ -516,14 +565,26 @@ fn behind_a_step(prompt: &[usize], context: usize) -> Vec<usize> {
     }
 }
 
-fn measure(
-    what: What,
-    dir: &Path,
+/// The numbers a measurement was asked for, which differ per measurement and are
+/// carried together rather than as six positional arguments one of which every
+/// caller passes zero for.
+#[derive(Debug, Clone, Copy)]
+struct Asked {
     tokens: usize,
     context: usize,
     depth: usize,
     numerics: Numerics,
-) -> Result<Vec<Reading>> {
+    reuse: usize,
+}
+
+fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
+    let Asked {
+        tokens,
+        context,
+        depth,
+        numerics,
+        reuse,
+    } = asked;
     let config = config::of_checkpoint(dir)?;
     let text = &config.text_config;
     let tokenizer = Tokenizer::open(dir, &config)?;
@@ -638,6 +699,56 @@ fn measure(
                 taken.push(Reading::new("prefill", millis(again.step()), "ms"));
                 taken.push(Reading::new("device", millis(again.gpu), "ms"));
                 taken.push(Reading::new("cold", millis(run.step()), "ms"));
+            }
+            // **The one arm here that measures more than one request.** What a
+            // kept cache is worth is the difference between a turn that
+            // re-prefills its whole conversation and one that prefills what was
+            // added to it, and neither number exists in a measurement of a
+            // single call.
+            //
+            // Every turn is a row, because the shape is the finding: turn one is
+            // cold in both arms and every turn after it is where they part.
+            What::Session => {
+                let plan = Session::new(tokens);
+                let mut kept = Kept::new(text, reuse);
+                let turns = session::run(&weights.generator(), &weights, &mut kept, plan, &prompt);
+
+                eprintln!(
+                    "session: {} turns keeping {reuse}, first eight {:?}",
+                    turns.len(),
+                    &session::tokens(&turns)[..OPENING.min(plan.generated * plan.turns)]
+                );
+                for (at, turn) in turns.iter().enumerate() {
+                    eprintln!(
+                        "  turn {at}: {} tokens, {} reused, {:.2} s wall, {:.2} s to first",
+                        turn.prompt,
+                        turn.reused,
+                        turn.wall.as_secs_f64(),
+                        turn.first.as_secs_f64(),
+                    );
+                    taken.push(Reading::new(
+                        format!("turn{at}.wall"),
+                        millis(turn.wall),
+                        "ms",
+                    ));
+                    taken.push(Reading::new(
+                        format!("turn{at}.first"),
+                        millis(turn.first),
+                        "ms",
+                    ));
+                    taken.push(Reading::new(
+                        format!("turn{at}.prefilled"),
+                        (turn.prompt - turn.reused) as f64,
+                        "tokens",
+                    ));
+                }
+                // The figure a user feels, which is the one nobody here has ever
+                // produced: the whole conversation, end to end.
+                taken.push(Reading::new(
+                    "session",
+                    millis(turns.iter().map(|turn| turn.wall).sum()),
+                    "ms",
+                ));
             }
             What::Sweep => {
                 let run = timed(&prompt, tokens);
@@ -1339,6 +1450,7 @@ mod tests {
                 context: 0,
                 depth: SWEPT,
                 numerics: Numerics::default(),
+                reuse: DEFAULT_BOUND,
             }
         );
         assert_eq!(
@@ -1350,6 +1462,7 @@ mod tests {
                 context: 0,
                 depth: SWEPT,
                 numerics: Numerics::default(),
+                reuse: DEFAULT_BOUND,
             }
         );
     }
@@ -1369,6 +1482,7 @@ mod tests {
                 context: 0,
                 depth: BEST,
                 numerics: Numerics::default(),
+                reuse: DEFAULT_BOUND,
             }
         );
         assert_ne!(BEST, SWEPT);
@@ -1376,6 +1490,34 @@ mod tests {
         assert!(
             Job::parse(["engines", "models/small", "--tokens", "769"].map(str::to_string)).is_err()
         );
+    }
+
+    /// **Only a session has a between-requests to keep anything across**, so it
+    /// is the only measurement here the number means anything to — and zero is
+    /// one of the numbers it means something by, which is why the arm that keeps
+    /// nothing is a command line rather than a second binary.
+    #[test]
+    fn only_a_session_takes_a_count_of_positions_to_keep() {
+        assert_eq!(
+            Job::parse(["session", "models/small", "--reuse-tokens", "0"].map(str::to_string))
+                .expect("parses"),
+            Job::Measure {
+                what: What::Session,
+                checkpoint: PathBuf::from("models/small"),
+                tokens: Session::OPENING,
+                context: 0,
+                depth: SWEPT,
+                numerics: Numerics::default(),
+                reuse: 0,
+            }
+        );
+        for what in ["decode", "prefill", "sweep", "engines"] {
+            assert!(
+                Job::parse([what, "models/small", "--reuse-tokens", "0"].map(str::to_string))
+                    .is_err(),
+                "{what} took a count of positions to keep"
+            );
+        }
     }
 
     /// **The numerics are an arm's own word and every measurement takes it**,
@@ -1541,9 +1683,10 @@ mod tests {
                 context: 8192,
                 depth: SWEPT,
                 numerics: Numerics::default(),
+                reuse: DEFAULT_BOUND,
             }
         );
-        for what in ["prefill", "sweep", "engines"] {
+        for what in ["prefill", "sweep", "engines", "session"] {
             assert!(
                 Job::parse([what, "models/small", "--context", "8192"].map(str::to_string))
                     .is_err(),
