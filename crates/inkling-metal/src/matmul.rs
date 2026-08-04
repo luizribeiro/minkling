@@ -6162,11 +6162,20 @@ kernel void decoded_elements(
     /// The lengths a coding session opens at, which is where this milestone's
     /// figures are taken.
     ///
-    /// **16384 is deliberately not here.** Attention is quadratic and the matmul
-    /// is not, so at that length attention is most of a prefill and the matmul's
-    /// share is flattered into looking small; at these three the matmul is 83 to
-    /// 85% of every pass a prefill runs. A parity claim made at 16384 is a claim
-    /// about the length that suits it best.
+    /// **16384 is not here, and the reason is not the one it would have been
+    /// before A8.** The argument used to be that attention is quadratic and the
+    /// matmul is not, so a long prompt flatters the matmul's share into looking
+    /// small — at 16384 the two attention rows were 64% of the passes and the
+    /// two matmul rows 56%. `mma_attention` took the attention rows nineteen
+    /// times down, and the in-model table now reads the two matmul rows at 88,
+    /// 85, 83 and 80% of every pass a prefill runs at 2048, 4096, 8192 and
+    /// 16384. **So no length flatters it any more**; the matmul is where a
+    /// prefill's time is at all of them.
+    ///
+    /// What is left is the plainer reason: a coding session opens between these
+    /// three, and a prefill here is seconds where 16384 is half a minute — so
+    /// this is the range a claim about the workload has to be made in, and 16384
+    /// is a check rather than a target.
     const BLOCKED_LENGTHS: [usize; 3] = [2048, 4096, 8192];
 
     /// The shipped production source with both staged tiles, and the fragments
