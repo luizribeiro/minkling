@@ -35,6 +35,7 @@ pub mod device;
 pub mod experts;
 pub mod grouping;
 pub mod heads;
+pub mod indirect;
 pub mod kernel;
 pub mod matmul;
 pub mod norm;

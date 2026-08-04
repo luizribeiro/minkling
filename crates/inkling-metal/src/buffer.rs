@@ -264,6 +264,19 @@ impl<T: Element> Buffer<T> {
     pub fn arg(&mut self) -> Arg<'_> {
         Arg::Bound(&self.raw)
     }
+
+    /// The allocation itself, which [`Arg::Bound`] is a wrapper around and
+    /// which [`crate::indirect`] needs on its own.
+    ///
+    /// **Shared where [`Buffer::arg`] is exclusive**, and that is the whole
+    /// difference: an indirect command binds several buffers into one command
+    /// and retains none of them, so the exclusivity an [`Arg`] carries would
+    /// refuse the arrangement rather than describe it. What keeps the bytes
+    /// alive there is the caller holding them past the execution, which is a
+    /// promise this side cannot make for it.
+    pub fn raw(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.raw
+    }
 }
 
 /// Bytes a kernel reads, however they got where they are: a copy the device

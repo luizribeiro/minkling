@@ -71,6 +71,12 @@ objc2-metal = { version = "0.3", default-features = false, features = [
   "MTLComputePipeline",
   "MTLCounters",
   "MTLDevice",
+  # The command sequence encoded once and executed many times, which is the
+  # only mechanism Metal offers for a step that dispatches the same thousand
+  # kernels every time it runs. The encoder header is where an already-encoded
+  # command is reached to be patched.
+  "MTLIndirectCommandBuffer",
+  "MTLIndirectCommandEncoder",
   "MTLLibrary",
   "MTLResource",
   "MTLTypes",

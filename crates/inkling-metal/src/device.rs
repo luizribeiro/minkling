@@ -64,6 +64,9 @@ pub enum MetalError {
     #[error("the command buffer would not open a compute encoder")]
     NoCommandEncoder,
 
+    #[error("the Metal device would not open an indirect command buffer")]
+    NoIndirectCommandBuffer,
+
     #[error("{entry} did not complete: {diagnostic}")]
     Execution { entry: String, diagnostic: String },
 

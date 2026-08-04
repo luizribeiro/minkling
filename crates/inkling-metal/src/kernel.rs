@@ -10,7 +10,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize,
+    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary,
+    MTLPipelineOption, MTLSize,
 };
 
 use crate::buffer::Arg;
@@ -68,27 +69,65 @@ impl Device {
     /// the first one carries the compiler's own diagnostic and the others have
     /// nothing to do with it.
     pub fn compile(&self, source: &str, entry: &str) -> Result<Kernel, MetalError> {
-        let library = self
-            .raw()
+        let function = self.function(source, entry)?;
+        Self::named(
+            entry,
+            self.raw()
+                .newComputePipelineStateWithFunction_error(&function),
+        )
+    }
+
+    /// The same entry, compiled into a pipeline an indirect command may name.
+    ///
+    /// **A pipeline has to be built for it and cannot be told afterwards**, so a
+    /// backend that wanted both an encoded and an indirect path for one kernel
+    /// would compile it twice. Whether the flag costs the kernel anything is a
+    /// measurement rather than a guess — see
+    /// `what_a_pipeline_built_for_an_indirect_command_costs`.
+    pub fn compile_indirect(&self, source: &str, entry: &str) -> Result<Kernel, MetalError> {
+        let function = self.function(source, entry)?;
+        let descriptor = MTLComputePipelineDescriptor::new();
+        descriptor.setComputeFunction(Some(&function));
+        descriptor.setSupportIndirectCommandBuffers(true);
+
+        Self::named(
+            entry,
+            self.raw()
+                .newComputePipelineStateWithDescriptor_options_reflection_error(
+                    &descriptor,
+                    MTLPipelineOption::empty(),
+                    None,
+                ),
+        )
+    }
+
+    /// `entry` out of a library compiled from `source`, which both ways of
+    /// making a pipeline start from.
+    fn function(
+        &self,
+        source: &str,
+        entry: &str,
+    ) -> Result<Retained<ProtocolObject<dyn MTLFunction>>, MetalError> {
+        self.raw()
             .newLibraryWithSource_options_error(&NSString::from_str(source), None)
-            .map_err(|err| MetalError::Compile(diagnostic(&err)))?;
-
-        let function = library
+            .map_err(|err| MetalError::Compile(diagnostic(&err)))?
             .newFunctionWithName(&NSString::from_str(entry))
-            .ok_or_else(|| MetalError::NoSuchKernel(entry.to_owned()))?;
+            .ok_or_else(|| MetalError::NoSuchKernel(entry.to_owned()))
+    }
 
-        let pipeline = self
-            .raw()
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|err| MetalError::Pipeline {
-                entry: entry.to_owned(),
-                diagnostic: diagnostic(&err),
-            })?;
-
+    /// Whichever way the pipeline was built, under the name a failed dispatch
+    /// has to report for anyone to find it in the source.
+    fn named(
+        entry: &str,
+        built: Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, Retained<NSError>>,
+    ) -> Result<Kernel, MetalError> {
         Ok(Kernel {
             label: entry.to_owned(),
             entry: entry.to_owned(),
-            pipeline,
+            pipeline: built.map_err(|err| MetalError::Pipeline {
+                entry: entry.to_owned(),
+                diagnostic: diagnostic(&err),
+            })?,
         })
     }
 
@@ -520,6 +559,16 @@ impl Kernel {
         self.pipeline.staticThreadgroupMemoryLength()
     }
 
+    /// Whether this pipeline may be named by an indirect command, which only a
+    /// pipeline built for it can be.
+    pub fn supports_indirect(&self) -> bool {
+        self.pipeline.supportIndirectCommandBuffers()
+    }
+
+    pub(crate) fn pipeline(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {
+        &self.pipeline
+    }
+
     /// How many threads of this kernel execute in lockstep, which is what a
     /// `simd_`-prefixed reduction inside it reduces over.
     ///
@@ -591,7 +640,9 @@ fn since(from: f64, to: f64) -> Duration {
     Duration::from_secs_f64((to - from).max(0.0))
 }
 
-fn one_dimensional(width: usize) -> MTLSize {
+/// A width as the one-dimensional `MTLSize` both ways of describing a dispatch
+/// take — a pass's own encoder, and a command inside an indirect buffer.
+pub(crate) fn one_dimensional(width: usize) -> MTLSize {
     MTLSize {
         width,
         height: 1,
