@@ -49,6 +49,12 @@ use crate::kernel::{Batch, Grid, Kernel, extent};
 
 const ENTRY: &str = "short_conv";
 
+/// The entry that runs two of those calls as one dispatch — see [`encode_pair`].
+const PAIRED_ENTRY: &str = "short_conv_pair";
+
+/// How many `uint`s the kernel's `Shape` struct declares.
+const FIELDS: usize = 8;
+
 /// Threads one threadgroup of a dispatch holds.
 ///
 /// A thread here is one channel of one timestep and reads `K` values that are
@@ -66,6 +72,10 @@ const THREADS_PER_GROUP: usize = 256;
 #[derive(Debug)]
 pub struct ShortConvolution {
     kernel: Kernel,
+    /// The same source's paired entry, compiled beside it because a model
+    /// wanting one wants the other: a layer's key and value convolutions pair
+    /// and the two on its residual path are a block apart.
+    paired: Kernel,
 }
 
 impl ShortConvolution {
@@ -79,6 +89,7 @@ impl ShortConvolution {
     pub(crate) fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
         Ok(Self {
             kernel: device.compile(source, ENTRY)?,
+            paired: device.compile(source, PAIRED_ENTRY)?,
         })
     }
 }
@@ -341,53 +352,13 @@ impl<'a> LayerConv<'a> {
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
-        let rows = self.rows(x.len());
-        assert!(landing.groups > 0, "a row has groups");
-        assert_eq!(
-            self.channels % landing.groups,
-            0,
-            "{} channels are not {} groups",
-            self.channels,
-            landing.groups
-        );
-        landing.fits(rows, self.channels / landing.groups);
-
-        if let Some(carried) = &carried {
-            assert_eq!(
-                carried.len(),
-                x.len(),
-                "a residual against what it is added to"
-            );
-        }
-        // The sequence in and out, the kernel every timestep reads, the window
-        // the call before this one left, the window this one leaves — and the
-        // residual, where there is one to add. The scale and the shape are in
-        // the command buffer rather than in memory, so they are not traffic.
-        let moves = size_of::<f32>()
-            * (2 * x.len()
-                + self.channels * self.taps
-                + 2 * self.held.get().floats()
-                + carried.as_ref().map_or(0, |_| x.len()));
-        let fields = [
-            extent(rows, "the rows of a call"),
-            extent(self.channels, "the channels of a convolution"),
-            extent(self.taps, "the taps of a kernel"),
-            extent(self.held.get().rows(), "the timesteps a window holds"),
-            extent(landing.groups, "the groups of a row"),
-            extent(landing.stride, "the rows a group has room for"),
-            extent(landing.base, "where a call's rows start"),
-            carried.is_some() as u32,
-        ];
-        let mut shape = self.device.inline(&fields)?;
+        let call = self.described(x.len(), carried.as_deref(), &landing);
+        let mut shape = self.device.inline(&call.fields)?;
         let scaled_by = [scale];
         let mut scaling = self.device.inline(&scaled_by)?;
         let mut weight = self.weight.borrow_mut();
         let mut windows = self.windows.borrow_mut();
-        let [first, second] = &mut *windows;
-        let (window, kept) = match self.reading.get() {
-            0 => (first, second),
-            _ => (second, first),
-        };
+        let (window, kept) = self.reading(&mut windows);
 
         // A slot the kernel is told to ignore still has to be filled, and one
         // float in the command buffer is what filling it costs — see
@@ -398,11 +369,6 @@ impl<'a> LayerConv<'a> {
             None => absent.arg(),
         };
 
-        // A thread to each channel of each timestep, and one more timestep's
-        // worth for the window left behind — which reads the same padded
-        // sequence the outputs are cut from and writes somewhere no output
-        // thread touches.
-        let threads = (rows + self.held.get().rows()) * self.channels;
         batch.add(
             &self.conv.kernel,
             &[
@@ -415,14 +381,94 @@ impl<'a> LayerConv<'a> {
                 kept.arg(),
                 carried,
             ],
-            Grid::new(threads, THREADS_PER_GROUP),
-            moves,
+            Grid::new(call.threads, THREADS_PER_GROUP),
+            call.moves,
         )?;
+        self.advanced(call.rows);
+        Ok(())
+    }
+
+    /// Everything about a call that does not depend on whether it has a
+    /// dispatch to itself: the eight fields the kernel reads, the threads it
+    /// needs, and the bytes it moves.
+    ///
+    /// Here rather than inside [`LayerConv::encode_over`] because a paired
+    /// dispatch asks the same of each half, and a second spelling of the shape
+    /// struct is one that could drift from the kernel's own.
+    fn described(
+        &self,
+        values: usize,
+        carried: Option<&Buffer<f32>>,
+        landing: &Landing<'_>,
+    ) -> Call {
+        let rows = self.rows(values);
+        assert!(landing.groups > 0, "a row has groups");
+        assert_eq!(
+            self.channels % landing.groups,
+            0,
+            "{} channels are not {} groups",
+            self.channels,
+            landing.groups
+        );
+        landing.fits(rows, self.channels / landing.groups);
+
+        if let Some(carried) = carried {
+            assert_eq!(
+                carried.len(),
+                values,
+                "a residual against what it is added to"
+            );
+        }
+        Call {
+            fields: [
+                extent(rows, "the rows of a call"),
+                extent(self.channels, "the channels of a convolution"),
+                extent(self.taps, "the taps of a kernel"),
+                extent(self.held.get().rows(), "the timesteps a window holds"),
+                extent(landing.groups, "the groups of a row"),
+                extent(landing.stride, "the rows a group has room for"),
+                extent(landing.base, "where a call's rows start"),
+                carried.is_some() as u32,
+            ],
+            rows,
+            // A thread to each channel of each timestep, and one more timestep's
+            // worth for the window left behind — which reads the same padded
+            // sequence the outputs are cut from and writes somewhere no output
+            // thread touches.
+            threads: (rows + self.held.get().rows()) * self.channels,
+            // The sequence in and out, the kernel every timestep reads, the
+            // window the call before this one left, the window this one leaves —
+            // and the residual, where there is one to add. The scale and the
+            // shape are in the command buffer rather than in memory, so they are
+            // not traffic.
+            moves: size_of::<f32>()
+                * (2 * values
+                    + self.channels * self.taps
+                    + 2 * self.held.get().floats()
+                    + carried.map_or(0, |_| values)),
+        }
+    }
+
+    /// The window a call reads and the one it leaves behind, of the two this
+    /// convolution alternates between.
+    fn reading<'w>(
+        &self,
+        windows: &'w mut [Buffer<f32>; 2],
+    ) -> (&'w mut Buffer<f32>, &'w mut Buffer<f32>) {
+        let [first, second] = windows;
+        match self.reading.get() {
+            0 => (first, second),
+            _ => (second, first),
+        }
+    }
+
+    /// The two windows swapped and the sequence moved on by `rows`, which is
+    /// what a call that has been encoded leaves behind it.
+    fn advanced(&self, rows: usize) {
         self.reading.set(1 - self.reading.get());
         let mut held = self.held.get();
         held.advanced(rows);
         self.held.set(held);
-        Ok(())
     }
 
     /// How many rows of this convolution's width `values` is.
@@ -435,6 +481,123 @@ impl<'a> LayerConv<'a> {
         );
         values / self.channels
     }
+}
+
+/// One convolution's call as a paired dispatch describes it.
+struct Call {
+    fields: [u32; FIELDS],
+    rows: usize,
+    threads: usize,
+    moves: usize,
+}
+
+/// One half of a paired convolution: the rows it reads, what it scales and adds,
+/// and where its own rows land.
+///
+/// A struct rather than five more arguments because [`encode_pair`] takes two of
+/// everything, and ten positional arguments of which five repeat is a call
+/// nobody can read.
+pub struct Convolving<'a> {
+    pub conv: &'a LayerConv<'a>,
+    pub x: &'a mut Buffer<f32>,
+    pub carried: Option<&'a mut Buffer<f32>>,
+    pub scale: f32,
+    pub landing: Landing<'a>,
+}
+
+/// **Two convolutions as one dispatch.**
+///
+/// A layer's key and value convolutions are the pair this exists for: they read
+/// different rows against different taps into different landings, each leaves
+/// its own window behind, and neither reads what the other writes. A decode step
+/// encoded 42 of each.
+///
+/// **Nothing has to agree between the halves**, which is where this parts
+/// company with [`norm::encode_pair`](crate::norm::encode_pair): this kernel
+/// declares no threadgroup memory and takes no barrier, so a thread is a channel
+/// of a timestep whichever side it is on and there is no threadgroup shape for
+/// two calls to disagree about. There is no fallback here because there is
+/// nothing to fall back from.
+///
+/// The answer is the same bits, which
+/// `a_paired_convolution_answers_what_the_two_it_replaces_answer` holds exactly:
+/// the same taps walked from zero in the same order over the same padded
+/// sequence, and the same window left behind.
+pub fn encode_pair(
+    batch: &mut Batch<'_>,
+    first: Convolving<'_>,
+    second: Convolving<'_>,
+) -> Result<(), MetalError> {
+    let _timed = profile::scope(Op::Encode);
+    let Convolving {
+        conv: one,
+        x: first_x,
+        carried: first_carried,
+        scale: first_scale,
+        landing: first_landing,
+    } = first;
+    let Convolving {
+        conv: other,
+        x: second_x,
+        carried: second_carried,
+        scale: second_scale,
+        landing: second_landing,
+    } = second;
+
+    let first_call = one.described(first_x.len(), first_carried.as_deref(), &first_landing);
+    let second_call = other.described(second_x.len(), second_carried.as_deref(), &second_landing);
+    let device = one.device;
+    let mut first_shape = device.inline(&first_call.fields)?;
+    let mut second_shape = device.inline(&second_call.fields)?;
+    let (first_scaled, second_scaled) = ([first_scale], [second_scale]);
+    let mut first_scaling = device.inline(&first_scaled)?;
+    let mut second_scaling = device.inline(&second_scaled)?;
+    let mut first_weight = one.weight.borrow_mut();
+    let mut second_weight = other.weight.borrow_mut();
+    let mut first_windows = one.windows.borrow_mut();
+    let mut second_windows = other.windows.borrow_mut();
+    let (first_window, first_kept) = one.reading(&mut first_windows);
+    let (second_window, second_kept) = other.reading(&mut second_windows);
+
+    // One a side, for the reason `encode_over` gives — and two rather than one
+    // because binding an inline value borrows it exclusively.
+    let mut first_absent = device.inline(&[0.0f32])?;
+    let mut second_absent = device.inline(&[0.0f32])?;
+    let first_carried = match first_carried {
+        Some(carried) => carried.arg(),
+        None => first_absent.arg(),
+    };
+    let second_carried = match second_carried {
+        Some(carried) => carried.arg(),
+        None => second_absent.arg(),
+    };
+
+    batch.add(
+        &one.conv.paired,
+        &[
+            first_shape.arg(),
+            first_scaling.arg(),
+            first_x.arg(),
+            first_weight.arg(),
+            first_window.arg(),
+            first_landing.out.arg(),
+            first_kept.arg(),
+            first_carried,
+            second_shape.arg(),
+            second_scaling.arg(),
+            second_x.arg(),
+            second_weight.arg(),
+            second_window.arg(),
+            second_landing.out.arg(),
+            second_kept.arg(),
+            second_carried,
+        ],
+        Grid::new(first_call.threads + second_call.threads, THREADS_PER_GROUP),
+        first_call.moves + second_call.moves,
+    )?;
+    one.advanced(first_call.rows);
+    other.advanced(second_call.rows);
+    Ok(())
 }
 
 /// The kernel. No constant of this crate's decides anything here — the taps, the
@@ -512,20 +675,21 @@ inline float padded(
 /// order `inkling_core::sconv` accumulates them in — and which is what makes a
 /// sequence split anywhere the same sequence, since the only thing a split
 /// changes is which call put a value in the window.
-kernel void short_conv(
-    constant Shape &shape [[buffer(0)]],
-    constant float &scale [[buffer(1)]],
-    device const float *x [[buffer(2)]],
-    device const float *weight [[buffer(3)]],
-    device const float *window [[buffer(4)]],
-    device float *out [[buffer(5)]],
-    device float *kept [[buffer(6)]],
-    device const float *carried [[buffer(7)]],
-    uint id [[thread_position_in_grid]]
+///
+/// Here rather than inside an entry point because two entry points run it,
+/// and what a paired dispatch changes is which of two shapes a thread reads
+/// and nothing else.
+static void convolve(
+    constant Shape &shape,
+    constant float &scale,
+    device const float *x,
+    device const float *weight,
+    device const float *window,
+    device float *out,
+    device float *kept,
+    device const float *carried,
+    uint id
 ) {
-    if (id >= (shape.rows + shape.held) * shape.channels) {
-        return;
-    }
     const uint t = id / shape.channels;
     const uint c = id % shape.channels;
     // What the window holds beyond what the convolution reads, which an output
@@ -562,6 +726,72 @@ kernel void short_conv(
         out + ((ulong)group * shape.stride + shape.base + t) * width + (c % width);
     *result = acc;
 }
+
+/// One call of it, over the threads a call's own rows and window need.
+kernel void short_conv(
+    constant Shape &shape [[buffer(0)]],
+    constant float &scale [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device const float *weight [[buffer(3)]],
+    device const float *window [[buffer(4)]],
+    device float *out [[buffer(5)]],
+    device float *kept [[buffer(6)]],
+    device const float *carried [[buffer(7)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= (shape.rows + shape.held) * shape.channels) {
+        return;
+    }
+    convolve(shape, scale, x, weight, window, out, kept, carried, id);
+}
+
+/// Two convolutions as one dispatch: a grid of both calls' threads, the first
+/// call's at the front of it.
+///
+/// **A layer's key and value convolutions were two dispatches because they are
+/// two sequences and for no other reason.** They read different rows against
+/// different taps, they leave their own windows behind, and neither reads
+/// anything the other writes.
+///
+/// This kernel declares no threadgroup memory and takes no barrier, so unlike
+/// the paired norm there is nothing about a threadgroup that has to agree
+/// between the halves: a thread is a channel of a timestep either way, and the
+/// only thing the merge changes is which of two shapes a thread reads. The
+/// answer is the same bits — the same taps walked from zero in the same order
+/// over the same padded sequence.
+kernel void short_conv_pair(
+    constant Shape &first [[buffer(0)]],
+    constant float &first_scale [[buffer(1)]],
+    device const float *first_x [[buffer(2)]],
+    device const float *first_weight [[buffer(3)]],
+    device const float *first_window [[buffer(4)]],
+    device float *first_out [[buffer(5)]],
+    device float *first_kept [[buffer(6)]],
+    device const float *first_carried [[buffer(7)]],
+    constant Shape &second [[buffer(8)]],
+    constant float &second_scale [[buffer(9)]],
+    device const float *second_x [[buffer(10)]],
+    device const float *second_weight [[buffer(11)]],
+    device const float *second_window [[buffer(12)]],
+    device float *second_out [[buffer(13)]],
+    device float *second_kept [[buffer(14)]],
+    device const float *second_carried [[buffer(15)]],
+    uint id [[thread_position_in_grid]]
+) {
+    const uint firsts = (first.rows + first.held) * first.channels;
+    if (id < firsts) {
+        convolve(
+            first, first_scale, first_x, first_weight, first_window,
+            first_out, first_kept, first_carried, id
+        );
+    } else if (id - firsts < (second.rows + second.held) * second.channels) {
+        convolve(
+            second, second_scale, second_x, second_weight, second_window,
+            second_out, second_kept, second_carried, id - firsts
+        );
+    }
+}
+
 "#;
 
 #[cfg(test)]
@@ -825,6 +1055,174 @@ mod tests {
                 assert_eq!(streamed, whole, "sequence {b} split {chunks:?}");
             }
         }
+    }
+
+    /// **A paired dispatch answers what the two dispatches it replaces answer,
+    /// exactly, and leaves the same two windows behind** — which is the whole of
+    /// what a merge is allowed to be, and here the window is half of it: a
+    /// convolution that answered the same rows and kept the wrong state would
+    /// pass on this step and be wrong on every one after it.
+    ///
+    /// The two halves are made as unalike as a layer's key and value
+    /// convolutions are: different sequences, different taps, different scales,
+    /// one with a carried residual and one without, and landings of different
+    /// strides. Then several chunks of a sequence in a row, because a window that
+    /// is right once and swapped wrongly is a state machine that fails on the
+    /// second call rather than the first.
+    #[test]
+    fn a_paired_convolution_answers_what_the_two_it_replaces_answer() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        assert!(
+            conv.paired.max_threads_per_group() >= THREADS_PER_GROUP,
+            "the paired entry cannot be dispatched in the threadgroup this kernel uses"
+        );
+        let fx = Synthetic::load();
+        let other_weight: Vec<f32> = fx.weight.iter().map(|w| 0.5 - w).collect();
+
+        // Three calls of one sequence each way round, so the alternation of the
+        // two windows is exercised rather than only their first use.
+        let chunks = [2, 1, 3];
+        let paired = {
+            let one = fx.wrapped(&device, &conv, &fx.weight);
+            let other = fx.wrapped(&device, &conv, &other_weight);
+            let mut at = 0;
+            chunks
+                .iter()
+                .map(|rows| {
+                    let cut = at..at + rows * fx.channels;
+                    at = cut.end;
+                    convolved_pair(&device, &one, &other, &fx.input[cut], fx.channels)
+                })
+                .collect::<Vec<_>>()
+        };
+        let apart = {
+            let one = fx.wrapped(&device, &conv, &fx.weight);
+            let other = fx.wrapped(&device, &conv, &other_weight);
+            let mut at = 0;
+            chunks
+                .iter()
+                .map(|rows| {
+                    let cut = at..at + rows * fx.channels;
+                    at = cut.end;
+                    convolved_apart(&device, &one, &other, &fx.input[cut], fx.channels)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(paired, apart);
+        assert!(
+            paired
+                .iter()
+                .flat_map(|(a, b)| [a, b])
+                .any(|rows| rows.iter().any(|value| *value != 0.0)),
+            "two calls that wrote nothing would compare equal to two others that did"
+        );
+    }
+
+    /// The two calls the case above pairs, as one dispatch: the first over `x`
+    /// with a carried residual and a scale, the second over the same rows
+    /// reversed with neither, into a landing of a different stride.
+    fn convolved_pair(
+        device: &Device,
+        one: &LayerConv<'_>,
+        other: &LayerConv<'_>,
+        x: &[f32],
+        channels: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let rows = x.len() / channels;
+        let reversed: Vec<f32> = x.iter().rev().copied().collect();
+        let mut first_x = device.buffer(x).expect("the rows upload");
+        let mut second_x = device.buffer(&reversed).expect("the rows upload");
+        let mut residual = device.buffer(&reversed).expect("the residual uploads");
+        let mut first_out = device
+            .zeroed::<f32>(x.len())
+            .expect("the landing allocates");
+        let mut second_out = device
+            .zeroed::<f32>(2 * x.len())
+            .expect("the landing allocates");
+        let mut batch = device.batch().expect("a command buffer opens");
+        super::encode_pair(
+            &mut batch,
+            Convolving {
+                conv: one,
+                x: &mut first_x,
+                carried: Some(&mut residual),
+                scale: 1.5,
+                landing: Landing {
+                    out: &mut first_out,
+                    groups: 1,
+                    stride: rows,
+                    base: 0,
+                },
+            },
+            Convolving {
+                conv: other,
+                x: &mut second_x,
+                carried: None,
+                scale: 1.0,
+                landing: Landing {
+                    out: &mut second_out,
+                    groups: 1,
+                    stride: 2 * rows,
+                    base: 0,
+                },
+            },
+        )
+        .expect("the pair encodes");
+        batch.wait().expect("the batch completes");
+        (first_out.to_vec(), second_out.to_vec())
+    }
+
+    /// The same two, as the two dispatches they were.
+    fn convolved_apart(
+        device: &Device,
+        one: &LayerConv<'_>,
+        other: &LayerConv<'_>,
+        x: &[f32],
+        channels: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let rows = x.len() / channels;
+        let reversed: Vec<f32> = x.iter().rev().copied().collect();
+        let mut first_x = device.buffer(x).expect("the rows upload");
+        let mut second_x = device.buffer(&reversed).expect("the rows upload");
+        let mut residual = device.buffer(&reversed).expect("the residual uploads");
+        let mut first_out = device
+            .zeroed::<f32>(x.len())
+            .expect("the landing allocates");
+        let mut second_out = device
+            .zeroed::<f32>(2 * x.len())
+            .expect("the landing allocates");
+        let mut batch = device.batch().expect("a command buffer opens");
+        one.encode_over(
+            &mut batch,
+            &mut first_x,
+            Some(&mut residual),
+            1.5,
+            Landing {
+                out: &mut first_out,
+                groups: 1,
+                stride: rows,
+                base: 0,
+            },
+        )
+        .expect("the first encodes");
+        other
+            .encode_over(
+                &mut batch,
+                &mut second_x,
+                None,
+                1.0,
+                Landing {
+                    out: &mut second_out,
+                    groups: 1,
+                    stride: 2 * rows,
+                    base: 0,
+                },
+            )
+            .expect("the second encodes");
+        batch.wait().expect("the batch completes");
+        (first_out.to_vec(), second_out.to_vec())
     }
 
     /// The window a call leaves behind is the last `taps - 1` timesteps of what

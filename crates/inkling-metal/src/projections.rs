@@ -69,7 +69,7 @@ use crate::kernel::{Batch, Submitted};
 use crate::matmul::{MatmulError, Multiply, PackedMatmul, PackedProjection, Pending, together};
 use crate::norm::{self, LayerNorm, Normalising, RmsNorm};
 use crate::numerics::Numerics;
-use crate::sconv::{LayerConv, ShortConvolution};
+use crate::sconv::{self, Convolving, LayerConv, ShortConvolution};
 use crate::swiglu::SwiGlu;
 use crate::tail::ModelTail;
 
@@ -482,8 +482,35 @@ impl<'a> LayerProjections<'a> {
 
         let queries = q.len() / (step.sdpa.heads() * step.sdpa.head_dim());
         let (keys, values) = span.landings();
-        let mut k = self.k_sconv.encode(batch, &mut k, None, 1.0)?;
-        self.v_sconv.encode_over(batch, &mut v, None, 1.0, values)?;
+        // One dispatch rather than two, for the reason the head norms below are
+        // one: two sequences, different taps, each leaving its own window, and
+        // neither reading what the other writes. The key's rows land in a buffer
+        // of their own because a head norm reads them next; the value's are keys
+        // of the span already.
+        let mut convolved = device.zeroed::<f32>(k.len())?;
+        sconv::encode_pair(
+            batch,
+            Convolving {
+                conv: &self.k_sconv,
+                x: &mut k,
+                carried: None,
+                scale: 1.0,
+                landing: Landing {
+                    out: &mut convolved,
+                    groups: 1,
+                    stride: queries,
+                    base: 0,
+                },
+            },
+            Convolving {
+                conv: &self.v_sconv,
+                x: &mut v,
+                carried: None,
+                scale: 1.0,
+                landing: values,
+            },
+        )?;
+        let mut k = convolved;
 
         // One dispatch rather than two: the two norms read different rows
         // against different weights into different landings, and neither reads
