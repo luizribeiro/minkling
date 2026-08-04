@@ -23,17 +23,17 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **624 of the 672 tests, no
+`just test` is the one to run while iterating: **642 of the 690 tests, no
 checkpoint, twelve seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
-37 that need weights report a skip and pass. It runs through libtest, which puts
-a crate's tests in one process: opening a Metal device costs a second, so the 214
+38 that need weights report a skip and pass. It runs through libtest, which puts
+a crate's tests in one process: opening a Metal device costs a second, so the 215
 kernel tests are 11.2 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 672 against a
-real checkpoint, nine minutes.** The 52 gated tests — the 37 above and fifteen
+`just test-full` is what has to pass at the ends of a series: **all 690 against a
+real checkpoint, nine minutes.** The 53 gated tests — the 38 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
@@ -68,6 +68,7 @@ three; the pre-commit hooks already skip clippy on those by config.
     just bench HEAD~1 .    prefill --tokens 769
     just bench v1 v2       sweep --depth 4
     just bench-engines                        # this engine against mlx-vlm
+    just bench-session                        # a conversation, kept against not
 
 **A decode step is the one measurement here with a context to be taken at**, and
 until the occupancy turn wanted one it was always taken at the structured
@@ -86,6 +87,13 @@ rebuild bought nothing**: the two binaries do not change between pairs. So each
 ref is built once into `target/bench/bin/<sha>` and kept, and the pairs are
 process launches against binaries that already exist. `.` is the working tree,
 which is the arm a change is measured from before it is a commit at all.
+
+**And one of them measures more than one request.** Everything else here is a
+call — a prefill, a decode step, a prompt and its answer — and a cache kept
+between requests is worth nothing on any of them, because none of them has a
+between. `just bench-session` is a conversation instead: several turns, each
+adding a question and each answered. See "What a conversation costs when its
+cache is kept".
 
 The four things it measures are the four this file quotes: a decode step, a
 prefill at a given length, the end-to-end `k` sweep with its acceptance and its
@@ -1166,6 +1174,160 @@ and 769 tokens cost 2.04, 5.45 and 10.1 s before the budget replaced the row
 count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
+
+## What a conversation costs when its cache is kept
+
+**Every figure in this file below this line is one request**, and the workload
+this engine exists for is not one request. A coding session sends the same
+context back turn after turn with a little added each time; the server built a
+fresh cache for each of them, so a conversation of a few thousand tokens paid for
+all of them on every turn. Nothing here had ever measured that, because a
+measurement of one call has no *between* for a kept cache to live in.
+
+`just bench-session` is that measurement. An arm is a session: 2048 tokens
+opened with, then five turns that each add 256 tokens of question, carry the
+previous reply back, and decode 64 tokens of their own — so the prompt grows
+2048, 2368, 2688, 3008, 3328, which is the shape a coding turn has.
+`inkling_core::workload::Session` owns it, beside the rest of what this repo
+measures over.
+
+**Three pairs, one sitting, the order flipped each pair**, on this repo's default
+checkpoint under the default numerics. The arm is a number rather than an
+executable — `--reuse-tokens 0` is the server as it was, the default bound is the
+server as it is — which is the shape `bench-numerics` puts one word through.
+
+    turn   prompt   prefilled  ── not kept ──   ──── kept ────   change
+                    not/kept    wall    first    wall    first    wall
+      0      2048   2048/2048  13.64 s  12.01 s 13.62 s  11.99 s   -0.2%
+      1      2368   2368/ 321  15.42 s  13.87 s  4.68 s   3.13 s  -69.7%
+      2      2688   2688/ 321  16.94 s  15.39 s  4.79 s   3.24 s  -71.7%
+      3      3008   3008/ 321  18.67 s  17.11 s  4.73 s   3.17 s  -74.7%
+      4      3328   3328/ 321  20.44 s  18.87 s  4.87 s   3.30 s  -76.2%
+    session                    85.10 s          32.68 s          -61.6%
+
+**The session is 85.10 s against 32.68 s**, three pairs of three moving the same
+way with the ranges apart. What a turn prefills stops growing: 321 tokens every
+turn after the first, which is the reply carried back, the question added, and
+the one token a generation has to be handed. By turn four that is 3328 tokens of
+prefill against 321, and the wait for the first token is 18.87 s against 3.30 s.
+
+**Turn zero is the sitting's own control and it reads -0.2% with the ranges
+across, no claim.** Nothing is kept yet, so both arms do identical work — and
+what the harness reads when there is nothing to read is what says the rest of the
+column is not the harness.
+
+### What it costs
+
+**The keys were already held between requests and this did not change that.** A
+layer's span lives on the device inside the wrapped weights, grows by doubling
+and is never given back; a fresh cache sets its count to zero and leaves the
+buffer where it is. So a kept conversation adds no KV at all on the device path.
+What it does add, held between turns, is the ids — eight bytes a position, 256
+KiB at the 32768-position bound — and the `ModelCache`, whose key vectors are
+empty on the device path and whose four convolution windows a layer are **4.92
+MiB across the stack**. On `--backend cpu` the keys *are* those vectors, and the
+bound is the whole of what stands between a server and a resident set that only
+climbs: 10752 MiB at 32768 by the KV table below. Both figures are arithmetic
+from the config's widths, and the second is that table's.
+
+**Inside a request the mark is 9.84 MiB** — the same four windows a layer read
+back off the device and cloned on this side — taken before the generation and
+dropped after it. Peak RSS on a single-request run is unmoved because nothing on
+that path takes one; a served request's peak gains that and nothing else.
+
+**And the arrangement's own bad case is 1.52 ms a turn.** That is the matching,
+the mark, the resume and the recording, on the miss path — where it also builds
+the fresh cache the server allocated on every request before any of this — with
+1.10 ms on the hit path. Against a turn that is seconds either way, a miss costs
+what a miss should cost.
+
+### The reference does this too, and it is not a gap we opened
+
+**mlx-vlm ships Automatic Prefix Caching**, and the brief for this work said to
+find out. For a plain attention model it is block-level and pageable; for one
+whose cache is not block-concatenable it falls to an exact path — a whole
+prompt-cache snapshot taken at a prefix boundary, matched by the ids that
+produced it. Inkling is that second kind, because every layer carries four
+short-convolution windows beside its keys, so the reference reaches the same
+arrangement this repo reached and from the same constraint. Two things about it
+are worth saying precisely: it is **off unless asked for** — `APC_ENABLED`
+defaults to `0` and the manager is wired through mlx-vlm's server rather than
+through `generate_step` — and its cache is **not trimmable**, since `ArraysCache`
+declares no `trim` and so `CacheList.is_trimmable()` is false here. The reply
+cannot be taken back out of a kept cache; the snapshot stands in for that.
+
+`reference/scripts/bench_session` is that machinery behind the same
+`name value unit` contract, so the same three-pair alternating sitting can be run
+against it. **Its own two arms are 32.54 s against 14.57 s, -55.2%** — the same
+effect, three of three, ranges apart. So this is not a differentiator and saying
+otherwise would be the substantial lie.
+
+**Both engines keeping, ours under `--numerics production`** — which is the
+arithmetic the cross-engine column is quoted under — the session is **20.09 s
+against 14.57 s, ours 1.40× behind**, three of three with the ranges apart. Both
+prefill the same 320 tokens a turn; what is left is prefill throughput and the
+decode step, which are the two rows the sections below are about.
+
+**Where the two do differ is what keeping costs.** Per turn, the reference spends
+**31.98 ms** to our **1.10 ms** — a factor of 29, and exactly what the two designs
+predict: a snapshot copies the whole KV where a mark copies a count and four
+windows. Neither number matters against a turn of seconds; the ratio is a fact
+about the designs rather than about the wall.
+
+**One caveat on the reference's column**: its not-kept session ranges 27.35 to
+42.72 s across the three pairs where ours ranges 85.00 to 85.20. The mean is
+reported as measured and the spread is the reference's own.
+
+### What it is not
+
+It is not a prefix-cache service and does not pretend to be one. **A layer holds
+one span and one window pair on the device**, so two conversations interleaved
+through it would overwrite each other's keys — there is no arrangement of this
+that keeps both. One entry, and the entry is a conversation; a prompt that does
+not extend it replaces it.
+
+The matching is all of the kept ids or none. One position is kept and it is the
+end of what was recorded, so a prompt that agrees for a while and then parts
+company has nothing here to start from. That covers a coding turn, which is an
+exact extension of the turn before it, and nothing wider.
+
+**And it changes no token.**
+`a_session_served_from_a_kept_cache_produces_the_tokens_a_cold_one_produces` runs
+four turns warm and four turns cold against the real checkpoint and compares the
+ids of every token of every turn. Ids and not text: a reply that reads the same
+is a reply that might have moved a token. That is what makes this a latency
+optimisation rather than an approximation, the same thing
+`speculation_changes_no_token` says about the other one.
+
+**Capping the windowed layers is still not done and is still the larger prize** —
+see the KV table below, where 35 of 42 layers retain 4.6× what their window could
+ever read at 8192. Nothing here forecloses it: the mark carries a window's rows
+and a count of keys, and a ring-addressed span would change what the count means
+without changing that a mark is those two things.
+
+### What did not move
+
+**No kernel was touched and no numerics decision was made.** The flag stays
+defaulted to reference. All 690 cases pass against a real checkpoint — 642 in the
+gated tier and the 48 of the timing tier, which **runs to completion without
+`--no-fail-fast`** — and the recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` is still what both backends
+write, `--backend cpu` included. The tiers are eighteen cases larger than they
+were and every one of the eighteen is new: the mark against the synthetic stack
+and against a run of layers on the device, the matching and the bound against
+their own cases, the session's shape, and the cold-against-warm session on real
+weights.
+
+The two floors, `a_calls_rows_share_a_weight_read_only_where_they_name_one_expert`,
+the acceptance rows on the packed heads, the decode step at every context and the
+prefill at 16384 are what the timing tier asserts and it passed unchanged: a
+decode step read 19.42, 19.44 and 19.44 ms across three settling runs before this
+sitting, against the 19.4 the same three read before any of this was written.
+
+**The null pair was run and it read +0.1%, ranges across, no claim** —
+`just bench HEAD HEAD decode`, same binary both arms, seven pairs. That control
+is what says the harness is not inventing the column above, and turn zero of the
+session sitting says the same thing inside the sitting itself.
 
 ## Against the reference, end to end
 
