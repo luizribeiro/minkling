@@ -2387,6 +2387,84 @@ fn mma_entry(entry: &str, grouped: bool) -> String {
 
 /// The block, the staging and the hardware multiply, with the three expressions
 /// [`mma_entry`] decides written as placeholders.
+///
+/// # What mlx's own quantised matmul does that this does not
+///
+/// **Everything read off the other engine before this was its dense path** —
+/// `steel_gemm`, `steel_attention`. mlx ships the direct analogue of this
+/// kernel and the metallib in `reference/.venv` at mlx 0.32.0 carries it under
+/// this checkpoint's own format:
+/// `mxfp4_gather_qmm_rhs_nt_float_gs_32_b_4_bm_16_bn_32_bk_32_wm_1_wn_2`, whose
+/// source is `fp_quantized.h`'s `gather_qmm_rhs` over `steel/gemm/mma.h`.
+///
+/// **Its shape is smaller than this one's and its inner loop is the same.** 16
+/// rows by 32 columns over `wm × wn` = 1 × 2 simdgroups, which is 64 threads
+/// where this runs 256; `BK` is 32, which is this kernel's step; and its `k`
+/// loop is barrier, fill both tiles, barrier, multiply `BK / 8` times — the
+/// arrangement here, barrier for barrier. `TM = BM / (8 × WM)` and
+/// `TN = BN / (8 × WN)` are both 2, so a simdgroup there holds **four
+/// accumulators against four fragment loads, which is 1:1** — the ratio a
+/// taller block was wanted for on this side, run by the kernel that was
+/// supposed to be the reason to want it.
+///
+/// What it does differently is three things, and none of them is the shape:
+///
+/// - **It never calls `simdgroup_load`.** `BaseMMAFrag::load` reads the two
+///   elements each lane owns straight out of threadgroup memory through a
+///   static lane-to-coordinate map, and takes the transpose by swapping the two
+///   strides it indexes with. This kernel issues a `simdgroup_load` a fragment
+///   and a *transposing* one for the weight.
+/// - **It has no answer tile.** `BlockMMA::store_result` writes the fragments to
+///   device memory where they lie, and `store_result_slice` is how it refuses a
+///   ragged edge.
+/// - **It walks runs rather than passes.** A block whose rows name several
+///   experts is cut at the boundaries of the sorted index list and each run gets
+///   its own gemm and its own slice of the store, where this kernel runs the
+///   whole reduction once per distinct expert and zeroes the rows that are not
+///   that pass's.
+///
+/// # The three claims about mlx this file inherited
+///
+/// Two hold and the third is false, and all three are read off that metallib
+/// rather than off anything written here. Its steel GEMM does run 64 to 128
+/// threads, and its 64×64 dense tile does reuse fragments 2.7:1. **What is false
+/// is that mlx ships no fp32 quantised matmul**: `mxfp4_qmm_t_float_gs_32_b_4`
+/// is in the same binary, and every one of the four quantised families it
+/// carries — affine, mxfp4, mxfp8, nvfp4 — is instantiated at `float` beside
+/// `float16_t` and `bfloat16_t`. That claim is what the 16-bit arm was argued
+/// from, and `what_sixteen_bit_operands_cost_and_what_they_give_up` is what
+/// answers it on this part instead.
+///
+/// # What the generated code says, and what it will not say
+///
+/// The Metal toolchain is installed off the nix PATH —
+/// `xcodebuild -showComponent MetalToolchain` gives the asset, and
+/// `Metal.xctoolchain/usr/bin` holds `metal`, `metallib`, `metal-objdump` and
+/// `applegpu-nt`, the AIR-to-native translator. Three readings come out of it
+/// and the one everybody wants does not:
+///
+/// - **The pipeline this device builds reports 1024 threads a threadgroup for
+///   both production entries**, which is this part's own maximum — so nothing
+///   about the block's occupancy is decided by its register allocation.
+/// - **The AIR the frontend emits keeps every fragment loop rolled**, and holds
+///   `lhs`, `rhs` and `sums` in `alloca`s indexed by the loop variable rather
+///   than in registers. That is not what runs: unrolling and register allocation
+///   happen in the AGX backend, and `#pragma clang loop unroll(full)` on all
+///   four loops changes the emitted metallib by one line. **So the metallib is
+///   not evidence about the inner loop's schedule**, which is the reading a
+///   source-level intuition would most like to take from it.
+/// - **The native object can be built and cannot be read.** `applegpu-nt -arch
+///   applegpu_g15d` translates the metallib into a Mach-O for this part —
+///   `mma_matmul_rows` is 4736 bytes of `__compute` against `packed_matmul_rows`
+///   at 7136 — but the toolchain ships no instruction printer for the `agx`
+///   targets (`metal-objdump: no instruction printer for target agx3---macho`),
+///   so the instruction stream is not readable with what Apple distributes.
+///
+/// **`what_the_matrix_instruction_issues_at` is what replaced that reading**,
+/// and it answers the question the disassembly was wanted for: how many of this
+/// kernel's cycles are the instruction. A ceiling measured in registers is a
+/// stronger answer than a listing anyway, because it needs no model of what the
+/// part does with what it is issued.
 const MMA: &str = r#"
 /// One threadgroup per MMA_ROWS_A_BLOCK rows of MMA_COLS_A_BLOCK columns, with
 /// the reduction carried by `simdgroup_multiply_accumulate` rather than by a
@@ -6909,7 +6987,7 @@ kernel void scalar_held(
             );
             for shape in &shapes {
                 let taken = shape.costs(&device, &shipped, &grouping);
-                let rate = shape.flops() as f64 / taken.as_secs_f64();
+                let rate = shape.flops() / taken.as_secs_f64();
                 assert!(
                     rate < ceiling,
                     "{} at {tokens} tokens reads {:.1} TFLOP/s against a matrix instruction that \
