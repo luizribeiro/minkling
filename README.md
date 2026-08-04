@@ -1420,9 +1420,9 @@ shipped one bit for bit, because changing the threadgroup changes which
 simdgroup owns an output element and not the order it is accumulated in; and the
 flag stays defaulted to reference.
 
-**All 695 cases pass against a real checkpoint** — 644 in the gated tier in 582 s
-and the 51 of the timing tier in 1364 s, both to completion without
-`--no-fail-fast`. The recorded continuation `[656, 13, 623, 180069, 86333,
+**All 695 cases pass against a real checkpoint** — 644 in the gated tier in 654 s
+and the 51 of the timing tier in 1427 s, both to completion without
+`--no-fail-fast`, run against the tree these commits leave. The recorded continuation `[656, 13, 623, 180069, 86333,
 60500, 220, 23]` is what both backends write,
 `a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` and both shape
 floors are where they were, and the acceptance rows on the packed heads are
