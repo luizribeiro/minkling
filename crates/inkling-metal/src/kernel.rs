@@ -631,6 +631,168 @@ mod tests {
         }
     }
 
+    /// A read of a buffer far larger than any cache, and a copy of one, summed
+    /// or stored a float at a time.
+    ///
+    /// **Strided by the whole grid rather than blocked**, so that the threads of
+    /// a simdgroup ask for consecutive floats on every iteration and the traffic
+    /// is one coalesced stream. A block per thread would have each lane walking
+    /// its own region and would measure the cache hierarchy instead.
+    const STREAMING: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void streaming_read(
+    constant uint &count [[buffer(0)]],
+    device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint i [[thread_position_in_grid]],
+    uint threads [[threads_per_grid]]
+) {
+    float sum = 0.0f;
+    for (uint at = i; at < count; at += threads) {
+        sum += x[at];
+    }
+    out[i] = sum;
+}
+
+kernel void streaming_copy(
+    constant uint &count [[buffer(0)]],
+    device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint i [[thread_position_in_grid]],
+    uint threads [[threads_per_grid]]
+) {
+    for (uint at = i; at < count; at += threads) {
+        out[at] = x[at];
+    }
+}
+
+kernel void streaming_read4(
+    constant uint &count [[buffer(0)]],
+    device const float4 *x [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint i [[thread_position_in_grid]],
+    uint threads [[threads_per_grid]]
+) {
+    const uint quads = count / 4u;
+    float4 sum = float4(0.0f);
+    for (uint at = i; at < quads; at += threads) {
+        sum += x[at];
+    }
+    out[i] = sum.x + sum.y + sum.z + sum.w;
+}
+
+kernel void streaming_copy4(
+    constant uint &count [[buffer(0)]],
+    device const float4 *x [[buffer(1)]],
+    device float4 *out [[buffer(2)]],
+    uint i [[thread_position_in_grid]],
+    uint threads [[threads_per_grid]]
+) {
+    const uint quads = count / 4u;
+    for (uint at = i; at < quads; at += threads) {
+        out[at] = x[at];
+    }
+}
+"#;
+
+    /// **What a streaming read achieves on this machine, which is what every
+    /// "of peak" figure in this repo ought to divide by.**
+    ///
+    /// This part's specification is 819 GB/s and nothing reaches it. A bandwidth
+    /// column exists to tell a kernel that is near the machine from one that is
+    /// a decade off it, and that only means something against a rate something
+    /// has actually reached — so this is the friendliest shape this repo can
+    /// arrange for the memory system: one buffer, read once, in order, with the
+    /// arithmetic on it a single add and the write a float a thread.
+    ///
+    /// **A copy is measured beside it because the column is about reads.** What
+    /// the kernels it describes spend their bytes on is weights, and a weight is
+    /// only ever read; if the two arms disagreed, the denominator would be a
+    /// statement about a traffic shape rather than about the machine, and which
+    /// shape it was would have to be said.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_streaming_read_achieves_on_this_machine() {
+        let Some(device) = device() else { return };
+        /// Floats a buffer holds, which is 4 GiB — far past any cache on this
+        /// part, so that what the rate is of is memory rather than what a
+        /// smaller buffer would have kept.
+        const FLOATS: usize = 1 << 30;
+        const WIDE: usize = 1024;
+        const LANES: usize = 80 * WIDE;
+        const CALLS: usize = 4;
+        const ROUNDS: usize = 3;
+
+        let mut x: Buffer<f32> = device.zeroed(FLOATS).expect("the source allocates");
+        let mut into: Buffer<f32> = device.zeroed(FLOATS).expect("the target allocates");
+        let mut sums: Buffer<f32> = device.zeroed(LANES).expect("the sums allocate");
+        let mut count: Buffer<u32> = device.buffer(&[FLOATS as u32]).expect("the count uploads");
+        let bytes = size_of::<f32>() * FLOATS;
+        let grid = Grid::new(LANES, WIDE);
+
+        // Four floats to a lane is the arm this reports, so it is the arm the
+        // device is brought up to its sustained clock on.
+        let opening = device
+            .compile(STREAMING, "streaming_read4")
+            .expect("the widest read compiles");
+        crate::testing::warmed(|| {
+            crate::testing::device_time(&device, CALLS, |batch| {
+                batch
+                    .add(&opening, &[count.arg(), x.arg(), sums.arg()], grid, bytes)
+                    .expect("the read encodes");
+            });
+        });
+
+        eprintln!("  {:>26}{:>12}{:>14}", "traffic", "moved", "achieved");
+        let mut read: f64 = 0.0;
+        for (what, entry, moves, reading) in [
+            ("one buffer read in order", "streaming_read", bytes, true),
+            (
+                "one read and one written",
+                "streaming_copy",
+                2 * bytes,
+                false,
+            ),
+            ("the same read four wide", "streaming_read4", bytes, true),
+            (
+                "the same copy four wide",
+                "streaming_copy4",
+                2 * bytes,
+                false,
+            ),
+        ] {
+            let kernel = device.compile(STREAMING, entry).expect("the arm compiles");
+            let mut best = Duration::MAX;
+            for _ in 0..ROUNDS {
+                best = best.min(crate::testing::device_time(&device, CALLS, |batch| {
+                    let out = if reading { sums.arg() } else { into.arg() };
+                    batch
+                        .add(&kernel, &[count.arg(), x.arg(), out], grid, moves)
+                        .expect("the arm encodes");
+                }));
+            }
+            let rate = moves as f64 / best.as_secs_f64();
+            // Only the reads, because a weight is only ever read and the column
+            // this feeds is about weights. A copy coming out ahead would be a
+            // finding rather than a denominator.
+            if reading {
+                read = read.max(rate);
+            }
+            eprintln!(
+                "  {what:>26}{:>12}{:>14}",
+                format!("{:.1} GiB", moves as f64 / (1u64 << 30) as f64),
+                format!("{:.0} GB/s", rate / 1e9)
+            );
+        }
+
+        assert!(
+            (400e9..819e9).contains(&read),
+            "{read:.3e} B/s is outside what this part can plausibly stream"
+        );
+    }
+
     #[test]
     fn a_kernel_reports_the_threadgroup_it_can_be_dispatched_in() {
         let Some(device) = device() else { return };

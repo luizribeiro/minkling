@@ -3475,6 +3475,12 @@ and that is a commit of its own rather than a line of this one. The block's own
 rows read 322 and 254 GB/s at 16384 tokens, which is 39% and 31% of 819 and 45%
 and 35% of 723.
 
+**The 723 was itself a written-down number and it is now measured at 725** — see
+"What a streaming read actually achieves", which is the commit of its own this
+paragraph asked for, and which also says why a float at a time reaches only 598.
+The two figures this paragraph already converted stand; the denominator is
+`725e9` from that sitting forward.
+
 **One row of the per-kernel table moved on a kernel the flag does not reach.**
 `rms_norm` is 427.93 ms of the reference's 16384-token prefill and 125.11 ms of
 the production one, over the same 168 calls moving the same 73295.31 MB. Nothing
@@ -3853,6 +3859,41 @@ in-model prefills**, which a clock state cannot reach — 12715 to 12239 ms and
 
 **So the turn holds, with the ordering stated, and the number beside it is
 smaller than the one this file carried on one of the two kernels.**
+
+### What a streaming read actually achieves, which is the denominator
+
+**A8 left the bandwidth denominator as a written-down number replacing a
+written-down number**, and the whole of this milestone's argument is that those
+do not survive being asked. `what_a_streaming_read_achieves_on_this_machine` is
+the friendliest shape this repo can arrange for the memory system — 4 GiB, read
+once, in order, nothing kept:
+
+    traffic                        moved      achieved
+    one buffer read in order     4.0 GiB      598 GB/s
+    one read and one written     8.0 GiB      650 GB/s
+    the same read four wide      4.0 GiB      725 GB/s
+    the same copy four wide      8.0 GiB      682 GB/s
+
+**A8's 723 is right and is measured at 725**, which is 0.3% away and is the only
+figure this milestone re-took that came back where it was put. **The width of a
+lane's load is what decides it**: the same read a float at a time is 598, so 127
+GB/s of this part's ceiling is reachable only by a kernel that asks for four
+floats at once — a fact about the kernels the column describes and not only about
+the column.
+
+**This is the one sweep in the crate the warm-up does not move**, and that is
+worth saying because it is the same discipline the occupancy sweeps needed: cold,
+the four arms read 590, 651, 726 and 682 against these. A kernel bound by memory
+is not bound by the core clock, so the clock state the matmul sweep turned out to
+be about cannot reach this one.
+
+`MEMORY_BANDWIDTH` is `725e9`, measured on whatever host the case runs on rather
+than asserted about this one. **The "of peak" figures recorded above divide by
+819 and convert by multiplying by 1.130** — every one of them except the two the
+paragraph under "What this milestone did not reach" already converted to 723, and
+those are within half a percent as they stand. The tables are not rewritten,
+because rewriting several hundred percentages by arithmetic is how a file
+acquires a figure nobody took.
 
 ## The tail of a step
 

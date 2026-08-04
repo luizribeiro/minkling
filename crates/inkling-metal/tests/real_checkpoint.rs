@@ -1318,14 +1318,18 @@ struct Measured<'a> {
 /// What this machine's memory will hand a kernel per second, as the ceiling the
 /// achieved column is a fraction of.
 ///
-/// **Written down rather than measured, and it is the one number in the table
-/// that is.** Metal has no API that answers it: an M3 Ultra's 819 GB/s is the
-/// part's stated figure, and no kernel reaches it — M2's isolated matmul,
-/// which is the closest thing here to a pure streaming read, measured 284 to
-/// 424. So a row at 40% of this is not 40% of what is achievable; what the
-/// column is for is telling a kernel that is near the machine from one that is
-/// a decade off it.
-const MEMORY_BANDWIDTH: f64 = 819e9;
+/// **This part's specification is 819 GB/s and this is not that**, because a
+/// column dividing by a rate nothing reaches cannot say how close a kernel is to
+/// the machine. `what_a_streaming_read_achieves_on_this_machine` is the
+/// friendliest shape this repo could arrange — 4 GiB read in order, four floats
+/// to a lane — and it reads **725 GB/s**, against 598 for the same read a float
+/// at a time and 682 for a copy. So 819 is the part's number and this is the
+/// memory system's, and what a row is a percentage of is something reached.
+///
+/// **The case measures it on whatever host it runs on** and refuses a reading
+/// outside what the part could plausibly stream, so a machine that is not this
+/// one fails rather than quietly reporting the wrong fraction.
+const MEMORY_BANDWIDTH: f64 = 725e9;
 
 /// A step's rows, and the kernels underneath them where the device was asked
 /// which of its dispatches owns which of the milliseconds.
