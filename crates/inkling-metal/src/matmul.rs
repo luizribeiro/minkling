@@ -2548,9 +2548,11 @@ kernel void __ENTRY__(
     // The answer is written over the staging, because the two are never both
     // live: nothing reads a staged tile after the last multiply-accumulate and
     // nothing writes the answer before it. What the overlap buys is not the
-    // memory but the occupancy — this part gives a core 80 KiB of threadgroup
-    // memory, so what a threadgroup declares decides how many of them it holds
-    // and how much of a barrier one waits at the others cover.
+    // memory but the occupancy: what a threadgroup declares decides how many of
+    // them a core holds, and how much of a barrier one waits at the others
+    // cover. RESIDENCY's sweep is where that turn was measured — three
+    // threadgroups a core at a declaration of 24 KiB and four at 20.
+    //
     // `Block::holds` is where the answer is held to fitting inside the staging.
     threadgroup float staged[(MMA_ROWS_A_BLOCK + MMA_COLS_A_BLOCK) * MMA_STAGED_STRIDE];
     threadgroup float *staged_x = staged;
