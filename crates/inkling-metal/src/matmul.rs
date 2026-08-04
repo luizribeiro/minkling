@@ -517,6 +517,39 @@ const BYTES_PER_GROUP: usize = GROUP_SIZE / CODES_PER_BYTE;
 /// [`GROUP_SIZE`] codes, which is 16 packed bytes.
 const BYTES_PER_LANE: usize = 4;
 
+/// Chunks of its weight row one lane of [`ENTRY`] reads before it adds any of
+/// them, which is how much of that row it has outstanding at a time.
+///
+/// **This is the term a decode step is bound by that is not its own bytes.** A
+/// walk's trip count is a runtime value — a row is `in_dim` wide and the kernel
+/// is compiled once for every width the checkpoint has — so nothing unrolls it,
+/// and a lane holding one chunk issues four bytes, waits a memory latency, adds
+/// them and issues four more.
+/// [`what_a_decode_dispatchs_fixed_cost_is_made_of`] prices that wait by sweeping
+/// the reduction at a fixed width: a dispatch costs **4.4 µs plus 0.41 µs a
+/// step** on top of its bytes at the bus, and 0.41 µs is a memory round trip.
+///
+/// **Nothing about the summation order moves, which is what makes this a constant
+/// rather than a second numerics.** Every other lever this module has taken on
+/// the innermost walk had to go behind [`Numerics`] for changing that order; the
+/// chunks here are read in the order the walk visits them and added in that
+/// order, so every arm of the sweep answers the shipped kernel's bits — see
+/// `weight_dot`, and
+/// [`a_walk_that_holds_several_chunks_answers_the_bits_one_holding_one_answers`].
+///
+/// **Four, and the sweep either side of it is measured in the model rather than
+/// only in a fixture.** Seven alternating pairs of a decode step, every pair the
+/// same way and the ranges apart: two held is 0.9% behind four and eight is 1.8%
+/// behind it.
+/// [`what_a_packed_multiply_costs_at_each_chunk_a_lane_holds`] is the same
+/// question of one dispatch at a time, and reads the turn at the same place —
+/// 1.43× at `k_proj`, 1.19× at a shared bank, 1.08× at a routed one and 1.02× at
+/// a call wide enough to hide its own loads. **That last column is the finding
+/// rather than the first**: what a held chunk buys is buying a narrow dispatch
+/// the latency hiding a wide one already has, which is the shape of finding
+/// [`BYTES_PER_LANE`] is from the other side.
+const CHUNKS_IN_FLIGHT: usize = 4;
+
 /// Where an f32's exponent field starts, above its 23 stored mantissa bits.
 const EXPONENT_SHIFT: u32 = f32::MANTISSA_DIGITS - 1;
 
@@ -1942,6 +1975,7 @@ constant uint CODE_MASK = {};
 constant uint CODES_PER_BYTE = {CODES_PER_BYTE};
 constant uint BYTES_PER_GROUP = {BYTES_PER_GROUP};
 constant uint BYTES_PER_LANE = {BYTES_PER_LANE};
+constant uint CHUNKS_IN_FLIGHT = {CHUNKS_IN_FLIGHT};
 constant uint EXPONENT_SHIFT = {EXPONENT_SHIFT};
 constant uint ROWS_A_TILE = {ROWS_A_TILE};
 constant uint COLS_A_TILE = {COLS_A_TILE};
@@ -2003,26 +2037,65 @@ inline float element(uint code) {
     return ELEMENTS[code];
 }
 
-/// One output element: lane `l` walks the weight row from byte
-/// `l * BYTES_PER_LANE` in strides of that many times the simdgroup width, and
-/// the caller reduces what the lanes held.
+/// One chunk of a weight row: [`BYTES_PER_LANE`] packed bytes from `b`, decoded
+/// and multiplied against the input floats their codes stand against, under the
+/// one scale byte the chunk lies inside.
 ///
 /// A byte is two codes, low nibble first, and its group's scale is a power of
 /// two — so every product here is exact and only the order they are summed in
 /// separates this from any other way of adding them up.
 ///
-/// The inner loop's trip count is a compile-time constant, so it is unrolled
-/// and its loads have no dependency on each other — which is the whole of what
-/// a chunk buys.
+/// The loop's trip count is a compile-time constant, so it is unrolled and its
+/// loads have no dependency on each other — which is the whole of what a chunk
+/// buys.
 ///
-/// **The chunk is bounded by `bytes` and not by anything inside it**, so what
-/// keeps a lane inside its own weight row is that a row is a whole number of
-/// chunks. `pairs` on the Rust side refuses a width that is not whole groups of
-/// 32 codes, which makes every row a whole number of 16 packed bytes, and 4
-/// divides 16 — and the same fact is what puts a whole chunk under the one
+/// **The chunk is bounded by `bytes` at the caller and not by anything inside
+/// it**, so what keeps a lane inside its own weight row is that a row is a whole
+/// number of chunks. `pairs` on the Rust side refuses a width that is not whole
+/// groups of 32 codes, which makes every row a whole number of 16 packed bytes,
+/// and 4 divides 16 — and the same fact is what puts a whole chunk under the one
 /// scale byte read for it. A GPU read past a row is an address inside the next
 /// one rather than a fault, so this is the invariant to check first if either
 /// constant moves.
+inline float chunk_dot(
+    device const uchar *packed,
+    device const uchar *scale,
+    device const float *values,
+    uint b
+) {
+    float dot = 0.0f;
+    for (uint i = 0; i < BYTES_PER_LANE; ++i) {
+        const uint code = packed[b + i];
+        const uint low = code & CODE_MASK;
+        const uint high = (code >> BITS) & CODE_MASK;
+        device const float *v = values + (b + i) * CODES_PER_BYTE;
+
+        dot += element(low) * v[0] + element(high) * v[1];
+    }
+    return dot * as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
+}
+
+/// One output element: lane `l` walks the weight row from byte
+/// `l * BYTES_PER_LANE` in strides of that many times the simdgroup width, and
+/// the caller reduces what the lanes held.
+///
+/// **`CHUNKS_IN_FLIGHT` chunks are read before any of them is added**, and that
+/// is the whole of what this loop's shape is for. The walk's trip count is a
+/// runtime value, so nothing unrolls it and a lane holds one chunk at a time: it
+/// issues four bytes, waits a memory latency for them, adds them, and issues four
+/// more. `what_a_decode_dispatchs_fixed_cost_is_made_of` prices that wait at 0.41
+/// microseconds a step, which across the 457 calls a decode step makes is 2.75 ms
+/// of an 18.6 ms step spent waiting rather than reading.
+///
+/// **The order every product enters every sum in is untouched, and that is by
+/// construction rather than within a tolerance.** The chunks are read in the
+/// order the walk visits them and added in that same order, so this reduces to
+/// the loop it replaces at [`CHUNKS_IN_FLIGHT`] of one, and the remainder walk
+/// below carries on from where the held one stopped, in the same stride, adding
+/// in the same direction.
+/// `a_walk_that_holds_several_chunks_answers_the_bits_one_holding_one_answers`
+/// is where that is held, over every reduction the checkpoint has and two that do
+/// not divide.
 inline float weight_dot(
     device const uchar *packed,
     device const uchar *scale,
@@ -2031,18 +2104,20 @@ inline float weight_dot(
     uint lane,
     uint width
 ) {
+    const uint step = width * BYTES_PER_LANE;
     float sum = 0.0f;
-    for (uint b = lane * BYTES_PER_LANE; b < bytes; b += width * BYTES_PER_LANE) {
-        float dot = 0.0f;
-        for (uint i = 0; i < BYTES_PER_LANE; ++i) {
-            const uint code = packed[b + i];
-            const uint low = code & CODE_MASK;
-            const uint high = (code >> BITS) & CODE_MASK;
-            device const float *v = values + (b + i) * CODES_PER_BYTE;
-
-            dot += element(low) * v[0] + element(high) * v[1];
+    uint b = lane * BYTES_PER_LANE;
+    for (; b + (CHUNKS_IN_FLIGHT - 1) * step < bytes; b += CHUNKS_IN_FLIGHT * step) {
+        float held[CHUNKS_IN_FLIGHT];
+        for (uint c = 0; c < CHUNKS_IN_FLIGHT; ++c) {
+            held[c] = chunk_dot(packed, scale, values, b + c * step);
         }
-        sum += dot * as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
+        for (uint c = 0; c < CHUNKS_IN_FLIGHT; ++c) {
+            sum += held[c];
+        }
+    }
+    for (; b < bytes; b += step) {
+        sum += chunk_dot(packed, scale, values, b);
     }
     return sum;
 }
@@ -5739,6 +5814,120 @@ kernel void decoded_elements(
         }
     }
 
+    /// **What a packed multiply costs at each chunk a lane holds**, and the sweep
+    /// [`CHUNKS_IN_FLIGHT`] was chosen from.
+    ///
+    /// One is the kernel this engine shipped for eleven milestones: the walk's
+    /// trip count is a runtime value, nothing unrolls it, and a lane waits a
+    /// memory latency for four bytes before it issues four more. Every arm above
+    /// one issues that many chunks before it adds any of them, and every arm
+    /// answers the same bits —
+    /// [`a_walk_that_holds_several_chunks_answers_the_bits_one_holding_one_answers`]
+    /// is where that is held, so what this table ranks is the same arithmetic
+    /// waiting differently.
+    ///
+    /// **The shapes are the ones that carry a decode step's bytes**, and the
+    /// widest of them is there to say where the lever stops paying: a call of
+    /// 32768 elements hides its own loads behind other simdgroups, which is what
+    /// a held chunk buys for the shapes that cannot.
+    ///
+    /// **A routed bank of sixteen experts rather than the engine's 256**, because
+    /// an arm here re-uploads its banks and at 256 that is a gigabyte copied
+    /// between two measurements. The rows still name six different experts and
+    /// still walk the same reduction; what the smaller bank gives up is the claim
+    /// that the weight was cold, which is a claim about the rate and not about
+    /// which arm won.
+    ///
+    /// Warm and swept both ways, for the reason
+    /// [`whether_a_decode_dispatch_is_short_of_the_machine`] gives. Nothing
+    /// asserts a rate; what is asserted is that the shipped count was among the
+    /// ones tried.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_packed_multiply_costs_at_each_chunk_a_lane_holds() {
+        let Some(device) = device() else { return };
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        assert!(
+            CHUNKS_HELD.contains(&CHUNKS_IN_FLIGHT),
+            "{CHUNKS_IN_FLIGHT}"
+        );
+
+        // `(what, rows, in_dim, out_dim, experts)`.
+        let shapes: Vec<Blocked> = [
+            ("k_proj, v_proj", 1, 4096, 1024, 1),
+            ("q_proj, o_proj", 1, 4096, 4096, 1),
+            ("shared gate, up", 2, 4096, 2048, 2),
+            ("routed gate, up", 6, 4096, 2048, 16),
+            ("a call wide enough", 1, 4096, 32768, 1),
+        ]
+        .into_iter()
+        .map(|(what, rows, in_dim, out_dim, experts)| {
+            Blocked::of(what, rows, in_dim, out_dim, experts, false)
+        })
+        .collect();
+        let arms: Vec<PackedMatmul> = CHUNKS_HELD
+            .iter()
+            .map(|&chunks| {
+                PackedMatmul::from_source(&device, &a_lane_holding(chunks))
+                    .unwrap_or_else(|err| panic!("{chunks} chunks compile: {err}"))
+            })
+            .collect();
+
+        let at: Vec<usize> = (0..CHUNKS_HELD.len()).collect();
+        let cost = |arm: usize| -> Vec<Duration> {
+            let banks: Vec<PackedBank<'_>> = shapes
+                .iter()
+                .map(|shape| shape.upload(&device, &arms[arm]))
+                .collect();
+            // **Warmed on the widest shape and not the narrowest.** A warm-up
+            // iteration is a submission the host waits 225 µs for, so warming
+            // on a 13 µs dispatch leaves the device idle four fifths of the
+            // budget and its clock where it was — which read as the first arm
+            // of each direction, and only the first, coming back twice as slow.
+            let widest = shapes.len() - 1;
+            crate::testing::warmed(|| {
+                shapes[widest].costs_on(&device, &banks[widest], &grouping);
+            });
+            shapes
+                .iter()
+                .zip(&banks)
+                .map(|(shape, bank)| shape.costs_on(&device, bank, &grouping))
+                .collect()
+        };
+        let (up, down) = crate::testing::both_ways(&at, cost);
+
+        eprintln!(
+            "  {:<20}{}",
+            "shape",
+            CHUNKS_HELD
+                .iter()
+                .map(|chunks| format!("{:>18}", format!("{chunks} held")))
+                .collect::<String>()
+        );
+        for (which, shape) in shapes.iter().enumerate() {
+            let moved = packed_bytes(shape.rows * shape.out_dim * shape.in_dim);
+            let cells: String = (0..CHUNKS_HELD.len())
+                .map(|arm| {
+                    format!(
+                        "{:>10}{:>8}",
+                        format!("{:.1}µs", 1e6 * up[arm][which].as_secs_f64()),
+                        format!("{:.0} GB/s", moved / up[arm][which].as_secs_f64() / 1e9),
+                    )
+                })
+                .collect();
+            eprintln!("  {:<20}{cells}", shape.what);
+            let other: String = (0..CHUNKS_HELD.len())
+                .map(|arm| {
+                    format!(
+                        "{:>18}",
+                        format!("{:.1}µs", 1e6 * down[arm][which].as_secs_f64())
+                    )
+                })
+                .collect();
+            eprintln!("  {:<20}{other}", "  the other way");
+        }
+    }
+
     /// **What a decode dispatch's fixed cost is made of**, which is the length of
     /// one output element's own walk.
     ///
@@ -6690,8 +6879,8 @@ kernel void decoded_elements(
                 "the weight's loads",
                 crate::testing::instead_of(
                     &shipped,
-                    "            const uint code = packed[b + i];",
-                    "            const uint code = b + i;",
+                    "        const uint code = packed[b + i];",
+                    "        const uint code = b + i;",
                 ),
             ),
             // **The input, which is the term this walk re-reads hardest.** Every
@@ -6705,9 +6894,8 @@ kernel void decoded_elements(
                 "the input's traffic",
                 crate::testing::instead_of(
                     &shipped,
-                    "            device const float *v = values + (b + i) * CODES_PER_BYTE;",
-                    "            device const float *v = values + (((b + i) * CODES_PER_BYTE) & \
-                     7u);",
+                    "        device const float *v = values + (b + i) * CODES_PER_BYTE;",
+                    "        device const float *v = values + (((b + i) * CODES_PER_BYTE) & 7u);",
                 ),
             ),
             // The same term with both loads gone and the two multiply-adds left,
@@ -6716,8 +6904,8 @@ kernel void decoded_elements(
                 "the input's loads",
                 crate::testing::instead_of(
                     &shipped,
-                    "            dot += element(low) * v[0] + element(high) * v[1];",
-                    "            dot += element(low) * (float)b + element(high) * (float)i;",
+                    "        dot += element(low) * v[0] + element(high) * v[1];",
+                    "        dot += element(low) * (float)b + element(high) * (float)i;",
                 ),
             ),
             // The dequantisation, which is two gathers into a 16-entry constant
@@ -6727,8 +6915,8 @@ kernel void decoded_elements(
                 "the table it decodes through",
                 crate::testing::instead_of(
                     &shipped,
-                    "            dot += element(low) * v[0] + element(high) * v[1];",
-                    "            dot += (float)low * v[0] + (float)high * v[1];",
+                    "        dot += element(low) * v[0] + element(high) * v[1];",
+                    "        dot += (float)low * v[0] + (float)high * v[1];",
                 ),
             ),
             // The group scale, which is a byte read and a shift per chunk.
@@ -6738,9 +6926,9 @@ kernel void decoded_elements(
                 "the scale it walks to",
                 crate::testing::instead_of(
                     &shipped,
-                    "        sum += dot * as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << \
+                    "    return dot * as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << \
                      EXPONENT_SHIFT);",
-                    "        sum += dot * as_type<float>(uint(scale[0]) << EXPONENT_SHIFT);",
+                    "    return dot * as_type<float>(uint(scale[0]) << EXPONENT_SHIFT);",
                 ),
             ),
             // The cross-lane reduction, which is one per output element at the
@@ -7767,9 +7955,9 @@ kernel void scalar_held(
         );
         let walked = crate::testing::instead_of(
             &carried,
-            "            dot += element(low) * v[0] + element(high) * v[1];",
-            "            const float2 pair = ELEMENT_PAIRS[code];\n            dot += pair.x * \
-             v[0] + pair.y * v[1];",
+            "        dot += element(low) * v[0] + element(high) * v[1];",
+            "        const float2 pair = ELEMENT_PAIRS[code];\n        dot += pair.x * v[0] + \
+             pair.y * v[1];",
         );
         crate::testing::instead_of(
             &walked,
@@ -8077,6 +8265,74 @@ kernel void scalar_held(
         );
         assert!(source.contains(&wanted), "the prelude declares {wanted}");
         source
+    }
+
+    /// The shipped kernel with a different [`CHUNKS_IN_FLIGHT`] written into its
+    /// prelude, which is the one thing that sweep varies.
+    ///
+    /// The declaration is named in full on both sides of the rewrite, for the
+    /// reason [`a_lane_reading`] gives: the prelude holds several `uint`
+    /// constants at small powers of two and a check for the value alone would
+    /// pass against one of those.
+    fn a_lane_holding(chunks: usize) -> String {
+        let wanted = format!("constant uint CHUNKS_IN_FLIGHT = {chunks};");
+        let source = source().replace(
+            &format!("constant uint CHUNKS_IN_FLIGHT = {CHUNKS_IN_FLIGHT};"),
+            &wanted,
+        );
+        assert!(source.contains(&wanted), "the prelude declares {wanted}");
+        source
+    }
+
+    /// The chunk counts the sweep runs and the bit-for-bit case holds, one of
+    /// which is the shipped one.
+    const CHUNKS_HELD: [usize; 5] = [1, 2, 4, 8, 16];
+
+    /// **A lane that holds several chunks answers the bits a lane holding one
+    /// answers**, which is what makes [`CHUNKS_IN_FLIGHT`] a constant rather than
+    /// a second numerics.
+    ///
+    /// Every other lever this module has taken on the innermost walk changed the
+    /// order the products are summed in and had to go behind [`Numerics`] for it.
+    /// This one does not: the held chunks are read in the order the walk visits
+    /// them and added in that order, so the sum is the same expression associated
+    /// the same way. The claim is cheap to make and worth nothing unheld, so it is
+    /// held here against the shipped kernel's own bit patterns.
+    ///
+    /// **The reductions are the checkpoint's and two that do not divide.** A walk
+    /// of `steps` chunks runs `steps / chunks` held iterations and the rest one at
+    /// a time, so what has to be checked is both paths and the seam between them —
+    /// and 1536 over 16 held chunks is no held iteration at all, which is the arm
+    /// that says the remainder walk alone still answers.
+    #[test]
+    fn a_walk_that_holds_several_chunks_answers_the_bits_one_holding_one_answers() {
+        let Some(device) = device() else { return };
+        // 2048 and 8192 are `shared down` and `dense down`; 4096 is every other
+        // reduction in the checkpoint; 1536 and 2560 divide neither the lane
+        // stride nor any chunk count above one.
+        const REDUCTIONS: [usize; 5] = [1536, 2048, 2560, 4096, 8192];
+
+        for in_dim in REDUCTIONS {
+            let case = Case::noisy(in_dim, 71, 3);
+            let answers = |chunks: usize| {
+                let matmul = PackedMatmul::from_source(&device, &a_lane_holding(chunks))
+                    .unwrap_or_else(|err| panic!("{chunks} chunks compile: {err}"));
+                bit_patterns(
+                    &case
+                        .upload(&device, &matmul)
+                        .multiply(&case.x)
+                        .expect("the dispatch runs"),
+                )
+            };
+            let want = answers(1);
+            for chunks in CHUNKS_HELD {
+                assert_eq!(
+                    answers(chunks),
+                    want,
+                    "a reduction of {in_dim} answered other bits with {chunks} chunks held"
+                );
+            }
+        }
     }
 
     /// A weight paired with another tensor's scales is the mistake the shapes
