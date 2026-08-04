@@ -296,6 +296,17 @@ smoke model="models/Inkling-Small-mxfp4":
 sdpa-probe *args:
     reference/.venv/bin/python reference/scripts/sdpa_probe.py {{ args }}
 
+# What mlx's own quantised matmul costs at the two shapes this engine's prefill
+# gives its own — one dispatch each, MXFP4, at the lengths the block's tables
+# are read at.
+#
+# Not a cross-engine claim and not paired: `bench-engines` is where those are
+# made. This is what lets `gather_qmm` and `quantized_matmul` be read beside a
+# number rather than only beside their source, and it is the arm that says
+# whether a quantised MoE matmul on this part is anywhere near a dense one.
+qmm-probe *args:
+    reference/.venv/bin/python reference/scripts/qmm_probe.py {{ args }}
+
 # Prefill wall time, throughput and peak memory across a prompt-length sweep
 prefill-bench model="models/Inkling-Small-mxfp4" *args:
     reference/.venv/bin/python reference/scripts/prefill_bench.py {{ model }} {{ args }}
