@@ -1175,6 +1175,336 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## The four levers the matmul had left
+
+**Every one of them was measured and every one of them is refused, and the
+measurement that did it is one cheap question asked first.** This milestone
+opened with four candidates for the prefill gap — whether the matmul had become
+bandwidth-bound, a block-height refactor, fragment reuse, and the thread width —
+and a fifth held back for last, 16-bit operands. The first was taken first
+because it could re-rank the rest, and it did: **it re-ranked all of them to
+zero.**
+
+**No kernel changed. What this milestone ships is a shape the block can be swept
+at, and five tables saying what the sweeps found.**
+
+### Which kernel the closed doors were closed on
+
+**Every "this is not bandwidth-bound" finding in this file was taken on the
+reference tile.** A3's 96-fold expert-weight re-read costing 10.4%, A4's whole
+limiter table — both of them on the kernel A7 then replaced with one 2.85×
+faster. **A kernel that was issue-bound can become
+bandwidth-bound when it gets faster**, and at that moment every byte-count lever
+those findings retired comes back.
+
+So `what_a_prefills_blocked_matmul_is_bound_by` is A4's instrument pointed at
+`mma_matmul_rows` and `mma_matmul_grouped` — the two entries that actually run a
+prefill under the production flag — at the three lengths a coding session lives
+between.
+
+### The premise this milestone had to correct before it could use it
+
+**The brief this milestone was written from argued that 16384 flatters the
+matmul, and that has not been true since A8.** The argument was that attention
+is quadratic and the matmul is not, so at 16384 attention was 43 s of the work
+and the matmul's share looked small: 64% of the passes against 56%.
+`mma_attention` took the two attention rows nineteen times down. The in-model
+per-kernel table now reads, under `--numerics production`, one sampled prefill a
+row:
+
+    tokens   the grouped matmul   the row-tiled matmul   both   of every pass
+     2048           1.88s                1.23s          3.11s        88%
+     4096           3.28s                2.46s          5.74s        85%
+     8192           6.13s                4.84s         10.97s        83%
+    16384          11.81s                9.65s         21.46s        80%
+
+**So no length flatters it any more.** The matmul is where a prefill's time is at
+every length, and the reason to measure at 2048 to 8192 is the plainer one: that
+is where a coding session opens, and a prefill there is seconds where 16384 is
+half a minute.
+
+### Whether the matmul is bandwidth-bound now, which is no
+
+**Two readings, because either alone is misread.** The first is the roofline —
+what a call must fetch once each, over the device's own clock, against the 725
+GB/s `what_a_streaming_read_achieves_on_this_machine` measures:
+
+                    q_proj, tiled                   a routed bank, grouped
+    tokens   taken   must move   at 725 GB/s      taken   must move   at 725 GB/s
+     2048   1.01ms    0.08 GB   0.10ms   10%     4.42ms    1.44 GB   1.99ms   45%
+     4096   1.98ms    0.14 GB   0.20ms   10%     6.83ms    1.74 GB   2.41ms   35%
+     8192   3.95ms    0.28 GB   0.38ms   10%    13.57ms    2.35 GB   3.24ms   24%
+
+**The compulsory floor is a quarter of the grouped call and a tenth of the tiled
+one, and it falls as the prompt grows** — the weight is the same 256 experts
+however many rows read it, so a longer prefill amortises it further. There is a
+factor of four to memory on the row that has least of it.
+
+But a roofline cannot tell a kernel bound by traffic it *must* move from one
+bound by traffic it *re-reads*, and those have opposite consequences for the rest
+of this list. So the second reading is the limiter table — the shipped kernel
+with one term at a time replaced by something that costs an instruction over the
+same operands and cannot be folded away. **Warm, and swept both ways**, because
+the arms are four and five percent apart and this file has the case on record
+where that was a clock: at 8192 tokens, the two passes agreeing to a hundredth of
+a millisecond at every arm.
+
+    without                                       q_proj, tiled   a routed bank, grouped
+    nothing — the kernel                         3.95ms   100%      13.57ms   100%
+    the weight it reads                          3.77ms    96%      13.07ms    96%
+    the input rows it walks                      3.78ms    96%      13.04ms    96%
+    the table it decodes through                 3.83ms    97%      13.23ms    97%
+    three of every four fragment loads           3.70ms    94%      12.86ms    95%
+    three quarters of the multiply-accumulates   2.70ms    68%       9.47ms    70%
+
+**Confining the whole weight working set to 2 KB is four percent.** Every byte of
+the 2.35 GB the call must fetch, plus all 1791 weight reads it issues where 256
+would do — the same bytes decoded, the same arithmetic, a working set that fits
+in a cache line — and the kernel comes back 96% of itself. **The matmul is not
+bandwidth-bound and it is not close.** A3's 10.4% is now 4%.
+
+**The input is four percent and the decode is three.** A4 measured the decode at
+30% of the reference tile and could not remove it; the block amortises it eight
+times as far, and what is left of it is 3%. That term is finished.
+
+**The multiply-accumulate is the only thing here with a factor in it.** Cutting
+three of every four leaves every fragment load where it was and takes 30 to 32%,
+so the instruction is about 41% of the kernel. Nothing in the brief's four levers
+points at it.
+
+### What fragment reuse would have bought, which is six percent at its ceiling
+
+**"What the taller block would cost at its floor" recorded the reuse half as
+unmeasurable without a refactor, and on this kernel it turns out to be
+measurable without one.** That section is about the *attention* block — A8 left
+its two multiplies at 1:1 and named the obstacle — and the matmul's block has
+the same obstacle and the same ratio. A simdgroup here holds
+`MMA_FRAGMENTS_DOWN × MMA_FRAGMENTS_ACROSS` = four accumulators and issues two
+`lhs` and two `rhs` loads to feed them, which is **1:1** where mlx-vlm's 64×64
+steel tile runs **2.7:1**. A taller block is the way to buy that ratio and it
+costs a doubled floor — on the attention kernel that is a measured 2.4 to 3.8× on
+a short turn over a long session, which is exactly the shape K1's kept cache
+produces.
+
+The arm above buys the ratio's ceiling for nothing instead. Hoisting the two
+fragment loads out of the step's `k` loop drives all sixteen multiply-accumulates
+off one set of fragments — **4:1, past mlx-vlm's 2.7:1**, with no taller block and
+no floor to pay. It answers wrongly, so what it prices is the loads alone and it
+is an upper bound on anything reuse could return.
+
+**It is worth five to six percent**, and it is an upper bound rather than an
+estimate. So the most a taller block could return on this kernel is that, and the
+floor table on the kernel beside it prices what the same trade gives away at 2.4
+to 3.8× on a short turn over a long session. **That closes the height on the
+matmul, and it closes it without the refactor that was thought to be needed to
+ask.**
+
+**And a block twice as tall does not fit on this part at all**, which the sweep
+found rather than argued: two staged tiles, an answer tile and the block's expert
+list at 64 rows come to 36160 bytes against a threadgroup's 32768, and the
+pipeline refuses it.
+
+### What the block's threadgroup is worth, which is nothing this side of 256
+
+**mlx-vlm runs its steel GEMM at 64 to 128 threads where this ships 256, and
+nothing here had ever tried another width.** That figure and the 2.7:1 above have
+been asserted in this file since A8 and were never checked against anything; they
+are checked now, against the metallib this repo's own oracle runs — mlx 0.32.0 in
+`reference/.venv`, whose `steel_gemm_fused_*_bm64_bn64_bk16_wm1_wn2` symbols and
+`steel/gemm/mma.h` give a 64×64 tile over `wm × wn` simdgroups of 32, which is 64
+threads at `1×2` and 128 at `2×2`, and 32 accumulators against 12 fragment loads.
+**Both hold.** The reason was not that it looked
+unpromising: the width was a host-side constant as well as a source one — the
+grid is `rows.div_ceil(rows) × out_dim.div_ceil(cols)` threadgroups of it — so an
+entry compiled at one width and dispatched over a grid sized for another leaves
+output no threadgroup reached, which is a wrong answer rather than a slow one.
+`Block` is what closed that, and it is the one thing this milestone ships.
+
+At 8192 tokens, warm, both ways, every arm answering the shipped block bit for
+bit:
+
+    a threadgroup                reuse     q_proj, tiled     a routed bank, grouped
+     64 threads, 1×2 simdgroups  2.0:1   68.18ms   1726%    210.06ms   1546%
+    128 threads, 2×2 simdgroups  1.3:1    5.37ms    136%     17.82ms    131%
+    256 threads, 2×4 simdgroups  1.0:1    3.95ms    100%     13.59ms    100%
+    512 threads, 2×8 simdgroups  0.7:1    6.31ms    160%     20.94ms    154%
+
+**The shipped width is the best of the four and the reuse column runs backwards
+against the clock.** A narrower threadgroup gives a simdgroup more fragments to
+hold, so 64 threads is 2.0:1 where 256 is 1:1 — most of the way to the ratio a
+taller block was wanted for — and it is **seventeen times slower**.
+
+The reason is that a block's threadgroup memory is a property of the block and
+not of its threads. Two staged tiles and an answer tile come to about 22 KiB
+whatever covers them, so a core holding 32 KiB holds one threadgroup either way —
+and at 64 threads that is two simdgroups a core against eight, with the same
+memory and a quarter of the work to hide a load behind. **This is the second
+measurement in this milestone saying that fragment reuse is not what this kernel
+wants**, and it is the one that says why.
+
+### What sixteen-bit operands cost and what they give up
+
+**Apple's guidance for this hardware is most emphatic about 16-bit types, and
+mlx's own quantised matmul takes it completely — `qmm` ships `bfloat16` and
+`float16` variants and no `float32` one.** (Its *dense* steel GEMM does ship
+fp32, which is worth saying because this file has asserted otherwise: the
+metallib in `reference/.venv` at mlx 0.32.0 carries
+`steel_gemm_fused_nn_float32_float32_bm64_bn64_bk16_wm1_wn2`.) A8 declined it and named the reason
+to respect: this flag's two sides sum the same exact products in different
+orders, and a 16-bit operand rounds the product itself, so it would have to move
+into the conditioning table rather than sit beside it.
+
+It is in the conditioning table. The accumulator stays `simdgroup_float8x8` —
+the instruction takes that mixed form on this family — so nothing about the
+summation order moves and what is priced is the operand alone. Drift from an f64
+accumulation of the same products:
+
+    a reduction   the reference   the block   16-bit operands
+       32            8.3e-8         1.3e-7        1.8e-4
+      128            1.4e-7         3.5e-7        1.7e-4
+      512            8.4e-8         6.6e-7        1.5e-4
+     2048            1.1e-7         1.5e-6        2.1e-4
+     4096            1.0e-7         1.6e-6        1.8e-4
+
+**The shape of that column is the finding rather than its size.** The block's own
+drift grows with the reduction, because its fragment accumulator is one running
+sum and a longer chain is a worse one. A drift that is *flat* is not a chain at
+all — it is the operand, arriving already rounded and staying that far off
+however few products are summed. Which is exactly what A8 predicted, and it sits
+two decades above the block at every length.
+
+**And it is slower.** Three paddings rather than one, because the shipped stride
+is derived against a four-byte staged element and at two bytes 36, 40 and 44 all
+put a fragment's eight rows on eight distinct banks and should read alike on the
+argument alone. They do not:
+
+    at                            the block   at 36    at 40    at 44
+    2048   q_proj, tiled             1.01ms     +6%      +3%      +2%
+    2048   a routed bank, grouped    4.42ms     +6%      +2%      +3%
+    4096   q_proj, tiled             1.99ms     +6%      +2%      +2%
+    4096   a routed bank, grouped    6.83ms     +5%      +1%      +2%
+    8192   q_proj, tiled             3.95ms     +6%      +2%      +2%
+    8192   a routed bank, grouped   13.58ms     +6%      +2%      +2%
+
+**A single-stride reading would have priced the padding and called it the operand
+width** — 36 costs six percent where 40 and 44 cost one to three. At the best of
+them it is still slower at every shape. **Refused on both counts**, and both are
+asserted, so either turning stops the tier rather than printing quietly.
+
+### A weight whose rows were all the same weight
+
+**The instrument had a hole in it and the first arm this milestone wrote fell
+into it.** `Case::seeded` built every synthetic MXFP4 code from
+`noise.next() % 16`, and `Noise` is a power-of-two linear congruence whose bit
+`i` has period `2^(i+1)`. Four bits off the bottom are the state's 8 to 11, so
+the code stream repeated **every 4096** — which is the width of every reduction
+in this checkpoint, and therefore exactly one row of a weight.
+
+So every row of every expert of every synthetic weight held the same codes. A
+kernel that read some other column's codes, or some other expert's, would have
+answered bit for bit what the right one answers; the limiter tables in this file
+have been pricing the weight through its *scale* alone, because 11 and 5 are not
+powers of two and the scales never had the problem. `no_two_rows_of_a_synthetic
+_weight_hold_the_same_codes` is what says it cannot come back, asked at the
+reduction this checkpoint has and either side of it.
+
+**The tables were re-taken after the fix and did not move**, which is what the
+limiter arms above are: the weight arm still reads 96% with the codes genuinely
+differing per column.
+
+### What did not move, which is every kernel and every token
+
+**No kernel changed and no default changed.** `Block::SHIPPED` emits the prelude
+the module constants emitted, byte for byte; every swept shape answers the
+shipped one bit for bit, because changing the threadgroup changes which
+simdgroup owns an output element and not the order it is accumulated in; and the
+flag stays defaulted to reference.
+
+**All 695 cases pass against a real checkpoint** — 644 in the gated tier in 582 s
+and the 51 of the timing tier in 1364 s, both to completion without
+`--no-fail-fast`. The recorded continuation `[656, 13, 623, 180069, 86333,
+60500, 220, 23]` is what both backends write,
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` and both shape
+floors are where they were, and the acceptance rows on the packed heads are
+unmoved. The tier is five cases larger than it was: the block's limiter table,
+the 16-bit table, the threadgroup sweep, and two ordinary cases holding the
+fixture and the swept shapes to what they promise.
+
+**The in-model per-kernel table was re-taken after the refactor and did not
+move**, which is the check that matters because the refactor is on the shipped
+dispatch path — `entry`, `rows_a_read` and `blocks` all read the block off the
+compiled entry now:
+
+    tokens    the grouped matmul       the row-tiled matmul
+              before     after         before     after
+     2048      1.88s     1.90s          1.23s     1.24s
+     4096      3.28s     3.28s          2.46s     2.45s
+     8192      6.13s     6.13s          4.84s     4.84s
+    16384     11.81s    11.81s          9.65s     9.63s
+
+**And the session is where it was.** Both openings, both engines, one sitting
+each, three pairs, ours under `--numerics production`:
+
+    opening        ours kept   mlx-vlm kept   behind    K1's behind
+    2048            19.68 s      14.38 s      1.37×        1.40×
+    8192            36.16 s      27.24 s      1.33×        1.32×
+
+    the prefill inside it, which is the turn's time to first token
+    2048             6.34 s       3.69 s      1.72×
+    8192            18.76 s      13.62 s      1.38×
+
+**K1's kept-cache advantage is untouched**, which is the one architectural
+advantage this engine has measured: the per-turn bookkeeping is **1.013 ms at
+the 2048 opening and 1.267 at 8192** against the reference's 31.44 and 66.26 —
+ours flat in the context where theirs is linear, because a mark is four windows a
+layer and a count of keys where a snapshot copies the whole KV.
+
+**The null pair was run and it read −0.3%, ranges across, no claim** —
+`just bench HEAD HEAD decode`, same binary both arms, seven pairs. The host was
+settled to 0.33% before the sitting and read 19.386 to 19.450 ms, against 19.406
+to 19.468 before any of this was written.
+
+**Our own prefill wall, unsampled, under the production flag**, at the three
+lengths — ours alone, since the cross-engine column above is the one taken in a
+sitting with the other engine in it:
+
+    tokens    wall      device
+     2048    5.74 s     3.39 s
+     4096    9.33 s     6.26 s
+     8192   17.29 s    12.19 s
+
+### What this milestone leaves
+
+**The matmul's remaining time is the matrix instruction and whatever is around
+it, and nothing on the brief's list reaches either.** Cutting three of four
+multiply-accumulates takes 31%, which by arithmetic puts the instruction near
+41% of the kernel if the term is linear in its count — labelled arithmetic
+because that is what it is. Everything else here is worth three to six percent
+apiece.
+
+**What the arms do not do is sum, and they are not asserted to.** Each is a
+marginal removal against the whole kernel and several of them overlap: the
+fragment-load arm and the accumulate arm reach the same registers, and the input
+arm and the weight arm reach the same cache. So what is left over is not a
+number this milestone has — what it has is that no byte-count term is worth more
+than six percent, and that the largest single term is an instruction.
+
+**That is the measurement the next milestone wants**, and it is a different
+instrument from this one: the terms left are inside the threadgroup — the staging
+stores, the two barriers a step, the loop — rather than across the bus, and an
+ablation that confines a device read cannot separate them.
+
+**What is now cheap that was not.** The block's shape is a value, so a height, a
+width, a column span or a staging step is one arm of a sweep rather than a
+milestone. The threadgroup sweep here cost an afternoon and the four levers it
+retired had cost four milestones of deferral between them.
+
+**What this does not license is a claim that the engine is finished.** It is 1.33×
+behind at the opening a coding turn has, and the gap is real; what this milestone
+says is that none of the five things anyone had written down would close it, and
+that the two doors A3 and A4 closed on the reference tile stay closed on the
+kernel that replaced it.
+
 ## What a conversation costs when its cache is kept
 
 **Every figure in this file below this line is one request**, and the workload
