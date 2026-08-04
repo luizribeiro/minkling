@@ -6064,7 +6064,45 @@ kernel void decoded_elements(
                 "three quarters of the multiply-accumulates",
                 crate::testing::instead_of(&shipped, EVERY_ACCUMULATE, ONE_ACCUMULATE),
             ),
+            // **The two barriers a step**, which is the term no ablation across
+            // the bus can reach and the largest thing left inside the
+            // threadgroup. A step is MMA_CODES_A_STEP codes wide, so a
+            // reduction of 4096 is 128 of them and 256 barriers a pass — every
+            // one of which stops all eight simdgroups until the slowest
+            // arrives.
+            //
+            // **This arm races and that is what it prices.** Without them a
+            // simdgroup reads a tile another is still filling, so what it
+            // answers is nothing in particular; what it costs is the step loop
+            // with the same loads, the same decode and the same
+            // multiply-accumulates and none of the waiting. It is the upper
+            // bound on what a wider step, a double buffer or a smaller
+            // threadgroup could return between them.
+            (
+                "the two barriers a step",
+                without_the_steps_barriers(&shipped),
+            ),
         ]
+    }
+
+    /// The shipped production source with the step loop's two barriers removed
+    /// and every other barrier left where it is.
+    ///
+    /// Anchored on what follows each of them, because [`MMA`] reaches
+    /// `threadgroup_barrier` six times and only these two are per step.
+    fn without_the_steps_barriers(shipped: &str) -> String {
+        let opened = crate::testing::instead_of(
+            shipped,
+            "            threadgroup_barrier(mem_flags::mem_threadgroup);\n\n            // The \
+             input, as it lies.",
+            "            // The input, as it lies.",
+        );
+        crate::testing::instead_of(
+            &opened,
+            "            threadgroup_barrier(mem_flags::mem_threadgroup);\n\n            for \
+             (uint k = 0;",
+            "            for (uint k = 0;",
+        )
     }
 
     /// The shipped production source with the two fragment loads hoisted out of
