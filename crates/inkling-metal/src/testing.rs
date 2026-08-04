@@ -120,18 +120,14 @@ kernel void saxpy(
 
 pub const SAXPY_ENTRY: &str = "saxpy";
 
-/// What the dispatches `encode` encoded declared they move, in bytes.
+/// What the device made of the dispatches `encode` encoded, per kernel.
 ///
-/// **A declared figure is the one number in the profile nothing else checks.**
-/// The device's clock is the device's, the call counts are the model's shape,
-/// and both are wrong loudly; a byte count that dropped a factor would move a
-/// whole column of the bandwidth table and read as a finding. So each kernel
-/// has a case asserting its own against what its source reads, and this is what
-/// those cases go through.
-///
-/// Sampling has to be on for the figure to reach the profile at all — it is
-/// charged per timed pass — so this switches it on and off around the batch.
-pub fn moved(device: &Device, encode: impl FnOnce(&mut Batch<'_>)) -> u64 {
+/// Sampling has to be on for a kernel to reach the profile at all — every
+/// per-kernel figure is charged per timed pass — so this switches it on and off
+/// around the batch, and empties the profile after the encoding rather than
+/// before it so that what comes back is these dispatches and nothing a caller
+/// did to set them up.
+pub fn sampled(device: &Device, encode: impl FnOnce(&mut Batch<'_>)) -> profile::Profile {
     device
         .time_each_dispatch(true)
         .expect("the device times a dispatch");
@@ -143,10 +139,37 @@ pub fn moved(device: &Device, encode: impl FnOnce(&mut Batch<'_>)) -> u64 {
 
     device.time_each_dispatch(false).expect("sampling stops");
     profile::take()
+}
+
+/// What the dispatches `encode` encoded declared they move, in bytes.
+///
+/// **A declared figure is the one number in the profile nothing else checks.**
+/// The device's clock is the device's, the call counts are the model's shape,
+/// and both are wrong loudly; a byte count that dropped a factor would move a
+/// whole column of the bandwidth table and read as a finding. So each kernel
+/// has a case asserting its own against what its source reads, and this is what
+/// those cases go through.
+pub fn moved(device: &Device, encode: impl FnOnce(&mut Batch<'_>)) -> u64 {
+    sampled(device, encode)
         .kernels()
         .iter()
         .map(|(_, dispatches)| dispatches.bytes)
         .sum()
+}
+
+/// The entries `encode` actually dispatched.
+///
+/// **A table about one kernel says nothing if the shape reached another**, and
+/// what decides which entry a packed call lands on is a predicate over the
+/// layout, the rows and the experts. So a case that means to measure a
+/// particular kernel asks the dispatch which one ran rather than asking this
+/// side which one it believes it asked for.
+pub fn entries_dispatched(device: &Device, encode: impl FnOnce(&mut Batch<'_>)) -> Vec<String> {
+    sampled(device, encode)
+        .kernels()
+        .iter()
+        .map(|(kernel, _)| (*kernel).to_string())
+        .collect()
 }
 
 /// What the device's own clock makes of one dispatch of `encode`, over a

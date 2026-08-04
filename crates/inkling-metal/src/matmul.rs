@@ -2518,8 +2518,9 @@ pub(crate) mod testing {
         /// **The top four are the state's own top four**, whose period is the
         /// whole 2^32 — so no two rows of a weight repeat at any size this file
         /// can build. Bits 24 to 27 would not have been enough: their period is
-        /// 2^28 codes and the routed bank [`BOUND_SHAPES`] builds is 2^31,
-        /// which would have left experts 32 apart holding identical codes.
+        /// 2^28 codes and the routed bank [`BOUND_SHAPES`] builds at the
+        /// longest of [`BLOCKED_LENGTHS`] is 2^31, which would have left experts
+        /// 32 apart holding identical codes.
         ///
         /// The scales never had the problem — `% 11` and `% 5` are not powers of
         /// two — which is why the mutation tables here have been measuring
@@ -2589,7 +2590,8 @@ mod tests {
     use inkling_core::workload::{BEST, SWEPT};
 
     use crate::grouping::ExpertGrouping;
-    use crate::testing::{device, drift};
+    use crate::kernel::MEMORY_BANDWIDTH;
+    use crate::testing::{device, drift, entries_dispatched};
 
     /// The reduction the checkpoint's projections are: `lm_head`, every
     /// attention projection and every expert reduce over 4096.
@@ -5315,19 +5317,28 @@ kernel void decoded_elements(
         );
     }
 
-    /// The two dispatches the tables below are read across: one shape a prefill
-    /// gives each tiled entry, at a 4096-token prompt.
+    /// The two dispatches every limiter table here is read across: one shape a
+    /// prefill gives each tiled entry, per token of the prompt.
     ///
-    /// `q_proj` is 4096 rows over one expert, which is the tiled entry's largest
-    /// shape; the routed bank is 96 rows an expert over 256 of them, which is the
-    /// run length [`how_often_a_long_prefill_reads_one_experts_weight`]'s third
-    /// arm measured and a 1.07 GB weight nothing caches.
+    /// `q_proj` is a row a token through one expert, which is the tiled entry's
+    /// largest shape; a routed bank is six rows a token over 256 experts, which
+    /// at [`BOUND_TOKENS`] is the 96-rows-an-expert run length
+    /// [`how_often_a_long_prefill_reads_one_experts_weight`]'s third arm
+    /// measured and a 1.07 GB weight nothing caches.
     ///
-    /// `(what, rows, in_dim, out_dim, experts, grouped)`.
+    /// **Per token rather than at one length, because two tables read it at
+    /// different ones.** The tile's is quoted at [`BOUND_TOKENS`] and the
+    /// block's at each of [`BLOCKED_LENGTHS`], and two constants naming the same
+    /// two calls are two that can drift into describing different work.
+    ///
+    /// `(what, rows a token, in_dim, out_dim, experts, grouped)`.
     const BOUND_SHAPES: [(&str, usize, usize, usize, usize, bool); 2] = [
-        ("q_proj, tiled", 4096, 4096, 4096, 1, false),
-        ("a routed bank, grouped", 6 * 4096, 4096, 2048, 256, true),
+        ("q_proj, tiled", 1, 4096, 4096, 1, false),
+        ("a routed bank, grouped", 6, 4096, 2048, 256, true),
     ];
+
+    /// The prompt the tile's own limiter tables are quoted at.
+    const BOUND_TOKENS: usize = 4096;
 
     fn bound_header() -> String {
         BOUND_SHAPES
@@ -5337,13 +5348,11 @@ kernel void decoded_elements(
     }
 
     /// What one dispatch of a bank of this shape costs `matmul` on the device,
-    /// through whichever tiled entry `grouped` names.
+    /// through whichever entry the shape reaches.
     ///
-    /// Four dispatches to a command buffer, so what the device's clock is
-    /// divided by is the dispatch rather than the submission around it — the
-    /// reason every sweep here takes the same number. The rows are sorted, so a
-    /// tile straddles two experts only where the run length made it and not by
-    /// accident of the routing.
+    /// The fixture is made and thrown away per call, which is what a caller
+    /// sweeping shapes rather than kernels wants — see [`Blocked`], which is the
+    /// same measurement over a fixture kept across many arms.
     #[allow(clippy::too_many_arguments)]
     fn a_packed_call_costs(
         device: &Device,
@@ -5355,55 +5364,163 @@ kernel void decoded_elements(
         experts: usize,
         grouped: bool,
     ) -> Duration {
-        const CALLS: usize = 4;
-        const ROUNDS: usize = 3;
-        let case = Case::seeded(1, in_dim, experts * out_dim, rows);
-        let bank = PackedBank::upload(
-            device,
-            matmul,
-            experts,
-            in_dim,
-            out_dim,
-            &case.packed(),
-            &case.scales,
-        )
-        .expect("the bank's shapes pair");
-        let chosen: Vec<u32> = (0..rows).map(|row| (row * experts / rows) as u32).collect();
-        let mut x = device.buffer(&case.x).expect("the rows upload");
-
-        let mut best = Duration::MAX;
-        for _ in 0..ROUNDS {
-            best = best.min(crate::testing::device_time(device, CALLS, |batch| {
-                let mut picked = device.buffer(&chosen).expect("the selection uploads");
-                match grouped {
-                    false => bank
-                        .encode_over(batch, &chosen, &mut x)
-                        .expect("the dispatch encodes"),
-                    true => {
-                        let mut sorted = grouping
-                            .encode(batch, &mut picked, experts)
-                            .expect("the grouping encodes");
-                        bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)
-                            .expect("the dispatch encodes")
-                    }
-                };
-            }));
-        }
-        best / CALLS as u32
+        Blocked::of("", rows, in_dim, out_dim, experts, grouped).costs(device, matmul, grouping)
     }
 
-    /// The same over both of [`BOUND_SHAPES`], which is what a row of either
-    /// table below is.
+    /// The same over both of [`BOUND_SHAPES`] at [`BOUND_TOKENS`], which is what
+    /// a row of either of the tile's tables is.
     fn a_prefills_shapes_cost(device: &Device, matmul: &PackedMatmul) -> Vec<Duration> {
         let grouping = ExpertGrouping::new(device).expect("the grouping compiles");
         BOUND_SHAPES
             .iter()
-            .map(|&(_, rows, in_dim, out_dim, experts, grouped)| {
-                a_packed_call_costs(
-                    device, matmul, &grouping, rows, in_dim, out_dim, experts, grouped,
-                )
-            })
+            .map(|&shape| Blocked::at(BOUND_TOKENS, shape).costs(device, matmul, &grouping))
             .collect()
+    }
+
+    /// One shape's fixture and the dispatch that measures it — the one place
+    /// this file encodes a packed call for a clock, whichever table is asking.
+    ///
+    /// **A struct rather than six arguments, because the [`Case`] is what
+    /// costs.** A routed bank's is 1.07 GB of codes and a couple of seconds to
+    /// generate, and the block's table puts six shapes through six arms — so a
+    /// fixture made per measurement would be most of that case's runtime and
+    /// none of its subject. A caller sweeping shapes rather than arms wants the
+    /// opposite and gets it from [`a_packed_call_costs`], which makes one of
+    /// these and drops it.
+    struct Blocked {
+        what: &'static str,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        experts: usize,
+        grouped: bool,
+        case: Case,
+        /// The codes as the kernel reads them, packed once. `Case::packed` walks
+        /// every code, and at a routed bank's 2^31 of them that is not something
+        /// to redo per arm.
+        packed: Vec<u8>,
+        chosen: Vec<u32>,
+    }
+
+    impl Blocked {
+        /// The shape a prompt of `tokens` gives one of [`BOUND_SHAPES`].
+        fn at(tokens: usize, shape: (&'static str, usize, usize, usize, usize, bool)) -> Self {
+            let (what, rows_a_token, in_dim, out_dim, experts, grouped) = shape;
+            Self::of(
+                what,
+                tokens * rows_a_token,
+                in_dim,
+                out_dim,
+                experts,
+                grouped,
+            )
+        }
+
+        fn of(
+            what: &'static str,
+            rows: usize,
+            in_dim: usize,
+            out_dim: usize,
+            experts: usize,
+            grouped: bool,
+        ) -> Self {
+            let case = Case::seeded(1, in_dim, experts * out_dim, rows);
+            Self {
+                what,
+                rows,
+                in_dim,
+                out_dim,
+                experts,
+                grouped,
+                packed: case.packed(),
+                case,
+                // Sorted already, so a block straddles two experts only where
+                // the run length made it and not by accident of the routing.
+                chosen: (0..rows).map(|row| (row * experts / rows) as u32).collect(),
+            }
+        }
+
+        /// This call encoded against `bank`, which is the one place the two
+        /// layouts differ and so the one place they are written.
+        fn encode(
+            &self,
+            batch: &mut Batch<'_>,
+            device: &Device,
+            bank: &PackedBank<'_>,
+            x: &mut Buffer<f32>,
+            grouping: &ExpertGrouping,
+        ) {
+            match self.grouped {
+                false => {
+                    bank.encode_over(batch, &self.chosen, x)
+                        .expect("the dispatch encodes");
+                }
+                true => {
+                    let mut picked = device.buffer(&self.chosen).expect("the selection uploads");
+                    let mut sorted = grouping
+                        .encode(batch, &mut picked, self.experts)
+                        .expect("the grouping encodes");
+                    bank.encode_grouped(batch, &mut sorted, x, 1, Through::Gathered)
+                        .expect("the dispatch encodes");
+                }
+            }
+        }
+
+        /// What one dispatch of this shape costs `matmul` on the device.
+        ///
+        /// Four dispatches to a command buffer, best of three rounds: a
+        /// submission costs 225 µs and the dispatches a sweep asks about are
+        /// tens, so what the device's clock is divided by has to be the dispatch
+        /// rather than the submission around it.
+        fn costs(
+            &self,
+            device: &Device,
+            matmul: &PackedMatmul,
+            grouping: &ExpertGrouping,
+        ) -> Duration {
+            const CALLS: usize = 4;
+            const ROUNDS: usize = 3;
+            let bank = self.upload(device, matmul);
+            let mut x = device.buffer(&self.case.x).expect("the rows upload");
+
+            let mut best = Duration::MAX;
+            for _ in 0..ROUNDS {
+                best = best.min(crate::testing::device_time(device, CALLS, |batch| {
+                    self.encode(batch, device, &bank, &mut x, grouping);
+                }));
+            }
+            best / CALLS as u32
+        }
+
+        fn upload<'a>(&self, device: &'a Device, matmul: &'a PackedMatmul) -> PackedBank<'a> {
+            PackedBank::upload(
+                device,
+                matmul,
+                self.experts,
+                self.in_dim,
+                self.out_dim,
+                &self.packed,
+                &self.case.scales,
+            )
+            .expect("the bank's shapes pair")
+        }
+
+        /// What this call has to move across memory however it is written: every
+        /// expert's weight once, the rows in, the rows out.
+        ///
+        /// **Not what [`PackedBank::moves`] declares, and the difference is the
+        /// whole question.** That method charges a weight per block of rows that
+        /// shares it, which is what the dispatch *issues* — 1791 weight reads at
+        /// 8192 tokens where there are 256 experts. This is the floor underneath
+        /// it: the bytes a kernel with an infinite cache would still have to
+        /// fetch, and so the only denominator against which "bandwidth-bound"
+        /// means bound by the machine rather than by the kernel's own re-reading.
+        fn compulsory(&self) -> usize {
+            let elements = self.experts * self.out_dim * self.in_dim;
+            elements * BITS / u8::BITS as usize
+                + elements / GROUP_SIZE
+                + size_of::<f32>() * self.rows * (self.in_dim + self.out_dim)
+        }
     }
 
     /// One arm of the limiter table: a name, and the shipped source with one
@@ -5511,6 +5628,163 @@ kernel void decoded_elements(
         ]
     }
 
+    /// One arm of the block's limiter table: a name, and the shipped production
+    /// source with one term of [`MMA`]'s inner loop replaced by something that
+    /// costs an instruction over the same operands and cannot be folded away.
+    ///
+    /// **The same discipline as [`without_each_term_of_a_tile`] and against a
+    /// different kernel.** Every "this is not bandwidth-bound" finding in this
+    /// repo was taken on the reference tile — A3's 10.4% re-read, A4's whole
+    /// limiter table — and the block is 2.85× faster than that tile. A kernel
+    /// that was issue-bound can become bandwidth-bound when it gets faster, and
+    /// nothing here had asked the question of the kernel that actually runs a
+    /// prefill under the production flag.
+    ///
+    /// **Both entries mutate, because both are the same string.**
+    /// [`source_under`] appends [`MMA`] twice — once per entry — so a
+    /// replacement made here lands in `mma_matmul_rows` and `mma_matmul_grouped`
+    /// alike, which is what lets one table carry a column for each.
+    fn without_each_term_of_a_block() -> Vec<(&'static str, String)> {
+        let shipped = source_under(Numerics::Production);
+        vec![
+            // The weight, which is A3's slot-zero mutation moved onto the block:
+            // every block stages expert zero's first column instead of its own,
+            // so the whole weight working set is one 2 KB column and its scales.
+            // The block stages the same bytes, decodes the same codes and drives
+            // the same fragments. `* 0u` rather than a constant, so nothing the
+            // block computed goes unused.
+            //
+            // **Both pointers, because confining one of them is not a working
+            // set.** The codes and the scales are separate walks over separate
+            // buffers, and an arm that pinned the codes alone would leave a
+            // megabyte of scales being fetched per expert.
+            (
+                "the weight it reads",
+                crate::testing::instead_of(
+                    &shipped,
+                    "+ (ulong)expert * shape.code_stride + (ulong)column * bytes;\n        device \
+                     const uchar *scale = scales + shape.scale_base\n            + (ulong)expert * \
+                     shape.scale_stride + (ulong)column * scale_bytes;",
+                    "+ (ulong)(expert * 0u) * shape.code_stride + (ulong)(column * 0u) * \
+                     bytes;\n        device const uchar *scale = scales + shape.scale_base\n       \
+                     \x20    + (ulong)(expert * 0u) * shape.scale_stride + (ulong)(column * 0u) * \
+                     scale_bytes;",
+                ),
+            ),
+            // The input, confined rather than removed the way the tile's arm
+            // confines it: the same load issued from the same place in the step
+            // loop, landing inside a kilobyte. **This is the term the block
+            // re-reads hardest** — a call of `out_dim` columns is
+            // `out_dim / MMA_COLS_A_BLOCK` block-columns and every one of them
+            // stages the same input rows again, which is 32 re-reads for a
+            // routed bank and 64 for `q_proj`.
+            (
+                "the input rows it walks",
+                crate::testing::instead_of(
+                    &shipped,
+                    "device const float *values = x + source + b * CODES_PER_BYTE + x_at;",
+                    "device const float *values = x + ((source + b * CODES_PER_BYTE + x_at) & \
+                     255u);",
+                ),
+            ),
+            // The dequantisation, which the block already amortises eight times
+            // as far as the tile does — the whole reason the flag was opened. A4
+            // measured it at 30% of the tile; what is left of it here is what
+            // says whether that amortisation finished the term or only moved it.
+            (
+                "the table it decodes through",
+                crate::testing::instead_of(
+                    &shipped,
+                    "staged_w[at] = element(code & CODE_MASK) * by;\n                \
+                     staged_w[at + 1] = element((code >> BITS) & CODE_MASK) * by;",
+                    "staged_w[at] = (float)(code & CODE_MASK) * by;\n                \
+                     staged_w[at + 1] = (float)((code >> BITS) & CODE_MASK) * by;",
+                ),
+            ),
+            // **Three of every four fragment loads, which is the reuse question
+            // asked without the refactor that would answer it properly.** A
+            // simdgroup here holds MMA_FRAGMENTS_DOWN × MMA_FRAGMENTS_ACROSS =
+            // four accumulators and issues two `lhs` and two `rhs` loads to feed
+            // them, which is 1:1 — where mlx-vlm's 64×64 steel tile holds 32
+            // accumulators against 12 loads and runs 2.7:1. A taller block is
+            // what buys that ratio and it costs a doubled floor.
+            //
+            // This arm is the ratio's ceiling bought for nothing: the loads are
+            // hoisted out of the `k` loop, so the four fragments of the first
+            // step drive all sixteen multiply-accumulates and the ratio is 4:1.
+            // **It answers wrongly — it is three quarters of the reduction — so
+            // what it prices is the loads and not the arithmetic**, and it is
+            // the upper bound on anything a taller block could return.
+            (
+                "three of every four fragment loads",
+                fragments_loaded_once(&shipped),
+            ),
+            // Three quarters of the multiply-accumulates, with every fragment
+            // load left where it was — the other side of the arm above, and the
+            // one that says whether the instruction itself is the wall.
+            (
+                "three quarters of the multiply-accumulates",
+                crate::testing::instead_of(&shipped, EVERY_ACCUMULATE, ONE_ACCUMULATE),
+            ),
+        ]
+    }
+
+    /// The shipped production source with the two fragment loads hoisted out of
+    /// the step's `k` loop, so that one set of fragments drives every
+    /// multiply-accumulate of the step.
+    ///
+    /// Two replacements rather than one because the declarations move and the
+    /// `if` has to be closed, and both anchors carry enough of their
+    /// surroundings to be unique in a source that holds three loops over
+    /// `MMA_FRAGMENTS_DOWN`.
+    fn fragments_loaded_once(shipped: &str) -> String {
+        let hoisted = crate::testing::instead_of(shipped, EVERY_STEP_LOADS, ONE_STEP_LOADS);
+        crate::testing::instead_of(
+            &hoisted,
+            EVERY_ACCUMULATE,
+            &format!("\n                }}{EVERY_ACCUMULATE}"),
+        )
+    }
+
+    /// The block's multiply-accumulate loops, as the two arms above anchor on
+    /// them: one prices the arithmetic by cutting three quarters of it and the
+    /// other closes a hoisted `if` in front of it, and a single spelling is what
+    /// keeps the two from drifting apart under an edit to the kernel.
+    ///
+    /// **Written with the newline and the indentation [`MMA`] has them at**, and
+    /// long enough to be unique — that source opens three loops over
+    /// `MMA_FRAGMENTS_DOWN` and only this one carries a
+    /// `simdgroup_multiply_accumulate` under it.
+    const EVERY_ACCUMULATE: &str = r#"
+                for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
+                    for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
+                        simdgroup_multiply_accumulate("#;
+
+    /// The same loops cut to one accumulator of the four, with every fragment
+    /// load left where it was.
+    const ONE_ACCUMULATE: &str = r#"
+                for (uint i = 0; i < 1u; ++i) {
+                    for (uint j = 0; j < 1u; ++j) {
+                        simdgroup_multiply_accumulate("#;
+
+    /// The step's `k` loop as it opens, with the two fragment arrays declared
+    /// inside it — so a set of fragments is loaded for every eighth of the
+    /// reduction and feeds four multiply-accumulates.
+    const EVERY_STEP_LOADS: &str = r#"
+            for (uint k = 0; k < MMA_CODES_A_STEP / MMA_FRAGMENT; ++k) {
+                simdgroup_float8x8 lhs[MMA_FRAGMENTS_DOWN];
+                simdgroup_float8x8 rhs[MMA_FRAGMENTS_ACROSS];
+"#;
+
+    /// The same with the declarations hoisted above the loop and the loads put
+    /// behind `k == 0`, so one set of fragments feeds sixteen.
+    const ONE_STEP_LOADS: &str = r#"
+            simdgroup_float8x8 lhs[MMA_FRAGMENTS_DOWN];
+            simdgroup_float8x8 rhs[MMA_FRAGMENTS_ACROSS];
+            for (uint k = 0; k < MMA_CODES_A_STEP / MMA_FRAGMENT; ++k) {
+                if (k == 0) {
+"#;
+
     /// **What a prefill's two tiled matmul rows are bound by, one term at a
     /// time** — 72.3 s of a 132.97 s prefill at 16384 tokens, and neither row
     /// near a plausible ceiling of anything.
@@ -5566,6 +5840,204 @@ kernel void decoded_elements(
                 "{what}: the mutation answered what the kernel answers"
             );
             row(what, &cost(&mutant));
+        }
+    }
+
+    /// The lengths a coding session opens at, which is where this milestone's
+    /// figures are taken.
+    ///
+    /// **16384 is deliberately not here.** Attention is quadratic and the matmul
+    /// is not, so at that length attention is most of a prefill and the matmul's
+    /// share is flattered into looking small; at these three the matmul is 83 to
+    /// 85% of every pass a prefill runs. A parity claim made at 16384 is a claim
+    /// about the length that suits it best.
+    const BLOCKED_LENGTHS: [usize; 3] = [2048, 4096, 8192];
+
+    /// **Whether the matmul is bandwidth-bound now that it is 2.85× faster, and
+    /// what it is waiting on if it is not** — the first question of this
+    /// milestone, because every closed door in this repo was closed by a
+    /// measurement on the kernel this one replaced.
+    ///
+    /// A3 priced the expert weight's 96-fold re-reading at 10.4%, A3's query
+    /// block at 23%, A4's whole limiter table: **all of them on the reference
+    /// tile.** The block is 2.85× faster than that tile, and a kernel that was
+    /// issue-bound can become bandwidth-bound when it gets faster — at which
+    /// moment every byte-count lever those findings retired comes back.
+    ///
+    /// Two readings, and they answer different questions:
+    ///
+    /// - **The roofline**, which is [`Blocked::compulsory`] over the device's own
+    ///   clock against the 725 GB/s `what_a_streaming_read_achieves_on_this
+    ///   _machine` measures. This says how far the dispatch is from a kernel
+    ///   that fetched each byte once — the floor no arrangement of this
+    ///   arithmetic gets under.
+    /// - **The limiter arms**, which say what it is actually waiting on. The
+    ///   roofline alone cannot separate a kernel bound by traffic it must move
+    ///   from one bound by traffic it re-reads, and those two have opposite
+    ///   consequences for the rest of this brief: the first closes the door on
+    ///   fragment reuse and a taller block, the second is exactly what they buy.
+    ///
+    /// **Every arm answers wrongly and the case asserts that it does**, the way
+    /// [`what_a_prefills_packed_matmul_is_bound_by`] asserts it: a replacement
+    /// that matched nothing would report the shipped kernel under another name.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_prefills_blocked_matmul_is_bound_by() {
+        let Some(device) = device() else { return };
+
+        let shipped =
+            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
+        let want = a_tiled_call_answers(&device, &shipped);
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+
+        let arms = without_each_term_of_a_block();
+        let mutants: Vec<(&str, PackedMatmul)> = arms
+            .iter()
+            .map(|(what, written)| {
+                let arm = PackedMatmul::compiled(
+                    &device,
+                    written,
+                    ROWS_A_TILE,
+                    COLS_A_TILE,
+                    Numerics::Production,
+                )
+                .expect("the mutant compiles");
+                assert_ne!(
+                    a_tiled_call_answers(&device, &arm),
+                    want,
+                    "{what}: the mutation answered what the block answers"
+                );
+                (*what, arm)
+            })
+            .collect();
+
+        for tokens in BLOCKED_LENGTHS {
+            let shapes: Vec<Blocked> = BOUND_SHAPES
+                .iter()
+                .map(|&shape| Blocked::at(tokens, shape))
+                .collect();
+
+            eprintln!("\n  a prefill of {tokens} tokens");
+            eprintln!(
+                "  {:<42}{}",
+                "without",
+                shapes
+                    .iter()
+                    .map(|shape| format!("{:>26}", shape.what))
+                    .collect::<String>()
+            );
+
+            for shape in &shapes {
+                let entries = entries_dispatched(&device, |batch| {
+                    let bank = shape.upload(&device, &shipped);
+                    let mut x = device.buffer(&shape.case.x).expect("the rows upload");
+                    shape.encode(batch, &device, &bank, &mut x, &grouping);
+                });
+                let blocked = match shape.grouped {
+                    false => MMA_TILED_ENTRY,
+                    true => MMA_GROUPED_ENTRY,
+                };
+                assert!(
+                    entries.iter().any(|entry| entry == blocked),
+                    "{} at {tokens} tokens dispatched {entries:?} and not {blocked}, so this \
+                     column is about the reference tile",
+                    shape.what
+                );
+            }
+
+            // **Warm, and swept both ways.** The arms this table separates are
+            // four and five percent apart, which is inside what a clock climbing
+            // over a sweep manufactures — and this crate has the case on record:
+            // external work reproducing the threadgroup-memory experiment
+            // reported a 1.7× win that vanished entirely once thirty warm-up
+            // dispatches were added. Two seconds of load puts every arm on the
+            // sustained clock, which is the one a prefill runs at, and running
+            // the list backwards is what separates a term the kernel has from a
+            // ramp that follows the order.
+            //
+            // The shipped kernel is arm zero rather than a figure taken before
+            // the sweep, so that what the percentages divide by was measured
+            // under the same conditions as what divides it — including its own
+            // place at each end of the list.
+            crate::testing::warmed(|| {
+                shapes[0].costs(&device, &shipped, &grouping);
+            });
+            let taken = |at: usize| -> Vec<Duration> {
+                let arm = match at {
+                    0 => &shipped,
+                    at => &mutants[at - 1].1,
+                };
+                shapes
+                    .iter()
+                    .map(|shape| shape.costs(&device, arm, &grouping))
+                    .collect()
+            };
+            let listed: Vec<usize> = (0..=mutants.len()).collect();
+            let (up, down) = crate::testing::both_ways(&listed, taken);
+
+            for (opened, passes) in [("swept up the list", &up), ("and down it", &down)] {
+                eprintln!("  {opened}");
+                let whole = &passes[0];
+                for (at, taken) in passes.iter().enumerate() {
+                    let what = match at {
+                        0 => "nothing — the kernel",
+                        at => mutants[at - 1].0,
+                    };
+                    let cells: String = taken
+                        .iter()
+                        .zip(whole)
+                        .map(|(each, whole)| {
+                            format!(
+                                "{:>17}{:>9}",
+                                format!("{:.2}ms", 1e3 * each.as_secs_f64()),
+                                format!("{:.0}%", 1e2 * each.as_secs_f64() / whole.as_secs_f64()),
+                            )
+                        })
+                        .collect();
+                    eprintln!("  {what:<42}{cells}");
+                }
+            }
+            let whole = up[0].as_slice();
+
+            eprintln!(
+                "  {:<42}{}",
+                "it must move, once each",
+                shapes
+                    .iter()
+                    .map(|shape| format!(
+                        "{:>26}",
+                        format!("{:.2} GB", shape.compulsory() as f64 / 1e9)
+                    ))
+                    .collect::<String>()
+            );
+            eprintln!(
+                "  {:<42}{}",
+                "which at 725 GB/s would take",
+                shapes
+                    .iter()
+                    .zip(whole)
+                    .map(|(shape, taken)| {
+                        let floor = shape.compulsory() as f64 / MEMORY_BANDWIDTH;
+                        format!(
+                            "{:>17}{:>9}",
+                            format!("{:.2}ms", 1e3 * floor),
+                            format!("{:.0}%", 1e2 * floor / taken.as_secs_f64())
+                        )
+                    })
+                    .collect::<String>()
+            );
+
+            for (shape, taken) in shapes.iter().zip(whole) {
+                let achieved = shape.compulsory() as f64 / taken.as_secs_f64();
+                assert!(
+                    achieved < MEMORY_BANDWIDTH,
+                    "{} at {tokens} tokens moved its {:.2} GB at {:.0} GB/s, which is past what \
+                     this machine streams — so either the clock or the byte count is wrong",
+                    shape.what,
+                    shape.compulsory() as f64 / 1e9,
+                    achieved / 1e9,
+                );
+            }
         }
     }
 
