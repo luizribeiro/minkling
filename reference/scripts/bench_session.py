@@ -55,7 +55,7 @@ from mlx_vlm.models import cache
 TURNS = 5
 ADDED = 256
 GENERATED = 64
-OPENING = 2048
+OPENING = 8192
 
 
 def prompt_for(ids, turn, produced, opening):

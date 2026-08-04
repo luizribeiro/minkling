@@ -52,11 +52,16 @@ pub const DECODED: usize = 64;
 /// tokens — a file, a task, a directory listing — and then turns that each add a
 /// question and are each answered.
 ///
-/// [`Session::OPENING`] is where the sitting's length is decided. A prefill here
-/// is 5.4 ms a token, so a session opening at 16384 would be four minutes an arm
-/// before a token is decoded, and the effect this measures does not need the
-/// length to be visible: 2048 is the shortest opening at which the re-prefill
-/// already dominates a turn.
+/// [`Session::OPENING`] is where the sitting's length is decided, and **it is
+/// the workload's number rather than the cheapest one to measure**: a coding
+/// turn opens nearer 8192 than 2048, and what a kept cache is worth moves with
+/// it — 72.6% off the session at 8192 against 61.6% at 2048. A shorter sitting
+/// is `--tokens 2048`, and it understates the effect rather than misrepresenting
+/// it.
+///
+/// What the default costs is a sitting of about seventeen minutes over three
+/// pairs, most of it the arm that keeps nothing re-prefilling nine thousand
+/// tokens five times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Session {
     /// Tokens the conversation opens at, before any turn is taken.
@@ -72,10 +77,10 @@ pub struct Session {
 }
 
 impl Session {
-    pub const OPENING: usize = 2048;
+    pub const OPENING: usize = 8192;
 
-    /// The default session: 2048 tokens opened with, five turns, a few hundred
-    /// tokens added and decoded each.
+    /// The default session: [`Session::OPENING`] tokens opened with, five
+    /// turns, a few hundred tokens added and decoded each.
     pub const fn new(opening: usize) -> Self {
         Self {
             opening,

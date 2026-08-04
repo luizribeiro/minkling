@@ -1184,37 +1184,50 @@ fresh cache for each of them, so a conversation of a few thousand tokens paid fo
 all of them on every turn. Nothing here had ever measured that, because a
 measurement of one call has no *between* for a kept cache to live in.
 
-`just bench-session` is that measurement. An arm is a session: 2048 tokens
+`just bench-session` is that measurement. An arm is a session: 8192 tokens
 opened with, then five turns that each add 256 tokens of question, carry the
 previous reply back, and decode 64 tokens of their own — so the prompt grows
-2048, 2368, 2688, 3008, 3328, which is the shape a coding turn has.
+8192, 8512, 8832, 9152, 9472, which is the shape a coding turn has.
 `inkling_core::workload::Session` owns it, beside the rest of what this repo
 measures over.
 
-**Three pairs, one sitting, the order flipped each pair**, on this repo's default
-checkpoint under the default numerics. The arm is a number rather than an
-executable — `--reuse-tokens 0` is the server as it was, the default bound is the
-server as it is — which is the shape `bench-numerics` puts one word through.
+**The opening is the workload's number rather than the cheapest one to measure.**
+A coding turn opens nearer 8192 than 2048, and what a kept cache is worth moves
+with the length — so both are reported below and the shorter one understates it.
 
-    turn   prompt   prefilled  ── not kept ──   ──── kept ────   change
-                    not/kept    wall    first    wall    first    wall
-      0      2048   2048/2048  13.64 s  12.01 s 13.62 s  11.99 s   -0.2%
-      1      2368   2368/ 321  15.42 s  13.87 s  4.68 s   3.13 s  -69.7%
-      2      2688   2688/ 321  16.94 s  15.39 s  4.79 s   3.24 s  -71.7%
-      3      3008   3008/ 321  18.67 s  17.11 s  4.73 s   3.17 s  -74.7%
-      4      3328   3328/ 321  20.44 s  18.87 s  4.87 s   3.30 s  -76.2%
-    session                    85.10 s          32.68 s          -61.6%
+**Three pairs each, one sitting each, the order flipped each pair**, on this
+repo's default checkpoint under the default numerics. The arm is a number rather
+than an executable — `--reuse-tokens 0` is the server as it was, the default
+bound is the server as it is — which is the shape `bench-numerics` puts one word
+through.
 
-**The session is 85.10 s against 32.68 s**, three pairs of three moving the same
+    turn   prompt   prefilled  ─── not kept ───   ──── kept ────   change
+                    not/kept     wall     first    wall    first    wall
+      0      8192   8192/8192  48.98 s   46.77 s 49.07 s  46.86 s   +0.2%
+      1      8512   8512/ 321  50.81 s   49.01 s  5.76 s   3.95 s  -88.7%
+      2      8832   8832/ 321  52.84 s   51.04 s  5.86 s   4.06 s  -88.9%
+      3      9152   9152/ 321  54.88 s   53.07 s  5.78 s   3.98 s  -89.5%
+      4      9472   9472/ 321  57.00 s   55.19 s  5.90 s   4.08 s  -89.7%
+    session                   264.51 s           72.36 s          -72.6%
+
+**The session is 264.51 s against 72.36 s**, three pairs of three moving the same
 way with the ranges apart. What a turn prefills stops growing: 321 tokens every
 turn after the first, which is the reply carried back, the question added, and
-the one token a generation has to be handed. By turn four that is 3328 tokens of
-prefill against 321, and the wait for the first token is 18.87 s against 3.30 s.
+the one token a generation has to be handed. By turn four that is 9472 tokens of
+prefill against 321, and the wait for the first token is 55.19 s against 4.08 s.
 
-**Turn zero is the sitting's own control and it reads -0.2% with the ranges
+**Turn zero is the sitting's own control and it reads +0.2% with the ranges
 across, no claim.** Nothing is kept yet, so both arms do identical work — and
 what the harness reads when there is nothing to read is what says the rest of the
 column is not the harness.
+
+**The same sitting at a 2048-token opening reads -61.6%**: 85.10 s against 32.68,
+turn four 20.44 s against 4.87, and turn zero -0.2% with the ranges across.
+**So the shorter session understates this by eleven points**, and it understates
+it for the reason the whole thing exists: what a kept cache saves is the
+re-prefill, which grows with the conversation, while what it cannot save — the
+opening prefill and the decode steps — does not grow with it nearly as fast. A
+figure taken at 2048 is a floor rather than an estimate.
 
 ### What it costs
 
@@ -1235,11 +1248,14 @@ back off the device and cloned on this side — taken before the generation and
 dropped after it. Peak RSS on a single-request run is unmoved because nothing on
 that path takes one; a served request's peak gains that and nothing else.
 
-**And the arrangement's own bad case is 1.52 ms a turn.** That is the matching,
+**And the arrangement's own bad case is 1.81 ms a turn.** That is the matching,
 the mark, the resume and the recording, on the miss path — where it also builds
 the fresh cache the server allocated on every request before any of this — with
-1.10 ms on the hit path. Against a turn that is seconds either way, a miss costs
-what a miss should cost.
+1.11 ms on the hit path. Against a turn that is seconds either way, a miss costs
+what a miss should cost. **It is also flat in the context**: 1.10 and 1.52 ms at
+a 2048-token opening against 1.11 and 1.81 at 8192, over conversations four times
+the length. A mark is four windows a layer and a count of keys, and neither of
+those grows with the keys.
 
 ### The reference does this too, and it is not a gap we opened
 
@@ -1258,25 +1274,41 @@ cannot be taken back out of a kept cache; the snapshot stands in for that.
 
 `reference/scripts/bench_session` is that machinery behind the same
 `name value unit` contract, so the same three-pair alternating sitting can be run
-against it. **Its own two arms are 32.54 s against 14.57 s, -55.2%** — the same
-effect, three of three, ranges apart. So this is not a differentiator and saying
-otherwise would be the substantial lie.
+against it. **Its own two arms are 81.79 s against 25.70 s, -68.6%** at the 8192
+opening and 32.54 against 14.57, -55.2%, at 2048 — the same effect, growing with
+the length the same way ours does, three of three with the ranges apart. So this
+is not a differentiator and saying otherwise would be the substantial lie.
 
 **Both engines keeping, ours under `--numerics production`** — which is the
-arithmetic the cross-engine column is quoted under — the session is **20.09 s
-against 14.57 s, ours 1.40× behind**, three of three with the ranges apart. Both
-prefill the same 320 tokens a turn; what is left is prefill throughput and the
-decode step, which are the two rows the sections below are about.
+arithmetic the cross-engine column is quoted under:
 
-**Where the two do differ is what keeping costs.** Per turn, the reference spends
-**31.98 ms** to our **1.10 ms** — a factor of 29, and exactly what the two designs
-predict: a snapshot copies the whole KV where a mark copies a count and four
-windows. Neither number matters against a turn of seconds; the ratio is a fact
-about the designs rather than about the wall.
+    opening      ours     mlx-vlm   behind
+       2048   20.09 s     14.57 s   1.40x
+       8192   33.73 s     25.51 s   1.32x
 
-**One caveat on the reference's column**: its not-kept session ranges 27.35 to
-42.72 s across the three pairs where ours ranges 85.00 to 85.20. The mean is
-reported as measured and the spread is the reference's own.
+three of three with the ranges apart at both lengths. Both prefill the same 320
+tokens a turn; what is left is prefill throughput and the decode step, which are
+the two rows the sections below are about. **The gap narrows as the session
+lengthens** — 1.40× to 1.32× — because more of what is left is decode, where this
+engine is the faster of the two.
+
+**Where the two do differ is what keeping costs, and that difference grows.**
+Per turn:
+
+    opening      ours     mlx-vlm    ratio
+       2048   1.10 ms    31.98 ms      29x
+       8192   1.11 ms    67.09 ms      60x
+
+**Ours is flat in the context and the reference's is linear in it**, which is
+exactly what the two designs predict: a mark is four windows a layer and a count
+of keys, and a snapshot is a copy of the whole KV. Neither number matters against
+a turn that is seconds; what the row says is that only one of the two would still
+be small at 32768.
+
+**One caveat on the reference's column**: its not-kept session ranges 76.55 to
+92.16 s across the three pairs at 8192, and 27.35 to 42.72 at 2048, where ours
+ranges 264.32 to 264.69 and 85.00 to 85.20. The mean is reported as measured and
+the spread is the reference's own.
 
 ### What it is not
 
@@ -1301,9 +1333,10 @@ optimisation rather than an approximation, the same thing
 
 **Capping the windowed layers is still not done and is still the larger prize** —
 see the KV table below, where 35 of 42 layers retain 4.6× what their window could
-ever read at 8192. Nothing here forecloses it: the mark carries a window's rows
-and a count of keys, and a ring-addressed span would change what the count means
-without changing that a mark is those two things.
+ever read at the 8192 tokens this session opens at. Nothing here forecloses it:
+the mark carries a window's rows and a count of keys, and a ring-addressed span
+would change what the count means without changing that a mark is those two
+things.
 
 ### What did not move
 
@@ -1324,9 +1357,9 @@ acceptance rows on the packed heads, the resident sets the gated tier bounds and
 the three decode-step tables are what those 48 assert, and all 48 passed. **No
 kernel here could have moved them**: nothing in this milestone is inside a
 forward pass. The host says the same — a decode step read 19.42, 19.44 and 19.44
-ms in the three settling runs taken before this sitting, against 19.36 to 19.44
-over the five taken before any of it was written, which is inside that settling's
-own 0.46% spread.
+ms in the three settling runs taken before the first sitting and 19.39 to 19.46
+in the three before the last, against 19.36 to 19.44 over the five taken before
+any of it was written — all of it inside that settling's own 0.46% spread.
 
 **The null pair was run and it read +0.1%, ranges across, no claim** —
 `just bench HEAD HEAD decode`, same binary both arms, seven pairs. That control
