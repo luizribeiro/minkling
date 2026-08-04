@@ -1318,11 +1318,15 @@ and against a run of layers on the device, the matching and the bound against
 their own cases, the session's shape, and the cold-against-warm session on real
 weights.
 
-The two floors, `a_calls_rows_share_a_weight_read_only_where_they_name_one_expert`,
-the acceptance rows on the packed heads, the decode step at every context and the
-prefill at 16384 are what the timing tier asserts and it passed unchanged: a
-decode step read 19.42, 19.44 and 19.44 ms across three settling runs before this
-sitting, against the 19.4 the same three read before any of this was written.
+The two floors,
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert`, the
+acceptance rows on the packed heads, the resident sets the gated tier bounds and
+the three decode-step tables are what those 48 assert, and all 48 passed. **No
+kernel here could have moved them**: nothing in this milestone is inside a
+forward pass. The host says the same — a decode step read 19.42, 19.44 and 19.44
+ms in the three settling runs taken before this sitting, against 19.36 to 19.44
+over the five taken before any of it was written, which is inside that settling's
+own 0.46% spread.
 
 **The null pair was run and it read +0.1%, ranges across, no claim** —
 `just bench HEAD HEAD decode`, same binary both arms, seven pairs. That control
