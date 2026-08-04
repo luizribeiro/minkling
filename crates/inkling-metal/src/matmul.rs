@@ -431,6 +431,48 @@ const RUNS_A_GROUPING: usize = 2;
 /// gives for the lane.
 const THREADS_PER_GROUP: usize = 256;
 
+/// Threads one threadgroup of the untiled entry holds, which is the only thing
+/// about that dispatch a caller decides.
+///
+/// **A threadgroup of [`ENTRY`] is that many independent simdgroups and nothing
+/// else** — no threadgroup memory, no barrier, no shared load, no fragment
+/// anything shares — so this is a scheduling knob rather than a kernel one, and
+/// every arm of a sweep over it answers the same bits. What it decides is how
+/// evenly a call's simdgroups land on 80 cores: at [`THREADS_PER_GROUP`] a
+/// 1024-element dispatch is 128 threadgroups of eight, so 48 cores take two and
+/// 32 take one and the whole dispatch waits for the slower half.
+///
+/// **Sixty-four, and the sweep that chose it is in the model.** Five alternating
+/// pairs of a decode step against the shipped 256, every pair the same way and
+/// the ranges apart at every arm:
+///
+/// ```text
+/// a threadgroup      a decode step   the device
+///  32 threads             -2.1%         -2.2%
+///  64 threads             -2.3%         -2.3%
+/// 128 threads             -1.8%         -1.9%
+/// 256 threads, before         —             —
+/// 512 threads             +3.5%         +3.8%
+/// ```
+///
+/// **The middle of a plateau rather than its edge**, which is the discipline
+/// [`RESIDENCY`] is sized under. Seven pairs each of 64 against 32 and 64 against
+/// 128 read +0.1% and +0.2% with the ranges across and no claim, so the three are
+/// one arm and 64 is the middle of it; 256 and 512 are behind all three.
+///
+/// [`what_a_packed_multiply_costs_at_each_threadgroup_an_untiled_call_takes`] is
+/// the same question of one dispatch at a time. It reproduces the ranking and it
+/// is what holds every arm to the shipped kernel's bits; what it is not is a
+/// second reading of the size, because one arm of each direction comes back on a
+/// clock the others were not measured on.
+///
+/// **Its own constant because [`THREADS_PER_GROUP`] is not free to move.** That
+/// one is the tiled entries' as well as this one's, and a block's is derived
+/// against it — `Block::holds` asserts the simdgroups a block is laid out in
+/// cover it — so a sweep that turned it turned the prefill's shape too, and the
+/// two want opposite widths.
+const THREADS_AN_ELEMENTS_GROUP: usize = 64;
+
 /// Floats of threadgroup memory a tile declares and never reads for anything,
 /// which is what puts the two tiled entries on the fast side of their occupancy
 /// turn.
@@ -618,6 +660,15 @@ pub struct PackedMatmul {
     rows_a_tile: usize,
     /// The columns it spans, the same way — see [`COLS_A_TILE`].
     cols_a_tile: usize,
+    /// The threads a threadgroup of `kernel` holds, which is
+    /// [`THREADS_AN_ELEMENTS_GROUP`] for every caller but the sweep that chose
+    /// it.
+    ///
+    /// **Carried rather than read off the module**, for the reason [`Block`]
+    /// gives about the block's own shape: a width that is a constant is a width
+    /// no sweep can turn, and a value the entry carries is one arm rather than a
+    /// milestone.
+    threads_an_elements_group: usize,
 }
 
 impl PackedMatmul {
@@ -771,6 +822,23 @@ impl PackedMatmul {
             numerics,
             rows_a_tile,
             cols_a_tile,
+            threads_an_elements_group: THREADS_AN_ELEMENTS_GROUP,
+        })
+    }
+
+    /// The same, dispatching an untiled call at a threadgroup of the caller's
+    /// own — which is what makes [`THREADS_AN_ELEMENTS_GROUP`] swept rather than
+    /// asserted.
+    ///
+    /// **Nothing about the kernel moves, which is why this is a field and not a
+    /// source string.** A threadgroup of [`ENTRY`] is that many independent
+    /// simdgroups and shares nothing between them, so the width reaches the grid
+    /// and stops there — see [`PackedMatmul::entry`].
+    #[cfg(test)]
+    pub(crate) fn dispatching_at(device: &Device, threads: usize) -> Result<Self, MetalError> {
+        Ok(Self {
+            threads_an_elements_group: threads,
+            ..Self::new(device)?
         })
     }
 
@@ -803,10 +871,11 @@ impl PackedMatmul {
     ///
     /// **The grid rather than a simdgroup count, because the two entries behind
     /// the flag count in blocks where the three in front of it count in
-    /// simdgroups.** Both dispatch [`THREADS_PER_GROUP`] to a threadgroup and
-    /// neither changes anything else about the submission; what differs is only
-    /// how many threads cover a call, which is the one thing a caller cannot
-    /// work out from the kernel alone.
+    /// simdgroups.** Neither changes anything else about the submission; what
+    /// differs is only how many threads cover a call and how many of them share a
+    /// threadgroup, which is the one thing a caller cannot work out from the
+    /// kernel alone. A tile takes [`THREADS_PER_GROUP`], a block takes its own,
+    /// and an untiled call takes [`THREADS_AN_ELEMENTS_GROUP`].
     fn entry(
         &self,
         layout: &Layout<'_>,
@@ -814,8 +883,8 @@ impl PackedMatmul {
         out_dim: usize,
         experts: usize,
     ) -> (&Kernel, Grid) {
-        let simdgroups = |kernel: &Kernel, elements: usize| {
-            Grid::new(elements * kernel.simd_width(), THREADS_PER_GROUP)
+        let simdgroups = |kernel: &Kernel, elements: usize, threads: usize| {
+            Grid::new(elements * kernel.simd_width(), threads)
         };
         // Off the entry that will run rather than off this module, which is the
         // whole of what makes the block's shape sweepable — see [`Block`].
@@ -825,9 +894,18 @@ impl PackedMatmul {
         };
         let tiles = rows.div_ceil(self.rows_a_tile) * out_dim.div_ceil(self.cols_a_tile);
         match (self.blocks(layout, rows, experts), layout) {
-            (_, Layout::Each) => (&self.kernel, simdgroups(&self.kernel, rows * out_dim)),
-            (None, Layout::Tiled) => (&self.tiled, simdgroups(&self.tiled, tiles)),
-            (None, Layout::Grouped { .. }) => (&self.grouped, simdgroups(&self.grouped, tiles)),
+            (_, Layout::Each) => (
+                &self.kernel,
+                simdgroups(&self.kernel, rows * out_dim, self.threads_an_elements_group),
+            ),
+            (None, Layout::Tiled) => (
+                &self.tiled,
+                simdgroups(&self.tiled, tiles, THREADS_PER_GROUP),
+            ),
+            (None, Layout::Grouped { .. }) => (
+                &self.grouped,
+                simdgroups(&self.grouped, tiles, THREADS_PER_GROUP),
+            ),
             (Some(mma), Layout::Tiled) => (&mma.tiled, blocks(mma)),
             (Some(mma), Layout::Grouped { .. }) => (&mma.grouped, blocks(mma)),
         }
@@ -3983,7 +4061,7 @@ kernel void decoded_elements(
         let width = matmul.kernel.simd_width();
         let elements = 3 * OUT_DIM;
         assert!(
-            elements * width % THREADS_PER_GROUP != 0,
+            elements * width % THREADS_AN_ELEMENTS_GROUP != 0,
             "a dispatch that filled its last threadgroup would not exercise the bounds check"
         );
 
@@ -5747,8 +5825,8 @@ kernel void decoded_elements(
     /// K2 left it in one line — "the laggards are dispatches with 1024–4096
     /// output elements, too few to fill 80 cores" — and every shape a decode step
     /// has is in or near that range. An output element is one simdgroup and a
-    /// threadgroup is [`THREADS_PER_GROUP`] threads, so 1024 elements is 128
-    /// threadgroups on a part with 80 cores and 4096 is 512.
+    /// threadgroup is [`THREADS_AN_ELEMENTS_GROUP`] threads, so 1024 elements is
+    /// 512 threadgroups on a part with 80 cores and 4096 is 2048.
     ///
     /// The same one-row call at every width from a quarter of that to fifty times
     /// it, so the curve says whether what a narrow dispatch is short of is
@@ -5804,13 +5882,127 @@ kernel void decoded_elements(
             let achieved = moved / up[at].as_secs_f64();
             eprintln!(
                 "  {out_dim:>10}{:>14}{:>10}{:>10}{:>11}{:>8}{:>10}",
-                out_dim * NARROWEST_SIMD / THREADS_PER_GROUP,
+                out_dim * NARROWEST_SIMD / THREADS_AN_ELEMENTS_GROUP,
                 format!("{:.1} MB", moved / 1e6),
                 format!("{:.0}µs", 1e6 * up[at].as_secs_f64()),
                 format!("{:.0} GB/s", achieved / 1e9),
                 format!("{:.0}%", 1e2 * achieved / MEMORY_BANDWIDTH),
                 format!("{:.0} GB/s", moved / down[at].as_secs_f64() / 1e9),
             );
+        }
+    }
+
+    /// The threadgroups an untiled dispatch is swept over, one of which is the
+    /// shipped one.
+    const THREADGROUPS_SWEPT: [usize; 5] = [32, 64, 128, 256, 512];
+
+    /// **What a packed multiply costs at each threadgroup an untiled call takes**,
+    /// and the sweep [`THREADS_AN_ELEMENTS_GROUP`] was chosen from.
+    ///
+    /// **The one knob here that changes no arithmetic at all.** A threadgroup of
+    /// [`ENTRY`] is that many independent simdgroups sharing nothing, so the
+    /// width reaches the grid and stops; what it decides is how evenly a call's
+    /// simdgroups land on 80 cores. Every arm answers the shipped kernel's bit
+    /// patterns and the case asserts it, which is what separates this from a
+    /// sweep that measured five different computations.
+    ///
+    /// The shapes are the narrow ones, because those are where the imbalance is:
+    /// a 512-element call is eight threadgroups of 64 against 80 cores whichever
+    /// way it is cut, and a call wide enough to fill the machine has nothing to
+    /// gain from being cut differently.
+    ///
+    /// Warm and swept both ways, for the reason
+    /// [`whether_a_decode_dispatch_is_short_of_the_machine`] gives.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_packed_multiply_costs_at_each_threadgroup_an_untiled_call_takes() {
+        let Some(device) = device() else { return };
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        assert!(
+            THREADGROUPS_SWEPT.contains(&THREADS_AN_ELEMENTS_GROUP),
+            "{THREADS_AN_ELEMENTS_GROUP}"
+        );
+
+        // `(what, rows, in_dim, out_dim, experts)`.
+        let shapes: Vec<Blocked> = [
+            ("r_proj", 1, 4096, 512, 1),
+            ("k_proj, v_proj", 1, 4096, 1024, 1),
+            ("q_proj, o_proj", 1, 4096, 4096, 1),
+            ("routed gate, up", 6, 4096, 2048, 16),
+        ]
+        .into_iter()
+        .map(|(what, rows, in_dim, out_dim, experts)| {
+            Blocked::of(what, rows, in_dim, out_dim, experts, false)
+        })
+        .collect();
+        let arms: Vec<PackedMatmul> = THREADGROUPS_SWEPT
+            .iter()
+            .map(|&threads| {
+                PackedMatmul::dispatching_at(&device, threads)
+                    .unwrap_or_else(|err| panic!("{threads} threads compile: {err}"))
+            })
+            .collect();
+
+        let want = bit_patterns(&an_untiled_call_answers(&device, &arms[0]));
+        for (threads, arm) in THREADGROUPS_SWEPT.into_iter().zip(&arms) {
+            assert_eq!(
+                bit_patterns(&an_untiled_call_answers(&device, arm)),
+                want,
+                "a threadgroup of {threads} answered other bits"
+            );
+        }
+
+        let at: Vec<usize> = (0..THREADGROUPS_SWEPT.len()).collect();
+        let cost = |arm: usize| -> Vec<Duration> {
+            // The banks are uploaded before the warm-up rather than inside it,
+            // for the reason the chunk sweep gives: an upload is a hundred
+            // megabytes copied with the device idle, and a warm-up loop that
+            // pays one an iteration warms the host.
+            let banks: Vec<PackedBank<'_>> = shapes
+                .iter()
+                .map(|shape| shape.upload(&device, &arms[arm]))
+                .collect();
+            let widest = shapes.len() - 1;
+            crate::testing::warmed(|| {
+                shapes[widest].costs_on(&device, &banks[widest], &grouping);
+            });
+            shapes
+                .iter()
+                .zip(&banks)
+                .map(|(shape, bank)| shape.costs_on(&device, bank, &grouping))
+                .collect()
+        };
+        let (up, down) = crate::testing::both_ways(&at, cost);
+
+        eprintln!(
+            "  {:<20}{}",
+            "shape",
+            THREADGROUPS_SWEPT
+                .iter()
+                .map(|threads| format!("{:>18}", format!("{threads} threads")))
+                .collect::<String>()
+        );
+        for (which, shape) in shapes.iter().enumerate() {
+            let moved = packed_bytes(shape.rows * shape.out_dim * shape.in_dim);
+            let cells: String = (0..THREADGROUPS_SWEPT.len())
+                .map(|arm| {
+                    format!(
+                        "{:>10}{:>8}",
+                        format!("{:.1}\u{b5}s", 1e6 * up[arm][which].as_secs_f64()),
+                        format!("{:.0} GB/s", moved / up[arm][which].as_secs_f64() / 1e9),
+                    )
+                })
+                .collect();
+            eprintln!("  {:<20}{cells}", shape.what);
+            let other: String = (0..THREADGROUPS_SWEPT.len())
+                .map(|arm| {
+                    format!(
+                        "{:>18}",
+                        format!("{:.1}\u{b5}s", 1e6 * down[arm][which].as_secs_f64())
+                    )
+                })
+                .collect();
+            eprintln!("  {:<20}{other}", "  the other way");
         }
     }
 
