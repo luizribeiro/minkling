@@ -3467,6 +3467,12 @@ shorter block and a lower floor, which is the direction the first column of the
 height sweep wants; it was not swept, because the width is a host-side constant
 as well as a source one and the sweep would have had to reach both.
 
+**That obstacle is the taller block's too and the two are one piece of work** —
+see "What the taller block would cost at its floor", which prices the floor half
+of the trade and sizes the rest. The block's height reaches the grid, `reach_for`
+and the byte accounting, so neither axis can be swept until it is a property of
+the compiled entry rather than a constant.
+
 **The bandwidth column is divided by 819 GB/s and should be divided by 723.**
 819 is this part's specification and 723 is what a streaming read achieves on
 this machine, so every "of peak" figure in this file is about 12% low. Nothing
@@ -3859,6 +3865,67 @@ in-model prefills**, which a clock state cannot reach — 12715 to 12239 ms and
 
 **So the turn holds, with the ordering stated, and the number beside it is
 smaller than the one this file carried on one of the two kernels.**
+
+### What the taller block would cost at its floor, and why the other half is not measured
+
+**The trade is a floor against a reuse ratio and only one of the two can be
+measured without a refactor.** A8 left fragment reuse at 1:1 on both multiplies
+where mlx-vlm's steel GEMM runs 2.7:1, and named the obstacle: a block twice as
+tall holds two query-row fragments a lane and uses each key and value fragment
+twice, **and doubles the floor** from 32 query rows to 64.
+
+**The floor is the half that is measurable, and it is priced by
+`what_a_block_of_query_rows_is_worth_at_each_height`** — what a call of 32 to 63
+rows would lose by falling back to the reference entry:
+
+    rows      own rows, global   own rows, window   2048 keys, global   2048 keys, window
+      24                 1.08×              1.11×               3.14×               2.07×
+      32                 1.26×              1.33×               3.02×               2.44×
+      48                 1.01×              0.98×               3.83×               3.00×
+      64                 2.06×              2.06×               4.98×               3.95×
+
+**What the band costs depends entirely on the span the rows come with, and the
+two columns disagree by a factor of three.** A call of 40 rows whose span is its
+own 40 keys — a fresh short prompt — gets nothing from the block at all: 0.98 to
+1.33×, which is inside what an unpaired reading settles. A call of 40 rows
+against a 2048-key span — **a follow-up turn in a session that already has a
+context** — gets 2.4 to 3.8×, and that is what doubling the floor would give
+away. So the floor's cost is not "short prompts", it is short turns on long
+sessions, which is the shape a chat server has and the shape none of this file's
+benchmarks measure.
+
+**And the premise that doubling the floor reaches a speculative round is
+wrong.** A round of depth `k` verifies `k + 1` rows, which is 5 at this repo's
+own `SWEPT` and 9 at the deepest the block table prices — every one of them
+already under the floor of 32, and already refused twice over by `splits_for`
+besides. A8's own reading records it: "the block never sees a verify block,
+because nine rows is under both floors." **Doubling the floor moves calls of 32
+to 63 rows and nothing else**, so speculation is not on either side of this
+trade.
+
+**The 48-row cell is anomalous in both arms and is not built on here**: 182 µs
+against 98 at 64 rows on a shape that dispatches the same single block, with the
+reference entry moving the same way. One unpaired reading, unexplained, and
+flagged rather than smoothed.
+
+**The reuse half was not measured, and the reason is the one A8 gave for the
+thread width — they turn out to be the same obstacle.** `MMA_ROWS_A_BLOCK` is a
+host-side constant as well as a source one: the grid is
+`heads * queries.div_ceil(MMA_ROWS_A_BLOCK) * THREADS_PER_GROUP`, `reach_for`
+cuts the call into blocks of it, and the byte accounting charges per block of it.
+So an arm compiled through `FusedAttention::from_source` with a taller block
+would be dispatched over a grid sized for the shorter one — **a wrong answer
+rather than a slow one**, which is why no sweep here can reach it and why this
+is sized rather than guessed.
+
+**What it would take, named so the next milestone does not rediscover it**: the
+height becomes a property of the compiled entry rather than a constant, threaded
+through the grid, `reach_for` and `PackedBank`-style byte accounting; then the
+kernel body carries `held`, `weighted`, `scores`, `peak`, `total`, the position
+and the store over a lane's rows rather than one, which is 64 more registers a
+thread. **That is a milestone and not a line**, and the floor table above is what
+it should be held against: it has to buy more than 2.4 to 3.8× on a short turn
+over a long session, which is the only workload it takes anything from.
 
 ### What a streaming read actually achieves, which is the denominator
 
