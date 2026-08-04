@@ -431,26 +431,32 @@ fn which(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<Numerics
         .with_context(|| format!("{name} is not numerics, which is reference or production"))
 }
 
-/// A count of at least one, which every number this takes is: no measurement is
-/// defined over zero tokens, zero pairs or a sweep of no depths.
 /// A count of positions to keep, which may be zero: keeping nothing is the arm
 /// a session is measured against, and it is the one number [`count`] refuses.
 fn positions(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize> {
-    let value = args
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("{flag} takes a value"))?;
-    value
-        .parse()
-        .map_err(|_| anyhow::anyhow!("{value} is not a count of positions, after {flag}"))
+    parsed(flag, args, "a count of positions", |_| true)
 }
 
+/// A count of at least one, which every number this takes is: no measurement is
+/// defined over zero tokens, zero pairs or a sweep of no depths.
 fn count(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<usize> {
+    parsed(flag, args, "a count of at least one", |count| *count > 0)
+}
+
+/// The next argument as a number `wanted` accepts, and a refusal naming both the
+/// word and what it was meant to be.
+fn parsed(
+    flag: &str,
+    args: &mut impl Iterator<Item = String>,
+    what: &str,
+    wanted: impl Fn(&usize) -> bool,
+) -> Result<usize> {
     let value = args
         .next()
         .with_context(|| format!("{flag} takes a value"))?;
     match value.parse() {
-        Ok(count) if count > 0 => Ok(count),
-        _ => bail!("{value} is not a count of at least one, after {flag}"),
+        Ok(number) if wanted(&number) => Ok(number),
+        _ => bail!("{value} is not {what}, after {flag}"),
     }
 }
 

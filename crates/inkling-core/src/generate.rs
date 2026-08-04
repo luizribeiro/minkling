@@ -323,9 +323,16 @@ impl<'a> Generator<'a> {
     /// The block of one is the seam **and it is not free of purpose**: a backend
     /// that carried the last layer's rows has a run still open, and the tail is
     /// what closes it. Marking a window a dispatch has not written is reading
-    /// whatever was there before. So this asks for the cheapest tail there is —
+    /// whatever was there before. So this asks for the smallest tail there is —
     /// one row, no logits handed back, nothing chained — and drops the id it
     /// names.
+    ///
+    /// **Smallest is not free, and it is worth saying what it costs.**
+    /// [`Tail::logits`] decides whether the logits cross back, not whether they
+    /// are formed: a backend holding the tail runs the norm, the muP divide and
+    /// the 200058-row projection either way. So a prompt split into a prefill
+    /// and a generation pays one more of those than a prompt fed whole — about
+    /// a decode step's head, once a turn, against a turn that is seconds.
     pub fn prefill(&self, cache: &mut ModelCache, ids: &[usize], weights: &impl ModelWeights) {
         self.tailed(
             cache,

@@ -206,10 +206,18 @@ impl<'a> Kept<'a> {
         }
     }
 
-    /// Keep nothing, and give the next request a cache that holds nothing.
+    /// Keep nothing, and start the next turn from a cache that holds nothing.
     ///
-    /// What a request that did not finish leaves behind: the cache is wherever
-    /// the failure stopped it and no mark says where that is.
+    /// **Both of the ways a conversation ends here**: a prompt that does not
+    /// extend the kept one, and a conversation that has grown past the bound.
+    /// Either way what the next turn needs is a cache whose count is zero, which
+    /// is what the device reads as a sequence beginning — see
+    /// [`Kept::opened`].
+    ///
+    /// It is not a recovery path and there is nothing here that could be one: a
+    /// failure inside a turn is a panic in this tree, and a panic takes the
+    /// process with it rather than leaving a server holding a cache nobody can
+    /// say the position of.
     pub fn forget(&mut self) {
         self.ids.clear();
         self.cache = ModelCache::new(self.config);
@@ -312,10 +320,11 @@ mod tests {
         assert_eq!(kept.held(), 0);
     }
 
-    /// A request that did not finish leaves a cache nobody can say the position
-    /// of, so what it leaves for the next one is nothing.
+    /// Forgetting is both of the ways a conversation ends here, and what it has
+    /// to leave is a cache the next turn reads as a sequence beginning — not
+    /// merely an empty list of ids beside a cache still holding keys.
     #[test]
-    fn a_request_that_did_not_finish_leaves_nothing_behind() {
+    fn forgetting_a_conversation_leaves_the_next_turn_nothing_to_start_from() {
         let stack = Stack::load();
         let mut kept = kept(&stack.config);
         kept.keep(&TURN[..4]);

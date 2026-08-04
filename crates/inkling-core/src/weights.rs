@@ -1173,14 +1173,15 @@ impl ModelWeights for CheckpointWeights<'_> {
 
     fn resume(&self, cache: &mut ModelCache, mark: &Mark) {
         cache.resume(mark.cache());
-        // A mark whose backend half is missing against weights that have one is
-        // half a sequence put back: the counts on this side move and the spans
-        // they are counts of do not. The backend refuses it by layer.
+        // A mark whose backend half is missing, against weights that have one,
+        // is half a sequence put back: the counts on this side move and the
+        // spans they are counts of do not. Handed over as the empty mark it is,
+        // so that the backend refuses it by the layers it holds rather than
+        // being quietly skipped — a backend that holds none accepts it, which is
+        // what an empty mark means there.
         if let Some(backend) = self.backend.as_deref() {
-            match mark.backend() {
-                Some(theirs) => backend.resume(theirs),
-                None => backend.resume(&CacheMark::new(Vec::new())),
-            }
+            let empty = CacheMark::new(Vec::new());
+            backend.resume(mark.backend().unwrap_or(&empty));
         }
     }
 
