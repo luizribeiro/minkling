@@ -6255,8 +6255,13 @@ kernel void decoded_elements(
     const CONDITIONING_REDUCTIONS: [usize; 5] = [32, 128, 512, 2048, 4096];
 
     /// **What 16-bit operands cost and what they give up** — the lever Apple's
-    /// guidance for this hardware is most emphatic about, and the one mlx-vlm
-    /// takes so completely that it ships no fp32 steel kernel at all.
+    /// guidance for this hardware is most emphatic about, and the one mlx's
+    /// quantised matmul takes completely: the metallib in `reference/.venv` at
+    /// mlx 0.32.0 carries `qmm` in `bfloat16` and `float16` and in no `float32`
+    /// at all. **Its dense steel GEMM does ship fp32**, which is worth saying
+    /// because this repo has asserted otherwise —
+    /// `steel_gemm_fused_nn_float32_float32_bm64_bn64_bk16_wm1_wn2` is in the
+    /// same binary.
     ///
     /// A8 declined it and named the reason to respect: "this flag's two sides
     /// sum the same exact products in different orders, and a 16-bit operand
@@ -6425,7 +6430,15 @@ kernel void decoded_elements(
     /// ever tried.
     ///
     /// mlx-vlm runs its steel GEMM at **64 to 128 threads** where this ships
-    /// **256**. The reason it was never swept is not that it looked
+    /// **256** — read off the metallib this repo's own oracle runs rather than
+    /// inherited, which is how it had stood since A8: mlx 0.32.0 carries
+    /// `steel_gemm_fused_*_bm64_bn64_bk16_wm1_wn2` and `_wm2_wn2`, and
+    /// `steel/gemm/mma.h` puts `WM × WN` simdgroups of 32 over the tile, which
+    /// is 64 threads and 128. The same header is where the 2.7:1 comes from:
+    /// `TM = BM / (8 × WM)` and `TN = BN / (8 × WN)` are 8 and 4 at that shape,
+    /// so 32 accumulators against `TM + TN` = 12 fragment loads.
+    ///
+    /// The reason it was never swept is not that it looked
     /// unpromising: the width is a host-side constant as well as a source one,
     /// so an entry compiled at one width and dispatched over a grid sized for
     /// another leaves output no threadgroup reached — a wrong answer rather
