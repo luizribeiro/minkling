@@ -67,7 +67,7 @@ use crate::device::{Device, MetalError};
 use crate::experts::{ExpertKernels, LayerExperts};
 use crate::kernel::{Batch, Submitted};
 use crate::matmul::{MatmulError, Multiply, PackedMatmul, PackedProjection, Pending, together};
-use crate::norm::{LayerNorm, RmsNorm};
+use crate::norm::{self, LayerNorm, Normalising, RmsNorm};
 use crate::numerics::Numerics;
 use crate::sconv::{LayerConv, ShortConvolution};
 use crate::swiglu::SwiGlu;
@@ -485,19 +485,32 @@ impl<'a> LayerProjections<'a> {
         let mut k = self.k_sconv.encode(batch, &mut k, None, 1.0)?;
         self.v_sconv.encode_over(batch, &mut v, None, 1.0, values)?;
 
+        // One dispatch rather than two: the two norms read different rows
+        // against different weights into different landings, and neither reads
+        // what the other writes — so what separated them was that they are two
+        // tensors. See `norm::encode_pair`, which is where they part company
+        // again if a checkpoint ever gives them different widths.
         let mut headed = device.zeroed::<f32>(q.len())?;
-        self.q_norm.encode_over(
+        norm::encode_pair(
             batch,
-            &mut q,
-            step.q_taus,
-            Landing {
-                out: &mut headed,
-                groups: step.sdpa.heads(),
-                stride: queries,
-                base: 0,
+            Normalising {
+                norm: &self.q_norm,
+                x: &mut q,
+                scale: step.q_taus,
+                landing: Landing {
+                    out: &mut headed,
+                    groups: step.sdpa.heads(),
+                    stride: queries,
+                    base: 0,
+                },
+            },
+            Normalising {
+                norm: &self.k_norm,
+                x: &mut k,
+                scale: None,
+                landing: keys,
             },
         )?;
-        self.k_norm.encode_over(batch, &mut k, None, keys)?;
 
         // **The span grows here rather than when the batch completes**, because
         // the step below is what has to see this call's keys and it is in the

@@ -63,6 +63,12 @@ use crate::kernel::{Batch, Grid, Kernel, extent};
 
 const ENTRY: &str = "rms_norm";
 
+/// The entry that runs two of those calls as one dispatch — see [`encode_pair`].
+const PAIRED_ENTRY: &str = "rms_norm_pair";
+
+/// How many `uint`s the kernel's `Shape` struct declares.
+const FIELDS: usize = 7;
+
 /// The widest threadgroup a dispatch here uses, and — unlike [`crate::matmul`]'s
 /// — all of it works on one group of one row.
 ///
@@ -109,6 +115,10 @@ const LEAST_EXPONENT: i32 = -60;
 #[derive(Debug)]
 pub struct RmsNorm {
     kernel: Kernel,
+    /// The same source's paired entry, compiled beside it because a model
+    /// wanting one wants the other: a layer's head norms pair and its input
+    /// layernorm has nothing to pair with.
+    paired: Kernel,
 }
 
 impl RmsNorm {
@@ -122,6 +132,7 @@ impl RmsNorm {
     pub(crate) fn from_source(device: &Device, source: &str) -> Result<Self, MetalError> {
         Ok(Self {
             kernel: device.compile(source, ENTRY)?,
+            paired: device.compile(source, PAIRED_ENTRY)?,
         })
     }
 }
@@ -327,46 +338,11 @@ impl<'a> LayerNorm<'a> {
         scale: Option<&[f32]>,
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
-        assert!(landing.groups > 0, "a row has groups");
-        assert_eq!(
-            x.len() % landing.groups,
-            0,
-            "{} values are not {} groups",
-            x.len(),
-            landing.groups
-        );
-        let rows = self.rows(x.len() / landing.groups) - from;
-        let scale = match scale {
-            Some(scale) => {
-                assert_eq!(scale.len(), rows, "a scale a row");
-                Cow::Borrowed(scale)
-            }
-            None => Cow::Owned(vec![1.0; rows]),
-        };
-        landing.fits(rows, self.width);
-
-        let fields = [
-            extent(rows, "rows of a call"),
-            extent(landing.groups, "the groups of a row"),
-            extent(self.width, "the width of a norm"),
-            extent(landing.stride, "the rows a group has room for"),
-            extent(landing.base, "where a call's rows start"),
-            extent(from, "where a call's rows are read from"),
-            self.eps.to_bits(),
-        ];
-        let mut shape = self.device.inline(&fields)?;
+        let (call, scale) = self.described(x.len(), from, scale, &landing);
+        let mut shape = self.device.inline(&call.fields)?;
         let mut weight = self.weight.borrow_mut();
         let mut scales = self.device.inline(&scale)?;
 
-        // A threadgroup to each group of each row, which is what makes the pair
-        // the threadgroup's own position and so what makes the barriers inside
-        // uniform: a threadgroup either runs a group or returns from one, and
-        // never splits over the question.
-        let grid = Grid::new(rows * landing.groups * self.threads, self.threads);
-        // The rows in, the same rows out, the one weight every row of every call
-        // reads, and a scale for each row. A call over a suffix reads and writes
-        // its own rows and not the ones in front of them.
-        let moves = size_of::<f32>() * (2 * rows * landing.groups * self.width + self.width + rows);
         batch.add(
             &self.norm.kernel,
             &[
@@ -376,10 +352,162 @@ impl<'a> LayerNorm<'a> {
                 scales.arg(),
                 landing.out.arg(),
             ],
-            grid,
-            moves,
+            // A threadgroup to each group of each row, which is what makes the
+            // pair the threadgroup's own position and so what makes the barriers
+            // inside uniform: a threadgroup either runs a group or returns from
+            // one, and never splits over the question.
+            Grid::new(call.slots * self.threads, self.threads),
+            call.moves,
         )
     }
+
+    /// Everything about a call that does not depend on whether it has a
+    /// dispatch to itself: the seven fields the kernel reads, the threadgroups
+    /// it needs, and the bytes it moves.
+    ///
+    /// Here rather than inside [`LayerNorm::encoding`] because a paired dispatch
+    /// asks the same three questions of each half, and a second spelling of the
+    /// shape struct is one that could drift from the kernel's own.
+    fn described<'s>(
+        &self,
+        values: usize,
+        from: usize,
+        scale: Option<&'s [f32]>,
+        landing: &Landing<'_>,
+    ) -> (Call, Cow<'s, [f32]>) {
+        assert!(landing.groups > 0, "a row has groups");
+        assert_eq!(
+            values % landing.groups,
+            0,
+            "{values} values are not {} groups",
+            landing.groups
+        );
+        let rows = self.rows(values / landing.groups) - from;
+        let scale = match scale {
+            Some(scale) => {
+                assert_eq!(scale.len(), rows, "a scale a row");
+                Cow::Borrowed(scale)
+            }
+            None => Cow::Owned(vec![1.0; rows]),
+        };
+        landing.fits(rows, self.width);
+
+        let call = Call {
+            fields: [
+                extent(rows, "rows of a call"),
+                extent(landing.groups, "the groups of a row"),
+                extent(self.width, "the width of a norm"),
+                extent(landing.stride, "the rows a group has room for"),
+                extent(landing.base, "where a call's rows start"),
+                extent(from, "where a call's rows are read from"),
+                self.eps.to_bits(),
+            ],
+            slots: rows * landing.groups,
+            // The rows in, the same rows out, the one weight every row of every
+            // call reads, and a scale for each row. A call over a suffix reads
+            // and writes its own rows and not the ones in front of them.
+            moves: size_of::<f32>() * (2 * rows * landing.groups * self.width + self.width + rows),
+        };
+        (call, scale)
+    }
+}
+
+/// One norm's call as a paired dispatch describes it.
+struct Call {
+    fields: [u32; FIELDS],
+    /// Threadgroups it wants, which is a group of a row each.
+    slots: usize,
+    moves: usize,
+}
+
+/// One half of a paired normalisation: the rows it reads, what multiplies them,
+/// and where its own rows land.
+///
+/// A struct rather than four more arguments because [`encode_pair`] takes two of
+/// everything, and eight positional arguments of which four repeat is a call
+/// nobody can read.
+pub struct Normalising<'a> {
+    pub norm: &'a LayerNorm<'a>,
+    pub x: &'a mut Buffer<f32>,
+    /// Log scaling's `tau`, one value per row. `None` is a row of ones.
+    pub scale: Option<&'a [f32]>,
+    pub landing: Landing<'a>,
+}
+
+/// **Two norms as one dispatch**, where the two ask for the same threadgroup —
+/// and as the two dispatches they have always been where they do not.
+///
+/// A layer's query norm and key norm are the pair this exists for: they read
+/// different rows against different weights into different landings, neither
+/// reads what the other writes, and a decode step encoded 42 of each. What they
+/// have to share is the threadgroup, which is a property of their widths — both
+/// are `head_dim` in this checkpoint's architecture — and nothing else.
+///
+/// **The fallback is not a fault.** A checkpoint whose query heads and key heads
+/// were different widths would ask for two threadgroup shapes out of one grid,
+/// which Metal has no way to dispatch; that is a pair this cannot make rather
+/// than a checkpoint this cannot run, and the two dispatches it makes instead are
+/// the two it always made.
+///
+/// The answer is the same bits either way, which
+/// `a_paired_norm_answers_what_the_two_norms_it_replaces_answer` holds exactly:
+/// a threadgroup runs the walk it ran alone, over the same values, in the same
+/// order, against the same weight.
+pub fn encode_pair(
+    batch: &mut Batch<'_>,
+    first: Normalising<'_>,
+    second: Normalising<'_>,
+) -> Result<(), MetalError> {
+    let _timed = profile::scope(Op::Encode);
+    let Normalising {
+        norm: one,
+        x: first_x,
+        scale: first_scale,
+        landing: first_landing,
+    } = first;
+    let Normalising {
+        norm: other,
+        x: second_x,
+        scale: second_scale,
+        landing: second_landing,
+    } = second;
+
+    if one.threads != other.threads {
+        one.encoding(batch, first_x, 0, first_scale, first_landing)?;
+        return other.encoding(batch, second_x, 0, second_scale, second_landing);
+    }
+
+    let (first_call, first_scale) = one.described(first_x.len(), 0, first_scale, &first_landing);
+    let (second_call, second_scale) =
+        other.described(second_x.len(), 0, second_scale, &second_landing);
+    let device = one.device;
+    let mut first_shape = device.inline(&first_call.fields)?;
+    let mut second_shape = device.inline(&second_call.fields)?;
+    let mut first_scales = device.inline(&first_scale)?;
+    let mut second_scales = device.inline(&second_scale)?;
+    let mut first_weight = one.weight.borrow_mut();
+    let mut second_weight = other.weight.borrow_mut();
+
+    batch.add(
+        &one.norm.paired,
+        &[
+            first_shape.arg(),
+            first_x.arg(),
+            first_weight.arg(),
+            first_scales.arg(),
+            first_landing.out.arg(),
+            second_shape.arg(),
+            second_x.arg(),
+            second_weight.arg(),
+            second_scales.arg(),
+            second_landing.out.arg(),
+        ],
+        Grid::new(
+            (first_call.slots + second_call.slots) * one.threads,
+            one.threads,
+        ),
+        first_call.moves + second_call.moves,
+    )
 }
 
 /// The kernel, with the one constant the range argument rests on written into
@@ -541,6 +669,56 @@ static void normalise(
     }
 }
 
+/// One threadgroup's share of a call: the group of the row `slot` names,
+/// normalised where the call's landing puts it.
+///
+/// Here rather than inside the entry point because two entry points run it —
+/// the call on its own, and either half of a pair. What a paired dispatch
+/// changes is which of two shapes a threadgroup reads and nothing else, which is
+/// what makes the pair bit-safe by construction rather than within a tolerance.
+static void normalise_slot(
+    constant Shape &shape,
+    device const float *x,
+    device const float *weight,
+    device const float *scale,
+    device float *out,
+    uint slot,
+    threadgroup float *peaks,
+    threadgroup float *sums,
+    uint local,
+    uint threads,
+    uint lane,
+    uint simd,
+    uint simds
+) {
+    const uint row = slot / shape.groups;
+    const uint group = slot % shape.groups;
+
+    device const float *values =
+        x + ((ulong)shape.source * shape.groups + slot) * shape.width;
+    device float *result =
+        out + ((ulong)group * shape.stride + shape.base + row) * shape.width;
+    const float row_scale = scale[row];
+
+    // The width is a shape and not a thread's own, so both barriers inside stay
+    // uniform however this branches.
+    if (shape.width % LANE == 0) {
+        normalise(
+            shape,
+            (device const float4 *)values,
+            (device const float4 *)weight,
+            (device float4 *)result,
+            shape.width / LANE,
+            row_scale, peaks, sums, local, threads, lane, simd, simds
+        );
+    } else {
+        normalise(
+            shape, values, weight, result, shape.width,
+            row_scale, peaks, sums, local, threads, lane, simd, simds
+        );
+    }
+}
+
 /// `out = x * rsqrt(mean(x^2) + eps) * weight * scale`, one threadgroup to each
 /// group of each row.
 ///
@@ -584,30 +762,60 @@ kernel void rms_norm(
     if (slot >= shape.rows * shape.groups) {
         return;
     }
-    const uint row = slot / shape.groups;
-    const uint group = slot % shape.groups;
+    normalise_slot(
+        shape, x, weight, scale, out, slot,
+        peaks, sums, local, threads, lane, simd, simds
+    );
+}
 
-    device const float *values =
-        x + ((ulong)shape.source * shape.groups + slot) * shape.width;
-    device float *result =
-        out + ((ulong)group * shape.stride + shape.base + row) * shape.width;
-    const float row_scale = scale[row];
+/// Two norms as one dispatch: a grid of both calls' threadgroups, the first
+/// call's at the front of it.
+///
+/// **A layer's query norm and key norm were two dispatches because they are two
+/// tensors and for no other reason.** They read different rows against different
+/// weights into different landings, and neither reads anything the other writes,
+/// so what separates them inside a dispatch is which shape a threadgroup reads.
+///
+/// **The branch is on the threadgroup's own position and so is uniform**, which
+/// is what keeps the two barriers inside `normalise` legal: a threadgroup takes
+/// one side whole. It is also what makes the answer the same bits — the walk,
+/// the rounding rule and the reduction order a threadgroup runs are the ones it
+/// ran when the call was alone, over the same values in the same order.
+///
+/// The two halves share one threadgroup width, which is why a pair is only
+/// formed where both call for the same one — see `norm::encode_pair`.
+kernel void rms_norm_pair(
+    constant Shape &first [[buffer(0)]],
+    device const float *first_x [[buffer(1)]],
+    device const float *first_weight [[buffer(2)]],
+    device const float *first_scale [[buffer(3)]],
+    device float *first_out [[buffer(4)]],
+    constant Shape &second [[buffer(5)]],
+    device const float *second_x [[buffer(6)]],
+    device const float *second_weight [[buffer(7)]],
+    device const float *second_scale [[buffer(8)]],
+    device float *second_out [[buffer(9)]],
+    uint slot [[threadgroup_position_in_grid]],
+    uint local [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint simds [[simdgroups_per_threadgroup]]
+) {
+    threadgroup float peaks[MOST_SIMDGROUPS];
+    threadgroup float sums[MOST_SIMDGROUPS];
 
-    // The width is a shape and not a thread's own, so both barriers inside stay
-    // uniform however this branches.
-    if (shape.width % LANE == 0) {
-        normalise(
-            shape,
-            (device const float4 *)values,
-            (device const float4 *)weight,
-            (device float4 *)result,
-            shape.width / LANE,
-            row_scale, peaks, sums, local, threads, lane, simd, simds
+    const uint firsts = first.rows * first.groups;
+    if (slot < firsts) {
+        normalise_slot(
+            first, first_x, first_weight, first_scale, first_out, slot,
+            peaks, sums, local, threads, lane, simd, simds
         );
-    } else {
-        normalise(
-            shape, values, weight, result, shape.width,
-            row_scale, peaks, sums, local, threads, lane, simd, simds
+    } else if (slot < firsts + second.rows * second.groups) {
+        normalise_slot(
+            second, second_x, second_weight, second_scale, second_out,
+            slot - firsts,
+            peaks, sums, local, threads, lane, simd, simds
         );
     }
 }
@@ -1101,6 +1309,202 @@ mod tests {
             deviation(&out.to_vec(), &apart) > TOLERANCE,
             "the groups landed in the order they were read"
         );
+    }
+
+    /// **A paired dispatch answers what the two dispatches it replaces answer,
+    /// exactly** — which is the whole of what a merge is allowed to be, and the
+    /// one thing a tolerance would be the wrong instrument for.
+    ///
+    /// The two halves are made as unalike as a layer's query norm and key norm
+    /// are: different rows, different values, different weights, one with a
+    /// per-row scale and one without, different group counts, and landings of
+    /// different strides. What they share is the width, which is what makes the
+    /// threadgroup one threadgroup.
+    ///
+    /// **And it costs the pipeline nothing**, which is asserted beside the
+    /// answer: a merge that halved the widest threadgroup this kernel can be
+    /// dispatched in would be giving back on one axis what it took on another.
+    #[test]
+    fn a_paired_norm_answers_what_the_two_norms_it_replaces_answer() {
+        let Some(device) = device() else { return };
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        assert!(
+            norm.paired.max_threads_per_group() >= norm.kernel.max_threads_per_group(),
+            "the paired entry is dispatched in a narrower threadgroup than the plain one"
+        );
+
+        let width = 32;
+        let query = weight_of(width, 3);
+        let key = weight_of(width, 5);
+        let (queries, heads, kv_heads) = (3, 4, 2);
+        let q = values(queries * heads * width, 11);
+        let k = values(queries * kv_heads * width, 23);
+        let taus: Vec<f32> = (0..queries).map(|i| 0.5 + i as f32 / 4.0).collect();
+
+        let one = LayerNorm::new(&device, &norm, &query, 1e-6).expect("the weight uploads");
+        let other = LayerNorm::new(&device, &norm, &key, 1e-5).expect("the weight uploads");
+        assert_eq!(
+            one.threads, other.threads,
+            "the two ask for one threadgroup"
+        );
+
+        // The strides differ so that a half reading the other's landing would
+        // write somewhere neither of them wrote alone.
+        let landings = (queries, queries + 4);
+        let together = normed_pair(
+            &device,
+            &one,
+            &q,
+            Some(&taus),
+            heads,
+            landings.0,
+            &other,
+            &k,
+            None,
+            kv_heads,
+            landings.1,
+        );
+        let apart = (
+            normed_alone(&device, &one, &q, Some(&taus), heads, landings.0),
+            normed_alone(&device, &other, &k, None, kv_heads, landings.1),
+        );
+
+        assert_eq!(together.0, apart.0, "the query norm");
+        assert_eq!(together.1, apart.1, "the key norm");
+        assert!(
+            together.0.iter().any(|value| *value != 0.0),
+            "a pair that wrote nothing would compare equal to another that did"
+        );
+    }
+
+    /// **Two norms of different widths are two dispatches, and answer the same.**
+    ///
+    /// A pair shares one threadgroup and a threadgroup is decided by the width,
+    /// so halves that disagree about it cannot come out of one grid. Nothing in
+    /// this checkpoint's architecture makes them disagree — a query head and a
+    /// key head are both `head_dim` — so this is the arm that says the fallback
+    /// is a fallback rather than a wrong answer.
+    #[test]
+    fn norms_that_cannot_share_a_threadgroup_are_dispatched_apart() {
+        let Some(device) = device() else { return };
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let (narrow, wide) = (32, 1024);
+        let one = LayerNorm::new(&device, &norm, &weight_of(narrow, 3), 1e-6)
+            .expect("the weight uploads");
+        let other =
+            LayerNorm::new(&device, &norm, &weight_of(wide, 5), 1e-6).expect("the weight uploads");
+        assert_ne!(one.threads, other.threads, "the two widths part company");
+
+        let (x, y) = (values(2 * narrow, 7), values(2 * wide, 9));
+        let dispatches = device.dispatches();
+        let together = normed_pair(&device, &one, &x, None, 1, 2, &other, &y, None, 1, 2);
+        assert_eq!(device.dispatches() - dispatches, 2, "two dispatches");
+
+        assert_eq!(together.0, normed_alone(&device, &one, &x, None, 1, 2));
+        assert_eq!(together.1, normed_alone(&device, &other, &y, None, 1, 2));
+    }
+
+    /// A weight that is not all one value, so a norm that dropped it or read it
+    /// at the wrong channel would answer differently.
+    fn weight_of(width: usize, salt: usize) -> Vec<f32> {
+        (0..width)
+            .map(|i| 0.5 + ((i * salt) % 11) as f32 / 8.0)
+            .collect()
+    }
+
+    /// Values spread over both signs and several magnitudes, so that the peak
+    /// and the reduction each have something to do.
+    fn values(len: usize, salt: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i * 37 + salt) % 89) as f32 / 8.0 - 5.5)
+            .collect()
+    }
+
+    /// One norm dispatched on its own, into a landing of `stride` rows.
+    fn normed_alone(
+        device: &Device,
+        norm: &LayerNorm<'_>,
+        x: &[f32],
+        scale: Option<&[f32]>,
+        groups: usize,
+        stride: usize,
+    ) -> Vec<f32> {
+        let mut input = device.buffer(x).expect("the rows upload");
+        let mut out = device
+            .zeroed::<f32>(groups * stride * norm.width())
+            .expect("the landing allocates");
+        let mut batch = device.batch().expect("a command buffer opens");
+        norm.encode_over(
+            &mut batch,
+            &mut input,
+            scale,
+            Landing {
+                out: &mut out,
+                groups,
+                stride,
+                base: 0,
+            },
+        )
+        .expect("the norm encodes");
+        batch.wait().expect("the batch completes");
+        out.to_vec()
+    }
+
+    /// The same two, through one [`encode_pair`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "two of everything a norm's call is, which is what the pair takes"
+    )]
+    fn normed_pair(
+        device: &Device,
+        one: &LayerNorm<'_>,
+        x: &[f32],
+        scale: Option<&[f32]>,
+        groups: usize,
+        stride: usize,
+        other: &LayerNorm<'_>,
+        y: &[f32],
+        other_scale: Option<&[f32]>,
+        other_groups: usize,
+        other_stride: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut first_x = device.buffer(x).expect("the rows upload");
+        let mut second_x = device.buffer(y).expect("the rows upload");
+        let mut first_out = device
+            .zeroed::<f32>(groups * stride * one.width())
+            .expect("the landing allocates");
+        let mut second_out = device
+            .zeroed::<f32>(other_groups * other_stride * other.width())
+            .expect("the landing allocates");
+        let mut batch = device.batch().expect("a command buffer opens");
+        super::encode_pair(
+            &mut batch,
+            Normalising {
+                norm: one,
+                x: &mut first_x,
+                scale,
+                landing: Landing {
+                    out: &mut first_out,
+                    groups,
+                    stride,
+                    base: 0,
+                },
+            },
+            Normalising {
+                norm: other,
+                x: &mut second_x,
+                scale: other_scale,
+                landing: Landing {
+                    out: &mut second_out,
+                    groups: other_groups,
+                    stride: other_stride,
+                    base: 0,
+                },
+            },
+        )
+        .expect("the pair encodes");
+        batch.wait().expect("the batch completes");
+        (first_out.to_vec(), second_out.to_vec())
     }
 
     /// A landing writes its call's rows into a span with room for more, and
