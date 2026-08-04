@@ -1175,6 +1175,191 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## The encode a decode step could stop doing, and what it would be worth
+
+**A decode step encodes the same thousand dispatches every step, that sequence
+is reusable, and patching one is an order of magnitude cheaper than encoding it.
+The milestone still does not exist, for two reasons that are each on their own
+sufficient: the device is already executing for 92% of a step, and an indirect
+command costs the device twice what the dispatch it replaces costs.**
+
+This was opened to remove the 7.79 ms of host-side encoding D2 measured in an
+18.22 ms step, on the reading that a step freed of it would approach the 10.43 ms
+it spends inside a wait — **roughly 1.75×, larger than every lever D1 and D2
+shipped combined.** The reading is wrong, and it is wrong in a way that retires a
+whole class of levers rather than only this one.
+
+### The ceiling on every host-side lever, which is 8%
+
+`where_a_decode_step_spends_its_time`, one run, one step:
+
+    a 17.70ms decode step, 1000 dispatches in 14 submissions over 997 buffers
+    operation           calls   self time   share
+    submit and wait        28     10.33ms   58.3%
+    dispatch encode       999      6.14ms   34.7%
+    unaccounted                    1.22ms    6.9%
+    of which the device reported executing for 16.29ms, 92.0% of the step
+
+**10.43 ms was never the device's floor.** It is what this process *blocked*
+for, and a run that commits at a layer boundary and keeps encoding blocks only
+for the part of the GPU's work it has run out of other things to overlap. The
+device's own clock says it executed for **16.29 ms of a 17.70 ms step**, summed
+over fourteen submissions of one serial queue — so 16.29 ms is a floor the step
+cannot go under whatever this side does.
+
+**That leaves 1.41 ms.** Every host-side lever this project could reach — a
+reused command sequence, buffers that are not reallocated every step, a cheaper
+shape struct — divides up 1.41 ms of a 17.70 ms step. **8.0% is the ceiling on
+all of them together**, and it is the same arithmetic whichever is tried.
+
+It also explains D2's own result rather than leaving it a puzzle. Eighty fewer
+dispatches took 0.33 ms off the device and about 0.3 ms off the encode, and the
+wall moved 0.06: the encode was never on the critical path, so the half of that
+change which landed on the host bought nothing at all.
+
+### What patching a command costs against encoding one fresh
+
+Asked anyway, because the mechanism is what the next milestone to want it will
+have to know. `what_patching_an_indirect_command_costs_against_encoding_it_fresh`,
+a thousand of each, warm, every wait taken outside the clock, median and mean:
+
+    what                                              each   a thousand    mean
+    a dispatch encoded into a pass, and committed   1.554µs      1.554ms  1.521ms
+    the same dispatch through this crate's own path 1.562µs      1.562ms  1.573ms
+    an indirect command written whole               1.395µs      1.395ms  1.406ms
+    every one of its five slots rebound             0.775µs      0.775ms  0.782ms
+    one slot of it rebound                          0.184µs      0.184ms  0.186ms
+    a command reached for rather than held          0.145µs      0.145ms  0.146ms
+    a pass executing one of them, and committed          —      0.007ms  0.007ms
+    a pass executing the thousand, and committed         —      0.008ms  0.011ms
+
+**Patching is an order cheaper than encoding: 0.184 µs against 1.554.** And the
+handover is a fixed cost rather than a per-command one — one command executed
+costs 0.007 ms and a thousand cost 0.008 — so nothing on this side walks the
+sequence. Both of the last two rows are the whole pass: open a command buffer,
+declare, execute, commit.
+
+**A command reached for costs what patching it costs**, which is the one trap in
+the API: `indirectComputeCommandAtIndex:` builds an Objective-C object every time
+it is asked, so the commands have to be taken once and held or the patch pays
+twice.
+
+**This crate's own path is what the raw calls are**, 1.562 µs against 1.554 —
+so none of a step's encode is bookkeeping this crate could have removed without
+Metal.
+
+The saxpy kernel this is measured through binds five buffers where this engine's
+kernels bind six to a dozen, so the fresh-encode row is *cheaper* than the
+dispatches it stands for and every ratio here is the conservative one.
+
+### What it would cost the device, which is where it dies
+
+`what_the_device_makes_of_a_thousand_indirect_commands`, the same thousand empty
+dispatches three ways, on **the driver's own clock** — `GPUEndTime` less
+`GPUStartTime`, because every arm ends in a wait and a wall time around one
+carries the commit and the wake, which at these durations is the same order as
+what is being measured:
+
+    what                                            each   a thousand    mean
+    a thousand dispatches through one pass       1.093µs      1.093ms  1.218ms
+    a thousand indirect commands, a barrier each 2.210µs      2.210ms  2.211ms
+    a thousand indirect commands, no barriers    0.205µs      0.205ms  0.205ms
+
+**An indirect command that means what the dispatch it replaces means costs the
+device 2.02× as much.** A pass's dispatches are serial and an indirect buffer's
+are concurrent, so a sequence that preserves the ordering asks for a barrier on
+every command — and that arm is 2.210 µs against the encoded 1.093.
+
+A decode step is 1042 dispatches, so a reused sequence would add about **1.2 ms
+to the 16.29 ms the device already spends**, against saving at most 1.41 ms on a
+host that is not the constraint. **It would make a decode step slower**, and no
+amount of cheaper patching changes that: the two figures are on opposite sides of
+the only clock that binds.
+
+The 0.205 µs row is the same mechanism with the ordering taken off, and it is a
+different finding — see the end of this section.
+
+### The two things it would cost that are affordable, measured anyway
+
+`what_a_pipeline_built_for_an_indirect_command_costs`:
+`supportIndirectCommandBuffers` is set on a descriptor before a pipeline is built
+and cannot be told to one afterwards, so an engine on this path compiles every
+kernel carrying it. It is free — **1.001× up the list and 1.000× down it** over a
+50 MB saxpy at 371 GB/s, and the same 1024-thread threadgroup either way.
+
+`what_declaring_a_steps_allocations_to_an_indirect_pass_costs`: a command inside
+an indirect buffer does not tell the driver what it binds, so the pass executing
+it has to name every allocation any command may reach. That is a cost in a step's
+*distinct buffers* rather than its dispatches, and it is nearly free at the scale
+this engine has — **0.010 ms for 256 and 0.102 ms for 4096**, and a residency set
+would remove it entirely.
+
+### Whether the sequence is reusable, which is yes at every context
+
+`what_changes_between_two_decode_steps` writes down every dispatch a step
+encodes — the entry, the pipeline, the grid, and what fills each argument slot —
+and holds consecutive steps against each other. The worst pair at each context:
+
+    context  dispatches  commands     slots    bound   inline  metal encode  the row
+         97        1042         0      6327     2688      168        2.32ms   6.23ms
+       2048        1042         0      6327     2864      168        2.28ms   6.11ms
+       8192        1042         0      6327     2458      168        2.37ms   6.24ms
+
+**`commands` is zero at every context and every pair.** Not one dispatch changes
+its entry, its pipeline or its grid between two steps, and the count does not
+move — so the concern about attention's span is answered: a decode step's
+attention takes its span as a value a kernel reads rather than as a grid, and
+8192 keys dispatch what 97 keys dispatch. The numerics flag and `splits_for` pick
+their kernels at a shape a decode step always has, and freeze nothing that was
+right for another. **So the premise of the lever holds and the lever still does
+not pay**, which is worth separating: what fails is the arithmetic, not the
+structure, and a later milestone that changes the arithmetic inherits a sequence
+already known to be reusable.
+
+**What varies is 2458 to 2864 of 6327 slots, and it varies because the engine
+allocates rather than because the model does.** 997 buffers a step is what the
+step table counts, and a slot naming a fresh allocation is most of that column;
+the 168 inline slots are the shapes and the spans, which move by a token a step.
+Those counts are floors — a slot is compared by the address it named, and this
+engine frees and reallocates enough that an address can come back — and a floor
+is the direction a decision *against* reusing the sequence can be made under.
+
+**The last two columns are the other half.** Of the 6.14 ms `dispatch encode`
+row, the Metal calls are **2.32 ms**; the remaining 3.8 ms is this side — 997
+allocations, the shape structs, the routing — and an indirect command buffer does
+not touch any of it. A reused sequence would replace 2.32 ms with about 2700
+`setKernelBuffer:` calls, which at 0.184 µs is **0.50 ms**, plus somewhere to put
+168 inline arguments, which an indirect command has no binding for at all.
+
+### What is kept
+
+**The probe, and the instrument.** `crate::indirect` prices the mechanism and
+asserts that a command written into an indirect buffer answers what the dispatch
+it stands for answers, exactly; `crate::trace` is what any later milestone that
+wants to reuse a sequence has to run first, and it is off unless somebody asks.
+Neither is on any path the model takes.
+
+**What is not kept is the plan**: every kernel recompiled behind a pipeline flag,
+168 inline arguments given allocations they do not have, a sequence replayed
+after a speculation rewind — for a step that would get slower.
+
+### The one thing this found that is worth more than what it was looking for
+
+The third row of the device table is the same mechanism with the ordering taken
+off: **2.210 µs a command with a barrier, 0.205 µs without.** D2 named Metal's
+serial dispatch type, put "most of the 4.4 microseconds" on it, and left it; this
+is that estimate measured from inside a mechanism that lets the barrier be
+addressed one command at a time, and it says the ordering is **91% of what an
+indirect command costs the device when it computes nothing.**
+
+A decode step pays 4.2 ms of its 16.29 for being a thousand dispatches, and the
+device's clock is the one thing here that does reach the wall. It stays left, for
+the reason D2 left it: it puts a wrong answer one missing barrier away with
+nothing in the arithmetic to catch it. What has changed is that it is no longer
+an estimate, and that **it does not need an indirect command buffer** —
+`computeCommandEncoderWithDispatchType:` offers the same concurrency to the
+encoder this engine already has, without the 2.02× an indirect command costs.
+
 ## A decode step's thousand dispatches
 
 **A decode step made 1080 dispatches and it makes 1000.** The eighty are every
