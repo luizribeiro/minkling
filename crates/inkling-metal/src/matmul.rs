@@ -2482,6 +2482,10 @@ pub(crate) mod testing {
     pub(crate) struct Noise(pub(crate) u32);
 
     impl Noise {
+        /// Bits [`Noise::next`] returns, which is the state less the poorly
+        /// mixed low eight it shifts off.
+        const SPREAD: u32 = u32::BITS - 8;
+
         pub(crate) fn next(&mut self) -> u32 {
             self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
             self.0 >> 8
@@ -2496,6 +2500,33 @@ pub(crate) mod testing {
         /// measures would measure nothing.
         pub(crate) fn signed(&mut self) -> f32 {
             self.next() as f32 / (1u32 << 23) as f32 - 1.0
+        }
+
+        /// One of the sixteen codes, off the top of the state rather than the
+        /// bottom of it.
+        ///
+        /// **Bit `i` of a power-of-two linear congruential state has period
+        /// `2^(i+1)`, so which four bits a code is taken from decides how far a
+        /// weight goes before it repeats itself.** Four off the bottom of
+        /// [`Noise::next`] are the state's bits 8 to 11 and repeat every 4096 —
+        /// which is the width of every reduction in this checkpoint, so a weight
+        /// built from them held one row's codes repeated for every row of every
+        /// expert, and a kernel that read some other column's codes or some
+        /// other expert's would have answered bit for bit what the right one
+        /// answers.
+        ///
+        /// **The top four are the state's own top four**, whose period is the
+        /// whole 2^32 — so no two rows of a weight repeat at any size this file
+        /// can build. Bits 24 to 27 would not have been enough: their period is
+        /// 2^28 codes and the routed bank [`BOUND_SHAPES`] builds is 2^31,
+        /// which would have left experts 32 apart holding identical codes.
+        ///
+        /// The scales never had the problem — `% 11` and `% 5` are not powers of
+        /// two — which is why the mutation tables here have been measuring
+        /// something rather than nothing all along, and measuring it through the
+        /// scale alone.
+        pub(crate) fn code(&mut self) -> u8 {
+            (self.next() >> (Self::SPREAD - BITS as u32)) as u8
         }
     }
 
@@ -2535,9 +2566,7 @@ pub(crate) mod testing {
             }
 
             Self {
-                codes: (0..out_dim * in_dim)
-                    .map(|_| (noise.next() % 16) as u8)
-                    .collect(),
+                codes: (0..out_dim * in_dim).map(|_| noise.code()).collect(),
                 x: (0..rows * in_dim).map(|_| noise.signed()).collect(),
                 scales,
                 in_dim,
@@ -2696,6 +2725,48 @@ mod tests {
                 }));
             }
             out
+        }
+    }
+
+    /// **No two rows of a synthetic weight hold the same codes**, which is the
+    /// property every mutation table in this file rests on and which it did not
+    /// have.
+    ///
+    /// A [`Noise`] state is a power-of-two linear congruence, so its low bits
+    /// have short periods — and four taken off the bottom repeat every 4096,
+    /// which is the width of every reduction in this checkpoint. A weight built
+    /// that way is one row of codes repeated for every row of every expert, so a
+    /// kernel that read the wrong column's codes, or the wrong expert's, would
+    /// have answered bit for bit what the right one answers and every arm that
+    /// confines the weight would have been priced through its scale alone.
+    ///
+    /// **Asked at the reduction this checkpoint has and at the two widths either
+    /// side of it**, because a period that divides the row length is the failure
+    /// and a case fixed at one width could not see it move.
+    #[test]
+    fn no_two_rows_of_a_synthetic_weight_hold_the_same_codes() {
+        for in_dim in [GROUP_SIZE, 2048, 4096, 8192] {
+            const ROWS: usize = 8;
+            let case = Case::seeded(1, in_dim, ROWS, 1);
+            let rows: Vec<&[u8]> = case.codes.chunks_exact(in_dim).collect();
+            assert_eq!(rows.len(), ROWS);
+            for (at, row) in rows.iter().enumerate() {
+                assert!(
+                    !rows[..at].contains(row),
+                    "at a reduction of {in_dim}, row {at} of a weight repeats an earlier one"
+                );
+            }
+            // And every code is reachable, so that the table the kernel decodes
+            // through is exercised across the whole of it rather than over
+            // whichever sixteenth a narrower generator happened to reach.
+            let mut seen = [false; 1 << BITS];
+            for &code in &case.codes {
+                seen[code as usize] = true;
+            }
+            assert!(
+                seen.iter().all(|&code| code),
+                "{in_dim}: a code never came up"
+            );
         }
     }
 
