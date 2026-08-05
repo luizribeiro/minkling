@@ -214,11 +214,15 @@ bench-session a="cold" b="kept" *measurement:
         case "$1" in
             cold)           echo "$bin --reuse-tokens 0 {{ absolute_path(checkpoint) }}" ;;
             kept)           echo "$bin {{ absolute_path(checkpoint) }}" ;;
-            # The arithmetic the cross-engine column is quoted under. A session
-            # against the other engine under the default word would be reading
-            # this engine's prefill at 4.8x the reference's, which is a
-            # measurement of the numerics rather than of the cache.
-            kept-production) echo "$bin --numerics production {{ absolute_path(checkpoint) }}" ;;
+            # `kept-<word>` is that word behind the flag, and the cross-engine
+            # column is quoted under `kept-production`: a session against the
+            # other engine under the default word would be reading this engine's
+            # prefill at 4.8x the reference's, which is a measurement of the
+            # numerics rather than of the cache. The word is passed through
+            # rather than matched, so a word the flag grows is an arm here
+            # without a line of its own — and one it does not have is refused by
+            # the binary rather than by a second copy of the list.
+            kept-*)         echo "$bin --numerics ${1#kept-} {{ absolute_path(checkpoint) }}" ;;
             reference-cold) echo "$root/reference/scripts/bench_session --reuse-tokens 0 {{ absolute_path(checkpoint) }}" ;;
             reference)      echo "$root/reference/scripts/bench_session {{ absolute_path(checkpoint) }}" ;;
             *) echo "$1 is not one of cold, kept, reference-cold, reference" >&2; exit 2 ;;
@@ -228,17 +232,23 @@ bench-session a="cold" b="kept" *measurement:
     "$root/target/debug/bench" alternate --pairs "${BENCH_PAIRS:-3}" \
         "$(arm '{{ a }}')" "$(arm '{{ b }}')" -- session {{ measurement }}
 
-# The two numerics against each other in one sitting, out of one build:
+# Two of the flag's words against each other in one sitting, out of one build:
 #
-#   just bench-numerics prefill --tokens 2048
-#   just bench-numerics decode  --context 8192
+#   just bench-numerics reference production prefill --tokens 2048
+#   just bench-numerics production rounded   prefill --tokens 8192
+#   just bench-numerics reference production decode  --context 8192
 #
-# **The arm is a word rather than an executable.** Nothing about the production
-# path is a different commit — it is the same binary asked for a different
-# accumulation — so what differs between the two command lines is `--numerics`
-# and nothing else, which is the shape `bench-weights` puts two checkpoints
-# through. Same alternation, same report, one build.
-bench-numerics *measurement:
+# **The arm is a word rather than an executable.** Nothing behind the flag is a
+# different commit — it is the same binary asked for a different accumulation —
+# so what differs between the two command lines is `--numerics` and nothing
+# else, which is the shape `bench-weights` puts two checkpoints through. Same
+# alternation, same report, one build.
+#
+# **Both words are named rather than one of them defaulted**, which is what a
+# third word made necessary: `production` against `rounded` is as much a pair as
+# `reference` against `production`, and a recipe that spelled one side would put
+# the word a reader has to check on the side they cannot see.
+bench-numerics a b *measurement:
     #!/usr/bin/env bash
     set -euo pipefail
     root="$(git rev-parse --show-toplevel)"
@@ -250,8 +260,8 @@ bench-numerics *measurement:
     # is still running.
     cp "$root/target/debug/bench" "$bin"
     "$root/target/debug/bench" alternate --pairs {{ pairs }} \
-        "$bin --numerics reference {{ absolute_path(checkpoint) }}" \
-        "$bin --numerics production {{ absolute_path(checkpoint) }}" \
+        "$bin --numerics {{ a }} {{ absolute_path(checkpoint) }}" \
+        "$bin --numerics {{ b }} {{ absolute_path(checkpoint) }}" \
         -- {{ measurement }}
 
 # The corpus through both numerics, and where their tokens part company.
