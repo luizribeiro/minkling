@@ -71,8 +71,10 @@ const NUMERICS_VAR: &str = "INKLINGRS_NUMERICS";
 fn numerics() -> Numerics {
     match std::env::var(NUMERICS_VAR) {
         Err(_) => Numerics::default(),
-        Ok(name) => Numerics::parse(&name)
-            .unwrap_or_else(|| panic!("{NUMERICS_VAR}={name} is not reference or production")),
+        Ok(name) => Numerics::parse(&name).unwrap_or_else(|| {
+            let every: Vec<&str> = Numerics::EVERY.into_iter().map(Numerics::named).collect();
+            panic!("{NUMERICS_VAR}={name} is none of {}", every.join(", "))
+        }),
     }
 }
 
@@ -2095,10 +2097,7 @@ fn what_a_decode_steps_dispatches_have_to_wait_for() {
     let Some(dir) = checkpoint_dir() else { return };
     let Some(device) = device() else { return };
 
-    eprintln!(
-        "{:>8}{:>12}{:>8}{:>9}{:>10}{:>9}{:>9}{:>11}",
-        "context", "dispatches", "passes", "groups", "barriers", "a group", "widest", "of them"
-    );
+    ordering_header("context");
     for context in TRACED_CONTEXTS {
         let run = OnTheDevice::running(&dir, &device, Asked::decoding_at(context).traced());
         // The prefill is a different sequence from every step behind it; the
@@ -2116,43 +2115,136 @@ fn what_a_decode_steps_dispatches_have_to_wait_for() {
         );
         let step = &steps[0];
 
-        // **The one assertion that makes this a fact about the engine rather
-        // than a report about a recording.** The division here and the barriers
-        // `Batch` encoded come out of the same `Open` asked the same question,
-        // so they have to be the same number — and a milestone whose whole
-        // claim is that the barriers left are the ones a dependency needs
-        // cannot leave that unchecked.
-        // Every charged step and not their average: the sequence is the same
-        // commands every step — `what_changes_between_two_decode_steps` is what
-        // says so — so the barriers are the same count every step, and an
-        // average would let one deviant step hide behind the others.
-        assert_eq!(
-            run.barriers,
-            step.barriers() as u64 * u64::from(run.charged_steps()),
-            "at {context} keys the engine encoded {} barriers over {} steps where the division \
-             needs {} each",
-            run.barriers,
-            run.charged_steps(),
-            step.barriers()
-        );
-
-        eprintln!(
-            "{context:>8}{:>12}{:>8}{:>9}{:>10}{:>9}{:>9}{:>11}",
-            step.dispatches(),
-            step.passes(),
-            step.groups(),
-            step.barriers(),
-            format!("{:.2}", step.average()),
-            step.widest(),
-            format!(
-                "{:.0}%",
-                100.0 * step.barriers() as f64 / step.dispatches() as f64
-            ),
-        );
+        derived_barriers_are_the_encoded_ones(&run, step, &format!("{context} keys"));
+        ordering_row(context, step);
+        eprintln!("  {}", spread(step));
         for (held, group) in step.shapes() {
             eprintln!("  {held:>6} of {}", group.join(", "));
         }
     }
+}
+
+/// The header the two ordering tables share, and one row of either.
+///
+/// Written once because the two are the same eight columns about the same
+/// division of the same kind of sequence, and a prefill's row that drifted from
+/// a decode step's would be two tables a reader cannot hold side by side —
+/// which is the whole use they are put to.
+fn ordering_header(first: &str) {
+    eprintln!(
+        "{:>8}{:>12}{:>8}{:>9}{:>10}{:>9}{:>9}{:>11}",
+        first, "dispatches", "passes", "groups", "barriers", "a group", "widest", "of them"
+    );
+}
+
+fn ordering_row(at: usize, groups: &Groups) {
+    eprintln!(
+        "{at:>8}{:>12}{:>8}{:>9}{:>10}{:>9}{:>9}{:>11}",
+        groups.dispatches(),
+        groups.passes(),
+        groups.groups(),
+        groups.barriers(),
+        format!("{:.2}", groups.average()),
+        groups.widest(),
+        format!(
+            "{:.0}%",
+            100.0 * groups.barriers() as f64 / groups.dispatches() as f64
+        ),
+    );
+}
+
+/// **The one assertion that makes either table a fact about the engine rather
+/// than a report about a recording.**
+///
+/// The division and the barriers [`Batch`](inkling_metal::Batch) encoded come
+/// out of the same `Open` asked the same question, so they have to be the same
+/// number — and a milestone whose whole claim is that the barriers left are the
+/// ones a dependency needs cannot leave that unchecked. **A missing barrier is a
+/// race that is correct most of the time**, so what this guards against is a
+/// failure that would otherwise be found by a wrong token months later.
+///
+/// Every charged step and not their average: the sequence is the same commands
+/// every step — `what_changes_between_two_decode_steps` is what says so — so the
+/// barriers are the same count every step, and an average would let one deviant
+/// step hide behind the others. A prefill charges one step and the arithmetic is
+/// the same one.
+fn derived_barriers_are_the_encoded_ones(run: &OnTheDevice, groups: &Groups, at: &str) {
+    assert_eq!(
+        run.barriers,
+        groups.barriers() as u64 * u64::from(run.charged_steps()),
+        "at {at} the engine encoded {} barriers over {} steps where the division needs {} each",
+        run.barriers,
+        run.charged_steps(),
+        groups.barriers()
+    );
+}
+
+/// **What a prefill's dispatches have to wait for, which nobody had asked.**
+///
+/// D4 derived a decode step's dependency graph, made its dispatches concurrent
+/// and measured the step 17.254 → 16.287 ms. The mechanism is in the encoder —
+/// [`Batch`](inkling_metal::Batch) opens every pass `MTLDispatchTypeConcurrent`
+/// and barriers what the open group's slots say to — so **it already reaches a
+/// prefill and has since the day it landed**; nothing about it is gated on a
+/// shape. What had never been read is what it finds there.
+///
+/// **The reason to expect more of it here is arithmetic and the reason to
+/// measure it is that the arithmetic has been wrong before.** T2's limiter table
+/// puts barriers at 10% of the prefill matmul, and a prefill issues over a
+/// thousand dispatches with far more independent work than a one-row step, where
+/// 546 of 670 groups were singletons. Whether that independence is *in the
+/// sequence* is what a width distribution says and a mean does not — see
+/// [`Groups::widths`](inkling_metal::ordering::Groups::widths).
+///
+/// **At the same three lengths the decode table uses**, so the two can be read
+/// down one column: a prefill of 97, 2048 and 8192 tokens against a decode step
+/// at 97, 2048 and 8192 keys.
+#[test]
+#[ignore = "needs a checkpoint: `INKLINGRS_CHECKPOINT=… cargo test -- --ignored`"]
+fn what_a_prefills_dispatches_have_to_wait_for() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    ordering_header("tokens");
+    for tokens in TRACED_CONTEXTS {
+        let run = OnTheDevice::running(&dir, &device, Asked::prefilling(tokens).traced());
+        // A prefill is the whole of what this run does, so its one trace is the
+        // one the profile charges and the barriers are all of them.
+        let prefill = Groups::over(&run.traces[0], &run.boundaries[0]);
+
+        derived_barriers_are_the_encoded_ones(&run, &prefill, &format!("{tokens} tokens"));
+        ordering_row(tokens, &prefill);
+        // **The distribution rather than the shapes.** A decode step's groups
+        // are a few dozen distinct entry lists a reader can hold against the
+        // layer they come from; a prefill's are hundreds, and what the question
+        // needs is how many dispatches a group holds rather than which.
+        eprintln!("  {}", spread(&prefill));
+    }
+}
+
+/// A division's width distribution as one line: how many of its groups are a
+/// single dispatch, and how the rest divide.
+///
+/// **The singletons first because they are the finding.** A group of one is a
+/// dispatch a concurrent pass found nothing to overlap with, so the share of
+/// them is what says how much of a sequence the ordering can reach at all — and
+/// it is the one column on which a prefill and a decode step read alike.
+fn spread(groups: &Groups) -> String {
+    let widths = groups.widths();
+    let singletons = widths
+        .iter()
+        .find(|(width, _)| *width == 1)
+        .map_or(0, |(_, count)| *count);
+    format!(
+        "{singletons} of {} groups are one dispatch, and the rest divide {}",
+        groups.groups(),
+        widths
+            .iter()
+            .filter(|(width, _)| *width > 1)
+            .map(|(width, count)| format!("{count}×{width}"))
+            .collect::<Vec<String>>()
+            .join(", ")
+    )
 }
 
 /// The three prompt lengths this file's prefill figures are quoted at, and the
