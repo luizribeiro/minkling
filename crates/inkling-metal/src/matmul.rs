@@ -59,7 +59,7 @@ use inkling_core::weights::Packed;
 
 use crate::buffer::{Arg, Buffer, Bytes};
 use crate::device::{Device, MetalError};
-use crate::grouping::Grouped;
+use crate::grouping::{Grouped, blocks_a_plan};
 use crate::kernel::{Batch, Grid, Kernel, extent};
 use crate::numerics::Numerics;
 
@@ -106,6 +106,25 @@ const PAIRED_ENTRY: &str = "packed_matmul_pair";
 /// its pipeline cache.
 const MMA_TILED_ENTRY: &str = "mma_matmul_rows";
 const MMA_GROUPED_ENTRY: &str = "mma_matmul_grouped";
+
+/// The third: the grouped walk over the blocks the sort's own runs cut into,
+/// rather than over the rows as they lie.
+///
+/// **A second entry and not a second kernel, and not one entry either.** It is
+/// [`MMA`] under a different `__HOLDS__` — the same staging, the same pass loop,
+/// the same store — so what separates the two is where a threadgroup gets its
+/// first row and how many it has. **What it costs is what says it has to be
+/// two**: the plan is a load in front of everything a threadgroup does, and the
+/// short-row branch it enables is a branch the full blocks do not want. Together
+/// they read 5.3% of the entry on a call whose runs already cover a block —
+/// against the 3.9% the run-cutting buys there. Below that the same two are
+/// worth 45 and 59% of the row, because the runs are a quarter of a block and
+/// the entry beside this one cannot be given them at all.
+///
+/// [`PackedMatmul::plans`] is the line, and
+/// [`what_a_grouped_call_costs_through_each_entry_as_the_runs_shorten`] is where
+/// it was set.
+const MMA_PLANNED_ENTRY: &str = "mma_matmul_planned";
 
 /// The two entries behind [`Numerics::Production`] that stand in front of the
 /// *untiled* pair, which is the decode path.
@@ -425,26 +444,6 @@ impl Block {
         }
     }
 
-    /// Rows an expert needs, on average, before a grouped call is dispatched
-    /// through the production entries.
-    ///
-    /// **A block is correct however its rows are laid out and fast only where
-    /// they agree**, so this is the line between the two. The kernel runs its
-    /// whole walk once per distinct expert a block's rows name, which is one
-    /// pass where a run covers the block and as many as the block is tall where
-    /// the routing is spread thin — and a routed bank at 97 tokens averages 2.3
-    /// rows an expert, which would be a dozen passes a block.
-    ///
-    /// A block's own height, so that the average run covers it: six rows a token
-    /// against 256 experts puts the line at about 1366 tokens, under which a
-    /// grouped call stays on the reference tile whatever the flag says.
-    /// [`RUNS_A_GROUPING`] is the same question asked of the sort rather than of
-    /// the block, and is a much lower bar because a sort that saves nothing
-    /// costs one dispatch where a block that straddles costs a whole extra walk.
-    const fn runs_an_expert(&self) -> usize {
-        self.rows
-    }
-
     /// Fragments one simdgroup holds down the rows and across the columns, which
     /// is what is left of the block once its simdgroups have taken their share.
     const fn fragments_down(&self) -> usize {
@@ -696,6 +695,60 @@ const MMA_BLOCKS_A_CALL: usize = 2;
 /// experts and the widest block the eight heads can propose is nine tokens,
 /// which is 54 — 0.02 and 0.2 rows an expert against this two.
 const RUNS_A_GROUPING: usize = 2;
+
+/// Rows an expert needs, on average, before a grouped call is dispatched
+/// through the production entries.
+///
+/// **This used to be the block's own height and the plan is why it is not.** A
+/// block laid over the rows as they lie holds whatever sits at its offset, so a
+/// call whose runs were shorter than a block handed it rows naming several
+/// experts and it ran the whole reduction once for each of them — a dozen walks
+/// a block where the routing is spread thin, which is what the height-sized bar
+/// was keeping out. A block laid over the runs the sort left holds one expert's
+/// rows and however few of them there are, so what a short run costs is a block
+/// that is part empty rather than a block walked twice.
+///
+/// **What is left to pay is the weight**, which a block decodes once for its
+/// whole height however many rows it has: a run of four rows in a 32-row block
+/// decodes the same bytes thirty-two would, where the tile beside it decodes
+/// what four rows need and no more. So there is still a line, and it is where
+/// that decode stops being worth what the block's arithmetic buys.
+///
+/// **Four, and it is the tile's own height.** A routed bank at 97 tokens
+/// averages 2.3 rows an expert and the tile takes it in 3.73 ms against the
+/// block's 5.00; at 171 tokens the average is exactly four and the block takes
+/// it in 5.04 against the tile's 6.60. See
+/// [`what_a_grouped_call_costs_through_each_entry_as_the_runs_shorten`], where
+/// the three entries are read against each other at every run length a prefill
+/// produces.
+const RUNS_A_BLOCKED_CALL: usize = 4;
+
+/// Blocks a run has to average before a grouped call is laid over its rows
+/// rather than cut at its run boundaries — see [`PackedMatmul::plans`], which is
+/// what this is the line for and where it is argued.
+///
+/// **Four, and it is set from the model rather than from the sweep beside it.**
+/// `what_a_grouped_call_costs_through_each_entry_as_the_runs_shorten` puts the
+/// crossing between one and a half blocks a run and three, and it is wrong about
+/// that for the reason this milestone opened on: its runs are all the same
+/// length, so its rows-laid arm never straddles a block and never pays the term
+/// the cut exists to remove. A router's runs are not that. Against the real
+/// routing, one prefill a length through each entry, the grouped row reads:
+///
+/// ```text
+/// tokens   a run   over the rows   over the runs
+///    321   0.2       769.03ms         421.94ms
+///    512   0.4        1.37 s          563.01ms
+///   2048   1.5        1.81 s           1.65 s
+///   4096   3.0        3.15 s           3.07 s
+///   8192   6.0        5.87 s           5.94 s
+///  16384  12.0       11.30 s          11.66 s
+/// ```
+///
+/// So the crossing is between three blocks a run and six, and four is inside it
+/// on the side that keeps the two long rows on the entry that was already
+/// there.
+const BLOCKS_A_RUN_PLANS: usize = 4;
 
 /// Threads one threadgroup of a dispatch holds.
 ///
@@ -1017,6 +1070,19 @@ impl PackedMatmul {
         numerics: Numerics,
         block: Block,
     ) -> Result<Self, MetalError> {
+        Self::planning_under(device, numerics, block, BLOCKS_A_RUN_PLANS)
+    }
+
+    /// The same at a line of the caller's own, which is the one way a sweep of
+    /// [`PackedMatmul::plans`] can be an arm: the line decides which of two
+    /// entries a grouped call reaches, so two lines are two matmuls and not two
+    /// builds.
+    pub(crate) fn planning_under(
+        device: &Device,
+        numerics: Numerics,
+        block: Block,
+        plans_under: usize,
+    ) -> Result<Self, MetalError> {
         Self::compiled(
             device,
             &source_blocked(numerics, block),
@@ -1024,6 +1090,7 @@ impl PackedMatmul {
             COLS_A_TILE,
             numerics,
             block,
+            plans_under,
         )
     }
 
@@ -1053,6 +1120,7 @@ impl PackedMatmul {
             COLS_A_TILE,
             Numerics::Production,
             block,
+            BLOCKS_A_RUN_PLANS,
         )
     }
 
@@ -1088,6 +1156,7 @@ impl PackedMatmul {
             cols_a_tile,
             Numerics::default(),
             Block::SHIPPED,
+            BLOCKS_A_RUN_PLANS,
         )
     }
 
@@ -1100,6 +1169,7 @@ impl PackedMatmul {
         cols_a_tile: usize,
         numerics: Numerics,
         block: Block,
+        plans_under: usize,
     ) -> Result<Self, MetalError> {
         let mut declared = vec![
             format!("constant uint ROWS_A_TILE = {rows_a_tile};"),
@@ -1145,7 +1215,9 @@ impl PackedMatmul {
             true => Some(Mma::of(
                 device.compile(source, MMA_TILED_ENTRY)?,
                 device.compile(source, MMA_GROUPED_ENTRY)?,
+                device.compile(source, MMA_PLANNED_ENTRY)?,
                 block,
+                plans_under,
             )?),
         };
         // **The two tiled entries are compiled before the untiled one, and the
@@ -1275,7 +1347,8 @@ impl PackedMatmul {
     /// than holding its prompts against a number. See
     /// [`Encoded::symbol`](crate::trace::Encoded::symbol), which is what lets a
     /// trace name the entry rather than the row it is charged to.
-    pub const BEHIND_THE_FLAG: &'static [&'static str] = &[MMA_TILED_ENTRY, MMA_GROUPED_ENTRY];
+    pub const BEHIND_THE_FLAG: &'static [&'static str] =
+        &[MMA_TILED_ENTRY, MMA_GROUPED_ENTRY, MMA_PLANNED_ENTRY];
 
     /// Which arithmetic this one accumulates with.
     ///
@@ -1309,26 +1382,60 @@ impl PackedMatmul {
         out_dim: usize,
         in_dim: usize,
         experts: usize,
-    ) -> (&Kernel, Grid) {
+    ) -> (&Kernel, Grid, bool) {
         // Off the entry that will run rather than off this module, which is the
         // whole of what makes the block's shape sweepable — see [`Block`].
-        let blocks = |mma: &Mma| {
-            let over = rows.div_ceil(mma.block.rows) * out_dim.div_ceil(mma.block.cols);
+        //
+        // **A grouped call's blocks are the plan's and not the rows'.** The plan
+        // cuts each run into blocks of its own, so there are as many of them as
+        // the runs need rather than as many as the rows divide into — and the
+        // grid is sized by the bound the plan was allocated at, since what the
+        // runs actually came to is on the device. The threadgroups past the last
+        // run read a block of no rows and return.
+        let blocks = |mma: &Mma, down: usize| {
+            let over = down * out_dim.div_ceil(mma.block.cols);
             Grid::new(over * mma.block.threads, mma.block.threads)
         };
         let tiles = rows.div_ceil(self.rows_a_tile) * out_dim.div_ceil(self.cols_a_tile);
+        // **The plan is bound by whichever entry this returns and by nothing
+        // else**, which is why it is answered here rather than asked again where
+        // the arguments are assembled: the entry is chosen by two predicates one
+        // inside the other, and a second reading of one of them would bind a plan
+        // to a kernel with no argument for it at every shape the two disagree
+        // about.
         match (self.blocks(layout, rows, experts), layout) {
-            (_, Layout::Each) => self.each(rows * out_dim, in_dim, false),
+            (_, Layout::Each) => {
+                let (kernel, grid) = self.each(rows * out_dim, in_dim, false);
+                (kernel, grid, false)
+            }
             (None, Layout::Tiled) => (
                 &self.tiled,
                 simdgroups(&self.tiled, tiles, THREADS_PER_GROUP),
+                false,
             ),
             (None, Layout::Grouped { .. }) => (
                 &self.grouped,
                 simdgroups(&self.grouped, tiles, THREADS_PER_GROUP),
+                false,
             ),
-            (Some(mma), Layout::Tiled) => (&mma.tiled, blocks(mma)),
-            (Some(mma), Layout::Grouped { .. }) => (&mma.grouped, blocks(mma)),
+            (Some(mma), Layout::Tiled) => (
+                &mma.tiled,
+                blocks(mma, rows.div_ceil(mma.block.rows)),
+                false,
+            ),
+            (
+                Some(mma),
+                Layout::Grouped {
+                    blocks: planned, ..
+                },
+            ) => match self.plans(rows, experts) {
+                true => (&mma.planned, blocks(mma, *planned), true),
+                false => (
+                    &mma.grouped,
+                    blocks(mma, rows.div_ceil(mma.block.rows)),
+                    false,
+                ),
+            },
         }
     }
 
@@ -1381,15 +1488,15 @@ impl PackedMatmul {
     ///
     /// **The production entries are correct for every shape and fast for some**,
     /// so this is where the difference is drawn rather than in the kernel. A
-    /// block's weight is one expert's, so a block whose rows name several runs
-    /// the walk once per expert — which is nothing where the runs cover a block
-    /// and a dozen walks where the routing is spread thin.
+    /// block's weight is one expert's, and it decodes that weight once for its
+    /// whole height whether the rows it was given fill it or not.
     ///
-    /// A tiled call's runs are as long as the call: a projection's rows all name
-    /// expert zero and a shared bank's are its input laid end to end once per
-    /// expert. A grouped call's are the routing's, and [`Block::runs_an_expert`] is
-    /// the line — under it the call stays on the reference tile whatever the
-    /// flag says, which is a rate and never an answer.
+    /// A tiled call's rows are one run: a projection's all name expert zero and
+    /// a shared bank's are its input laid end to end once per expert, so a
+    /// block of them is always full. A grouped call's runs are the routing's,
+    /// and its blocks are cut at their boundaries — so what a short run costs is
+    /// a part-empty block rather than a block walked twice, and
+    /// [`RUNS_A_BLOCKED_CALL`] is where that stops being worth it.
     ///
     /// **[`Layout::Each`] never reaches it**, and that is the decode path stated
     /// where it is decided: a single-row projection, a two-row shared bank and a
@@ -1443,11 +1550,20 @@ impl PackedMatmul {
             && match layout {
                 Layout::Each => false,
                 Layout::Tiled => true,
-                Layout::Grouped { .. } => {
-                    rows >= experts.saturating_mul(mma.block.runs_an_expert())
-                }
+                Layout::Grouped { .. } => rows >= experts.saturating_mul(RUNS_A_BLOCKED_CALL),
             };
         worth.then_some(mma)
+    }
+
+    /// Rows one block of the production entries covers, and zero where this
+    /// matmul compiled none.
+    ///
+    /// **What a sort behind a grouped call cuts its runs against.** The height is
+    /// a value the entries carry rather than a constant of this module, so the
+    /// only side that can answer it is the matmul that compiled them — and a
+    /// plan cut at some other height would leave rows no block reaches.
+    pub(crate) fn rows_a_block(&self) -> usize {
+        self.mma.as_ref().map_or(0, |mma| mma.block.rows)
     }
 
     /// The rows one dispatch of this shape reads a weight once for, which is the
@@ -1461,6 +1577,30 @@ impl PackedMatmul {
         match self.blocks(layout, rows, experts) {
             Some(mma) => mma.block.rows,
             None => self.rows_a_tile,
+        }
+    }
+
+    /// Whether a grouped call's blocks are cut at the sort's run boundaries or
+    /// laid over its rows as they lie.
+    ///
+    /// **The two are the same walk over the same rows and they trade one waste
+    /// for another.** Cut at the boundaries, no block is given rows that name
+    /// two experts and none runs the reduction twice — but every run ends in a
+    /// block that is part empty, and a part-empty block decodes a whole expert's
+    /// columns for the few rows it has. Laid over the rows, no block is ever
+    /// part empty and the blocks a boundary falls inside walk the reduction once
+    /// for each expert they name.
+    ///
+    /// So the cut is worth it while the runs are short: the boundaries are the
+    /// bank's 255 however long the prompt, where the blocks are `rows / 32` and
+    /// grow with it, and the part-empty blocks the cut makes are one a run at
+    /// every length. **The line is where the two counts cross** and is set from
+    /// [`what_a_grouped_call_costs_through_each_entry_as_the_runs_shorten`]
+    /// rather than from that arithmetic.
+    fn plans(&self, rows: usize, experts: usize) -> bool {
+        match self.mma.as_ref() {
+            None => false,
+            Some(mma) => rows < experts.saturating_mul(mma.plans_under * mma.block.rows),
         }
     }
 
@@ -1480,17 +1620,28 @@ impl PackedMatmul {
     }
 }
 
-/// The two entries behind [`Numerics::Production`], held together because a
-/// dispatch reaches one or the other by the same predicate and neither is any
-/// use without the other.
+/// The three entries behind [`Numerics::Production`], held together because a
+/// dispatch reaches one of them by the same predicate and none is any use
+/// without the others.
 #[derive(Debug)]
 struct Mma {
     tiled: Kernel,
     grouped: Kernel,
-    /// The shape these two were cut to, which is what the grid covering a call
-    /// and the weight the accounting charges are both taken from — see
-    /// [`Block`].
+    /// The grouped walk over the sort's runs rather than over the rows — see
+    /// [`MMA_PLANNED_ENTRY`] and [`PackedMatmul::plans`].
+    planned: Kernel,
+    /// The shape these were cut to, which is what the grid covering a call and
+    /// the weight the accounting charges are both taken from — see [`Block`].
     block: Block,
+    /// Blocks a run has to average before the walk over the rows is taken
+    /// instead of the walk over the runs.
+    ///
+    /// **Carried beside the entries for the reason the block's own shape is**
+    /// — see [`Block`]. It decides which of two entries a call reaches, so a
+    /// sweep of it is an arm only if a matmul can be built at one line and
+    /// another at a second; a module constant would make the table below a fact
+    /// about the build.
+    plans_under: usize,
 }
 
 impl Mma {
@@ -1518,8 +1669,14 @@ impl Mma {
     /// and it is the other half of the same hazard: `block.threads` is swept,
     /// and a width past what the pipeline reports would otherwise be a dispatch
     /// Metal clamps rather than one it runs.
-    fn of(tiled: Kernel, grouped: Kernel, block: Block) -> Result<Self, MetalError> {
-        for kernel in [&tiled, &grouped] {
+    fn of(
+        tiled: Kernel,
+        grouped: Kernel,
+        planned: Kernel,
+        block: Block,
+        plans_under: usize,
+    ) -> Result<Self, MetalError> {
+        for kernel in [&tiled, &grouped, &planned] {
             if kernel.simd_width() != NARROWEST_SIMD {
                 return Err(MetalError::UnexpectedSimdWidth {
                     entry: kernel.entry().to_string(),
@@ -1538,7 +1695,9 @@ impl Mma {
         Ok(Self {
             tiled,
             grouped,
+            planned,
             block,
+            plans_under,
         })
     }
 }
@@ -1573,7 +1732,17 @@ enum Layout<'a> {
     /// One simdgroup a tile of consecutive rows.
     Tiled,
     /// One simdgroup a tile of consecutive rows of the grouping.
-    Grouped { order: Arg<'a>, through: Through },
+    Grouped {
+        order: Arg<'a>,
+        /// Where each block of this call starts and how many rows it holds, cut
+        /// at the sort's own run boundaries — see [`Grouped::plan`].
+        plan: Arg<'a>,
+        /// Blocks that plan can hold, which is what the grid covering a blocked
+        /// dispatch of it is sized by. A bound rather than a count, because the
+        /// counts are on the device.
+        blocks: usize,
+        through: Through,
+    },
 }
 
 /// Whether a call's rows are laid out so that tiling them is worth a dispatch.
@@ -1942,6 +2111,12 @@ impl<'a> PackedBank<'a> {
         self.out_dim
     }
 
+    /// The height a sort feeding this bank has to cut its runs against — see
+    /// [`PackedMatmul::rows_a_block`].
+    pub(crate) fn rows_a_block(&self) -> usize {
+        self.matmul.rows_a_block()
+    }
+
     /// Whether a call of `rows` rows against this bank is worth sorting by
     /// expert first — see [`PackedMatmul::groups`], which decides it, and which
     /// needs the bank's own expert count to.
@@ -2117,8 +2292,16 @@ impl<'a> PackedBank<'a> {
         let _timed = profile::scope(Op::Encode);
         let rows = grouped.order.len();
         self.rows_a_source(rows, per_source, x.len());
+        assert_eq!(
+            grouped.rows_a_block,
+            self.matmul.rows_a_block(),
+            "the plan was cut at a height this bank's block is not, so its blocks would reach \
+             some of the call's rows twice and some of them never"
+        );
         let layout = Layout::Grouped {
             order: grouped.order.arg(),
+            plan: grouped.plan.arg(),
+            blocks: blocks_a_plan(rows, self.experts, grouped.rows_a_block),
             through,
         };
         self.dispatch(batch, rows, per_source, grouped.experts.arg(), x, layout)
@@ -2289,7 +2472,7 @@ impl<'a> PackedBank<'a> {
         let resident = &mut *resident;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
 
-        let (kernel, grid) =
+        let (kernel, grid, plans) =
             self.matmul
                 .entry(&layout, rows, self.out_dim, self.in_dim, self.experts);
         let moves = self.moves(rows, x.len(), &layout);
@@ -2302,14 +2485,14 @@ impl<'a> PackedBank<'a> {
             out.arg(),
         ];
         match layout {
-            Layout::Grouped { order, .. } => {
+            // **Which entry ran decides the bindings**, and it is the answer
+            // that chose it rather than a second copy of the question: only the
+            // planned entry has an argument for the plan.
+            Layout::Grouped { order, plan, .. } => {
                 let [shape, chosen, x, codes, scales, written] = bound;
-                batch.add(
-                    kernel,
-                    &[shape, chosen, x, codes, scales, written, order],
-                    grid,
-                    moves,
-                )?;
+                let taken = [shape, chosen, x, codes, scales, written, order, plan];
+                let takes = taken.len() - usize::from(!plans);
+                batch.add(kernel, &taken[..takes], grid, moves)?;
             }
             Layout::Each | Layout::Tiled => batch.add(kernel, &bound, grid, moves)?,
         }
@@ -2365,16 +2548,13 @@ impl<'a> PackedBank<'a> {
         let tiles = rows.div_ceil(rows_a_read);
         let boundaries = tiles.min(self.experts.saturating_sub(1));
         // **A straddling tile is charged every weight it could name, and a
-        // straddling block only the two it can.** The two arms differ because
-        // their gates do. A tile of [`ROWS_A_TILE`] rows is dispatched at runs of
-        // four and a grouped call is dispatched at runs of two, so a tile can
-        // hold as many runs as it has rows and is charged that many weights. A
-        // block is dispatched at [`Block::runs_an_expert`] runs an expert — a
-        // block's worth — so a block of its own height spans at most two of
-        // them, and charging it thirty-two would put a routed bank's declared
-        // bytes thirteen times over what it reads and its bandwidth column at
-        // 290% of this part's peak. Both are bounds and neither is below what the
-        // call reads; this is the tighter one its own predicate licenses.
+        // block is charged one apiece.** A tile of [`ROWS_A_TILE`] rows is laid
+        // over the rows as they lie, so a tile can hold as many runs as it has
+        // rows and is charged that many weights. A grouped call's blocks are cut
+        // at the run boundaries — see [`Grouped::plan`] — so each of them reads
+        // exactly one expert's weight, and how many there are is the rows over
+        // the height plus at most a block a run. Both are bounds and neither is
+        // below what the call reads.
         let extra = match rows_a_read > self.matmul.rows_a_tile {
             true => boundaries,
             false => (rows_a_read - 1) * boundaries,
@@ -2835,8 +3015,9 @@ pub(crate) fn source_blocked(numerics: Numerics, block: Block) -> String {
     if numerics.compiles_the_entries() {
         block.holds();
         written.push_str(&block.declares());
-        written.push_str(&mma_entry(MMA_TILED_ENTRY, false));
-        written.push_str(&mma_entry(MMA_GROUPED_ENTRY, true));
+        written.push_str(&mma_entry(MMA_TILED_ENTRY, Rows::AsTheyLie));
+        written.push_str(&mma_entry(MMA_GROUPED_ENTRY, Rows::Permuted));
+        written.push_str(&mma_entry(MMA_PLANNED_ENTRY, Rows::Planned));
     }
     written
 }
@@ -3289,7 +3470,14 @@ __PICKS__
 /// straddles two runs is correct and saves nothing, exactly as it is for the
 /// ungrouped entry, so neither of the two assumes anything the other does not.
 fn tiled_entry(entry: &str, grouped: bool) -> String {
-    over_the_rows(TILE, entry, grouped)
+    over_the_rows(
+        TILE,
+        entry,
+        match grouped {
+            false => Rows::AsTheyLie,
+            true => Rows::Permuted,
+        },
+    )
 }
 
 /// The three expressions that separate a call over the rows as they lie from one
@@ -3301,13 +3489,21 @@ fn tiled_entry(entry: &str, grouped: bool) -> String {
 /// nothing about which row of the input a row reads or which row of the output
 /// it writes. A second copy of these three would be a second place for
 /// `shape.scatters` to be got backwards.
-fn over_the_rows(walk: &str, entry: &str, grouped: bool) -> String {
-    let (order, reads, writes) = match grouped {
-        false => ("", "row", "row"),
-        true => (
+fn over_the_rows(walk: &str, entry: &str, rows: Rows) -> String {
+    let (order, reads, writes) = match rows {
+        Rows::AsTheyLie => ("", "row", "row"),
+        Rows::Permuted | Rows::Planned => (
             "\n    device const uint *order [[buffer(6)]],",
             "shape.scatters ? row : order[row]",
             "shape.scatters ? order[row] : row",
+        ),
+    };
+    let (plan, holds, works) = match rows {
+        Rows::AsTheyLie | Rows::Permuted => ("", OVER_THE_ROWS_AS_THEY_LIE, "true"),
+        Rows::Planned => (
+            "\n    device const uint2 *plan [[buffer(7)]],",
+            OVER_THE_RUNS_THE_SORT_LEFT,
+            "down * MMA_FRAGMENTS_DOWN * MMA_FRAGMENT < rows",
         ),
     };
     substituted(
@@ -3315,11 +3511,66 @@ fn over_the_rows(walk: &str, entry: &str, grouped: bool) -> String {
         &[
             ("__ENTRY__", entry),
             ("__ORDER__", order),
+            ("__PLAN__", plan),
+            ("__HOLDS__", holds),
+            ("__WORKS__", works),
             ("__READS__", reads),
             ("__WRITES__", writes),
         ],
     )
 }
+
+/// How a walk finds the rows it multiplies.
+///
+/// **Three and not two, because a permutation and a plan are different
+/// questions.** A permuted walk reads its input and writes its output through
+/// the order the sort left and takes its own rows where they lie; a planned one
+/// takes its rows where the plan says, which is the sort's runs cut into blocks.
+/// The first two are what [`TILE`] can be; all three are what [`MMA`] is
+/// compiled as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    AsTheyLie,
+    Permuted,
+    Planned,
+}
+
+/// Which of the call's rows a block covers, where the blocks are laid over the
+/// rows as they lie.
+///
+/// **The grid covers exactly the blocks the two extents cut the call into**, so
+/// the guard is the same one every entry here carries for the same reason: a
+/// dispatch whose shape and grid disagreed would be a wrong answer rather than a
+/// failure.
+const OVER_THE_ROWS_AS_THEY_LIE: &str =
+    "    const uint first = (block / across) * MMA_ROWS_A_BLOCK;
+    if (first >= shape.rows) {
+        return;
+    }
+    const uint rows = min((uint)MMA_ROWS_A_BLOCK, shape.rows - first);";
+
+/// The same, where the blocks are laid over the runs the sort left rather than
+/// over the rows.
+///
+/// **This is the one thing that decides whether a grouped call's block runs its
+/// reduction once or twice.** A block laid over the rows holds whatever rows sit
+/// at its offset, and a run boundary landing inside it makes it two passes over
+/// the whole of `in_dim`; a block laid over the runs holds one expert's rows and
+/// however few of them are left, and the pass loop below finds one expert and
+/// runs once. Correctness does not turn on it either way — the pass loop is what
+/// makes the kernel right for any expert list, and this only ever hands it a
+/// list it has nothing to do with.
+///
+/// **A block of no rows is a block past the last run.** The plan is covered by a
+/// grid sized to a bound rather than to a count, because the counts are the
+/// sort's and are never read back; the entries past the last run are the zeros
+/// the buffer was allocated with.
+const OVER_THE_RUNS_THE_SORT_LEFT: &str = "    const uint2 run = plan[block / across];
+    const uint first = run.x;
+    const uint rows = run.y;
+    if (rows == 0) {
+        return;
+    }";
 
 /// The tiled kernel with the three expressions [`tiled_entry`] decides written
 /// as placeholders, which is what makes one walk serve both entries.
@@ -3512,8 +3763,8 @@ kernel void __ENTRY__(
 /// `splits_for`, the occupancy declarations and every submission decision are
 /// shared. What differs is the accumulate, and the accumulate cannot be
 /// bit-compared — which is the whole reason the flag exists.
-fn mma_entry(entry: &str, grouped: bool) -> String {
-    over_the_rows(MMA, entry, grouped)
+fn mma_entry(entry: &str, rows: Rows) -> String {
+    over_the_rows(MMA, entry, rows)
 }
 
 /// The block, the staging and the hardware multiply, with the three expressions
@@ -3639,9 +3890,11 @@ const MMA: &str = r#"
 /// named some other expert on the way in, and a zeroed row contributes exactly
 /// 0.0 to its own outputs — so what a row ends up holding is the pass that was
 /// its own, and the passes that were not its own added nothing to it. Correct
-/// for any expert list, exactly as the reference tile is, and fast only where
-/// the runs are at least a block — which is what `runs_an_expert` is for and
-/// what keeps a grouped call off this entry until the routing can feed it.
+/// for any expert list, exactly as the reference tile is. **What keeps it to one
+/// pass is the plan rather than the kernel**: a grouped call's blocks are cut at
+/// the sort's own run boundaries, so the rows a block is given name one expert
+/// and this loop finds one. A block handed rows that disagree still answers
+/// them, which is what makes the plan a rate and never an answer.
 ///
 /// **Every barrier below is reached by every thread of the threadgroup**, and
 /// what makes that true rather than hoped is that the pass loop and the step
@@ -3654,24 +3907,15 @@ kernel void __ENTRY__(
     device const float *x [[buffer(2)]],
     device const uchar *codes [[buffer(3)]],
     device const uchar *scales [[buffer(4)]],
-    device float *out [[buffer(5)]],__ORDER__
+    device float *out [[buffer(5)]],__ORDER____PLAN__
     uint block [[threadgroup_position_in_grid]],
     uint local [[thread_position_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
     const uint across = (shape.out_dim + MMA_COLS_A_BLOCK - 1) / MMA_COLS_A_BLOCK;
-    const uint first = (block / across) * MMA_ROWS_A_BLOCK;
+__HOLDS__
     const uint leftmost = (block % across) * MMA_COLS_A_BLOCK;
-    // The grid covers exactly the blocks the two extents cut the call into, so
-    // this is the same guard the reference entries carry for the same reason:
-    // a dispatch whose shape and grid disagreed would be a wrong answer rather
-    // than a failure.
-    if (first >= shape.rows) {
-        return;
-    }
-
-    const uint rows = min((uint)MMA_ROWS_A_BLOCK, shape.rows - first);
     const uint cols = min((uint)MMA_COLS_A_BLOCK, shape.out_dim - leftmost);
     const uint bytes = shape.in_dim / CODES_PER_BYTE;
     const uint scale_bytes = bytes / BYTES_PER_GROUP;
@@ -3734,26 +3978,36 @@ kernel void __ENTRY__(
     const uint down = simd / MMA_SIMDS_ACROSS;
     const uint alongside = simd % MMA_SIMDS_ACROSS;
 
-    // Fragments down this simdgroup has a row of the call in, which is every
-    // one of them where the block is full and fewer where it is not.
+    // Whether this simdgroup's share of the block holds a row of the call at
+    // all, which is every simdgroup where the block is full and half of them
+    // where the rows it was given are under half its height.
     //
-    // **A fragment is eight rows and the call's rows start at the top of the
-    // block**, so a fragment past `rows` holds no row this dispatch is for: its
-    // staged input is the zeros the fill wrote, its accumulator would stay zero
-    // and the write-out below refuses its rows anyway. Skipping it takes its
-    // fragment reads and its multiply-accumulates off a call whose last block is
-    // ragged — and off *every* block of a grouped call laid out over runs
-    // shorter than the block, which is the shape a coding session's prefills
-    // give this kernel.
+    // **Written as a constant for the entry whose blocks are always full.** A
+    // tiled call's rows are one run, so only its last block is ever short and
+    // the branch buys a fraction of one threadgroup — where it costs 4% of the
+    // row that entry owns, which is `mma_matmul_rows` at every prefill length.
+    // Folded away there, the entry is byte for byte the one that shipped.
     //
-    // Per simdgroup and threadgroup-uniform inside one, and no barrier is inside
-    // the loops it bounds — the staging is a whole-threadgroup fill either side
-    // of a barrier and is not touched by this.
-    const uint reached = (rows + MMA_FRAGMENT - 1) / MMA_FRAGMENT;
-    const uint held_down = min(
-        (uint)MMA_FRAGMENTS_DOWN,
-        (uint)max((int)reached - (int)(down * MMA_FRAGMENTS_DOWN), 0)
-    );
+    // **The call's rows start at the top of the block**, so a simdgroup whose
+    // rows are all past `rows` has nothing to multiply: its staged input is the
+    // zeros the fill wrote, its accumulators would stay zero, and the write-out
+    // refuses its rows anyway. That is most of the multiply on a grouped call
+    // whose runs are shorter than a block — the shape a coding session's own
+    // prefills give this kernel.
+    //
+    // **Around the loops and not inside them, which is a measurement rather
+    // than a preference.** The fragment loops are trip-counted by constants so
+    // that the backend unrolls them and keeps `lhs`, `rhs` and `sums` in
+    // registers. Bounding them by a count this side computes costs 2.2x the
+    // whole kernel and guarding each fragment's body inside them costs 1.2x —
+    // both on the shipped shape, where every block is full and the skip is
+    // worth nothing. One uniform branch outside leaves every loop byte for byte
+    // what it was.
+    //
+    // Uniform across the simdgroup and no barrier is inside what it skips: the
+    // staging is a whole-threadgroup fill either side of a barrier and is
+    // untouched.
+    const bool works = __WORKS__;
 
     simdgroup_float8x8 sums[MMA_FRAGMENTS_DOWN][MMA_FRAGMENTS_ACROSS];
     for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
@@ -3804,10 +4058,13 @@ kernel void __ENTRY__(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+            if (!works) {
+                continue;
+            }
             for (uint k = 0; k < MMA_CODES_A_STEP / MMA_FRAGMENT; ++k) {
                 simdgroup_matrix<MMA_OPERAND, 8, 8> lhs[MMA_FRAGMENTS_DOWN];
                 simdgroup_matrix<MMA_OPERAND, 8, 8> rhs[MMA_FRAGMENTS_ACROSS];
-                for (uint i = 0; i < held_down; ++i) {
+                for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
                     mma_read(
                         lhs[i],
                         staged_x
@@ -3830,7 +4087,7 @@ kernel void __ENTRY__(
                         lane
                     );
                 }
-                for (uint i = 0; i < held_down; ++i) {
+                for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
                     for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
                         simdgroup_multiply_accumulate(sums[i][j], lhs[i], rhs[j], sums[i][j]);
                     }
@@ -3842,7 +4099,7 @@ kernel void __ENTRY__(
     // Reached before the first fragment is stored, because the store lands on
     // the staged tiles and another simdgroup may still be reading them.
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = 0; i < held_down; ++i) {
+    for (uint i = 0; works && i < MMA_FRAGMENTS_DOWN; ++i) {
         for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
             simdgroup_store(
                 sums[i][j],
@@ -5160,7 +5417,7 @@ kernel void decoded_elements(
         // `PackedMatmul::blocked` compiles the pair, so a shape that cleared the
         // tiled probe and failed the grouped one would panic where this
         // documents a skip.
-        for entry in [MMA_TILED_ENTRY, MMA_GROUPED_ENTRY] {
+        for entry in [MMA_TILED_ENTRY, MMA_GROUPED_ENTRY, MMA_PLANNED_ENTRY] {
             let compiled = match device.compile(&source, entry) {
                 Ok(compiled) => compiled,
                 Err(MetalError::Pipeline { diagnostic, .. }) => {
@@ -5271,7 +5528,8 @@ kernel void decoded_elements(
         const ROWS: usize = TOKENS * SLOTS;
         // A call under the line stays on the reference tile and would prove
         // nothing here, so the shape is held above it where it is written.
-        const _: () = assert!(ROWS >= EXPERTS * Block::SHIPPED.runs_an_expert());
+        const _: () = assert!(ROWS >= EXPERTS * RUNS_A_BLOCKED_CALL);
+        const _: () = assert!(ROWS >= MMA_BLOCKS_A_CALL * MMA_ROWS_A_BLOCK);
 
         let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, ROWS);
         let chosen: Vec<u32> = (0..TOKENS)
@@ -5299,7 +5557,7 @@ kernel void decoded_elements(
                 .expect("the rows upload");
             let mut batch = device.batch().expect("a command buffer opens");
             let mut sorted = grouping
-                .encode(&mut batch, &mut selection, EXPERTS)
+                .encode(&mut batch, &mut selection, EXPERTS, bank.rows_a_block())
                 .expect("the grouping encodes");
             let pending = bank
                 .encode_grouped(&mut batch, &mut sorted, &mut x, SLOTS, through)
@@ -5505,6 +5763,8 @@ kernel void mma_lane_probe___T__(
         let matmul = PackedMatmul::under(&device, Numerics::Production).expect("compiles");
         let grouped = Layout::Grouped {
             order: Arg::Inline(&[]),
+            plan: Arg::Inline(&[]),
+            blocks: 0,
             through: Through::Gathered,
         };
         // A single-row projection, a two-row shared bank naming two experts, and
@@ -5553,11 +5813,65 @@ kernel void mma_lane_probe___T__(
         assert!(matmul.blocks(&Layout::Tiled, 48, 1).is_none());
         assert!(matmul.blocks(&Layout::Tiled, 64, 1).is_some());
 
-        // The line a routed bank crosses, from either side. Six rows a token
-        // against 256 experts puts it at 1366 tokens.
+        // The line a routed bank crosses, from either side, read off the two
+        // constants that set it rather than spelled — so a line moved without
+        // re-measuring moves this with it, and what fails instead is the sweep's
+        // own assertion.
         let tokens = |tokens: usize| matmul.blocks(&grouped, tokens * 6, 256).is_some();
-        assert!(!tokens(1365) && tokens(1366), "the line is at 1366 tokens");
+        let line = (256 * RUNS_A_BLOCKED_CALL)
+            .max(MMA_BLOCKS_A_CALL * MMA_ROWS_A_BLOCK)
+            .div_ceil(6);
+        assert!(
+            !tokens(line - 1) && tokens(line),
+            "the line is at {line} tokens"
+        );
         assert!(tokens(2048) && tokens(16384));
+    }
+
+    /// **The plan is bound to the entry that takes it and to no other**, which
+    /// is a claim about two predicates one inside the other rather than about
+    /// either of them.
+    ///
+    /// A grouped call reaches the planned entry only where the block is worth
+    /// dispatching *and* the runs are short enough to want cutting. Those are
+    /// [`PackedMatmul::blocks`] and [`PackedMatmul::plans`], and the second says
+    /// yes over a band the first says no over — 512 to 1023 rows against a
+    /// 256-expert bank, which is where a 97-token prefill's routed bank sits. A
+    /// dispatch that read the second on its own would hand the plan to a kernel
+    /// with no argument for it.
+    ///
+    /// So this asks the one answer rather than the two questions: whatever
+    /// `entry` says about the plan has to be what `entry` chose.
+    #[test]
+    fn only_the_planned_entry_is_handed_a_plan() {
+        let Some(device) = device() else { return };
+        let matmul = PackedMatmul::under(&device, Numerics::Production).expect("compiles");
+        let grouped = Layout::Grouped {
+            order: Arg::Inline(&[]),
+            plan: Arg::Inline(&[]),
+            blocks: 1,
+            through: Through::Gathered,
+        };
+
+        let mut planned = 0;
+        for experts in [1usize, 3, 256] {
+            for rows in [1usize, 6, 63, 64, 511, 512, 1023, 1024, 12288, 24576, 49152] {
+                for layout in [&Layout::Each, &Layout::Tiled, &grouped] {
+                    let (kernel, _, plans) = matmul.entry(layout, rows, OUT_DIM, IN_DIM, experts);
+                    assert_eq!(
+                        plans,
+                        kernel.entry() == MMA_PLANNED_ENTRY,
+                        "{rows} rows over {experts} experts reached {} and was told {plans}                          about the plan",
+                        kernel.entry()
+                    );
+                    planned += usize::from(plans);
+                }
+            }
+        }
+        assert!(
+            planned > 0,
+            "no shape here reached the planned entry, so this proves only that nothing does"
+        );
     }
 
     /// The kernel against the CPU it replaces, over the reduction length and the
@@ -6188,8 +6502,8 @@ kernel void mma_lane_probe___T__(
             !tiles(&chosen, ROWS_A_TILE),
             "a routing a tile could already reach would prove nothing"
         );
-        let (order, grouped) = grouping
-            .group(&device, &chosen, EXPERTS)
+        let (order, grouped, _) = grouping
+            .group(&device, &chosen, EXPERTS, Block::SHIPPED.rows)
             .expect("the dispatch completes");
         assert_ne!(
             order,
@@ -6226,7 +6540,7 @@ kernel void mma_lane_probe___T__(
             let mut x = device.buffer(x).expect("the rows upload");
             let mut batch = device.batch().expect("a command buffer opens");
             let mut sorted = grouping
-                .encode(&mut batch, &mut selection, EXPERTS)
+                .encode(&mut batch, &mut selection, EXPERTS, bank.rows_a_block())
                 .expect("the grouping encodes");
             let pending = bank
                 .encode_grouped(&mut batch, &mut sorted, &mut x, per_source, through)
@@ -6431,7 +6745,12 @@ kernel void mma_lane_probe___T__(
             let mut x = device.buffer(tokens).expect("the rows upload");
             let mut batch = device.batch().expect("a command buffer opens");
             let mut sorted = grouping
-                .encode(&mut batch, &mut selection, EXPERTS)
+                .encode(
+                    &mut batch,
+                    &mut selection,
+                    EXPERTS,
+                    pair.gate().rows_a_block(),
+                )
                 .expect("the grouping encodes");
             let grouped = pair
                 .encode_grouped(&mut batch, &mut sorted, &mut x, TOP_K)
@@ -6439,7 +6758,7 @@ kernel void mma_lane_probe___T__(
             batch.wait().expect("the dispatches complete");
             let [grouped_gate, grouped_up] = grouped.map(Pending::take);
             let order = grouping
-                .group(&device, &chosen, EXPERTS)
+                .group(&device, &chosen, EXPERTS, Block::SHIPPED.rows)
                 .expect("the dispatch completes")
                 .0;
             let row = |rows: &[f32], i: usize| rows[i * OUT_DIM..][..OUT_DIM].to_vec();
@@ -7040,8 +7359,8 @@ kernel void mma_lane_probe___T__(
         );
         for tokens in [97usize, 385, 769] {
             let chosen = prefill_routing(tokens, EXPERTS, ROUTED_TOP_K);
-            let (_, grouped) = grouping
-                .group(&device, &chosen, EXPERTS)
+            let (_, grouped, _) = grouping
+                .group(&device, &chosen, EXPERTS, Block::SHIPPED.rows)
                 .expect("the dispatch completes");
 
             let rows = chosen.len();
@@ -7127,7 +7446,7 @@ kernel void mma_lane_probe___T__(
                                 .expect("the dispatch encodes"),
                             true => {
                                 let mut sorted = grouping
-                                    .encode(batch, &mut picked, EXPERTS)
+                                    .encode(batch, &mut picked, EXPERTS, bank.rows_a_block())
                                     .expect("the grouping encodes");
                                 bank.encode_grouped(
                                     batch,
@@ -7246,7 +7565,7 @@ kernel void mma_lane_probe___T__(
                                 .expect("the dispatch encodes"),
                             Arm::Grouped => {
                                 let mut sorted = grouping
-                                    .encode(batch, &mut picked, experts)
+                                    .encode(batch, &mut picked, experts, bank.rows_a_block())
                                     .expect("the grouping encodes");
                                 bank.encode_grouped(
                                     batch,
@@ -7291,7 +7610,8 @@ kernel void mma_lane_probe___T__(
                 let mut picked = device.buffer(&chosen)?;
                 let untiled = bank.encode_picked(batch, &mut picked, &mut x, 1)?;
                 let tiled = bank.encode_over(batch, &chosen, &mut x)?;
-                let mut sorted = grouping.encode(batch, &mut picked, experts)?;
+                let mut sorted =
+                    grouping.encode(batch, &mut picked, experts, bank.rows_a_block())?;
                 let grouped =
                     bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)?;
                 Ok([untiled, tiled, grouped])
@@ -8158,7 +8478,7 @@ kernel void mma_lane_probe___T__(
                 best = best.min(crate::testing::device_time(&device, CALLS, |batch| {
                     let mut picked = device.buffer(&chosen).expect("the selection uploads");
                     let mut sorted = grouping
-                        .encode(batch, &mut picked, EXPERTS)
+                        .encode(batch, &mut picked, EXPERTS, bank.rows_a_block())
                         .expect("the grouping encodes");
                     bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)
                         .expect("the dispatch encodes");
@@ -8264,7 +8584,7 @@ kernel void mma_lane_probe___T__(
                     let taken = crate::testing::device_time(&device, CALLS, |batch| {
                         let mut picked = device.buffer(&chosen).expect("the selection uploads");
                         let mut sorted = grouping
-                            .encode(batch, &mut picked, EXPERTS)
+                            .encode(batch, &mut picked, EXPERTS, bank.rows_a_block())
                             .expect("the grouping encodes");
                         if multiplies {
                             bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)
@@ -8462,7 +8782,7 @@ kernel void mma_lane_probe___T__(
                 true => {
                     let mut picked = device.buffer(&self.chosen).expect("the selection uploads");
                     let mut sorted = grouping
-                        .encode(batch, &mut picked, self.experts)
+                        .encode(batch, &mut picked, self.experts, bank.rows_a_block())
                         .expect("the grouping encodes");
                     bank.encode_grouped(batch, &mut sorted, x, 1, Through::Gathered)
                         .expect("the dispatch encodes");
@@ -8541,7 +8861,7 @@ kernel void mma_lane_probe___T__(
                 best = best.min(crate::testing::device_time(device, CALLS, |batch| {
                     let mut picked = device.buffer(&self.chosen).expect("the selection uploads");
                     grouping
-                        .encode(batch, &mut picked, self.experts)
+                        .encode(batch, &mut picked, self.experts, Block::SHIPPED.rows)
                         .expect("the grouping encodes");
                 }));
             }
@@ -9779,6 +10099,17 @@ kernel void mma_lane_probe___T__(
         )
     }
 
+    /// Blocks the plan cuts these rows into, which is a block per whole
+    /// `rows_a_block` of each run and one more for what the run has left.
+    fn blocks_a_run_is_cut_into(chosen: &[u32], rows_a_block: usize) -> usize {
+        let mut sorted = chosen.to_vec();
+        sorted.sort_unstable();
+        sorted
+            .chunk_by(|a, b| a == b)
+            .map(|run| run.len().div_ceil(rows_a_block))
+            .sum()
+    }
+
     /// `counts[e]` rows naming expert `e`, which is a run-length layout written
     /// out as the selection a call is dispatched with.
     fn named_by(counts: &[usize]) -> Vec<u32> {
@@ -9882,6 +10213,14 @@ kernel void mma_lane_probe___T__(
     /// stopped after its first pass, which answers wrongly and prices what the
     /// later ones cost.
     ///
+    /// **Kept as the case that says the plan works, now that there is one.** A
+    /// grouped call's blocks are cut at the run boundaries, so no block is given
+    /// rows that disagree and the pass loop finds one expert whatever the
+    /// layout — which is what the bound arm reading the shipped kernel's own
+    /// clock says, where it read 78% of it before. What is left between the
+    /// layouts is the part-empty block a run leaves at its end, which is a tenth
+    /// rather than a half.
+    ///
     /// Warm and swept both ways, for the reason every table on this kernel is.
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
@@ -9945,9 +10284,9 @@ kernel void mma_lane_probe___T__(
             eprintln!(
                 "  {:<46}{:>9}{:>9}{:>10}{:>15}{:>12}{:>9}",
                 "the rows laid out",
-                "blocks",
+                "over rows",
                 "passes",
-                "a block",
+                "planned",
                 "with the sort",
                 "the block",
                 "of it"
@@ -9955,14 +10294,13 @@ kernel void mma_lane_probe___T__(
             let taken = |at: usize| up[at].max(down[at]);
             let alone = |at: usize| taken(at).saturating_sub(sorts);
             for (at, (what, shape, _)) in arms.iter().enumerate() {
+                // The first two columns are the layout laid over the rows, which
+                // is what the blocks and the passes were before the plan and is
+                // what the third is read against.
                 let (blocks, passes) = blocks_and_passes(&shape.chosen, rows_a_block);
-                let passes = match at + 1 == arms.len() {
-                    true => blocks,
-                    false => passes,
-                };
                 eprintln!(
                     "  {what:<46}{blocks:>9}{passes:>9}{:>10}{:>15}{:>12}{:>9}",
-                    format!("{:.2}", passes as f64 / blocks as f64),
+                    blocks_a_run_is_cut_into(&shape.chosen, rows_a_block),
                     format!("{:.2}ms", 1e3 * taken(at).as_secs_f64()),
                     format!("{:.2}ms", 1e3 * alone(at).as_secs_f64()),
                     format!(
@@ -9980,145 +10318,138 @@ kernel void mma_lane_probe___T__(
                 format!("{:.2}ms", 1e3 * sorts.as_secs_f64()),
             );
 
-            // **The claim is that the clock follows the passes and not the
-            // prompt**, and this is where it is held rather than read off the
-            // table. The two arms compared are the aligned one, which runs one
-            // pass a block by construction, and the ragged one, which runs the
-            // passes a router's own counts produce — so the pass ratio between
-            // them is a number this side computed before the clock ran and the
-            // time ratio is what the device answered.
-            //
-            // **Held from both sides.** A band around the prediction is what an
-            // extra pass costing what a first one costs would land inside; the
-            // reading that must not pass is a clock that moved by much less than
-            // the passes, which is the shape "the term is something else" has and
-            // which an upper bound alone would call a success.
-            let aligned = blocks_and_passes(&arms[1].1.chosen, rows_a_block);
+            // **The claim is that no block runs a second pass**, and the bound
+            // arm is what holds it: it stops the pass loop after the first pass,
+            // so a kernel still running second ones would be measurably faster
+            // without them. Held against the ragged layout, which laid over the
+            // rows would run 1.64 passes a block.
             let ragged = blocks_and_passes(&arms[2].1.chosen, rows_a_block);
-            assert_eq!(
-                aligned.0, aligned.1,
-                "the aligned arm at {tokens} tokens straddled a block, so the denominator below \
-                 is not one pass a block"
-            );
             assert!(
                 ragged.1 > ragged.0,
-                "the ragged arm at {tokens} tokens straddled no block, so it is not the arm this \
-                 table needs: {ragged:?}"
+                "the ragged arm at {tokens} tokens straddles no block laid over the rows, so it \
+                 is not the arm this table needs: {ragged:?}"
             );
-            let predicted = ragged.1 as f64 / aligned.1 as f64 - 1.0;
-            let measured = alone(2).as_secs_f64() / alone(1).as_secs_f64() - 1.0;
+            let removed = 1.0 - alone(3).as_secs_f64() / alone(0).as_secs_f64();
             assert!(
-                (0.5..1.25).contains(&(measured / predicted)),
-                "at {tokens} tokens the ragged layout ran {:.2} passes a block against the \
-                 aligned layout's 1.00 and cost {:.2}x it, where the passes predict {:.2}x — an \
-                 extra pass came to {:.2} of a first one, and outside this band what this \
-                 kernel's cost follows is not its pass count and the diagnosis is about the \
-                 wrong term",
-                ragged.1 as f64 / ragged.0 as f64,
-                1.0 + measured,
-                1.0 + predicted,
-                measured / predicted,
+                removed < 0.05,
+                "at {tokens} tokens stopping the pass loop after its first pass took {:.0}% off \
+                 the shipped kernel, so its blocks are still being given rows that name several \
+                 experts and the plan is not reaching this dispatch",
+                1e2 * removed,
             );
         }
     }
 
-    /// The prompts a coding session's own prefills are, which are the lengths
-    /// [`Block::runs_an_expert`] refuses a grouped call at.
+    /// The prompts the two entries are read against each other at, which are
+    /// the run lengths a prefill produces from the shortest up.
     ///
-    /// A turn's opening prompt is thousands of tokens and is prefilled once;
-    /// every turn after it adds about 321. Six rows a token over 256 experts
-    /// puts an expert at 7.5 rows at 321 and 12 at 512, against the 32 a block
-    /// holds — so a routed bank at either length runs the reference tile, and
-    /// what the block is worth there is a question no table here has asked.
-    const SESSION_LENGTHS: [usize; 2] = [321, 512];
+    /// **A coding session's own prefills are the two under a thousand.** A
+    /// turn's opening prompt is thousands of tokens and is prefilled once; every
+    /// turn after it adds about 321, and six rows a token over 256 experts puts
+    /// an expert at 7.5 rows there and 12 at 512 — a quarter and a third of the
+    /// block's own height. The lengths above them are where the runs cover a
+    /// block and the block should win outright.
+    const SHORTENING_RUNS: [usize; 8] = [97, 171, 321, 512, 1024, 2048, 4096, 8192];
 
-    /// **What a routed bank costs at a prompt the block is refused at, and what
-    /// a block cut at the run boundaries would cost instead.**
+    /// **What a grouped call costs through each of the three entries as the
+    /// runs shorten**, which is where [`BLOCKS_A_RUN_PLANS`] is set from.
     ///
-    /// The block is refused below 1366 tokens because a block whose rows name
-    /// several experts runs the whole reduction once per expert they name, and
-    /// at 512 tokens a 32-row block would straddle two or three runs. **What the
-    /// refusal costs is what this asks**, and the second arm is what says it,
-    /// because a block does not have to be given rows that disagree: a grid laid
-    /// out over the runs rather than over the rows gives every block one
-    /// expert's rows and however few of them that run holds.
+    /// The three are the reference tile, the block laid over the rows as they
+    /// lie, and the block cut at the sort's own run boundaries. They answer the
+    /// same values over the same rows of the same weights and differ in what
+    /// they waste.
     ///
-    /// **The second arm is that call exactly and not a model of it.** A run-cut
-    /// block over `rows` rows in runs of `L` dispatches one block per
-    /// `ceil(L / 32)`, each staging 32 rows of which `L` are the call's and the
-    /// rest are the zeros the kernel already stages for a row that is not this
-    /// pass's. So a grouped call of `experts × 32` rows in runs of exactly 32 is
-    /// the same block count doing the same walk over the same weights — and
-    /// dividing its clock by the *useful* multiply-adds, which are the shorter
-    /// call's, is what the rate column does.
+    /// - **The tile** shares a weight read across four rows and wastes nothing
+    ///   on rows it does not have, which is why it is what a short prompt used
+    ///   to get.
+    /// - **The block over the rows** decodes a weight once for thirty-two rows
+    ///   and runs the whole reduction again for every expert a block's rows
+    ///   disagree about — 255 boundaries against `rows / 32` blocks, which is
+    ///   most of them at a 512-token prompt.
+    /// - **The block over the runs** never runs a second pass and leaves one
+    ///   part-empty block per run instead, at every length.
     ///
-    /// Warm and swept both ways, and the sort is off both columns.
+    /// So the third beats the second while the runs are short and loses to it
+    /// once they are long, and the line between them is a value the entries
+    /// carry rather than a constant — which is what lets both be arms here at
+    /// every length.
+    ///
+    /// Warm and swept both ways, and the sort — which all three dispatch and
+    /// which is the same dispatch for all three — is taken off every column.
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
-    fn what_a_block_would_be_worth_at_a_prompt_it_is_refused_at() {
+    fn what_a_grouped_call_costs_through_each_entry_as_the_runs_shorten() {
         let Some(device) = device() else { return };
 
-        let shipped =
-            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
+        // **The line is what separates the second arm from the third**, so one
+        // matmul is built past every run length here and one under none of them.
+        let arms = [
+            ("the tile", matmul(&device)),
+            (
+                "over the rows",
+                PackedMatmul::planning_under(&device, Numerics::Production, Block::SHIPPED, 0)
+                    .expect("the block compiles"),
+            ),
+            (
+                "over the runs",
+                PackedMatmul::planning_under(
+                    &device,
+                    Numerics::Production,
+                    Block::SHIPPED,
+                    usize::MAX / (2 * Block::SHIPPED.rows),
+                )
+                .expect("the block compiles"),
+            ),
+        ];
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
-        let (_, a_token, in_dim, out_dim, experts, _) = BOUND_SHAPES[1];
-        let rows_a_block = Block::SHIPPED.rows;
+        let (_, a_token, .., experts, _) = BOUND_SHAPES[1];
 
         eprintln!(
-            "\n  {:<10}{:>10}{:>12}{:>10}{:>12}{:>15}{:>12}{:>15}",
-            "tokens", "an expert", "the entry", "blocks", "as it runs", "", "run-cut", ""
+            "\n  {:<10}{:>12}{:>9}{}",
+            "tokens",
+            "an expert",
+            "it picks",
+            header(arms.iter().map(|(what, _)| *what), 27)
         );
-        for tokens in SESSION_LENGTHS {
+        for tokens in SHORTENING_RUNS {
             let shape = Blocked::at(tokens, BOUND_SHAPES[1]);
-            let entries = entries_dispatched(&device, |batch| {
-                let bank = shape.upload(&device, &shipped);
-                let mut x = device.buffer(&shape.case.x).expect("the rows upload");
-                shape.encode(batch, &device, &bank, &mut x, &grouping);
-            });
-            let reached = entries
+            let banks: Vec<PackedBank<'_>> = arms
                 .iter()
-                .find(|entry| entry.contains("matmul"))
-                .cloned()
-                .unwrap_or_default();
-
-            // One block an expert's run, which is what a grid over the runs
-            // gives a prompt whose runs are shorter than a block.
-            let blocks = shape.rows.div_ceil(rows_a_block).max(experts);
-            let cut = Blocked::of("", blocks * rows_a_block, in_dim, out_dim, experts, true);
-            assert_eq!(
-                blocks_and_passes(&cut.chosen, rows_a_block),
-                (blocks, blocks),
-                "the run-cut arm at {tokens} tokens straddles a block, so it is not the call a \
-                 grid over the runs would dispatch"
-            );
-
-            let banks = (
-                shape.upload(&device, &shipped),
-                cut.upload(&device, &shipped),
-            );
+                .map(|(_, matmul)| shape.upload(&device, matmul))
+                .collect();
+            let sorts = shape.sorts(&device, &grouping);
             crate::testing::warmed(|| {
-                shape.costs_on(&device, &banks.0, &grouping);
+                shape.costs_on(&device, &banks[0], &grouping);
             });
-            let (up, down) = crate::testing::both_ways(&[0usize, 1], |at| match at {
-                0 => shape.costs_on(&device, &banks.0, &grouping) - shape.sorts(&device, &grouping),
-                _ => cut.costs_on(&device, &banks.1, &grouping) - cut.sorts(&device, &grouping),
+            let listed: Vec<usize> = (0..arms.len()).collect();
+            let (up, down) = crate::testing::both_ways(&listed, |at| {
+                shape.costs_on(&device, &banks[at], &grouping)
             });
-            // The useful multiply-adds are the shorter call's under both arms —
-            // the run-cut one stages the same zeros a straddled pass stages and
-            // is charged for none of them.
-            let rate = |at: usize| {
-                let taken = up[at].max(down[at]).as_secs_f64();
-                (
-                    format!("{:.2}ms", 1e3 * taken),
-                    format!("{:.1} TFLOP/s", 1e-12 * shape.flops() / taken),
-                )
-            };
-            let (as_it_runs, its_rate) = rate(0);
-            let (run_cut, cut_rate) = rate(1);
+
+            let cells: String = listed
+                .iter()
+                .map(|&at| {
+                    let taken = (up[at].max(down[at]) - sorts).as_secs_f64();
+                    format!(
+                        "{:>12}{:>15}",
+                        format!("{:.2}ms", 1e3 * taken),
+                        format!("{:.1} TFLOP/s", 1e-12 * shape.flops() / taken),
+                    )
+                })
+                .collect();
             eprintln!(
-                "  {tokens:<10}{:>10}{reached:>12}{blocks:>10}{as_it_runs:>12}{its_rate:>15}\
-                 {run_cut:>12}{cut_rate:>15}",
+                "  {tokens:<10}{:>12}{:>9}{cells}",
                 format!("{:.1} rows", (tokens * a_token) as f64 / experts as f64),
+                // Which of the two the shipped line picks at this length, so a
+                // line moved without re-reading this table says so here.
+                match (
+                    shape.rows >= experts * RUNS_A_BLOCKED_CALL,
+                    shape.rows < experts * BLOCKS_A_RUN_PLANS * Block::SHIPPED.rows,
+                ) {
+                    (false, _) => "the tile",
+                    (true, true) => "the runs",
+                    (true, false) => "the rows",
+                },
             );
         }
     }
@@ -10162,13 +10493,16 @@ kernel void mma_lane_probe___T__(
     /// gives up is the arithmetic intensity the height was taken for**, and this
     /// is the two of them on one clock rather than either alone.
     ///
-    /// The gate is the other half of it and is not a separate lever:
-    /// [`Block::runs_an_expert`] refuses a grouped call until an expert averages
-    /// a block of rows, so a block of 16 reaches a 683-token prompt where one of
-    /// 32 needs 1366 — which is the axis a coding session's own prefills sit
-    /// below.
+    /// **Taken before the plan was, and kept as the reading that made the plan
+    /// the answer rather than the height.** A shorter block halves what a
+    /// straddle costs and gives back a tenth of the rate on runs that straddle
+    /// nothing, so it wins at the short end and loses at the long one — a trade
+    /// rather than a lever, which is what sent this milestone at the layout
+    /// instead. `where_a_grouped_calls_run_boundaries_land_against_a_block` is
+    /// where the term itself is, and the plan is what removes it at every
+    /// height.
     ///
-    /// Warm and swept both ways, and the sort is taken off both columns.
+    /// Warm and swept both ways, and the sort is taken off every column.
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn what_a_block_of_each_height_costs_where_the_runs_do_not_divide_it() {
@@ -10218,7 +10552,7 @@ kernel void mma_lane_probe___T__(
             eprintln!(
                 "  {:<22}{:>10}{}",
                 "a block of",
-                "reaches",
+                "blocks",
                 shapes
                     .iter()
                     .map(|(what, _)| format!("{:>32}", *what))
@@ -10242,12 +10576,9 @@ kernel void mma_lane_probe___T__(
                 eprintln!(
                     "  {:<22}{:>10}{cells}",
                     format!("{} rows", block.rows),
-                    // The shortest prompt whose routing feeds this height, which
-                    // is the gate read as a prompt rather than as a row count.
-                    format!(
-                        "{} tokens",
-                        (whole.experts * block.runs_an_expert()).div_ceil(6)
-                    ),
+                    // The blocks the call is cut into at this height, which is
+                    // what the straddles are counted against.
+                    whole.rows.div_ceil(block.rows),
                 );
             }
         }

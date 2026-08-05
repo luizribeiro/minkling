@@ -271,6 +271,17 @@ impl<'a> ExpertBanks<'a> {
         self.glu.gate().groups(rows)
     }
 
+    /// The height the sort in front of this bank cuts its runs against — see
+    /// [`PackedBank::rows_a_block`], asked of `gate_proj` for the reason above.
+    ///
+    /// **The three banks are one plan.** `gate`, `up` and `down` take the same
+    /// rows through the same permutation in the same layer, so a plan cut once
+    /// serves all three — which is also what says the height they are compiled
+    /// at has to be the one height.
+    pub(crate) fn rows_a_block(&self) -> usize {
+        self.glu.gate().rows_a_block()
+    }
+
     pub fn device(&self) -> &'a Device {
         self.glu.gate().device()
     }
@@ -597,13 +608,14 @@ impl<'a> LayerExperts<'a> {
         tokens: usize,
     ) -> Result<([Pending; 2], RoutedRows), MatmulError> {
         let top_k = self.router.config().top_k;
+        let rows_a_block = self.routed.rows_a_block();
         if !self.routed.groups(self.router.assignments(tokens)) {
             let glu = self.routed.glu.encode_picked(batch, picked, x, top_k)?;
             return Ok((glu, RoutedRows::Picked));
         }
-        let mut grouped = self
-            .grouping
-            .encode(batch, picked, self.router.config().n_routed)?;
+        let mut grouped =
+            self.grouping
+                .encode(batch, picked, self.router.config().n_routed, rows_a_block)?;
         let glu = self
             .routed
             .glu
@@ -1383,7 +1395,7 @@ mod tests {
                     true => {
                         let mut sorted = kernels
                             .grouping
-                            .encode(&mut batch, &mut picked, EXPERTS)
+                            .encode(&mut batch, &mut picked, EXPERTS, bank.rows_a_block())
                             .expect("the grouping encodes");
                         let glu = bank
                             .glu

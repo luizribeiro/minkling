@@ -58,6 +58,30 @@ const THREADS_PER_GROUP: usize = 256;
 /// fallback, which is why it is refused where a grouping is asked for.
 const MOST_EXPERTS: usize = 512;
 
+/// The `uint`s one block of the plan is written as: where its rows start, and
+/// how many of them it holds.
+pub(crate) const PLAN_FIELDS: usize = 2;
+
+/// Blocks a plan of this shape can hold, which is what the grid a dispatch
+/// through it is covered by has to be.
+///
+/// **A bound rather than a count, because the counts are on the device.** A run
+/// of `L` rows is `ceil(L / rows_a_block)` blocks, and the worst the runs can
+/// do is leave every one of them a part-block short — so summing the ceilings
+/// is at most the rows over the height plus a block a bucket. The plan is zeroed
+/// and the blocks past the last run hold nothing, which is what the dispatch
+/// reads them as.
+///
+/// The bucket count is the bank's experts and one more, for the reason
+/// `bucket_of` gives: an index past the bank goes in a bucket of its own so that
+/// the layout stays a rearrangement of the rows.
+pub(crate) fn blocks_a_plan(rows: usize, experts: usize, rows_a_block: usize) -> usize {
+    match rows_a_block {
+        0 => 0,
+        height => rows.div_ceil(height) + experts + 1,
+    }
+}
+
 /// The compiled kernel, which every MoE layer on a device shares.
 ///
 /// Per source string rather than per layer, like [`crate::PackedMatmul`] and
@@ -84,7 +108,37 @@ pub struct Grouped {
     /// The expert row `i` of the grouped call goes through, which is
     /// `chosen[order[i]]` and nothing else.
     pub(crate) experts: Buffer<u32>,
+    /// Where each block of a blocked dispatch starts and how many of the call's
+    /// rows it holds, a pair of `uint` apiece.
+    ///
+    /// **This is the sort's answer to a question only the sort can answer
+    /// cheaply.** A block whose rows name several experts runs the whole
+    /// reduction once per expert they name, and where the boundaries fall is
+    /// decided by counts that live on the device and are never read back. The
+    /// counting sort has every one of them in a threadgroup array by the time it
+    /// places a row, so cutting the blocks at the boundaries costs it a few
+    /// hundred writes and costs the block that reads it one load.
+    ///
+    /// A pair of zeros is a block with nothing in it, which is what the entries
+    /// past the last run hold: the count is bounded above rather than known, so
+    /// the grid covers the bound and the threadgroups over it return.
+    pub(crate) plan: Buffer<u32>,
+    /// The height the plan was cut against, which a dispatch through it has to
+    /// be the block of.
+    ///
+    /// **Carried so that a mismatch is a panic rather than an answer.** A plan
+    /// cut at 32 rows and read by a block of 16 would leave every second block's
+    /// rows unreached — a wrong answer and not a slow one — and the height is a
+    /// value the block carries, so a sweep can hold one of each in a process.
+    pub(crate) rows_a_block: usize,
 }
+
+/// What a sort leaves behind, read back: where each row went, what each of them
+/// named, and the blocks the plan cut the runs into.
+///
+/// The three together because none of them says anything alone — see
+/// [`Grouped`], which is the same three where a dispatch reads them.
+pub type Sorted = (Vec<u32>, Vec<u32>, Vec<u32>);
 
 impl ExpertGrouping {
     pub fn new(device: &Device) -> Result<Self, MetalError> {
@@ -112,6 +166,7 @@ impl ExpertGrouping {
         batch: &mut Batch<'_>,
         chosen: &mut Buffer<u32>,
         experts: usize,
+        rows_a_block: usize,
     ) -> Result<Grouped, MetalError> {
         let _timed = profile::scope(Op::Encode);
         assert!(
@@ -124,11 +179,22 @@ impl ExpertGrouping {
         let fields = [
             extent(rows, "the rows of a call"),
             extent(experts, "the experts a bank holds"),
+            extent(
+                rows_a_block,
+                "the rows a block of the dispatch behind this holds",
+            ),
         ];
         let mut shape = batch.device().inline(&fields)?;
         let mut grouped = Grouped {
             order: batch.device().zeroed::<u32>(rows)?,
             experts: batch.device().zeroed::<u32>(rows)?,
+            // A call with no block behind it plans nothing and is still handed a
+            // buffer, because a binding is what a kernel takes and an
+            // allocation of no bytes is what Metal refuses.
+            plan: batch
+                .device()
+                .zeroed::<u32>(PLAN_FIELDS * blocks_a_plan(rows, experts, rows_a_block).max(1))?,
+            rows_a_block,
         };
 
         // **The selection is read twice and charged once**, which is the same
@@ -143,6 +209,7 @@ impl ExpertGrouping {
                 chosen.arg(),
                 grouped.order.arg(),
                 grouped.experts.arg(),
+                grouped.plan.arg(),
             ],
             Grid::new(THREADS_PER_GROUP, THREADS_PER_GROUP),
             moves,
@@ -157,12 +224,17 @@ impl ExpertGrouping {
         device: &Device,
         chosen: &[u32],
         experts: usize,
-    ) -> Result<(Vec<u32>, Vec<u32>), MetalError> {
+        rows_a_block: usize,
+    ) -> Result<Sorted, MetalError> {
         let mut chosen = device.buffer(chosen)?;
         let mut batch = device.batch()?;
-        let grouped = self.encode(&mut batch, &mut chosen, experts)?;
+        let grouped = self.encode(&mut batch, &mut chosen, experts, rows_a_block)?;
         batch.wait()?;
-        Ok((grouped.order.to_vec(), grouped.experts.to_vec()))
+        Ok((
+            grouped.order.to_vec(),
+            grouped.experts.to_vec(),
+            grouped.plan.to_vec(),
+        ))
     }
 }
 
@@ -180,6 +252,10 @@ using namespace metal;
 struct Shape {
     uint rows;
     uint experts;
+    /// Rows one block of the dispatch behind this covers, which is what the
+    /// runs are cut into blocks against — or zero where nothing behind this
+    /// blocks its rows and the plan is not written.
+    uint rows_a_block;
 };
 
 /// The bucket a row falls in, which is its expert unless the expert is one the
@@ -212,6 +288,7 @@ kernel void group_by_expert(
     device const uint *chosen [[buffer(1)]],
     device uint *order [[buffer(2)]],
     device uint *grouped [[buffer(3)]],
+    device uint *plan [[buffer(4)]],
     uint local [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]]
 ) {
@@ -231,14 +308,42 @@ kernel void group_by_expert(
 
     for (uint bucket = local; bucket < buckets; bucket += threads) {
         uint at = 0;
+        // Blocks the buckets before this one take, which is the same prefix sum
+        // as `at` over a different summand — so it is walked here rather than in
+        // a second loop over the same loads.
+        uint planned = 0;
         for (uint before = 0; before < bucket; ++before) {
-            at += atomic_load_explicit(&counts[before], memory_order_relaxed);
+            const uint count = atomic_load_explicit(&counts[before], memory_order_relaxed);
+            at += count;
+            if (shape.rows_a_block > 0) {
+                planned += (count + shape.rows_a_block - 1) / shape.rows_a_block;
+            }
         }
+        const uint start = at;
         for (uint row = 0; row < shape.rows; ++row) {
             if (bucket_of(chosen[row], shape.experts) == bucket) {
                 order[at] = row;
                 grouped[at] = chosen[row];
                 ++at;
+            }
+        }
+
+        // **This bucket's run cut into blocks**, which is the whole of what the
+        // plan is: a block of the dispatch behind this gets one bucket's rows
+        // and however few of them are left over, so no block of it ever holds
+        // rows naming two experts and no block runs the reduction twice.
+        //
+        // The last block of a run holds what the run had left, which is what
+        // lets the rows stay where the sort put them — a layout padded to whole
+        // blocks would move every row after the first short run and every reader
+        // of `order` would have to know it.
+        // Refused rather than skipped where nothing behind this blocks its rows,
+        // because a stride of zero here is a loop that never ends.
+        if (shape.rows_a_block > 0) {
+            for (uint held = start; held < at; held += shape.rows_a_block) {
+                plan[2 * planned] = held;
+                plan[2 * planned + 1] = min(shape.rows_a_block, at - held);
+                ++planned;
             }
         }
     }
@@ -253,6 +358,13 @@ mod tests {
     /// Tokens enough that every expert of the shape below is named several times
     /// over, and not a multiple of anything here.
     const TOKENS: usize = 131;
+
+    /// The height these cases cut a plan against.
+    ///
+    /// **A number of this module's own rather than the matmul's**, because what
+    /// is being checked here is that the plan describes the runs — which is true
+    /// of any height, and is most easily got wrong at one that divides nothing.
+    const ROWS_A_BLOCK: usize = 5;
 
     /// A selection of the shape a router writes: `top_k` experts a token, no two
     /// of a token's the same, and spread over the whole bank rather than over its
@@ -287,8 +399,8 @@ mod tests {
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
         let chosen = selection(TOKENS, ROUTING.n_routed, ROUTING.top_k, 0);
 
-        let (order, grouped) = grouping
-            .group(&device, &chosen, ROUTING.n_routed)
+        let (order, grouped, _) = grouping
+            .group(&device, &chosen, ROUTING.n_routed, ROWS_A_BLOCK)
             .expect("the dispatch completes");
 
         let mut seen = order.clone();
@@ -335,8 +447,8 @@ mod tests {
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
         let chosen = selection(TOKENS, ROUTING.n_routed, ROUTING.top_k, 3);
 
-        let (_, grouped) = grouping
-            .group(&device, &chosen, ROUTING.n_routed)
+        let (_, grouped, _) = grouping
+            .group(&device, &chosen, ROUTING.n_routed, ROWS_A_BLOCK)
             .expect("the dispatch completes");
 
         assert!(
@@ -355,6 +467,82 @@ mod tests {
         );
     }
 
+    /// **The plan covers every row of the call exactly once and never covers two
+    /// experts' rows in one block**, which is the whole of what a dispatch
+    /// through it rests on.
+    ///
+    /// Three properties, and none implies the others. Every row is in some block,
+    /// which is what says no output row goes unwritten. No row is in two, which
+    /// is what says none is written twice — a block laid over another's rows
+    /// would answer them under one expert and then the other, and the second
+    /// write would win. And no block spans a run boundary, which is what the
+    /// plan is *for*: a block whose rows disagree still answers them, so this is
+    /// the rate the plan buys rather than the answer it keeps.
+    ///
+    /// **A height that divides nothing here**, so a plan that happened to be
+    /// right at 32 rows over runs that were multiples of it would not be right
+    /// at this one.
+    #[test]
+    fn a_plan_covers_every_row_once_and_never_two_experts_in_one_block() {
+        let Some(device) = device() else { return };
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        // A bank narrow enough that the runs are dozens of rows and wide enough
+        // that there are boundaries for a block to land on, with rows naming an
+        // index it does not hold — because those go in a bucket of their own and
+        // the plan has to cover that run like any other.
+        let mut chosen = selection(TOKENS, 11, ROUTING.top_k, 7);
+        for row in chosen.iter_mut().step_by(17) {
+            *row = 11;
+        }
+
+        let (_, grouped, plan) = grouping
+            .group(&device, &chosen, 11, ROWS_A_BLOCK)
+            .expect("the dispatch completes");
+        assert!(
+            grouped.contains(&11),
+            "no row named an index past the bank, so the bucket that holds them is empty"
+        );
+
+        let mut covered = vec![0usize; chosen.len()];
+        let mut blocks = 0;
+        for held in plan.chunks_exact(PLAN_FIELDS) {
+            let (first, rows) = (held[0] as usize, held[1] as usize);
+            if rows == 0 {
+                continue;
+            }
+            blocks += 1;
+            assert!(
+                rows <= ROWS_A_BLOCK,
+                "a block of {rows} rows is over the {ROWS_A_BLOCK} it was cut at"
+            );
+            assert!(
+                grouped[first..first + rows]
+                    .iter()
+                    .all(|e| *e == grouped[first]),
+                "a block at {first} of {rows} rows spans a run boundary"
+            );
+            covered[first..first + rows]
+                .iter_mut()
+                .for_each(|times| *times += 1);
+        }
+        assert!(
+            covered.iter().all(|times| *times == 1),
+            "the plan covers {} rows once, {} never and {} twice over",
+            covered.iter().filter(|times| **times == 1).count(),
+            covered.iter().filter(|times| **times == 0).count(),
+            covered.iter().filter(|times| **times > 1).count(),
+        );
+        let runs = grouped.chunk_by(|a, b| a == b).count();
+        eprintln!(
+            "{} rows over {runs} runs: {blocks} blocks of at most {ROWS_A_BLOCK}",
+            chosen.len()
+        );
+        assert!(
+            blocks >= runs && blocks <= chosen.len().div_ceil(ROWS_A_BLOCK) + runs,
+            "{blocks} blocks over {runs} runs is neither a block a run nor the rows cut into them"
+        );
+    }
+
     /// A stable sort, which is what says the same call gives the same layout
     /// twice — so a measurement repeated over one prompt is repeated over one
     /// set of tiles.
@@ -368,8 +556,8 @@ mod tests {
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
         let chosen = selection(TOKENS, 8, ROUTING.top_k, 11);
 
-        let (order, _) = grouping
-            .group(&device, &chosen, 8)
+        let (order, ..) = grouping
+            .group(&device, &chosen, 8, ROWS_A_BLOCK)
             .expect("the dispatch completes");
 
         let mut want: Vec<u32> = (0..chosen.len() as u32).collect();
@@ -377,7 +565,7 @@ mod tests {
         assert_eq!(order, want, "the rows of an expert are not in row order");
         assert_eq!(
             grouping
-                .group(&device, &chosen, 8)
+                .group(&device, &chosen, 8, ROWS_A_BLOCK)
                 .expect("the dispatch completes")
                 .0,
             order,
@@ -398,8 +586,8 @@ mod tests {
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
         let chosen = [3u32, 9, 0, 9, 1, 3];
 
-        let (order, grouped) = grouping
-            .group(&device, &chosen, 4)
+        let (order, grouped, _) = grouping
+            .group(&device, &chosen, 4, ROWS_A_BLOCK)
             .expect("the dispatch completes");
 
         let mut seen = order.clone();
@@ -425,7 +613,7 @@ mod tests {
             panic!("experts are not between one and the: no device to ask")
         };
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
-        let _ = grouping.group(&device, &[0u32, 1], MOST_EXPERTS + 1);
+        let _ = grouping.group(&device, &[0u32, 1], MOST_EXPERTS + 1, ROWS_A_BLOCK);
     }
 
     /// What the bandwidth column divides by, against what the kernel reads: the
@@ -439,7 +627,7 @@ mod tests {
 
         let moved = crate::testing::moved(&device, |batch| {
             grouping
-                .encode(batch, &mut on_the_device, ROUTING.n_routed)
+                .encode(batch, &mut on_the_device, ROUTING.n_routed, ROWS_A_BLOCK)
                 .expect("the grouping encodes");
         });
 
