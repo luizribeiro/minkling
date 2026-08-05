@@ -660,6 +660,8 @@ pub(crate) fn diagnostic(err: &NSError) -> String {
 mod tests {
     use std::time::Instant;
 
+    use objc2_metal::{MTLBarrierScope, MTLDispatchType};
+
     use super::*;
     use crate::buffer::Buffer;
     use crate::testing::{SAXPY, SAXPY_ENTRY, device, saxpy_moves};
@@ -704,6 +706,22 @@ mod tests {
                 self.y.arg(),
                 self.out.arg(),
             ]
+        }
+
+        /// The same five as allocations a barrier may name, retained rather
+        /// than borrowed: a pass that names them is encoded inside a closure
+        /// that also binds them, and a borrow of one would refuse the other.
+        fn resources(&self) -> Vec<Retained<ProtocolObject<dyn objc2_metal::MTLResource>>> {
+            [
+                self.alpha.raw(),
+                self.count.raw(),
+                self.x.raw(),
+                self.y.raw(),
+                self.out.raw(),
+            ]
+            .into_iter()
+            .map(|buffer| ProtocolObject::from_retained(buffer.retain()))
+            .collect()
         }
 
         /// The same arithmetic the kernel is asked for, over the same inputs.
@@ -1342,6 +1360,255 @@ kernel void streaming_copy4(
             together / DISPATCHES as u32,
         );
         assert!(together < apart, "{together:?} against {apart:?}");
+    }
+
+    /// **What the barrier between two dispatches costs the device, in the
+    /// mechanism this engine would remove it with.**
+    ///
+    /// D3 priced the same ordering from inside an indirect command buffer —
+    /// 2.210 µs a command with a barrier against 0.205 without — and closed by
+    /// naming the encoder as the cheaper way to the same concurrency. That
+    /// figure cannot be carried across: an indirect command reaches the GPU by
+    /// another route and costs 2.02× the dispatch it replaces, so what the
+    /// barrier is worth *there* says nothing about what it is worth in a pass.
+    /// This is the same question asked of `computeCommandEncoderWithDispatchType:`,
+    /// which is the mechanism a decode step would actually use.
+    ///
+    /// One grid, one entry, the kernel returning on its first instruction so
+    /// that what is timed is the launch and the ordering rather than any
+    /// arithmetic. The first arm is the serial pass every dispatch here is
+    /// encoded into today; the rest are concurrent passes with a barrier every
+    /// `n` dispatches, down to none at all.
+    ///
+    /// **The sweep is what makes this an answer rather than two numbers.** A
+    /// step that removes barriers does not remove all of them — its dependency
+    /// chain is real — so what decides whether the lever pays is the *ratio*, and
+    /// the row where a concurrent pass overtakes the serial one is the group size
+    /// a sequence has to average to be worth encoding concurrently at all.
+    ///
+    /// **The clock is the driver's own**, for the reason
+    /// `what_the_device_makes_of_a_thousand_indirect_commands` gives: a wall
+    /// time around a thousand empty dispatches carries the commit and the wake,
+    /// which at these durations is the same order as what is being measured.
+    /// Swept both ways for the reason [`crate::testing::both_ways`] gives.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_barrier_costs_the_device_against_the_dispatches_it_separates() {
+        let Some(device) = device() else { return };
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        /// The dispatches a decode step makes, so that a per-barrier figure is
+        /// read beside the count it would be multiplied by.
+        const DISPATCHES: usize = 1000;
+        let mut saxpy = Saxpy::new(&device, 0);
+        let grid = Grid::new(1, 1);
+
+        // A group wider than the pass, which is the arm that encodes no barrier
+        // at all: a barrier goes after the last dispatch of each group, so a
+        // group of exactly `DISPATCHES` would still end in one.
+        const UNBARRIERED: usize = DISPATCHES + 1;
+        // How many dispatches share a group, and which barrier separates two
+        // groups. `None` is the serial pass every dispatch here is encoded into
+        // today.
+        let arms: Vec<Option<(Barrier, usize)>> = std::iter::once(None)
+            .chain([1, 2, 3, 4, 6, 8, 16, UNBARRIERED].map(|group| Some((Barrier::Scope, group))))
+            .chain([1, 2, 4].map(|group| Some((Barrier::Resources, group))))
+            .collect();
+
+        let resources = saxpy.resources();
+        let mut pass = |arm: Option<(Barrier, usize)>| {
+            let dispatch_type = match arm {
+                None => MTLDispatchType::Serial,
+                Some(_) => MTLDispatchType::Concurrent,
+            };
+            crate::testing::on_the_device(|| {
+                let commands = device.queue().commandBuffer().expect("a command buffer");
+                let encoder = commands
+                    .computeCommandEncoderWithDispatchType(dispatch_type)
+                    .expect("a compute pass");
+                for at in 0..DISPATCHES {
+                    dispatch(&encoder, &kernel, &saxpy.args(), grid);
+                    // After the last of a group and not before the first, so
+                    // that a group of one is a barrier after every dispatch.
+                    match arm {
+                        Some((barrier, group)) if at % group == group - 1 => {
+                            barrier.encode(&encoder, &resources);
+                        }
+                        _ => {}
+                    }
+                }
+                encoder.endEncoding();
+                commands
+            })
+        };
+        let (up, down) = crate::testing::both_ways(&arms, &mut pass);
+        let (up, down): (Vec<Duration>, Vec<Duration>) = (
+            up.iter().map(|(middle, _)| *middle).collect(),
+            down.iter().map(|(middle, _)| *middle).collect(),
+        );
+        let taken = crate::testing::better(&up, &down);
+        let each = |at: usize| taken[at].as_secs_f64() * 1e6 / DISPATCHES as f64;
+
+        eprintln!(
+            "  {:>44}{:>10}{:>12}{:>12}",
+            "a thousand empty dispatches", "barriers", "each", "disagreed"
+        );
+        for (at, arm) in arms.iter().enumerate() {
+            let what = match arm {
+                None => "a serial pass".to_owned(),
+                Some((barrier, 1)) => format!("a concurrent pass, {barrier} each"),
+                Some((_, UNBARRIERED)) => "a concurrent pass, no barriers".to_owned(),
+                Some((barrier, group)) => {
+                    format!("a concurrent pass, {group} to a group, {barrier}")
+                }
+            };
+            eprintln!(
+                "  {what:>44}{:>10}{:>12}{:>12}",
+                arm.map_or(0, |(_, group)| DISPATCHES / group),
+                format!("{:.3}\u{b5}s", each(at)),
+                format!(
+                    "{:.0}%",
+                    100.0
+                        * (up[at].max(down[at]).as_secs_f64() / up[at].min(down[at]).as_secs_f64()
+                            - 1.0)
+                ),
+            );
+        }
+
+        // The serial pass, the barrier-each pass and the barrier-free pass, which
+        // are the three the arithmetic is drawn from.
+        let (serial, barriered, free) = (each(0), each(1), each(8));
+        eprintln!(
+            "  a barrier is {:.3}\u{b5}s and the ordering it replaces is {:.3}\u{b5}s, so a group has to \
+             average {:.2} dispatches before a concurrent pass is worth encoding",
+            barriered - free,
+            serial - free,
+            (barriered - free) / (serial - free),
+        );
+        assert!(
+            free < serial,
+            "a pass that orders nothing cannot cost more than one that orders everything: {free} \
+             against {serial}"
+        );
+    }
+
+    /// One dispatch encoded into a pass by hand, which is what [`Batch::add`]
+    /// does with the bookkeeping this crate adds around it.
+    ///
+    /// The raw form rather than the batch because both callers need a pass they
+    /// opened themselves — one to choose its dispatch type, the other to put a
+    /// barrier inside it — and neither is reachable through [`Device::batch`].
+    fn dispatch(
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        kernel: &Kernel,
+        args: &[Arg<'_>],
+        grid: Grid,
+    ) {
+        encoder.setComputePipelineState(&kernel.pipeline);
+        for (slot, arg) in args.iter().enumerate() {
+            let Arg::Bound(buffer) = arg else {
+                unreachable!("saxpy binds allocations")
+            };
+            // SAFETY: as `Batch::add`, which this is the raw form of.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), 0, slot) };
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            one_dimensional(grid.groups()),
+            one_dimensional(grid.threads_per_group()),
+        );
+    }
+
+    /// Which of Metal's two compute barriers separates two groups: everything
+    /// the pass may have written, or the allocations named.
+    ///
+    /// A resource barrier is the finer of the two and is what a step with a
+    /// derived dependency graph would reach for — a dispatch that reads one
+    /// buffer has no reason to wait on a write to another. Whether the hardware
+    /// makes anything of that distinction is what the two rows say.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Barrier {
+        Scope,
+        Resources,
+    }
+
+    impl Barrier {
+        fn encode(
+            self,
+            encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+            resources: &[Retained<ProtocolObject<dyn objc2_metal::MTLResource>>],
+        ) {
+            match self {
+                Self::Scope => encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers),
+                Self::Resources => {
+                    let mut pointers: Vec<NonNull<ProtocolObject<dyn objc2_metal::MTLResource>>> =
+                        resources.iter().map(|r| NonNull::from(&**r)).collect();
+                    // SAFETY: the pointers are the borrowed resources' own and
+                    // the count is the vector's own length.
+                    unsafe {
+                        encoder.memoryBarrierWithResources_count(
+                            NonNull::new(pointers.as_mut_ptr()).expect("a non-empty vector"),
+                            pointers.len(),
+                        )
+                    };
+                }
+            }
+        }
+    }
+
+    impl std::fmt::Display for Barrier {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Self::Scope => "a barrier over every buffer",
+                Self::Resources => "a barrier over the five named",
+            })
+        }
+    }
+
+    /// **A concurrent pass with a barrier where the dependency is still answers
+    /// what the serial pass answers**, which is the whole of what the lever
+    /// rests on.
+    ///
+    /// The same chained saxpy `a_dispatch_reads_what_the_one_before_it_in_the_batch_wrote`
+    /// runs — the second reads the first's output, so only an ordering produces
+    /// `alpha * (alpha * x + y) + y` — encoded into a pass that orders nothing on
+    /// its own. What stands between them is one `memoryBarrierWithScope:` call.
+    #[test]
+    fn a_barrier_in_a_concurrent_pass_orders_what_the_dispatch_type_no_longer_does() {
+        let Some(device) = device() else { return };
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        let mut saxpy = Saxpy::new(&device, LEN);
+        let mut chained = Saxpy::new(&device, LEN);
+        let grid = Grid::new(LEN, THREADS_PER_GROUP);
+
+        let commands = device.queue().commandBuffer().expect("a command buffer");
+        let encoder = commands
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+            .expect("a compute pass");
+        dispatch(&encoder, &kernel, &saxpy.args(), grid);
+        encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        dispatch(
+            &encoder,
+            &kernel,
+            &[
+                chained.alpha.arg(),
+                chained.count.arg(),
+                saxpy.out.arg(),
+                chained.y.arg(),
+                chained.out.arg(),
+            ],
+            grid,
+        );
+        encoder.endEncoding();
+        commands.commit();
+        commands.waitUntilCompleted();
+        assert!(commands.error().is_none(), "the pass completes");
+
+        let want: Vec<f32> = saxpy
+            .on_the_cpu()
+            .iter()
+            .zip(chained.y.as_slice())
+            .map(|(x, y)| ALPHA * x + y)
+            .collect();
+        assert_eq!(chained.out.to_vec(), want);
     }
 
     #[test]

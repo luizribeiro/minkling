@@ -224,7 +224,9 @@ mod tests {
 
     use super::*;
     use crate::buffer::Buffer;
-    use crate::testing::{SAXPY, SAXPY_ENTRY, device, warmed};
+    use crate::testing::{
+        ROUNDS, SAXPY, SAXPY_ENTRY, device, middle_and_mean, on_the_device, warmed,
+    };
 
     /// The dispatches a decode step makes, so that a per-command figure is read
     /// beside the count it would be multiplied by.
@@ -234,12 +236,6 @@ mod tests {
     /// output — which is the low end of what this engine's kernels bind and so
     /// the arrangement least flattering to the patch.
     const SLOTS: usize = 5;
-
-    /// Rounds each arm is taken over, the median and the mean of them both
-    /// reported: a host-side loop of a thousand Objective-C messages is where
-    /// this machine's scheduler shows up, and one reading cannot say whether it
-    /// did.
-    const ROUNDS: usize = 9;
 
     /// Everything a saxpy command binds, held so the buffers outlive every
     /// command that names them — **an indirect command retains nothing**, which
@@ -298,15 +294,6 @@ mod tests {
         }
     }
 
-    /// The middle reading and the average of them, which this file reports
-    /// together for the reason D2's decode table gives: they can disagree, and
-    /// the disagreement is the finding.
-    fn middle_and_mean(mut taken: Vec<Duration>) -> (Duration, Duration) {
-        taken.sort_unstable();
-        let sum: Duration = taken.iter().sum();
-        (taken[taken.len() / 2], sum / taken.len() as u32)
-    }
-
     /// `work` timed over [`ROUNDS`] rounds, warm, with whatever it leaves
     /// running waited for outside the clock.
     ///
@@ -331,29 +318,6 @@ mod tests {
     /// An arm that leaves nothing running, which is every arm that only writes
     /// into an indirect buffer.
     fn nothing<T>(_: T) {}
-
-    /// What the *device* made of the command buffer `encode` filled and closed,
-    /// over [`ROUNDS`] rounds, warm.
-    ///
-    /// The buffer is committed and waited for here rather than by the caller,
-    /// because the two timestamps this reads are only meaningful once it has
-    /// completed — and the wait is outside no clock, since the clock is the
-    /// driver's rather than this process's.
-    fn on_the_device(
-        mut encode: impl FnMut() -> Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    ) -> (Duration, Duration) {
-        let mut ran = || {
-            let commands = encode();
-            commands.commit();
-            commands.waitUntilCompleted();
-            assert!(commands.error().is_none(), "the pass completes");
-            Duration::from_secs_f64((commands.GPUEndTime() - commands.GPUStartTime()).max(0.0))
-        };
-        warmed(|| {
-            ran();
-        });
-        middle_and_mean((0..ROUNDS).map(|_| ran()).collect())
-    }
 
     /// **What an indirect command costs to patch, against what a dispatch costs
     /// to encode fresh.** The whole of whether there is a milestone in encoding

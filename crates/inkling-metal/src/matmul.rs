@@ -3448,22 +3448,7 @@ mod tests {
 
     use crate::grouping::ExpertGrouping;
     use crate::kernel::MEMORY_BANDWIDTH;
-    use crate::testing::{device, drift, entries_dispatched};
-
-    /// The better of a sweep's two directions, arm by arm.
-    ///
-    /// **A slower reading is contamination and never the kernel being faster**,
-    /// which is the argument [`Blocked::costs`] already takes best-of-three
-    /// rounds on — met again one level up. What the two directions are for is
-    /// saying how far apart they were, which is what the `disagreed` column
-    /// prints: a sweep whose arms agree is one whose ranking is about the arms,
-    /// and one whose arms do not is a sweep that has to say so.
-    fn better(up: &[Duration], down: &[Duration]) -> Vec<Duration> {
-        up.iter()
-            .zip(down)
-            .map(|(up, down)| *up.min(down))
-            .collect()
-    }
+    use crate::testing::{better, device, drift, entries_dispatched};
 
     /// What a count of packed codes weighs on the wire: half a byte a code and
     /// one scale byte a group of [`GROUP_SIZE`].

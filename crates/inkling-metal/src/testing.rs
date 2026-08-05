@@ -221,6 +221,70 @@ pub fn warmed(mut work: impl FnMut()) {
     }
 }
 
+/// The middle reading and the average of them, which this crate's measurements
+/// report together for the reason D2's decode table gives: they can disagree,
+/// and the disagreement is the finding.
+pub fn middle_and_mean(
+    mut taken: Vec<std::time::Duration>,
+) -> (std::time::Duration, std::time::Duration) {
+    taken.sort_unstable();
+    let sum: std::time::Duration = taken.iter().sum();
+    (taken[taken.len() / 2], sum / taken.len() as u32)
+}
+
+/// How many rounds a device-clock arm is read over. Odd, so the middle reading
+/// is one that was taken rather than the average of two.
+pub const ROUNDS: usize = 9;
+
+/// What the *device* made of the command buffer `encode` filled and closed, over
+/// [`ROUNDS`] rounds, warm.
+///
+/// The buffer is committed and waited for here rather than by the caller,
+/// because the two timestamps this reads are only meaningful once it has
+/// completed — and the wait is outside no clock, since the clock is the driver's
+/// rather than this process's. A thousand dispatches that compute nothing are
+/// microseconds of device work behind a commit and a wake that cost the same
+/// order, so a wall time around one would be measuring the round trip.
+pub fn on_the_device(
+    mut encode: impl FnMut() -> objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+    >,
+) -> (std::time::Duration, std::time::Duration) {
+    use objc2_metal::MTLCommandBuffer;
+
+    let mut ran = || {
+        let commands = encode();
+        commands.commit();
+        commands.waitUntilCompleted();
+        assert!(commands.error().is_none(), "the pass completes");
+        std::time::Duration::from_secs_f64(
+            (commands.GPUEndTime() - commands.GPUStartTime()).max(0.0),
+        )
+    };
+    warmed(|| {
+        ran();
+    });
+    middle_and_mean((0..ROUNDS).map(|_| ran()).collect())
+}
+
+/// The better of a sweep's two directions, arm by arm.
+///
+/// **A slower reading is contamination and never the kernel being faster**,
+/// which is the argument a best-of-three round already rests on, met one level
+/// up. What the two directions are for is saying how far apart they were, which
+/// is what a `disagreed` column prints: a sweep whose arms agree is one whose
+/// ranking is about the arms, and one whose arms do not is a sweep that has to
+/// say so.
+pub fn better(
+    up: &[std::time::Duration],
+    down: &[std::time::Duration],
+) -> Vec<std::time::Duration> {
+    up.iter()
+        .zip(down)
+        .map(|(up, down)| *up.min(down))
+        .collect()
+}
+
 /// Every arm of a sweep, measured up the list and then down it.
 ///
 /// **One order cannot separate a turn the kernel has from one the clock drew.**
