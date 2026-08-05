@@ -23,18 +23,18 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **682 of the 755 tests, no
-checkpoint, twelve seconds.** Everything a fixture can settle is here — the
+`just test` is the one to run while iterating: **692 of the 766 tests, no
+checkpoint, thirteen seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
 38 that need weights report a skip and pass. It runs through libtest, which puts
-a crate's tests in one process: opening a Metal device costs a second, so the 246
-kernel tests are 11.9 s sharing a process and minutes with one each. Nothing in this
+a crate's tests in one process: opening a Metal device costs a second, so the 256
+kernel tests are 13.6 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 755 against a
-real checkpoint, thirteen minutes.** The 682 the gated tier runs and the 73 the
-timing tier does. The 53 gated tests — the 38 above and fifteen
+`just test-full` is what has to pass at the ends of a series: **all 766 against a
+real checkpoint, fifteen minutes.** The 692 the gated tier runs and the 74 the
+timing tier does. The 54 gated tests — the 38 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
@@ -44,7 +44,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the seventy-three tests whose result *is* a number — a duration
+`just test-timing` is the seventy-four tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -138,7 +138,7 @@ GB of packed bytes the GPU path indexes into and never decodes at all. The rest
 is every layer's own projections — five for attention, three more on each of the
 two dense layers — which are 9 GB of float32 that *every* token reads all of.
 
-### Two numerics behind one flag, and which of them is checkable
+### Three numerics behind one flag, and which of them is checkable
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' \
         --numerics production
@@ -154,16 +154,30 @@ multiply-accumulate sums its `k` dimension in an order the instruction defines
 and this side does not choose, so **any kernel built on one is ruled out before
 it is written**. The flag is what lets it be written and measured anyway.
 
-**Neither of the two is "more accurate", and saying so is not a hedge.** Both
-sum the same exact products of the same exactly-decoded codes — MXFP4's sixteen
-values are one table and a group scale is a power of two, so no product either
-path forms is rounded at all. What separates them is the order the sums are
-taken in and nothing else, and a matrix instruction's order is not the worse of
-the two; on a long reduction it is usually a little better. What the reference
-has that the production path cannot have is an **oracle**: an order this side
-picked, that `--backend cpu` reproduces exactly, so that a wrong token has a
-witness. That is the whole of the difference and it is a difference about
+**Neither `reference` nor `production` is "more accurate", and saying so is not
+a hedge.** Both sum the same exact products of the same exactly-decoded codes —
+MXFP4's sixteen values are one table and a group scale is a power of two, so no
+product either path forms is rounded at all. What separates them is the order the
+sums are taken in and nothing else, and a matrix instruction's order is not the
+worse of the two; on a long reduction it is usually a little better. What the
+reference has that the production path cannot have is an **oracle**: an order
+this side picked, that `--backend cpu` reproduces exactly, so that a wrong token
+has a witness. That is the whole of the difference and it is a difference about
 checkability rather than about precision.
+
+**`rounded` is the third word and it is the one that does give something up.**
+It stages the packed matmul's two tiles as 16-bit floats, so `element × scale`
+carries eleven bits of significand where every other path here carries
+twenty-four: the sentence above stops being true of it, which is exactly why it
+is a third word rather than a faster `production`. **Nothing about what
+`production` guarantees moved to make room for it** — the two words behind the
+flag compile the same two entries at the same block shape through the same
+predicates, and `the_production_source_stages_and_multiplies_in_full_width` is
+where that is held. It is not a default, it is not what anything in this file is
+measured under unless the row says so, and what it is worth is under "The operand
+door, opened as a third word": **6.7 to 7.3% of a prefill's device time, and 384
+of 384 sampled argmaxes unmoved.** Whether that trade is one this engine should
+make is not a question this file answers.
 
 **So the chain a disagreement is bisected through gains a link.** It was
 CPU → Metal, one arrow, settled by rerunning a command with `--backend cpu`. It
@@ -189,9 +203,11 @@ flag existed. `--numerics` on `--backend cpu` is refused rather than dropped: th
 CPU path has one arithmetic, and a run that took the word and ignored it would
 print a command line saying something other than what it did.
 
-    just diverge                                 # the corpus through both, and where they part
-    just bench-numerics prefill --tokens 2048     # the two paired, alternating, out of one build
-    INKLINGRS_NUMERICS=production just test-timing  # the per-kernel table on the other side
+    just diverge                                     # the corpus through the reference and production
+    just diverge --against rounded                   # and through the reference and the operand word
+    just bench-numerics reference production prefill --tokens 2048
+    just bench-numerics production rounded  prefill --tokens 2048
+    INKLINGRS_NUMERICS=production just test-timing   # the per-kernel table on the other side
 
 **What is behind the flag today is the packed matmul's two tiled entries and the
 attention step's block of query rows**, which are the two kernels the profile's
@@ -1187,6 +1203,386 @@ and 769 tokens cost 2.04, 5.45 and 10.1 s before the budget replaced the row
 count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
+
+## The operand door, opened as a third word, and prefill's ordering
+
+**The door T3 left open is now two numbers, and the first is that no token
+moves.** 16-bit operands are built here as a **third word of `--numerics`**
+rather than as a change to what `production` does, and A7's divergence corpus
+through them reads **384 of 384 sampled argmaxes identical, no prompt parted**.
+Every reordering change in this repo has come back 384/384; operand rounding is a
+much larger perturbation and comes back 384/384 too.
+
+**The second is that it is worth 6.7 to 7.3% of a prefill's device time**, paired
+and alternating at 2048, 4096 and 8192, every pair the same way and the ranges
+apart at all three, against a null pair that read 0.0%. That is eight times what
+both of T3's levers returned between them, and it takes the routed bank from
+**62.5% of the instruction ceiling to 66.7%** — the largest move on this kernel
+since the block itself.
+
+**It is not a default and it is not a recommendation.** What it costs is the
+sentence `--numerics production` is documented on, and that sentence is untouched:
+`reference` is still bit-exact and still the default, `production` still forms
+exact products and still differs from the reference by summation order alone.
+**The decision is the owner's and this milestone does not take it.**
+
+**And prefill's ordering turns out to be a question the tree had already
+answered.** D4's concurrent encoder is not gated on a shape — it has reached
+every prefill since the day it landed — and what it finds there is a sequence as
+narrow as a decode step's: **501 of a prefill's 665 groups are one dispatch**,
+against 546 of a decode step's 670. It is worth **1.4% of a 2048-token prefill's
+device time and nothing measurable at 8192**. That closes it, with the
+distribution rather than with an argument.
+
+### The divergence, which is what decides it
+
+**Reported first, because a speed figure read before it would be an argument
+rather than a measurement.**
+
+    just diverge                     # the reference against production
+    just diverge --against rounded   # the reference against the operand word
+
+    six prompts, six distributions, 64 to 2123 tokens, 64 argmaxes each
+    the reference against production      384 of 384 agreed, no prompt parted
+    the reference against rounded         384 of 384 agreed, no prompt parted
+
+**And the run says it reached the arithmetic rather than saying the harness
+works.** D5's dispatch-list differential holds what each arm *dispatched* against
+the list each kernel keeps of what it put behind the flag. Under `rounded` the
+corpus selected `mma_attention`, `mma_matmul_grouped` and `mma_matmul_rows` at a
+prefill and **nothing at a decode step** — the same three `production` selects,
+which is what says the two words are the same entries at the same shapes rather
+than two different coverings of the model.
+
+**The recorded continuation is unmoved under all three words.**
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` off the device under `reference`,
+`production` and `rounded` alike, and off `--backend cpu`.
+
+**This was the likely outcome, and that is a reason to have measured it rather
+than a reason to have skipped it.** S3 put the narrowest first-to-second logit
+margin in the corpus at 1.56e-2, about 75× this drift, so the arithmetic said the
+tokens should hold. The arithmetic in this file has also said the matmul was
+bandwidth-bound, that two ablation arms bounded two levers, and that a barrier's
+fixed cost predicted a *slower* step. **384 agreeing argmaxes is a measurement
+and 75× is a hope.**
+
+### What the word costs the answer, and the shape of it
+
+Against an f64 accumulation of the same products, at the reductions
+`a_block_answers_the_reference_tile_where_neither_extent_divides_it` uses:
+
+    a reduction      the reference       the block  rounded operands
+    32                      8.3e-8          1.3e-7            1.8e-4
+    128                     1.4e-7          3.5e-7            1.7e-4
+    512                     8.4e-8          6.6e-7            1.5e-4
+    2048                    1.1e-7          1.5e-6            2.1e-4
+    4096                    1.0e-7          1.6e-6            1.8e-4
+
+**Two decades above the block's own, and the size is the smaller half of it.**
+The block's drift *grows* with the reduction — twelvefold across these five —
+because a fragment accumulator carries the whole reduction as one running sum. A
+drift that is flat is not a chain at all: it is the operand, arriving already
+rounded and staying that far off however few products are summed. **That shape is
+what separates "this word is less accurate" from "this word has a bug"**, and it
+is asserted rather than only printed.
+`what_the_operand_word_costs_the_answer_is_flat_in_the_reduction` runs in the tier
+that runs after every edit, and it fails both if the drift lands *inside* the
+block's own bound — a word whose staging never narrowed, which would compile,
+dispatch, agree with everything and not be what it says it is — and if it grows
+like a chain.
+
+### What the operand width is worth
+
+**The width reaches the traffic under one fragment read and not the other**,
+which is T3's finding and is why the word ships behind the read T3 shipped. A
+lane pulling the two elements it owns pulls four bytes at half where it pulls
+eight at float; a `simdgroup_load` is one instruction over the whole fragment
+either way. Each column is against the block compiled with its own read, warm and
+swept both ways, and the padding is swept because
+[`MMA_STAGED_PADDING`]'s bank argument is derived against a *four*-byte staged
+element and does not separate these three at two:
+
+    a fragment read through simdgroup_load
+    at                              the block   rounded at 4      at 8     at 12
+    2048   q_proj, tiled               3.79ms            +9%       +9%       +5%
+    2048   a routed bank, grouped     16.79ms            +8%       +9%       +5%
+    4096   q_proj, tiled               7.56ms            +9%       +9%       +5%
+    4096   a routed bank, grouped     26.37ms            +8%       +8%       +4%
+    8192   q_proj, tiled              15.08ms            +9%       +9%       +5%
+    8192   a routed bank, grouped     52.48ms            +8%       +8%       +5%
+
+    a fragment read per lane, which is the shipped one
+    at                              the block   rounded at 4      at 8     at 12
+    2048   q_proj, tiled               3.76ms            -2%       -2%       -8%
+    2048   a routed bank, grouped     16.63ms            +0%       +1%       -7%
+    4096   q_proj, tiled               7.50ms            -1%       -1%       -8%
+    4096   a routed bank, grouped     26.14ms            -0%       -1%       -6%
+    8192   q_proj, tiled              14.97ms            -1%       -1%       -8%
+    8192   a routed bank, grouped     52.16ms            -1%       -1%       -6%
+
+**12 is what ships**, and it is set from that sweep rather than from the bank
+arithmetic — 4, 8 and 12 all put a fragment's eight rows on eight distinct banks
+at two bytes, so the argument that set 4 does not choose between them and the
+clock does.
+
+**And on a whole prefill**, one build under the two words, seven alternating
+pairs each, the order flipped every pair:
+
+    tokens         device          wall        of the instruction, routed bank
+     2048   3231.8 -> 2997.0   5558.1 -> 5229.7      62% -> 66%   (49.0 -> 52.7)
+     4096   5995.5 -> 5583.1   9050.3 -> 8526.2      62% -> 66%   (62.2 -> 66.5)
+     8192  11715.5 -> 10934.6 16735.7 -> 15958.7     62% -> 67%   (62.5 -> 66.7)
+
+    device  -7.3%  -6.9%  -6.7%    7 of 7 apart at every length
+    wall    -5.9%  -5.8%  -4.6%    7 of 7 apart at every length
+
+**Medians and means agree to a tenth of a percent** — device medians 3231.7 →
+2996.6, 5995.3 → 5582.5 and 11715.4 → 10932.0, which is −7.3, −6.9 and −6.7%
+again. **The null pair was run first**, same word both arms, seven pairs:
+**+0.6% on the wall and 0.0% on the device**, ranges across, no claim on either.
+
+### What it is against the ceiling
+
+The instruction issues where it issued — the four register arms are within a
+tenth of the sitting T2 and T3 read them on:
+
+    what issues                            device            rate
+    the matrix instruction, four held     16.55ms    25.3 TFLOP/s
+    the same chain held once               4.73ms    22.2 TFLOP/s
+    the same four on 16-bit operands      15.86ms    26.4 TFLOP/s
+    scalar fused multiply-adds             4.55ms    23.0 TFLOP/s
+
+    a prefill of                production   rounded    of the instruction
+     2048  q_proj, tiled            3.76ms    3.46ms      72.1% → 78.4%
+     2048  a routed bank           16.62ms   15.44ms      49.0% → 52.7%
+     4096  q_proj, tiled            7.50ms    6.92ms      72.3% → 78.4%
+     4096  a routed bank           26.15ms   24.46ms      62.2% → 66.5%
+     8192  q_proj, tiled           14.98ms   13.81ms      72.4% → 78.6%
+     8192  a routed bank           52.10ms   48.80ms      62.5% → 66.7%
+
+**824.6 GFLOP at 52.10 ms against the same at 48.80** — 15.83 TFLOP/s against
+16.90, which is **62.5% of the instruction against 66.7%.** T3 stopped at 62.4%
+and T2 at 61.9%; the two levers those milestones were sent for moved it half a
+point between them and this moves it four.
+
+**What it does not do is move the ceiling.** The instruction's own 16-bit row is
+26.4 TFLOP/s against 25.3 — four percent — so what this buys is not issue rate.
+It is the threadgroup traffic a lane's own read pulls, which is the term the
+per-lane read left standing and the one T2's hoisting arm priced at 6%.
+
+### What the new entries cost to compile
+
+**No entry was added, which is the first thing to say and is a fact rather than a
+measurement.** `rounded` compiles the same two production entries a model load
+builds, from a source that differs by a typedef and a stride:
+
+    a block of                                            entries  compiling  the source
+    32 codes a step, the elements a lane owns, float            2    1955 us    56.0 KiB
+    64 codes a step, the elements a lane owns, float            2    1993 us    56.0 KiB
+    32 codes a step, through simdgroup_load, float              2    1906 us    55.5 KiB
+    32 codes a step, the elements a lane owns, half             2    1964 us    56.0 KiB
+
+**The operand word is 9 µs over the shipped block on a two-millisecond compile,
+out of a source the same size to a tenth of a kilobyte.** An earlier sitting read
+it 30 µs *under*; both are the same answer, which is that a typedef is not a
+build cost. D1 found that merely reordering which entries are created first is
+worth 2.4% of a 2048-token prefill, so this is the row that had to be checked,
+and what it says is that the word costs nothing to build. The clock is a warm
+compile and says so — every row is timed behind one shipped build.
+
+What this milestone did add to the *shipped* block's own compile is 42 µs and
+0.9 KiB, against T3's 1913 µs and 55.1 KiB: the typedef and the three casts. That
+is 0.0008% of a 5.6-second prefill, paid once at load.
+
+## Prefill's ordering, which the encoder already had
+
+**D4's mechanism is in the encoder and the encoder is not gated on a shape.**
+`Batch` opens every pass `MTLDispatchTypeConcurrent` and puts a barrier in front
+of any dispatch touching something the open group wrote, deriving the answer from
+each kernel's own Metal source. Nothing about that asks what is being run. **So a
+prefill has had it since the day it landed, and what was missing was the
+reading.**
+
+T2's limiter table puts barriers at 10% of the prefill matmul and a prefill
+issues over a thousand dispatches with far more independent work than a one-row
+step, where 546 of 670 groups were singletons. **That expectation is wrong, and
+the width distribution is what says so rather than a mean:**
+
+    a prefill of  dispatches  passes  groups  barriers  a group  widest  of them
+        97               996      21     668       647     1.49       4     65%
+      2048               993      43     665       622     1.49       4     63%
+      8192               993      43     665       622     1.49       4     63%
+
+    504 of 668 groups are one dispatch at 97, 501 of 665 at 2048 and at 8192,
+    and the rest divide 42x2, 80x3, 42x4
+
+    a decode step at  dispatches  passes  groups  barriers  a group  widest  of them
+        97 / 2048 / 8192       918      14     670       656     1.37       4     71%
+
+    546 of 670 groups are one dispatch, and the rest divide 42x2, 40x3, 42x4
+
+**They are the same sequence with different shapes in it.** A prefill and a
+decode step both walk 42 layers of the same dependency graph — a norm feeds four
+projections, a convolution feeds a norm, an activation feeds a `down` — so a
+prefill's extra 75 dispatches buy it 40 more three-wide groups and nothing else.
+**75% of a prefill's groups are one dispatch against a decode step's 81%**, and
+63% of its dispatches still sit behind a barrier.
+
+**And what it is worth there is 1.4%, decaying to nothing.** D4's own two refs,
+paired under `--numerics production`, seven alternating pairs:
+
+    a prefill of   serial pass    concurrent, barriered    change
+     2048            3286.3 ms          3240.3 ms         -1.4%   7 of 7 apart
+     8192           11798.9 ms         11762.2 ms         -0.3%   ranges across
+
+Against a decode step, where D4 measured the same lever at **16.204 → 15.200 ms,
+−6.2%**. The two readings have one explanation and it is the shape of the
+dispatches rather than the shape of the graph: a decode step's dispatches are
+microseconds and leave the machine idle, so overlapping two of them hides a
+launch; a prefill's are milliseconds and already fill it, so overlapping two of
+them hides nothing. **The concurrency a prefill has is the same concurrency, and
+there is less to buy with it.**
+
+**So this closes.** The mechanism generalises, it was already generalised, it is
+worth about a percent at the opening a coding session has and nothing at a long
+one, and a prefill's groups are as narrow as a decode step's. The
+derived-versus-encoded barrier count is now held at prefill shape as well as at
+decode shape, out of one helper — a missing barrier is a race that is correct
+most of the time, and that count is the only thing that catches it.
+
+### What did not move
+
+**No token changed and no default changed.** The flag stays defaulted to
+`reference`, the reference path is byte-identical — nothing behind the flag is
+compiled under it — and the recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what all three words and both
+backends write.
+
+**`production` is where T3 left it, to the digit.** Paired against the commit
+this milestone opened at, both arms under `--numerics production`, seven pairs at
+2048 tokens: device **3232.2 ms against 3231.9**, ranges across, no claim; the
+wall reads +1.2% with the ranges across and 5 of 7, which is this instrument's
+own 0.6% null and not a change. **A typedef that reads `float` is a typedef that
+compiles to what was there before**, and the source-level case is what says it
+rather than the clock.
+
+**A decode step is untouched, which it has to be**: the block is not dispatched
+at any shape a decode step has. Seven pairs at the recorded prompt's own context:
+**16.315 ms against 16.325**, device **15.224 against 15.223**, ranges across, no
+claim. Five pairs at a 2048-key context: device **20.082 against 20.029**, ranges
+across, no claim.
+
+**And the tiers pass at the ends of this series**: 692 hermetic, 692 gated, 74
+timing, nothing failed. One of the 74 did fail on the first run of it and is the
+error this milestone's own review missed — three ablation arms in
+`what_a_prefills_blocked_matmul_is_bound_by` match the block's source by hand and
+two of them matched lines the operand width rewrote. `instead_of` refused them
+rather than reporting the shipped kernel under another name, which is what it is
+for. The limiter table it prints is where T2 left it: the barriers at 91 and 92%,
+the hoisted loads at 100%, the weight at 97 and 98%.
+
+**Speculation is where it was.** `bench sweep` on the packed heads, one sitting:
+
+    k    a token   tokens/s   speedup   accepted
+    0    16.271ms     61.5      1.000
+    1    15.622ms     64.0      1.042   84.85%
+    2    15.383ms     65.0      1.058   86.96 78.26%
+    3    15.207ms     65.8      1.070   85.00 65.00 55.00%
+    4    18.346ms     54.5      0.887   82.35 64.71 52.94 47.06%
+
+**`k = 3` is still the best depth and every acceptance figure is the one this
+file records**, at 1.829, 2.560, 2.909 and 3.368 tokens a round.
+
+**A session is where K1 left it, at both openings**, three pairs each, ours under
+`--numerics production` with both engines keeping their cache:
+
+    opening        ours kept   mlx-vlm kept   behind
+    2048            18.03 s       14.35 s     1.26×
+    8192            31.83 s       25.44 s     1.25×
+
+    the per-turn bookkeeping inside it
+    2048             1.045 ms     31.228 ms
+    8192             1.098 ms     64.023 ms
+
+**K1's kept cache is flat in the context where theirs is linear** — about a
+millisecond a turn against 31 and 64.
+
+**Against the reference, one sitting**, on the packed heads under
+`--numerics production`, and both engines wrote the same first eight tokens at
+every one of the four prompts:
+
+    prompt × answer   ours p50   mlx-vlm p50   ahead on p50
+        97 × 128       16.37ms       23.06ms          1.41×
+       385 × 128       17.51ms       23.32ms          1.33×
+       769 × 128       18.43ms       23.74ms          1.29×
+        97 × 512       17.50ms       23.49ms          1.34×
+
+Speculating two deep, the same sitting: **14.45 ms a token at 97 × 128 and 14.36
+at 97 × 512**, against the reference's 23.06 and 23.49 — 1.60× and 1.64×.
+
+**Our own column there is the standalone reading and the other engine's is the
+paired one, and that is a fact about the instrument this milestone found.** Under
+`just bench-engines`'s alternation the two *long-prompt* rows read **24.40 and
+24.89 ms** where a run of the same binary alone reads 17.51 and 18.43 — while the
+two 97-token rows read 16.43 and 17.11 against 16.37 and 17.50, which is nothing.
+So it is not this engine getting slower: it is the other engine's residency
+between two of our arms, and it reaches only the runs whose prompt is long enough
+to touch a lot of the checkpoint. **What says it is not this milestone** is a
+paired decode step at a 2048-key context across the commit this opened at: device
+**20.082 ms against 20.029**, ranges across, no claim, five pairs. The
+cross-engine rows above are quoted standalone and labelled; `bench-engines`'s
+alternation is what a *ratio* wants and it is contaminating an absolute.
+
+**And what the operand word would be worth to a session, which is the shape a
+user feels**, three pairs at the 2048 opening, both arms keeping:
+**18.167 s under `production` against 17.560 under `rounded`, −3.3%, 3 of 3 with
+the ranges apart** — the whole of it in the opening prefill, which is 7.67 s
+against 7.40. That would put the 2048 opening at about 1.22× behind rather than
+1.26×.
+
+### The floor this stops at, and what is under it
+
+**The instruction issues at 25.3 TFLOP/s and that is where it issued.** The
+routed bank at 8192 runs 824.6 GFLOP: **52.10 ms and 15.83 TFLOP/s under
+`production`, 48.80 and 16.90 under `rounded` — 62.5% of the instruction against
+66.7%.**
+
+What that leaves under the 33%, re-read from T2's terms: the barriers are 10%,
+reachable by evening out or hiding what a threadgroup stages rather than by
+having fewer of them, and a double buffer is the candidate that leaves open; the
+fragment loads are 6%, reachable only by holding a fragment across steps, which
+T2 measured at 101% on both shapes; the three byte-count terms are 8%. **The
+operand width was the largest priced thing left on this kernel and it is now
+measured and spent.**
+
+**What is not left is prefill's ordering**, which is measured at 1.4% and already
+taken, and **what is not left is a decode step**, which D5 closed at 71% of its
+own bandwidth floor.
+
+**What this does not license is a claim that the engine is finished.** It is
+1.25× behind at the 8192 opening and 1.26× at 2048 under `production`, and about
+1.22× at 2048 under a word nobody has adopted. The gap is real and the next thing
+after it is continuous batching, which nothing here starts.
+
+### What this milestone leaves the owner
+
+**One decision, with both halves of it measured.**
+
+- **What it costs**: a product that used to be exact carries eleven bits of
+  significand instead of twenty-four; the drift is 1.5 to 2.1e-4, flat in the
+  reduction, two decades above the block's own; and the sentence this file's
+  numerics section is written on stops being true of one of its three words.
+  There is no oracle on that side and there cannot be one.
+- **What it buys**: 6.7 to 7.3% of a prefill's device time, 4.6 to 5.9% of its
+  wall, 3.3% of a coding session's opening turn, and four points of the
+  instruction ceiling.
+- **What it does not cost**: any token, over 384 sampled argmaxes across six
+  prompts and six distributions; the recorded continuation; a decode step; a
+  compiled entry; 30 µs of compile.
+
+**Nothing here makes it a default and nothing here recommends one.** What the
+flag's third word is *for* is that the question can now be asked with numbers on
+both sides of it.
 
 ## The two levers between 62% and 74%
 
