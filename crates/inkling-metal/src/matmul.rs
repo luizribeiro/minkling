@@ -8364,6 +8364,30 @@ kernel void mma_lane_probe___T__(
             }
         }
 
+        /// The same call with its rows naming the experts `chosen` names rather
+        /// than the even runs [`Blocked::of`] lays them out in.
+        ///
+        /// **The run lengths are the one thing about a grouped call the block's
+        /// own cost turns on and the one thing the constructor above cannot
+        /// vary.** Everything else is held: the same weights, the same rows, the
+        /// same 256 experts and the same multiply-adds, so an arm that moves only
+        /// this is an arm about where the run boundaries land.
+        fn named(mut self, chosen: Vec<u32>) -> Self {
+            assert_eq!(
+                chosen.len(),
+                self.rows,
+                "a row apiece, or the call and its selection are two different shapes"
+            );
+            assert!(
+                chosen
+                    .iter()
+                    .all(|&expert| (expert as usize) < self.experts),
+                "every row names an expert this bank holds"
+            );
+            self.chosen = chosen;
+            self
+        }
+
         /// This call encoded against `bank`, which is the one place the two
         /// layouts differ and so the one place they are written.
         fn encode(
@@ -8432,6 +8456,37 @@ kernel void mma_lane_probe___T__(
             for _ in 0..ROUNDS {
                 best = best.min(crate::testing::device_time(device, CALLS, |batch| {
                     self.encode(batch, device, bank, &mut x, grouping);
+                }));
+            }
+            best
+        }
+
+        /// What the sort dispatched beside a grouped call costs, which is the
+        /// same batch with the multiply left out of it.
+        ///
+        /// **A grouped call is two dispatches and every table above charges the
+        /// block for both.** [`ExpertGrouping`]'s own is a tenth of a
+        /// 2048-token routed bank and a seventh of an 8192-token one — it grows
+        /// with the rows and the block grows faster — so a column read off the
+        /// pair understates the block by a share that is itself a function of
+        /// the length, which is the one thing a table about how a length behaves
+        /// cannot afford. [`how_often_a_long_prefill_reads_one_experts_weight`]
+        /// takes the same difference for the same reason.
+        ///
+        /// Ungrouped shapes dispatch no sort, so for them this is zero.
+        fn sorts(&self, device: &Device, grouping: &ExpertGrouping) -> Duration {
+            if !self.grouped {
+                return Duration::ZERO;
+            }
+            const CALLS: usize = 4;
+            const ROUNDS: usize = 3;
+            let mut best = Duration::MAX;
+            for _ in 0..ROUNDS {
+                best = best.min(crate::testing::device_time(device, CALLS, |batch| {
+                    let mut picked = device.buffer(&self.chosen).expect("the selection uploads");
+                    grouping
+                        .encode(batch, &mut picked, self.experts)
+                        .expect("the grouping encodes");
                 }));
             }
             best
@@ -9640,6 +9695,274 @@ kernel void mma_lane_probe___T__(
                     }
                 );
             }
+        }
+    }
+
+    /// How many blocks a grouped call of these rows is cut into, and how many
+    /// times [`MMA`]'s pass loop walks one.
+    ///
+    /// **The kernel runs its whole reduction once per distinct expert a block's
+    /// rows name.** A block whose rows all name one expert is one walk; a block a
+    /// run boundary falls inside is two, and every code of the reduction is read,
+    /// decoded and multiplied a second time for it. The blocks are fixed by the
+    /// call's shape and the passes are fixed by where the boundaries land, so the
+    /// ratio between them is the work the shape does not ask for.
+    fn blocks_and_passes(chosen: &[u32], rows_a_block: usize) -> (usize, usize) {
+        let mut sorted = chosen.to_vec();
+        sorted.sort_unstable();
+        (
+            sorted.len().div_ceil(rows_a_block),
+            sorted
+                .chunks(rows_a_block)
+                .map(|block| {
+                    let mut named: Vec<u32> = block.to_vec();
+                    named.dedup();
+                    named.len()
+                })
+                .sum(),
+        )
+    }
+
+    /// `counts[e]` rows naming expert `e`, which is a run-length layout written
+    /// out as the selection a call is dispatched with.
+    fn named_by(counts: &[usize]) -> Vec<u32> {
+        counts
+            .iter()
+            .enumerate()
+            .flat_map(|(expert, &count)| std::iter::repeat_n(expert as u32, count))
+            .collect()
+    }
+
+    /// The three ways `rows` can be spread over `experts` at one mean run
+    /// length, which differ in where the run boundaries land against a block of
+    /// `rows_a_block` and in nothing else.
+    ///
+    /// **Same rows, same experts, same multiply-adds.** Every arm names 256
+    /// experts over the same number of rows of the same weights, so what
+    /// separates them is the pass count [`blocks_and_passes`] reports and the
+    /// answer each is held to is its own — a row's result does not depend on
+    /// which block it lands in.
+    fn each_way_runs_can_land(
+        rows: usize,
+        experts: usize,
+        rows_a_block: usize,
+    ) -> Vec<(&'static str, Vec<u32>)> {
+        let mean = rows / experts;
+        let whole = rows / rows_a_block;
+        let cut = |at: usize| rows_a_block * (whole * at / experts);
+        // Whole blocks apiece, spread as evenly as a whole number of them can
+        // be: no boundary falls inside a block, so no block straddles and the
+        // pass count is the block count exactly.
+        let aligned: Vec<usize> = (0..experts).map(|at| cut(at + 1) - cut(at)).collect();
+        // A boundary a third of the way into a block, then two thirds, then
+        // back — seven is coprime with the block's height, so the offsets walk
+        // every alignment rather than alternating between two of them. That is
+        // the shape a router's own counts have and the shape the even runs
+        // above are the one length in eight that does not.
+        let jitter = |at: usize| (at * 7 % rows_a_block) as isize - (rows_a_block / 2) as isize;
+        let at = |expert: usize| match expert {
+            0 => 0,
+            expert if expert == experts => rows,
+            expert => ((rows * expert / experts) as isize + jitter(expert)) as usize,
+        };
+        let ragged: Vec<usize> = (0..experts).map(|e| at(e + 1) - at(e)).collect();
+        assert!(
+            mean > rows_a_block,
+            "a mean run of {mean} rows is under the {rows_a_block} a block holds, and a call \
+             whose runs are that short does not reach the block at all"
+        );
+        vec![
+            (
+                "as the routing gives them",
+                (0..rows).map(|row| (row * experts / rows) as u32).collect(),
+            ),
+            (
+                "the same rows, runs cut to whole blocks",
+                named_by(&aligned),
+            ),
+            ("the same rows, runs ragged", named_by(&ragged)),
+        ]
+    }
+
+    /// The shipped block with its pass loop stopped after the first pass, which
+    /// answers zeros for every row that named some other expert and prices the
+    /// rest of them.
+    ///
+    /// **A bound rather than a kernel.** What it removes is exactly the walks a
+    /// straddled block runs for the experts that are not its first, so the
+    /// difference between it and the shipped block is the whole of the term the
+    /// table above divides — measured rather than derived from the pass count.
+    ///
+    /// Every barrier below it is still reached by every thread: `pass` is
+    /// threadgroup-uniform and so is the comparison, so no thread takes a branch
+    /// another does not.
+    fn without_the_passes_after_the_first(shipped: &str) -> String {
+        crate::testing::instead_of(
+            shipped,
+            "        if (!opens[pass]) {",
+            "        if (!opens[pass] || pass > 0) {",
+        )
+    }
+
+    /// **Where a short prompt's routed bank loses the points a long one keeps**,
+    /// which is the question this milestone opened on: the block reads 49.0% of
+    /// the instruction ceiling at 2048 tokens and 62.2 and 62.5% at 4096 and
+    /// 8192, and nothing had asked why.
+    ///
+    /// **The answer is not the prompt.** Every arm here is the same kernel over
+    /// the same rows of the same weights, and what moves between them is where
+    /// the 255 run boundaries land against a block 32 rows tall. A routed bank at
+    /// 2048 tokens gives an expert 48 rows, which is a block and a half — so
+    /// every other boundary falls inside a block and that block runs the whole
+    /// reduction twice. At 4096 and 8192 an expert gets 96 and 192, which are
+    /// three blocks and six exactly, and *the fixture's own even runs put every
+    /// boundary on a block edge*. **The plateau is the divisibility of the
+    /// fixture and not a property of the length**, which the ragged arm is what
+    /// says: it holds the mean run where the routing puts it and lands the
+    /// boundaries where a router's counts land them, and the points come off at
+    /// every length.
+    ///
+    /// The bound arm is the same reading taken the other way — the pass loop
+    /// stopped after its first pass, which answers wrongly and prices what the
+    /// later ones cost.
+    ///
+    /// Warm and swept both ways, for the reason every table on this kernel is.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn where_a_grouped_calls_run_boundaries_land_against_a_block() {
+        let Some(device) = device() else { return };
+
+        let shipped =
+            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
+        let bound = PackedMatmul::blocked_from_source(
+            &device,
+            &without_the_passes_after_the_first(&source_blocked(
+                Numerics::Production,
+                Block::SHIPPED,
+            )),
+            Block::SHIPPED,
+        )
+        .expect("the bound arm compiles");
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        let rows_a_block = Block::SHIPPED.rows;
+
+        let (routed, ..) = BOUND_SHAPES[1];
+        for tokens in BLOCKED_LENGTHS {
+            let whole = Blocked::at(tokens, BOUND_SHAPES[1]);
+            let ways = each_way_runs_can_land(whole.rows, whole.experts, rows_a_block);
+            let arms: Vec<(String, Blocked, &PackedMatmul)> = ways
+                .iter()
+                .map(|(what, chosen)| {
+                    (
+                        (*what).to_string(),
+                        Blocked::at(tokens, BOUND_SHAPES[1]).named(chosen.clone()),
+                        &shipped,
+                    )
+                })
+                .chain([(
+                    "as the routing gives them, one pass a block".to_string(),
+                    Blocked::at(tokens, BOUND_SHAPES[1]),
+                    &bound,
+                )])
+                .collect();
+
+            // One bank for the whole column: the codes are 1.07 GB and every arm
+            // reads the same ones, so an upload between two arms would put them
+            // on two machines.
+            let bank = whole.upload(&device, &shipped);
+            let bound_bank = whole.upload(&device, &bound);
+            crate::testing::warmed(|| {
+                whole.costs_on(&device, &bank, &grouping);
+            });
+            let listed: Vec<usize> = (0..arms.len()).collect();
+            let (up, down) = crate::testing::both_ways(&listed, |at| {
+                let (_, shape, matmul) = &arms[at];
+                let held = match std::ptr::eq(*matmul, &shipped) {
+                    true => &bank,
+                    false => &bound_bank,
+                };
+                shape.costs_on(&device, held, &grouping)
+            });
+
+            let sorts = whole.sorts(&device, &grouping);
+            eprintln!("\n  a routed bank at {tokens} tokens — {routed}");
+            eprintln!(
+                "  {:<46}{:>9}{:>9}{:>10}{:>15}{:>12}{:>9}",
+                "the rows laid out",
+                "blocks",
+                "passes",
+                "a block",
+                "with the sort",
+                "the block",
+                "of it"
+            );
+            let taken = |at: usize| up[at].max(down[at]);
+            let alone = |at: usize| taken(at).saturating_sub(sorts);
+            for (at, (what, shape, _)) in arms.iter().enumerate() {
+                let (blocks, passes) = blocks_and_passes(&shape.chosen, rows_a_block);
+                let passes = match at + 1 == arms.len() {
+                    true => blocks,
+                    false => passes,
+                };
+                eprintln!(
+                    "  {what:<46}{blocks:>9}{passes:>9}{:>10}{:>15}{:>12}{:>9}",
+                    format!("{:.2}", passes as f64 / blocks as f64),
+                    format!("{:.2}ms", 1e3 * taken(at).as_secs_f64()),
+                    format!("{:.2}ms", 1e3 * alone(at).as_secs_f64()),
+                    format!(
+                        "{:.0}%",
+                        1e2 * alone(at).as_secs_f64() / alone(0).as_secs_f64()
+                    ),
+                );
+            }
+            eprintln!(
+                "  {:<46}{:>9}{:>9}{:>10}{:>15}",
+                "the sort beside them",
+                "",
+                "",
+                "",
+                format!("{:.2}ms", 1e3 * sorts.as_secs_f64()),
+            );
+
+            // **The claim is that the clock follows the passes and not the
+            // prompt**, and this is where it is held rather than read off the
+            // table. The two arms compared are the aligned one, which runs one
+            // pass a block by construction, and the ragged one, which runs the
+            // passes a router's own counts produce — so the pass ratio between
+            // them is a number this side computed before the clock ran and the
+            // time ratio is what the device answered.
+            //
+            // **Held from both sides.** A band around the prediction is what an
+            // extra pass costing what a first one costs would land inside; the
+            // reading that must not pass is a clock that moved by much less than
+            // the passes, which is the shape "the term is something else" has and
+            // which an upper bound alone would call a success.
+            let aligned = blocks_and_passes(&arms[1].1.chosen, rows_a_block);
+            let ragged = blocks_and_passes(&arms[2].1.chosen, rows_a_block);
+            assert_eq!(
+                aligned.0, aligned.1,
+                "the aligned arm at {tokens} tokens straddled a block, so the denominator below \
+                 is not one pass a block"
+            );
+            assert!(
+                ragged.1 > ragged.0,
+                "the ragged arm at {tokens} tokens straddled no block, so it is not the arm this \
+                 table needs: {ragged:?}"
+            );
+            let predicted = ragged.1 as f64 / aligned.1 as f64 - 1.0;
+            let measured = alone(2).as_secs_f64() / alone(1).as_secs_f64() - 1.0;
+            assert!(
+                (0.5..1.25).contains(&(measured / predicted)),
+                "at {tokens} tokens the ragged layout ran {:.2} passes a block against the \
+                 aligned layout's 1.00 and cost {:.2}x it, where the passes predict {:.2}x — an \
+                 extra pass came to {:.2} of a first one, and outside this band what this \
+                 kernel's cost follows is not its pass count and the diagnosis is about the \
+                 wrong term",
+                ragged.1 as f64 / ragged.0 as f64,
+                1.0 + measured,
+                1.0 + predicted,
+                measured / predicted,
+            );
         }
     }
 
