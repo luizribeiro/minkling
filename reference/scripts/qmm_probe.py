@@ -19,6 +19,18 @@ The `sorted` column is what decides which kernel a gather reaches:
 reached only when the indices are declared sorted. Unsorted is the same call
 through the matrix-per-row path, and the gap between them is not a claim about
 this engine — it is what mlx's own routing pays for not sorting.
+
+**`ragged` is the row this probe was missing.** Every figure it has ever printed
+was taken over `arange(rows) * experts // rows`, which gives every expert the
+same run of `6 * tokens / 256` rows — 48 at 2048, 96 at 4096, 192 at 8192, and
+each of them a whole number of `gather_qmm_rhs`'s own 16-row tile. So the even
+column asks that kernel only about run lengths its tile divides. A router's
+counts are not those: `fp_gather_qmm_rhs` cuts a tile at each boundary the
+sorted indices hold and runs a *whole* gemm over `K` for every run it finds, so
+a boundary landing inside a tile costs it a second walk exactly as it costs this
+engine's block a second pass. The `ragged` arm is the same rows and the same
+experts with the boundaries where a router puts them, and it is the arm that says
+whether 79% is the kernel or the fixture.
 """
 
 import argparse
@@ -48,7 +60,27 @@ def best_of(fn, rounds):
     return best
 
 
-def quantised(rows, in_dim, out_dim, experts, dtype, mode, group, bits, sort):
+def ragged(rows, experts, block=32):
+    """The same rows over the same experts with the run boundaries where a
+    router's own counts put them, rather than every run the same length.
+
+    `each_way_runs_can_land` in `crates/inkling-metal/src/matmul.rs`, written
+    out again here so that both kernels are asked the identical question — seven
+    is coprime with `block`, so the offsets walk every alignment instead of
+    alternating between two of them.
+    """
+    at = (
+        [0]
+        + [
+            rows * e // experts + (e * 7 % block) - block // 2
+            for e in range(1, experts)
+        ]
+        + [rows]
+    )
+    return [e for e in range(experts) for _ in range(at[e + 1] - at[e])]
+
+
+def quantised(rows, in_dim, out_dim, experts, dtype, mode, group, bits, sort, runs):
     """One dispatch of the call this shape gives mlx, and what it took."""
     x = mx.random.normal((rows, 1, in_dim) if experts > 1 else (rows, in_dim))
     x = x.astype(dtype)
@@ -73,7 +105,11 @@ def quantised(rows, in_dim, out_dim, experts, dtype, mode, group, bits, sort):
             ),
             ROUNDS,
         )
-    at = mx.arange(rows, dtype=mx.uint32) * experts // rows
+    at = (
+        mx.array(ragged(rows, experts), dtype=mx.uint32)
+        if runs == "ragged"
+        else mx.arange(rows, dtype=mx.uint32) * experts // rows
+    )
     mx.eval(x, codes, scales, at)
     return best_of(
         lambda: mx.gather_qmm(
@@ -134,7 +170,7 @@ def main():
     for tokens in args.tokens:
         print(f"\n  a prefill of {tokens} tokens")
         print(
-            f"  {'':<16}{'dtype':<11}{'mode':<9}{'indices':<10}"
+            f"  {'':<16}{'dtype':<11}{'mode':<9}{'indices':<16}"
             f"{'device':>10}{'rate':>16}"
         )
         for what, a_token, in_dim, out_dim, experts in SHAPES:
@@ -143,21 +179,34 @@ def main():
             for dtype in dtypes:
                 name = "bfloat16" if dtype == mx.bfloat16 else "float32"
                 for mode in modes:
-                    sorts = [True, False] if experts > 1 else [True]
-                    for sort in sorts:
+                    sorts = (
+                        [(True, "even"), (True, "ragged"), (False, "even")]
+                        if experts > 1
+                        else [(True, "even")]
+                    )
+                    for sort, runs in sorts:
                         taken = quantised(
-                            rows, in_dim, out_dim, experts, dtype, mode, 32, 4, sort
+                            rows,
+                            in_dim,
+                            out_dim,
+                            experts,
+                            dtype,
+                            mode,
+                            32,
+                            4,
+                            sort,
+                            runs,
                         )
-                        told = "sorted" if sort else "unsorted"
+                        told = f"sorted, {runs}" if sort else "unsorted"
                         print(
-                            f"  {what:<16}{name:<11}{mode:<9}{told:<10}"
+                            f"  {what:<16}{name:<11}{mode:<9}{told:<16}"
                             f"{taken * 1e3:9.2f}ms{flop / taken / 1e12:11.1f} TFLOP/s"
                         )
                 if args.dense:
                     taken = dense(rows, in_dim, out_dim, experts, dtype)
                     if taken is not None:
                         print(
-                            f"  {what:<16}{name:<11}{'dense':<9}{'':<10}"
+                            f"  {what:<16}{name:<11}{'dense':<9}{'':<16}"
                             f"{taken * 1e3:9.2f}ms{flop / taken / 1e12:11.1f} TFLOP/s"
                         )
 
