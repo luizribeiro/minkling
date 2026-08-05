@@ -23,17 +23,17 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **681 of the 751 tests, no
+`just test` is the one to run while iterating: **682 of the 755 tests, no
 checkpoint, twelve seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
 38 that need weights report a skip and pass. It runs through libtest, which puts
-a crate's tests in one process: opening a Metal device costs a second, so the 245
+a crate's tests in one process: opening a Metal device costs a second, so the 246
 kernel tests are 11.9 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 751 against a
-real checkpoint, thirteen minutes.** The 681 the gated tier runs and the 70 the
+`just test-full` is what has to pass at the ends of a series: **all 755 against a
+real checkpoint, thirteen minutes.** The 682 the gated tier runs and the 73 the
 timing tier does. The 53 gated tests — the 38 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -44,7 +44,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the sixty-eight tests whose result *is* a number — a duration
+`just test-timing` is the seventy-three tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -1187,6 +1187,368 @@ and 769 tokens cost 2.04, 5.45 and 10.1 s before the budget replaced the row
 count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
+
+## The two levers between 62% and 74%
+
+**Both were priced off the instruction mix rather than off a build, both are
+built and measured here, and together they are worth 0.8% where they were priced
+at 16%.** T2 left the routed bank at 62% of an instruction ceiling nothing can
+beat, named the two terms worth taking next — a 64-code step at the barrier arm's
+10%, mlx-style per-lane fragment loads at the hoisting arm's 6% — and put the two
+at their ceilings at 74%. **61.9% is where this milestone opened and 62.4% is
+where it stops.**
+
+**One of the two is refused and one of the two ships**, and they fail in the same
+shape: each was priced off an ablation arm, and each arm prices the *memory
+traffic and the waiting behind it* rather than the instruction that expresses it.
+A lever that changes only the expression reaches neither.
+
+**And the one that ships re-opened a door T2 closed, which is the largest thing
+here.** 16-bit operands were 5 to 9% behind the block through `simdgroup_load` and
+are 6 to 8% *ahead* of it per lane, because that read is the one where the operand
+width reaches the bytes a lane pulls. It is not taken — the drift it was refused
+on has not moved and the exact-product property is what this flag is written on —
+but it is on the table at a size neither lever reached.
+
+### What a step of 64 codes is worth, which is less than nothing
+
+A step is `MMA_CODES_A_STEP` codes wide and carries two barriers, so a reduction
+of 4096 is 128 steps and **256 barriers a pass**. A step of two quantisation
+groups halves that count, and the barrier arm — the one that removes them and
+races — prices the whole term at 10%, so 5% was the ceiling.
+
+It is a value the block carries now, beside the height, the width and the
+threadgroup T1 made values. Warm, swept both ways, every arm answering the
+shipped kernel bit for bit except the two that race:
+
+    a prefill of 8192 tokens
+    a step of                        declares      q_proj, tiled      a routed bank
+    32 codes                         13.5 KiB    15.08ms   100%     52.52ms   100%
+    64 codes                         25.5 KiB    16.52ms   110%     56.03ms   107%
+    32 codes, declaring the wider    25.5 KiB    15.93ms   106%     55.15ms   105%
+    32 codes, racing                 13.5 KiB    13.42ms    89%     47.48ms    90%
+    64 codes, racing                 25.5 KiB    14.92ms    99%     51.29ms    98%
+
+**The third row is what makes this a diagnosis rather than a refusal.** It is the
+shipped step declaring the wider one's threadgroup memory and never touching the
+extra — `RESIDENCY`'s own trick pointed the other way, since what a threadgroup
+declares decides how many of them a core holds. It carries the wider step's
+occupancy and none of its benefit, and it costs **5%**. So the staging is what a
+wider step is bought at, and the arithmetic of the trade is on the table.
+
+**And the last two rows say the barrier term is not the barriers' count.** At 32
+codes the barriers cost 52.52 ms against 47.48 racing, which is 5.04 ms; at 64
+codes, with *half as many of them*, they cost 56.03 against 51.29, which is 4.74.
+**Halving the count returned 0.30 ms — six percent of the term and 0.6% of the
+call — where the staging it needed cost 2.63 ms.** What a barrier waits is the
+spread between the first simdgroup to arrive and the last, and a step twice as
+wide puts twice as much staging behind each one: the count halves, the imbalance
+behind each doubles, and the wait is conserved.
+
+The same reading at 2048 and 4096, to a percent. Two groups is also as far as
+this can be asked at all — the staging is `(rows + cols)` rows of the step and its
+padding, so 32 codes declares 13.5 KiB, 64 declares 25.5 and 128 would declare
+49.5, past the 32 KiB a threadgroup gets.
+
+**So the lever is refused, and with it every lever whose mechanism is a smaller
+count.** The 10% the arm prices is the spread a threadgroup's staging leaves, so
+what could still reach it is an arrangement that evens that spread or hides it —
+a double buffer, where one tile fills while the other is multiplied, is the
+obvious candidate and is *not* refused here, because what it changes is what a
+barrier waits on rather than how many there are. What is refused is the reading
+that made a wider step look worth half the term.
+
+### What reading a fragment per lane is worth, which is a twelfth of its price
+
+`gather_qmm`'s `BaseMMAFrag::load` never calls `simdgroup_load`. It reads the two
+elements each lane owns straight out of threadgroup memory through a static
+lane-to-coordinate map, and takes the transpose by swapping the two strides it
+indexes with — the one structural difference between mlx's inner loop and this
+one, and the reason the hoisting arm's 6% was thought reachable.
+
+**The map is measured against this part rather than inherited.** Three lines of a
+header are a claim about which two elements of an 8×8 fragment a lane holds, and
+this is hardware nobody here has a document for — **a map naming somebody else's
+two elements would not crash and would not read zero**, it would read two staged
+floats, multiply them, and answer a plausible number of the right magnitude. So
+one tile goes through both forms in one kernel and the two are held equal lane for
+lane and element for element, plain and transposed, at both widths the 16-bit arm
+puts these same two calls through. The tile's own coverage is checked beside that
+agreement, because the two forms share the tile if not the map: a fill striding by
+a width the probe was not dispatched at had both of them agreeing about the same
+wrong thing, and the 64 distinct values against a padding none of them takes is
+what caught it.
+
+Warm, swept both ways, bit for bit against each other:
+
+    a fragment read                     q_proj, tiled      a routed bank
+    through simdgroup_load            15.08ms   101%     52.54ms   101%
+    the two elements a lane owns      14.96ms   100%     52.18ms   100%
+
+**0.7 to 0.9% at every shape and every length, and it ships.** In the model,
+paired and alternating, seven pairs, under the production flag — the two ends at
+the commit before this one and 4096 across the whole milestone, which is the same
+claim because the step commit's own pair read **11751.0 ms against 11755.9 at
+8192 with the ranges across**:
+
+    prefill device        before      after   change   ranges
+     2048               3240.7ms   3231.7ms    -0.3%   apart, 7 of 7
+     4096               6021.3ms   5995.9ms    -0.4%   apart, 7 of 7
+     8192              11760.6ms  11713.9ms    -0.4%   apart, 7 of 7
+
+**A twelfth of what it was priced at, and the arm that priced it is what says
+why.** Hoisting leaves three of every four fragments unread and reads 6%, so what
+it prices is three of every four *reads of threadgroup memory*. The per-lane form
+issues the same reads of the same bytes and changes only the instruction that
+carries them, so 0.8% is the instruction and 5.2% is the traffic — which only a
+fragment held across steps could reach, and T2 measured a block twice as tall at
+101% on both shapes at 8192.
+
+### The door the per-lane read re-opened, which is worth more than either lever
+
+**16-bit operands were refused twice and one of the two reasons has gone.** A8
+refused them on principle — this flag's two sides sum the same exact products in
+different orders, and a 16-bit operand rounds the product itself — and T2 refused
+them again on the clock, at 5 to 9% behind the block at equal occupancy. The
+clock half was measured against a block that read its fragments through
+`simdgroup_load`, and this milestone changed that.
+
+The same arm under both reads, each against the block compiled with the same
+read, warm and swept both ways:
+
+    a fragment read through simdgroup_load
+    at                              the block   16-bit at 36     at 40     at 44
+    2048   q_proj, tiled               3.79ms            +9%       +9%       +5%
+    2048   a routed bank, grouped     16.80ms            +9%       +9%       +5%
+    4096   q_proj, tiled               7.56ms            +9%       +9%       +5%
+    4096   a routed bank, grouped     26.36ms            +8%       +8%       +4%
+    8192   q_proj, tiled              15.09ms            +9%       +9%       +5%
+    8192   a routed bank, grouped     52.54ms            +8%       +8%       +5%
+
+    a fragment read per lane, which is the shipped one
+    at                              the block   16-bit at 36     at 40     at 44
+    2048   q_proj, tiled               3.77ms            -2%       -2%       -8%
+    2048   a routed bank, grouped     16.67ms            +0%       +0%       -7%
+    4096   q_proj, tiled               7.50ms            -1%       -1%       -8%
+    4096   a routed bank, grouped     26.12ms            -0%       -1%       -6%
+    8192   q_proj, tiled              14.98ms            -1%       -1%       -8%
+    8192   a routed bank, grouped     52.17ms            -1%       -1%       -6%
+
+**The operand width reaches the traffic under one read and not under the other.**
+A lane pulling the two elements it owns pulls four bytes at half where it pulls
+eight at float; a `simdgroup_load` is one instruction over the whole fragment
+either way, so under it the width reached the registers and nothing else. That is
+the same finding as the per-lane lever's own, read from the other side: what these
+two levers move between them is threadgroup-memory traffic, and only the one that
+moves *bytes* is worth anything.
+
+**So the refusal now rests on the drift alone, and the drift has not moved.**
+1.5 to 2.1e-4 across reductions of 32 to 4096, flat — which is the operand
+arriving already rounded and not a chain getting longer — against the block's own
+1.3e-7 to 1.6e-6, which grows with the reduction because a fragment accumulator is
+one running sum. Two decades.
+
+**This is not taken here and the reason is scope rather than arithmetic.** 6 to
+8% at the padding that wins is larger than both levers this milestone was sent for
+put together, and it is the largest priced thing left on this kernel. What it
+costs is the sentence this file's numerics section is written on — that both sides
+form the same exact products and differ only in the order they are summed. A
+16-bit operand ends that, so it is a third numerics rather than a faster
+production path, and A8's own words for it still hold: it would have to move into
+the conditioning table rather than sit beside it. **What has changed is that it is
+now a 6 to 8% question rather than a −5% one**, and that is a different question
+to decline.
+
+### What the two of them are worth against the ceiling
+
+The instruction issues where it issued — the four register arms land within a
+hundredth of a millisecond of the sitting T2 read them on, which is what says the
+denominator did not move under the numerator:
+
+    what issues                            device            rate
+    the matrix instruction, four held     16.55ms    25.3 TFLOP/s
+    the same chain held once               4.75ms    22.1 TFLOP/s
+    the same four on 16-bit operands      15.86ms    26.4 TFLOP/s
+    scalar fused multiply-adds             4.55ms    23.0 TFLOP/s
+
+And against it, one sitting each side of the milestone:
+
+    a prefill of                    before             after      of the instruction
+     2048  q_proj, tiled            3.79ms            3.76ms         72% → 72%
+     2048  a routed bank           16.79ms           16.65ms         48% → 49%
+     4096  q_proj, tiled            7.55ms            7.50ms         72% → 72%
+     4096  a routed bank           26.41ms           26.16ms         62% → 62%
+     8192  q_proj, tiled           15.09ms           14.98ms         72% → 72%
+     8192  a routed bank           52.56ms           52.13ms         62% → 62%
+
+The column prints 62% on both sides of the milestone; the milliseconds behind it
+are 824.6 GFLOP at 52.56 ms against the same at 52.13, which is **61.9% against
+62.4%**. **74% did not arrive**: of the 16% the two levers were priced at, one
+*cost* 6.7% and is refused and the other returned 0.8%.
+
+### What the compile cost
+
+**No entry was added, which is the first thing to say and the one that is a fact
+rather than a measurement.** D1 found that merely reordering which of this
+source's entries are created first is worth 2.4% of a 2048-token prefill, so a
+lever that made the entries longer to build would spend its winnings before a call
+reached them. Every arm of both sweeps builds the two production entries a model
+load builds, and the case asserts the count:
+
+    a block of                                  entries   compiling   the source
+    32 codes a step, the elements a lane owns         2     1913 us     55.1 KiB
+    64 codes a step, the elements a lane owns         2     1911 us     55.1 KiB
+    32 codes a step, through simdgroup_load           2     1878 us     54.6 KiB
+
+**35 microseconds and half a kilobyte**, against a prefill that is seconds. The
+clock is a warm compile and says so: the first build in a process carries the
+compiler's start-up, so every row is timed behind one shipped build.
+
+### The per-kernel table, and against the reference in one sitting
+
+Under `--numerics production`, one sampled prefill a row:
+
+    tokens   the grouped matmul   the row-tiled matmul   both   of every pass
+     2048           1.81s                1.20s          3.01s        88%
+     4096           3.15s                2.37s          5.52s        85%
+     8192           5.87s                4.67s         10.54s        82%
+    16384          11.30s                9.26s         20.56s        80%
+
+**The share is where T2 read it and the seconds are two to four percent under**,
+which is this milestone and a sitting between them and not separable at that
+size — the paired instrument above is what claims, and it claims 0.3 to 0.4%.
+
+`just bench-engines` on the packed heads, three pairs, both engines alternating,
+ranges apart at every row, and both engines wrote the same first eight tokens at
+every one of the four prompts:
+
+    prompt × answer   ours p50   mlx-vlm p50   ahead on p50
+        97 × 128       16.42ms       22.87ms          1.39×
+       385 × 128       17.69ms       23.13ms          1.31×
+       769 × 128       18.54ms       23.54ms          1.27×
+        97 × 512       17.55ms       23.09ms          1.31×
+
+Speculating three deep, the same sitting: **13.77 ms a token at 97 × 128 and 13.06
+at 97 × 512**, against the reference's 22.98 and 23.16 — 1.67× and 1.77×.
+
+**And a session, both openings, both engines, one sitting each**, three pairs,
+ours under the production flag with both engines keeping their cache:
+
+    opening        ours kept   mlx-vlm kept   behind
+    2048            18.11 s       14.28 s     1.27×
+    8192            31.52 s       25.49 s     1.24×
+
+    the per-turn bookkeeping inside it
+    2048             0.947 ms     30.588 ms
+    8192             1.022 ms     68.954 ms
+
+**K1's kept cache is where K1 left it** — ours flat in the context where theirs is
+linear, at about a millisecond a turn against 31 and 69.
+
+### What did not move
+
+**No token changed and no default changed.** The flag stays defaulted to
+reference, the reference path is byte-identical — neither lever is compiled under
+it — and the recorded continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]`
+is what both backends write. `just diverge` puts the corpus through both numerics
+and reads **384 of 384 tokens agreed, no prompt parted**, which is the gate the
+production path owes before any timing claim.
+
+**A decode step is untouched, which it has to be**: the block is not dispatched at
+any shape a decode step has. Paired against the commit this milestone opened at,
+seven pairs: **16.295 ms against 16.299**, device **15.216 against 15.213**, ranges
+across, no claim. **The null pair was run first and read 0.1% on the wall and 0.0%
+on the device**, ranges across — same binary both arms, seven pairs.
+
+**Speculation is where it was, digit for digit.** `bench sweep` on the packed
+heads, one sitting:
+
+    k    a token   tokens/s   speedup   accepted
+    0    16.388ms     61.0      1.000
+    1    15.654ms     63.9      1.047   84.85%
+    2    15.485ms     64.6      1.058   86.96 78.26%
+    3    15.430ms     64.8      1.062   85.00 65.00 55.00%
+    4    18.350ms     54.5      0.893   82.35 64.71 52.94 47.06%
+
+**`k = 3` is still the best depth** and every acceptance figure is the one this
+file records, at 1.829, 2.560, 2.909 and 3.368 tokens a round. The absolute
+column sits about 6% above the rows quoted elsewhere, which is this sitting rather
+than this milestone — the paired decode above is what says the step did not move,
+and it read no claim.
+
+**Our own prefill wall, unsampled, under the production flag**, one sitting:
+
+    tokens    wall      device
+     2048    5.60 s     3.23 s
+     4096    9.05 s     6.00 s
+     8192   16.73 s    11.71 s
+
+### The floor this stops at, and its arithmetic
+
+**A stopping condition is a floor you can prove, and T2's is still the one this
+stops at — the two levers it named are now measured rather than priced.**
+
+The instruction issues at 25.34 TFLOP/s on this part and that is the same rate its
+scalar fused multiply-add issues at, so no arrangement of this arithmetic goes
+faster. The routed bank at 8192 runs 824.6 GFLOP: **52.56 ms and 15.69 TFLOP/s
+before, 52.13 and 15.82 after — 61.9% of the instruction against 62.4%.** The
+column prints 62% on both sides, which is the honest way to read it.
+
+**74% was the arithmetic and it was arithmetic about the wrong thing.** T2 put the
+two levers at 16% between them by reading two ablation arms — the barrier arm at
+10% and the hoisting arm at 6% — and both readings are correct about what they
+measure. What is wrong is the step from an arm to a lever:
+
+- The barrier arm removes the barriers and races, so it prices **the waiting**. A
+  wider step halves the count and doubles what each one waits behind, and the term
+  went 5.04 ms to 4.74 — **6% of it, where halving the count predicted 50%.**
+- The hoisting arm leaves three of every four fragments unread, so it prices
+  **three of every four reads of threadgroup memory**. A per-lane read issues the
+  same reads and rewrites the instruction around them, and returned 0.8% of a 6%
+  term — **a twelfth, where the arm's own share predicted all of it.**
+
+**So the rule this milestone leaves is about the instrument rather than about the
+kernel: an ablation that removes work prices the work, and it bounds only a lever
+that also removes the work.** A lever that keeps the work and rewrites the
+instruction around it collects the instruction alone, and on this part the
+instruction is the smaller part of both terms priced here.
+
+What that leaves under the 38%, re-read: the barriers are 10%, reachable by
+evening out or hiding what a threadgroup stages rather than by having fewer of
+them, and a double buffer is the candidate that leaves open; the fragment loads
+are 6%, reachable only by holding a fragment across steps, which is the taller
+block T2 measured at 101% on both shapes at 8192; the three byte-count terms are
+8%; and about a fifth is unattributed. **Removing every priced term entirely still
+puts the call at 82% and mlx's quantised kernel is at 79%**, so the distance is
+where T2 left it and the two named levers across it are closed with measurements
+rather than open with prices.
+
+**And the largest priced thing left on this kernel is now the operand width**, at
+6 to 8% under the shipped read, behind a drift two decades above the block's own
+and behind the exact-product property this flag is documented on. That is a
+question about what `--numerics production` is allowed to mean rather than about
+the matmul, and it is not this milestone's to answer.
+
+**What this does not license is a claim that the engine is finished.** It is
+1.24× behind at the 8192 opening and 1.27× at 2048, and the gap is real. What it
+says is that the two levers a reader of T2 would have taken next are worth 0.8%
+between them, that the third thing is where the unattributed fifth is, and that
+the next person to price a lever off an ablation arm should ask first whether the
+lever removes the work the arm removed.
+
+### What this milestone leaves
+
+**The block now carries seven values and the last of them is not a shape.** The
+height, the width, the threadgroup and its two simdgroup extents are T1's; the
+step is this milestone's and is still a shape; the fragment read is the first axis
+here that changes the instruction the kernel issues rather than what one
+threadgroup covers. Every one of the seven is swept by a case that holds its arms
+bit for bit against the shipped block, and `distinct` is what keeps an arm from
+quietly becoming the shipped one when a sweep's subject moves.
+
+**What that is for is the thing after this**, which is continuous batching: a
+batch adds a dimension to every shape-keyed decision this engine makes, and these
+are where the matmul's now live. Nothing here starts it.
 
 ## The walk a decode step could stop doing serially, and why it cannot
 
@@ -3396,6 +3758,15 @@ at most **1.6× between here and a kernel that is nothing but its instruction.**
   instruction. **That closes about two thirds of the distance to mlx and does not
   close it**, so a third thing would still be wanted — and the honest reading of
   the fifth that is unattributed is that it is where the third thing is.
+
+**Both were taken and the 16% was 0.8%** — see "The two levers between 62% and
+74%", where the step is built, swept and refused at 107% and the per-lane read
+ships at 0.7 to 0.9%. What each of the two prices above gets wrong is the same
+step: an arm that *removes* work prices the work, and neither lever removes any.
+The barrier arm's 10% is the imbalance the staging leaves rather than the count of
+barriers, so halving the count returned a sixteenth of it; the fragment arm's 6%
+is three of every four reads of threadgroup memory rather than the instruction
+around them, so rewriting the instruction returned a twelfth.
 
 **What this does not license is a claim that the engine is finished.** It is
 1.28× behind at the 8192 opening and 1.36× at 2048, and the gap is real. What
