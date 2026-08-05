@@ -241,6 +241,13 @@ const MMA_SIMDS_ACROSS: usize = 4;
 /// was set from.
 const MMA_CODES_A_STEP: usize = GROUP_SIZE;
 
+/// How the shipped block gets a fragment out of the staging.
+///
+/// **`simdgroup_load`, and what would move it is
+/// [`what_a_packed_multiply_costs_at_each_way_it_reads_a_fragment`]**, which is
+/// the sweep this constant exists to be the subject of.
+const MMA_FRAGMENTS: Fragments = Fragments::Loaded;
+
 /// Floats of padding between two staged rows.
 ///
 /// **Load-bearing rather than defensive.** Threadgroup memory is 32 banks of four
@@ -283,6 +290,36 @@ pub(crate) struct Block {
     simds_down: usize,
     simds_across: usize,
     step: usize,
+    fragments: Fragments,
+}
+
+/// How a fragment gets out of the staging and into the registers the matrix
+/// instruction reads it from.
+///
+/// **The one structural difference between this inner loop and mlx's.** Its
+/// `BaseMMAFrag::load` never calls `simdgroup_load`: it reads the two elements
+/// each lane owns straight out of threadgroup memory through a static
+/// lane-to-coordinate map, and takes the transpose by swapping the two strides it
+/// indexes with. This kernel issues a `simdgroup_load` a fragment and a
+/// *transposing* one for the weight, and
+/// [`what_a_prefills_blocked_matmul_is_bound_by`]'s hoisting arm prices all of
+/// them together at **6%**.
+///
+/// A value the block carries rather than a second kernel, for the reason every
+/// other axis here is one: the two answer the same bits out of the same staging
+/// and differ in the instruction that moves it, so a sweep is what says which is
+/// faster and a fork would be two of everything the next edit touches.
+// One of the two is what [`MMA_FRAGMENTS`] names and the other is the arm the
+// sweep holds it against, and which is which is that constant's to say — so the
+// unnamed one is reachable from the sweep alone, and gating it on the value
+// would make a table of two arms a fact about a `cfg`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fragments {
+    /// `simdgroup_load`, and a transposing one for the weight.
+    Loaded,
+    /// The two elements a lane owns, read where they lie.
+    PerLane,
 }
 
 impl Block {
@@ -295,6 +332,7 @@ impl Block {
         simds_down: MMA_SIMDS_DOWN,
         simds_across: MMA_SIMDS_ACROSS,
         step: MMA_CODES_A_STEP,
+        fragments: MMA_FRAGMENTS,
     };
 
     /// Rows an expert needs, on average, before a grouped call is dispatched
@@ -438,9 +476,76 @@ constant uint THREADS_PER_GROUP = {};
             self.bytes_a_thread(),
             self.threads_a_weight_row(),
             self.threads,
-        )
+        ) + self.reads_a_fragment()
+    }
+
+    /// The two ways [`MMA`] reads a fragment out of the staging, written the way
+    /// this block asks for.
+    ///
+    /// **One call site apiece in the kernel whichever this is**, which is what
+    /// makes the axis a value rather than a second copy of the inner loop.
+    ///
+    /// Templated on the matrix and on what the staging holds because the 16-bit
+    /// arm reads narrow tiles through these same two calls — see
+    /// [`through_sixteen_bit_operands`], which swaps the fragment declarations
+    /// and nothing else.
+    fn reads_a_fragment(&self) -> &'static str {
+        match self.fragments {
+            Fragments::Loaded => MMA_LOADED_FRAGMENTS,
+            Fragments::PerLane => MMA_PER_LANE_FRAGMENTS,
+        }
     }
 }
+
+/// A fragment through `simdgroup_load`, which is what this kernel has always
+/// issued.
+const MMA_LOADED_FRAGMENTS: &str = r#"
+template <typename M, typename T>
+inline void mma_read(thread M &into, threadgroup const T *from, uint lane) {
+    simdgroup_load(into, from, MMA_STAGED_STRIDE);
+}
+
+template <typename M, typename T>
+inline void mma_read_transposed(thread M &into, threadgroup const T *from, uint lane) {
+    simdgroup_load(into, from, MMA_STAGED_STRIDE, ulong2(0, 0), true);
+}
+"#;
+
+/// A fragment through the two elements each lane owns, read where they lie.
+///
+/// **The map is verified against this part rather than inherited.** These three
+/// lines are mlx's `BaseMMAFrag<float, 8, 8>::get_coord`, and what a header says
+/// about a lane layout is a claim about hardware nobody here has a document for —
+/// so `the_lane_map_a_fragment_is_read_through_is_this_parts_own` puts the same
+/// tile through both forms and holds them equal lane for lane and element for
+/// element. A map that were wrong would not fail: it would read somebody else's
+/// two elements and answer a plausible number.
+///
+/// The transpose is the same two elements with the strides swapped, which is
+/// what a transposing `simdgroup_load` costs an instruction to express and this
+/// costs an index.
+const MMA_PER_LANE_FRAGMENTS: &str = r#"
+inline ushort2 mma_lane_holds(uint lane) {
+    const ushort quad = lane / 4;
+    return ushort2((quad & 2) * 2 + (lane % 2) * 2, (quad & 4) + ((lane / 2) % 4));
+}
+
+template <typename M, typename T>
+inline void mma_read(thread M &into, threadgroup const T *from, uint lane) {
+    const ushort2 at = mma_lane_holds(lane);
+    thread vec<T, 2> &held = (thread vec<T, 2> &)(into.thread_elements());
+    held[0] = from[at.y * MMA_STAGED_STRIDE + at.x];
+    held[1] = from[at.y * MMA_STAGED_STRIDE + at.x + 1];
+}
+
+template <typename M, typename T>
+inline void mma_read_transposed(thread M &into, threadgroup const T *from, uint lane) {
+    const ushort2 at = mma_lane_holds(lane);
+    thread vec<T, 2> &held = (thread vec<T, 2> &)(into.thread_elements());
+    held[0] = from[at.x * MMA_STAGED_STRIDE + at.y];
+    held[1] = from[(at.x + 1) * MMA_STAGED_STRIDE + at.y];
+}
+"#;
 
 /// The narrowest simdgroup Metal reports, which is what the layout above
 /// divides the threadgroup into simdgroups by.
@@ -3422,7 +3527,8 @@ kernel void __ENTRY__(
     device float *out [[buffer(5)]],__ORDER__
     uint block [[threadgroup_position_in_grid]],
     uint local [[thread_position_in_threadgroup]],
-    uint simd [[simdgroup_index_in_threadgroup]]
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
 ) {
     const uint across = (shape.out_dim + MMA_COLS_A_BLOCK - 1) / MMA_COLS_A_BLOCK;
     const uint first = (block / across) * MMA_ROWS_A_BLOCK;
@@ -3546,12 +3652,12 @@ kernel void __ENTRY__(
                 simdgroup_float8x8 lhs[MMA_FRAGMENTS_DOWN];
                 simdgroup_float8x8 rhs[MMA_FRAGMENTS_ACROSS];
                 for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
-                    simdgroup_load(
+                    mma_read(
                         lhs[i],
                         staged_x
                             + (down * MMA_FRAGMENTS_DOWN + i) * MMA_FRAGMENT * MMA_STAGED_STRIDE
                             + k * MMA_FRAGMENT,
-                        MMA_STAGED_STRIDE
+                        lane
                     );
                 }
                 // Transposed on the way in, because the staged weight is
@@ -3559,15 +3665,13 @@ kernel void __ENTRY__(
                 // which is the same transpose `out = x @ w^T` names and is free
                 // here rather than a second staging.
                 for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
-                    simdgroup_load(
+                    mma_read_transposed(
                         rhs[j],
                         staged_w
                             + (alongside * MMA_FRAGMENTS_ACROSS + j) * MMA_FRAGMENT
                                 * MMA_STAGED_STRIDE
                             + k * MMA_FRAGMENT,
-                        MMA_STAGED_STRIDE,
-                        ulong2(0, 0),
-                        true
+                        lane
                     );
                 }
                 for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
@@ -4578,6 +4682,43 @@ kernel void decoded_elements(
         },
     ];
 
+    /// The two ways of reading a fragment, at the shipped shape.
+    ///
+    /// **Both named rather than one of them left to [`Block::SHIPPED`]**, which
+    /// is what keeps this a sweep whichever way [`MMA_FRAGMENTS`] is set — an arm
+    /// written as "the shipped block, with the other read" collapses into the
+    /// shipped block itself the moment the other read becomes the shipped one,
+    /// and a table of one arm printed twice is what it collapses into.
+    /// [`distinct`] is that hazard stated once for all three sweeps.
+    const SWEPT_FRAGMENTS: [Block; 2] = [
+        Block {
+            fragments: Fragments::Loaded,
+            ..Block::SHIPPED
+        },
+        Block {
+            fragments: Fragments::PerLane,
+            ..Block::SHIPPED
+        },
+    ];
+
+    /// **Every arm of a sweep has to be a different block**, or the table reads
+    /// as a comparison and is one shape measured against itself.
+    ///
+    /// The way that happens is not a typo: an arm written as the shipped block
+    /// with one field overridden stops being an arm when that field's shipped
+    /// value moves to what the arm overrides it to. Nothing about such a table
+    /// looks wrong — the rows are the same shape and read within the noise of
+    /// each other, which is exactly what an arm that made no difference would
+    /// print.
+    fn distinct(swept: &[Block]) {
+        for (at, block) in swept.iter().enumerate() {
+            assert!(
+                !swept[..at].contains(block),
+                "a sweep offers {block:?} twice, so one of its rows is the other measured again"
+            );
+        }
+    }
+
     /// **A block cut to another shape answers what the shipped one answers**,
     /// which is the whole of what makes the sweep beside it a measurement rather
     /// than a comparison of two different computations.
@@ -4609,7 +4750,11 @@ kernel void decoded_elements(
             &PackedMatmul::under(&device, Numerics::Production).expect("the block compiles"),
         );
 
-        let swept: Vec<Block> = SWEPT_BLOCKS.into_iter().chain(SWEPT_STEPS).collect();
+        let swept: Vec<Block> = SWEPT_BLOCKS
+            .into_iter()
+            .chain(SWEPT_STEPS)
+            .chain(SWEPT_FRAGMENTS)
+            .collect();
         let mut ran = 0;
         for block in swept.iter().copied() {
             let Some(matmul) = a_block_of(&device, block) else {
@@ -4846,6 +4991,148 @@ kernel void decoded_elements(
         for kernel in [&mma.tiled, &mma.grouped] {
             assert_eq!(kernel.simd_width(), NARROWEST_SIMD);
             assert!(kernel.max_threads_per_group() >= THREADS_PER_GROUP);
+        }
+    }
+
+    /// One 8×8 tile of the staging read both ways, so that the two can be held
+    /// against each other lane for lane.
+    ///
+    /// **Both reads out of one kernel and one tile**, because what is asked is
+    /// whether the two forms name the same element and not whether two dispatches
+    /// agree about a number.
+    ///
+    /// `__T__` is what the staging holds, and the entry is emitted once per width
+    /// the block is ever compiled at — see [`lane_probe`]. The sink stays `float`
+    /// at both, since the values a probe puts through it are whole numbers under
+    /// 64 and exact in either.
+    const LANE_PROBE: &str = r#"
+kernel void mma_lane_probe___T__(
+    device const float *from [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    uint local [[thread_position_in_threadgroup]],
+    uint width [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup __T__ tile[MMA_FRAGMENT * MMA_STAGED_STRIDE];
+    for (uint at = local; at < MMA_FRAGMENT * MMA_STAGED_STRIDE; at += width) {
+        tile[at] = (__T__)from[at];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup___T__8x8 plain, across;
+    mma_read(plain, tile, lane);
+    mma_read_transposed(across, tile, lane);
+    thread vec<__T__, 2> &held = (thread vec<__T__, 2> &)(plain.thread_elements());
+    thread vec<__T__, 2> &turned = (thread vec<__T__, 2> &)(across.thread_elements());
+    out[lane * 4 + 0] = (float)held[0];
+    out[lane * 4 + 1] = (float)held[1];
+    out[lane * 4 + 2] = (float)turned[0];
+    out[lane * 4 + 3] = (float)turned[1];
+}
+"#;
+
+    /// [`LANE_PROBE`] at both widths a fragment of this kernel is ever read at.
+    ///
+    /// **The narrow one is here because [`through_sixteen_bit_operands`] puts the
+    /// same two calls through `simdgroup_half8x8`**, and the map they compute
+    /// takes no notice of what the staging holds. That independence is the claim,
+    /// and a claim about a lane layout is what this whole case exists not to
+    /// inherit.
+    fn lane_probe() -> String {
+        LANE_WIDTHS
+            .iter()
+            .map(|holds| crate::testing::instead_of(LANE_PROBE, "__T__", holds))
+            .collect()
+    }
+
+    /// What the staging holds, at each width this kernel's fragments are ever
+    /// read at.
+    const LANE_WIDTHS: [&str; 2] = ["float", "half"];
+
+    /// **The lane-to-coordinate map a per-lane read is written from is this
+    /// part's own**, which is the one thing about [`Fragments::PerLane`] that
+    /// could be wrong without anything failing.
+    ///
+    /// The three lines it computes are mlx's `BaseMMAFrag<float, 8, 8>` header,
+    /// and a header is a claim about which two elements of an 8×8 fragment a lane
+    /// holds — hardware nobody here has a document for. **A map that named
+    /// somebody else's two elements would not crash and would not read zero**: it
+    /// would read two staged floats and multiply them, and every call would come
+    /// back a plausible number of the right magnitude.
+    ///
+    /// So the same tile goes through both forms and the two are held equal
+    /// element for element, transposed as well as plain, **at both widths a
+    /// fragment of this kernel is ever read at** — the map takes no notice of
+    /// what the staging holds, and `through_sixteen_bit_operands` is where that
+    /// independence is relied on.
+    ///
+    /// **And the tile's own coverage is checked beside the agreement, because
+    /// the two forms share the tile if not the map.** They read one threadgroup
+    /// array filled by one loop, so a probe that filled part of it would have
+    /// both forms agreeing about the same wrong thing — which is what a fill
+    /// striding by the wrong width did here, and what the 64 distinct values
+    /// `1..=64` against a padding none of them takes is what caught.
+    #[test]
+    fn the_lane_map_a_fragment_is_read_through_is_this_parts_own() {
+        let Some(device) = device() else { return };
+
+        let stride = Block::SHIPPED.staged_stride();
+        let mut staged: Vec<f32> = vec![-1.0; MMA_FRAGMENT * stride];
+        for down in 0..MMA_FRAGMENT {
+            for across in 0..MMA_FRAGMENT {
+                staged[down * stride + across] = (down * MMA_FRAGMENT + across + 1) as f32;
+            }
+        }
+
+        let read = |fragments: Fragments, holds: &str| {
+            let block = Block {
+                fragments,
+                ..Block::SHIPPED
+            };
+            let source = source_blocked(Numerics::Production, block) + &lane_probe();
+            let kernel = device
+                .compile(&source, &format!("mma_lane_probe_{holds}"))
+                .expect("the probe compiles");
+            let mut from = device.buffer(&staged).expect("the tile uploads");
+            let mut out = device
+                .zeroed::<f32>(4 * NARROWEST_SIMD)
+                .expect("the sink allocates");
+            let mut batch = device.batch().expect("a command buffer opens");
+            batch
+                .add(
+                    &kernel,
+                    &[from.arg(), out.arg()],
+                    Grid::new(NARROWEST_SIMD, NARROWEST_SIMD),
+                    0,
+                )
+                .expect("the probe encodes");
+            batch.wait().expect("the probe completes");
+            out.to_vec()
+        };
+
+        let want: Vec<f32> = (1..=(MMA_FRAGMENT * MMA_FRAGMENT) as u32)
+            .map(|value| value as f32)
+            .collect();
+        for holds in LANE_WIDTHS {
+            let loaded = read(Fragments::Loaded, holds);
+            let per_lane = read(Fragments::PerLane, holds);
+            assert_eq!(
+                per_lane, loaded,
+                "over {holds}, the per-lane map named other elements than `simdgroup_load` reads \
+                 on this part"
+            );
+
+            for (what, at) in [("plain", 0), ("transposed", 2)] {
+                let mut covered: Vec<f32> = (0..NARROWEST_SIMD)
+                    .flat_map(|lane| [per_lane[lane * 4 + at], per_lane[lane * 4 + at + 1]])
+                    .collect();
+                covered.sort_by(f32::total_cmp);
+                assert_eq!(
+                    covered, want,
+                    "over {holds}, the {what} read does not cover the tile's 64 elements exactly \
+                     once"
+                );
+            }
         }
     }
 
@@ -8793,6 +9080,7 @@ kernel void decoded_elements(
     fn what_a_blocks_threadgroup_is_worth() {
         let Some(device) = device() else { return };
 
+        distinct(&SWEPT_BLOCKS);
         let arms: Vec<(Block, PackedMatmul)> = SWEPT_BLOCKS
             .iter()
             .filter_map(|&block| a_block_of(&device, block).map(|matmul| (block, matmul)))
@@ -8895,6 +9183,7 @@ kernel void decoded_elements(
     fn what_a_packed_multiply_costs_at_each_step_its_staging_brings_in() {
         let Some(device) = device() else { return };
 
+        distinct(&SWEPT_STEPS);
         let mut arms: Vec<(String, usize, PackedMatmul)> = SWEPT_STEPS
             .iter()
             .filter_map(|&block| {
@@ -9025,6 +9314,94 @@ kernel void decoded_elements(
                       MMA_STAGED_STRIDE";
         let spare = bytes / size_of::<f32>() - Block::SHIPPED.staged_bytes() / size_of::<f32>();
         crate::testing::instead_of(shipped, staged, &format!("{staged} + {spare}"))
+    }
+
+    /// **What reading a fragment per lane is worth** — the second of the two
+    /// levers T2 priced off the instruction mix, and the one structural
+    /// difference between this inner loop and the quantised kernel mlx runs at
+    /// these same shapes.
+    ///
+    /// `gather_qmm`'s `BaseMMAFrag::load` never calls `simdgroup_load`: it reads
+    /// the two elements each lane owns straight out of threadgroup memory through
+    /// a lane-to-coordinate map, and takes the transpose by swapping the two
+    /// strides it indexes with. This kernel issues a `simdgroup_load` a fragment
+    /// and a *transposing* one for the weight, and
+    /// [`what_a_prefills_blocked_matmul_is_bound_by`]'s hoisting arm — which
+    /// leaves three of every four loads unissued and answers wrongly for it —
+    /// prices all of them together at **6%**. So 6% is the whole of what this can
+    /// return, and only if the two instructions cost nothing at all.
+    ///
+    /// **The transposing load is the one that was expected to pay.** It is the
+    /// one most likely to be doing more than the two element reads it owes, since
+    /// the per-lane form expresses the same transpose as an index rather than as
+    /// an instruction.
+    ///
+    /// Warm and swept both ways, and every arm answers the shipped kernel bit for
+    /// bit — which it must, since what moves is where a fragment's two elements
+    /// come from and not what they are.
+    /// [`the_lane_map_a_fragment_is_read_through_is_this_parts_own`] is what says
+    /// the map is this part's rather than a header's.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_packed_multiply_costs_at_each_way_it_reads_a_fragment() {
+        let Some(device) = device() else { return };
+
+        distinct(&SWEPT_FRAGMENTS);
+        let arms: Vec<(Block, PackedMatmul)> = SWEPT_FRAGMENTS
+            .iter()
+            .filter_map(|&block| a_block_of(&device, block).map(|matmul| (block, matmul)))
+            .collect();
+        let shipped = arms
+            .iter()
+            .position(|(block, _)| *block == Block::SHIPPED)
+            .expect("the shipped read is one of the arms");
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+
+        for tokens in BLOCKED_LENGTHS {
+            let shapes = shapes_at(tokens);
+            crate::testing::warmed(|| {
+                shapes[0].costs(&device, &arms[shipped].1, &grouping);
+            });
+            let listed: Vec<usize> = (0..arms.len()).collect();
+            let (up, down) = crate::testing::both_ways(&listed, |at| {
+                shapes
+                    .iter()
+                    .map(|shape| shape.costs(&device, &arms[at].1, &grouping))
+                    .collect::<Vec<Duration>>()
+            });
+
+            eprintln!("\n  a prefill of {tokens} tokens");
+            eprintln!(
+                "  {:<38}{}",
+                "a fragment read",
+                shapes
+                    .iter()
+                    .map(|shape| format!("{:>26}", shape.what))
+                    .collect::<String>()
+            );
+            for (at, (block, _)) in arms.iter().enumerate() {
+                // The slower of the two passes, so a row is not whichever
+                // direction the clock happened to favour.
+                let taken = |arm: usize, column: usize| up[arm][column].max(down[arm][column]);
+                let cells: String = (0..shapes.len())
+                    .map(|column| {
+                        let (each, whole) = (taken(at, column), taken(shipped, column));
+                        format!(
+                            "{:>17}{:>9}",
+                            format!("{:.2}ms", 1e3 * each.as_secs_f64()),
+                            format!("{:.0}%", 1e2 * each.as_secs_f64() / whole.as_secs_f64()),
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "  {:<38}{cells}",
+                    match block.fragments {
+                        Fragments::Loaded => "through simdgroup_load",
+                        Fragments::PerLane => "the two elements a lane owns",
+                    }
+                );
+            }
+        }
     }
 
     /// **What a table here reports has to be one dispatch of the shape it
