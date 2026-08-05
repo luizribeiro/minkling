@@ -2111,10 +2111,24 @@ impl<'a> PackedBank<'a> {
         self.out_dim
     }
 
-    /// The height a sort feeding this bank has to cut its runs against — see
-    /// [`PackedMatmul::rows_a_block`].
-    pub(crate) fn rows_a_block(&self) -> usize {
-        self.matmul.rows_a_block()
+    /// The height a sort feeding this bank has to cut its runs against, and
+    /// zero where a call of `rows` rows will not read a plan.
+    ///
+    /// **Asked per call and not once, because the plan is not free to write.**
+    /// The sort's prefix sum over the blocks each run takes is a division a
+    /// bucket per bucket before it, which at 256 experts is 34 ms of a
+    /// 16384-token prefill — and at that length the entry that runs is the one
+    /// laid over the rows, which never reads a plan. So a call that will not
+    /// plan asks for none.
+    ///
+    /// [`PackedMatmul::plans`] answers it, which is the same predicate the entry
+    /// is chosen by — see [`PackedBank::encode_grouped`], where the two are held
+    /// to agreeing.
+    pub(crate) fn rows_a_block(&self, rows: usize) -> usize {
+        match self.matmul.plans(rows, self.experts) {
+            true => self.matmul.rows_a_block(),
+            false => 0,
+        }
     }
 
     /// Whether a call of `rows` rows against this bank is worth sorting by
@@ -2294,9 +2308,9 @@ impl<'a> PackedBank<'a> {
         self.rows_a_source(rows, per_source, x.len());
         assert_eq!(
             grouped.rows_a_block,
-            self.matmul.rows_a_block(),
-            "the plan was cut at a height this bank's block is not, so its blocks would reach \
-             some of the call's rows twice and some of them never"
+            self.rows_a_block(rows),
+            "the plan was cut at a height this call's blocks are not, so they would reach some \
+             of its rows twice and some of them never"
         );
         let layout = Layout::Grouped {
             order: grouped.order.arg(),
@@ -5557,7 +5571,12 @@ kernel void decoded_elements(
                 .expect("the rows upload");
             let mut batch = device.batch().expect("a command buffer opens");
             let mut sorted = grouping
-                .encode(&mut batch, &mut selection, EXPERTS, bank.rows_a_block())
+                .encode(
+                    &mut batch,
+                    &mut selection,
+                    EXPERTS,
+                    bank.rows_a_block(chosen.len()),
+                )
                 .expect("the grouping encodes");
             let pending = bank
                 .encode_grouped(&mut batch, &mut sorted, &mut x, SLOTS, through)
@@ -5874,7 +5893,7 @@ kernel void mma_lane_probe___T__(
             let mut picked = device.buffer(&chosen).expect("the selection uploads");
             let mut x = device.buffer(&case.x).expect("the rows upload");
             let mut sorted = grouping
-                .encode(&mut batch, &mut picked, EXPERTS, bank.rows_a_block())
+                .encode(&mut batch, &mut picked, EXPERTS, bank.rows_a_block(ROWS))
                 .expect("the grouping encodes");
             let pending = bank
                 .encode_grouped(&mut batch, &mut sorted, &mut x, 1, Through::Gathered)
@@ -6607,7 +6626,12 @@ kernel void mma_lane_probe___T__(
             let mut x = device.buffer(x).expect("the rows upload");
             let mut batch = device.batch().expect("a command buffer opens");
             let mut sorted = grouping
-                .encode(&mut batch, &mut selection, EXPERTS, bank.rows_a_block())
+                .encode(
+                    &mut batch,
+                    &mut selection,
+                    EXPERTS,
+                    bank.rows_a_block(chosen.len()),
+                )
                 .expect("the grouping encodes");
             let pending = bank
                 .encode_grouped(&mut batch, &mut sorted, &mut x, per_source, through)
@@ -6816,7 +6840,7 @@ kernel void mma_lane_probe___T__(
                     &mut batch,
                     &mut selection,
                     EXPERTS,
-                    pair.gate().rows_a_block(),
+                    pair.gate().rows_a_block(chosen.len()),
                 )
                 .expect("the grouping encodes");
             let grouped = pair
@@ -7505,6 +7529,7 @@ kernel void mma_lane_probe___T__(
             let mut best = [Duration::MAX; 2];
             for _ in 0..ROUNDS {
                 for (at, grouped) in [false, true].into_iter().enumerate() {
+                    let cut = bank.rows_a_block(chosen.len());
                     let taken = crate::testing::device_time(&device, CALLS, |batch| {
                         let mut picked = device.buffer(&chosen).expect("the selection uploads");
                         match grouped {
@@ -7513,7 +7538,7 @@ kernel void mma_lane_probe___T__(
                                 .expect("the dispatch encodes"),
                             true => {
                                 let mut sorted = grouping
-                                    .encode(batch, &mut picked, EXPERTS, bank.rows_a_block())
+                                    .encode(batch, &mut picked, EXPERTS, cut)
                                     .expect("the grouping encodes");
                                 bank.encode_grouped(
                                     batch,
@@ -7621,6 +7646,7 @@ kernel void mma_lane_probe___T__(
                     .into_iter()
                     .enumerate()
                 {
+                    let cut = bank.rows_a_block(chosen.len());
                     let taken = crate::testing::device_time(&device, CALLS, |batch| {
                         let mut picked = device.buffer(&chosen).expect("the selection uploads");
                         match arm {
@@ -7632,7 +7658,7 @@ kernel void mma_lane_probe___T__(
                                 .expect("the dispatch encodes"),
                             Arm::Grouped => {
                                 let mut sorted = grouping
-                                    .encode(batch, &mut picked, experts, bank.rows_a_block())
+                                    .encode(batch, &mut picked, experts, cut)
                                     .expect("the grouping encodes");
                                 bank.encode_grouped(
                                     batch,
@@ -7673,12 +7699,12 @@ kernel void mma_lane_probe___T__(
             // The three arms are three ways of cutting the same multiply up, so
             // a difference between their answers would be a difference in what
             // was measured rather than in how fast it ran.
+            let cut = bank.rows_a_block(chosen.len());
             let [untiled, tiled, grouped] = together(&device, |batch| {
                 let mut picked = device.buffer(&chosen)?;
                 let untiled = bank.encode_picked(batch, &mut picked, &mut x, 1)?;
                 let tiled = bank.encode_over(batch, &chosen, &mut x)?;
-                let mut sorted =
-                    grouping.encode(batch, &mut picked, experts, bank.rows_a_block())?;
+                let mut sorted = grouping.encode(batch, &mut picked, experts, cut)?;
                 let grouped =
                     bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)?;
                 Ok([untiled, tiled, grouped])
@@ -8542,10 +8568,11 @@ kernel void mma_lane_probe___T__(
 
             let mut best = Duration::MAX;
             for _ in 0..ROUNDS {
+                let cut = bank.rows_a_block(chosen.len());
                 best = best.min(crate::testing::device_time(&device, CALLS, |batch| {
                     let mut picked = device.buffer(&chosen).expect("the selection uploads");
                     let mut sorted = grouping
-                        .encode(batch, &mut picked, EXPERTS, bank.rows_a_block())
+                        .encode(batch, &mut picked, EXPERTS, cut)
                         .expect("the grouping encodes");
                     bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)
                         .expect("the dispatch encodes");
@@ -8648,10 +8675,11 @@ kernel void mma_lane_probe___T__(
             let mut best = [Duration::MAX; 2];
             for _ in 0..ROUNDS {
                 for (at, multiplies) in [false, true].into_iter().enumerate() {
+                    let cut = bank.rows_a_block(chosen.len());
                     let taken = crate::testing::device_time(&device, CALLS, |batch| {
                         let mut picked = device.buffer(&chosen).expect("the selection uploads");
                         let mut sorted = grouping
-                            .encode(batch, &mut picked, EXPERTS, bank.rows_a_block())
+                            .encode(batch, &mut picked, EXPERTS, cut)
                             .expect("the grouping encodes");
                         if multiplies {
                             bank.encode_grouped(batch, &mut sorted, &mut x, 1, Through::Gathered)
@@ -8849,7 +8877,12 @@ kernel void mma_lane_probe___T__(
                 true => {
                     let mut picked = device.buffer(&self.chosen).expect("the selection uploads");
                     let mut sorted = grouping
-                        .encode(batch, &mut picked, self.experts, bank.rows_a_block())
+                        .encode(
+                            batch,
+                            &mut picked,
+                            self.experts,
+                            bank.rows_a_block(self.rows),
+                        )
                         .expect("the grouping encodes");
                     bank.encode_grouped(batch, &mut sorted, x, 1, Through::Gathered)
                         .expect("the dispatch encodes");

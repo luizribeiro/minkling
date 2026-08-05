@@ -271,15 +271,16 @@ impl<'a> ExpertBanks<'a> {
         self.glu.gate().groups(rows)
     }
 
-    /// The height the sort in front of this bank cuts its runs against — see
-    /// [`PackedBank::rows_a_block`], asked of `gate_proj` for the reason above.
+    /// The height the sort in front of this bank cuts its runs against for a
+    /// call of `rows` rows — see [`PackedBank::rows_a_block`], asked of
+    /// `gate_proj` for the reason above.
     ///
     /// **The three banks are one plan.** `gate`, `up` and `down` take the same
     /// rows through the same permutation in the same layer, so a plan cut once
     /// serves all three — which is also what says the height they are compiled
     /// at has to be the one height.
-    pub(crate) fn rows_a_block(&self) -> usize {
-        self.glu.gate().rows_a_block()
+    pub(crate) fn rows_a_block(&self, rows: usize) -> usize {
+        self.glu.gate().rows_a_block(rows)
     }
 
     pub fn device(&self) -> &'a Device {
@@ -608,7 +609,7 @@ impl<'a> LayerExperts<'a> {
         tokens: usize,
     ) -> Result<([Pending; 2], RoutedRows), MatmulError> {
         let top_k = self.router.config().top_k;
-        let rows_a_block = self.routed.rows_a_block();
+        let rows_a_block = self.routed.rows_a_block(self.router.assignments(tokens));
         if !self.routed.groups(self.router.assignments(tokens)) {
             let glu = self.routed.glu.encode_picked(batch, picked, x, top_k)?;
             return Ok((glu, RoutedRows::Picked));
@@ -1382,6 +1383,7 @@ mod tests {
                     .expect("the activation encodes");
                     activated.expect("the bank dispatched its pair")
                 };
+                let cut = bank.rows_a_block(picked.len());
                 let pending = match grouped {
                     false => {
                         let glu = bank
@@ -1395,7 +1397,7 @@ mod tests {
                     true => {
                         let mut sorted = kernels
                             .grouping
-                            .encode(&mut batch, &mut picked, EXPERTS, bank.rows_a_block())
+                            .encode(&mut batch, &mut picked, EXPERTS, cut)
                             .expect("the grouping encodes");
                         let glu = bank
                             .glu

@@ -308,16 +308,8 @@ kernel void group_by_expert(
 
     for (uint bucket = local; bucket < buckets; bucket += threads) {
         uint at = 0;
-        // Blocks the buckets before this one take, which is the same prefix sum
-        // as `at` over a different summand — so it is walked here rather than in
-        // a second loop over the same loads.
-        uint planned = 0;
         for (uint before = 0; before < bucket; ++before) {
-            const uint count = atomic_load_explicit(&counts[before], memory_order_relaxed);
-            at += count;
-            if (shape.rows_a_block > 0) {
-                planned += (count + shape.rows_a_block - 1) / shape.rows_a_block;
-            }
+            at += atomic_load_explicit(&counts[before], memory_order_relaxed);
         }
         const uint start = at;
         for (uint row = 0; row < shape.rows; ++row) {
@@ -337,9 +329,22 @@ kernel void group_by_expert(
         // lets the rows stay where the sort put them — a layout padded to whole
         // blocks would move every row after the first short run and every reader
         // of `order` would have to know it.
-        // Refused rather than skipped where nothing behind this blocks its rows,
-        // because a stride of zero here is a loop that never ends.
+        // **A second walk of the same counts rather than a second accumulator in
+        // the one above**, which is the shape a cost decides. The prefix sum
+        // this needs is over the *blocks* each bucket takes rather than over its
+        // rows, and carrying both through one loop puts a division and a branch
+        // in a loop every dispatch runs — where a grouped call whose runs are
+        // long reads no plan at all and would pay for one anyway. That is 34 ms
+        // of a 16384-token prefill, which is 0.1% of it and was measured.
+        //
+        // Skipped entirely rather than reached with a stride of zero, which
+        // would be a loop that never ends.
         if (shape.rows_a_block > 0) {
+            uint planned = 0;
+            for (uint before = 0; before < bucket; ++before) {
+                planned += (atomic_load_explicit(&counts[before], memory_order_relaxed)
+                            + shape.rows_a_block - 1) / shape.rows_a_block;
+            }
             for (uint held = start; held < at; held += shape.rows_a_block) {
                 plan[2 * planned] = held;
                 plan[2 * planned + 1] = min(shape.rows_a_block, at - held);
