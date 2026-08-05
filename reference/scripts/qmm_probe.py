@@ -62,13 +62,17 @@ def best_of(fn, rounds):
 
 def ragged(rows, experts, block=32):
     """The same rows over the same experts with the run boundaries where a
-    router's own counts put them, rather than every run the same length.
+    router's own counts put them, rather than every run the same length, or
+    `None` where the mean run is no longer than the tile and so holds no
+    boundary that could land inside one.
 
     `each_way_runs_can_land` in `crates/inkling-metal/src/matmul.rs`, written
     out again here so that both kernels are asked the identical question — seven
     is coprime with `block`, so the offsets walk every alignment instead of
     alternating between two of them.
     """
+    if rows // experts <= block:
+        return None
     at = (
         [0]
         + [
@@ -105,9 +109,12 @@ def quantised(rows, in_dim, out_dim, experts, dtype, mode, group, bits, sort, ru
             ),
             ROUNDS,
         )
+    spread = ragged(rows, experts) if runs == "ragged" else None
+    if runs == "ragged" and spread is None:
+        return None
     at = (
-        mx.array(ragged(rows, experts), dtype=mx.uint32)
-        if runs == "ragged"
+        mx.array(spread, dtype=mx.uint32)
+        if spread is not None
         else mx.arange(rows, dtype=mx.uint32) * experts // rows
     )
     mx.eval(x, codes, scales, at)
@@ -197,6 +204,11 @@ def main():
                             sort,
                             runs,
                         )
+                        # A mean run no longer than the tile holds no
+                        # boundary that could land inside one, so the arm is not
+                        # a question at that length.
+                        if taken is None:
+                            continue
                         told = f"sorted, {runs}" if sort else "unsorted"
                         print(
                             f"  {what:<16}{name:<11}{mode:<9}{told:<16}"

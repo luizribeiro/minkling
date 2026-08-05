@@ -2369,7 +2369,13 @@ fn a_sampled_prefills_accounting_adds_up(run: &OnTheDevice, tokens: usize) {
 /// past, and its own list stops where this one does for a reason of its own —
 /// a decode step at 65536 keys is a dispatch and a prefill to it is half an
 /// hour, so the two lists are the same question asked at different prices.
-const LONG_PREFILLS: [usize; 4] = [2048, 4096, 8192, 16384];
+///
+/// **The two under a thousand are where a coding session actually lives.** A
+/// turn's opening prompt is thousands of tokens and is prefilled once; every
+/// turn after it adds about 321, and K1's kept cache is what makes the delta
+/// rather than the whole prompt the thing that gets prefilled. So the lengths
+/// this engine is asked at most often are the two the table used to open above.
+const LONG_PREFILLS: [usize; 6] = [321, 512, 2048, 4096, 8192, 16384];
 
 /// **Where a prefill's time goes at a prompt a coding turn opens with**, which
 /// is the same table as `where_a_prefill_spends_its_time` at 385 and 769 tokens

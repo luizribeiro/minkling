@@ -3734,6 +3734,27 @@ kernel void __ENTRY__(
     const uint down = simd / MMA_SIMDS_ACROSS;
     const uint alongside = simd % MMA_SIMDS_ACROSS;
 
+    // Fragments down this simdgroup has a row of the call in, which is every
+    // one of them where the block is full and fewer where it is not.
+    //
+    // **A fragment is eight rows and the call's rows start at the top of the
+    // block**, so a fragment past `rows` holds no row this dispatch is for: its
+    // staged input is the zeros the fill wrote, its accumulator would stay zero
+    // and the write-out below refuses its rows anyway. Skipping it takes its
+    // fragment reads and its multiply-accumulates off a call whose last block is
+    // ragged — and off *every* block of a grouped call laid out over runs
+    // shorter than the block, which is the shape a coding session's prefills
+    // give this kernel.
+    //
+    // Per simdgroup and threadgroup-uniform inside one, and no barrier is inside
+    // the loops it bounds — the staging is a whole-threadgroup fill either side
+    // of a barrier and is not touched by this.
+    const uint reached = (rows + MMA_FRAGMENT - 1) / MMA_FRAGMENT;
+    const uint held_down = min(
+        (uint)MMA_FRAGMENTS_DOWN,
+        (uint)max((int)reached - (int)(down * MMA_FRAGMENTS_DOWN), 0)
+    );
+
     simdgroup_float8x8 sums[MMA_FRAGMENTS_DOWN][MMA_FRAGMENTS_ACROSS];
     for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
         for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
@@ -3786,7 +3807,7 @@ kernel void __ENTRY__(
             for (uint k = 0; k < MMA_CODES_A_STEP / MMA_FRAGMENT; ++k) {
                 simdgroup_matrix<MMA_OPERAND, 8, 8> lhs[MMA_FRAGMENTS_DOWN];
                 simdgroup_matrix<MMA_OPERAND, 8, 8> rhs[MMA_FRAGMENTS_ACROSS];
-                for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
+                for (uint i = 0; i < held_down; ++i) {
                     mma_read(
                         lhs[i],
                         staged_x
@@ -3809,7 +3830,7 @@ kernel void __ENTRY__(
                         lane
                     );
                 }
-                for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
+                for (uint i = 0; i < held_down; ++i) {
                     for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
                         simdgroup_multiply_accumulate(sums[i][j], lhs[i], rhs[j], sums[i][j]);
                     }
@@ -3821,7 +3842,7 @@ kernel void __ENTRY__(
     // Reached before the first fragment is stored, because the store lands on
     // the staged tiles and another simdgroup may still be reading them.
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
+    for (uint i = 0; i < held_down; ++i) {
         for (uint j = 0; j < MMA_FRAGMENTS_ACROSS; ++j) {
             simdgroup_store(
                 sums[i][j],
@@ -4918,6 +4939,41 @@ kernel void decoded_elements(
         );
         eprintln!("a reduction of {MMA_CODES_A_STEP}: drift from exact {close:e}");
         assert!(close <= f64::from(TOLERANCE), "drift {close:e}");
+    }
+
+    /// **A block that stops inside its first fragment still answers every row
+    /// it holds**, which is the edge the fragment bound in [`MMA`] is at.
+    ///
+    /// The kernel skips the fragments down that hold no row of the call, and
+    /// what decides how many those are is a division that rounds up. So the row
+    /// counts worth pinning are the ones either side of it: a block holding one
+    /// row keeps one fragment where a whole simdgroup's worth would keep none,
+    /// and a block holding a fragment and one row keeps two.
+    ///
+    /// **The case above already lands a block on thirteen rows** and is where the
+    /// drift is read; this is the arithmetic of the bound rather than the
+    /// arithmetic of the sum, so it asserts agreement and no more.
+    #[test]
+    fn a_block_that_stops_inside_a_fragment_answers_every_row_it_holds() {
+        let Some(device) = device() else { return };
+
+        let reference = matmul(&device);
+        let block = PackedMatmul::under(&device, Numerics::Production).expect("compiles");
+        for over in [1, MMA_FRAGMENT - 1, MMA_FRAGMENT, MMA_FRAGMENT + 1] {
+            let rows = PackedMatmul::SHORTEST_BLOCKED_CALL + over;
+            let case = Case::noisy(IN_DIM, OUT_DIM, rows);
+            let through = |matmul: &PackedMatmul| {
+                case.upload(&device, matmul)
+                    .multiply(&case.x)
+                    .expect("the dispatch completes")
+            };
+            let deviation = deviation(&through(&block), &through(&reference));
+            assert!(
+                deviation <= MMA_TOLERANCE,
+                "a last block of {over} rows deviated {deviation:e}, so a row the block holds \
+                 went unmultiplied"
+            );
+        }
     }
 
     /// The block shapes this file sweeps, beside the one it ships.
@@ -9963,6 +10019,237 @@ kernel void mma_lane_probe___T__(
                 1.0 + predicted,
                 measured / predicted,
             );
+        }
+    }
+
+    /// The prompts a coding session's own prefills are, which are the lengths
+    /// [`Block::runs_an_expert`] refuses a grouped call at.
+    ///
+    /// A turn's opening prompt is thousands of tokens and is prefilled once;
+    /// every turn after it adds about 321. Six rows a token over 256 experts
+    /// puts an expert at 7.5 rows at 321 and 12 at 512, against the 32 a block
+    /// holds — so a routed bank at either length runs the reference tile, and
+    /// what the block is worth there is a question no table here has asked.
+    const SESSION_LENGTHS: [usize; 2] = [321, 512];
+
+    /// **What a routed bank costs at a prompt the block is refused at, and what
+    /// a block cut at the run boundaries would cost instead.**
+    ///
+    /// The block is refused below 1366 tokens because a block whose rows name
+    /// several experts runs the whole reduction once per expert they name, and
+    /// at 512 tokens a 32-row block would straddle two or three runs. **What the
+    /// refusal costs is what this asks**, and the second arm is what says it,
+    /// because a block does not have to be given rows that disagree: a grid laid
+    /// out over the runs rather than over the rows gives every block one
+    /// expert's rows and however few of them that run holds.
+    ///
+    /// **The second arm is that call exactly and not a model of it.** A run-cut
+    /// block over `rows` rows in runs of `L` dispatches one block per
+    /// `ceil(L / 32)`, each staging 32 rows of which `L` are the call's and the
+    /// rest are the zeros the kernel already stages for a row that is not this
+    /// pass's. So a grouped call of `experts × 32` rows in runs of exactly 32 is
+    /// the same block count doing the same walk over the same weights — and
+    /// dividing its clock by the *useful* multiply-adds, which are the shorter
+    /// call's, is what the rate column does.
+    ///
+    /// Warm and swept both ways, and the sort is off both columns.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_block_would_be_worth_at_a_prompt_it_is_refused_at() {
+        let Some(device) = device() else { return };
+
+        let shipped =
+            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        let (_, a_token, in_dim, out_dim, experts, _) = BOUND_SHAPES[1];
+        let rows_a_block = Block::SHIPPED.rows;
+
+        eprintln!(
+            "\n  {:<10}{:>10}{:>12}{:>10}{:>12}{:>15}{:>12}{:>15}",
+            "tokens", "an expert", "the entry", "blocks", "as it runs", "", "run-cut", ""
+        );
+        for tokens in SESSION_LENGTHS {
+            let shape = Blocked::at(tokens, BOUND_SHAPES[1]);
+            let entries = entries_dispatched(&device, |batch| {
+                let bank = shape.upload(&device, &shipped);
+                let mut x = device.buffer(&shape.case.x).expect("the rows upload");
+                shape.encode(batch, &device, &bank, &mut x, &grouping);
+            });
+            let reached = entries
+                .iter()
+                .find(|entry| entry.contains("matmul"))
+                .cloned()
+                .unwrap_or_default();
+
+            // One block an expert's run, which is what a grid over the runs
+            // gives a prompt whose runs are shorter than a block.
+            let blocks = shape.rows.div_ceil(rows_a_block).max(experts);
+            let cut = Blocked::of("", blocks * rows_a_block, in_dim, out_dim, experts, true);
+            assert_eq!(
+                blocks_and_passes(&cut.chosen, rows_a_block),
+                (blocks, blocks),
+                "the run-cut arm at {tokens} tokens straddles a block, so it is not the call a \
+                 grid over the runs would dispatch"
+            );
+
+            let banks = (
+                shape.upload(&device, &shipped),
+                cut.upload(&device, &shipped),
+            );
+            crate::testing::warmed(|| {
+                shape.costs_on(&device, &banks.0, &grouping);
+            });
+            let (up, down) = crate::testing::both_ways(&[0usize, 1], |at| match at {
+                0 => shape.costs_on(&device, &banks.0, &grouping) - shape.sorts(&device, &grouping),
+                _ => cut.costs_on(&device, &banks.1, &grouping) - cut.sorts(&device, &grouping),
+            });
+            // The useful multiply-adds are the shorter call's under both arms —
+            // the run-cut one stages the same zeros a straddled pass stages and
+            // is charged for none of them.
+            let rate = |at: usize| {
+                let taken = up[at].max(down[at]).as_secs_f64();
+                (
+                    format!("{:.2}ms", 1e3 * taken),
+                    format!("{:.1} TFLOP/s", 1e-12 * shape.flops() / taken),
+                )
+            };
+            let (as_it_runs, its_rate) = rate(0);
+            let (run_cut, cut_rate) = rate(1);
+            eprintln!(
+                "  {tokens:<10}{:>10}{reached:>12}{blocks:>10}{as_it_runs:>12}{its_rate:>15}\
+                 {run_cut:>12}{cut_rate:>15}",
+                format!("{:.1} rows", (tokens * a_token) as f64 / experts as f64),
+            );
+        }
+    }
+
+    /// The heights a grouped call's block is priced at, which is the axis a
+    /// straddle's cost is measured along.
+    ///
+    /// **A straddled block runs the whole reduction twice over its own rows, so
+    /// what a straddle costs is a walk of the block** — and the same 255
+    /// boundaries fall into twice as many blocks when the block is half as tall,
+    /// each costing half as much. The term should therefore be proportional to
+    /// the height, and what a shorter block gives up for it is the reuse the
+    /// height was taken for: a weight byte decoded once and driven through this
+    /// many rows.
+    ///
+    /// Sixteen is `gather_qmm_rhs`'s own `BM` and is why it is here. Both arms
+    /// keep the 256-thread threadgroup and the 64-column width, so what moves
+    /// between them is the rows and the fragments a simdgroup holds down them.
+    const SWEPT_HEIGHTS: [Block; 3] = [
+        Block {
+            rows: MMA_ROWS_A_BLOCK / 2,
+            ..Block::SHIPPED
+        },
+        Block::SHIPPED,
+        Block {
+            rows: 2 * MMA_ROWS_A_BLOCK,
+            simds_down: 4,
+            simds_across: 2,
+            ..Block::SHIPPED
+        },
+    ];
+
+    /// **What a block of each height costs where the runs divide it and where
+    /// they do not**, which is the lever the diagnosis above implies and the
+    /// price it is bought at.
+    ///
+    /// The table above says a grouped call's cost follows the passes its run
+    /// boundaries produce. The boundaries are the bank's — 255 of them however
+    /// the call is blocked — so a block half as tall meets the same number of
+    /// them across twice as many blocks and pays half a walk for each. **What it
+    /// gives up is the arithmetic intensity the height was taken for**, and this
+    /// is the two of them on one clock rather than either alone.
+    ///
+    /// The gate is the other half of it and is not a separate lever:
+    /// [`Block::runs_an_expert`] refuses a grouped call until an expert averages
+    /// a block of rows, so a block of 16 reaches a 683-token prompt where one of
+    /// 32 needs 1366 — which is the axis a coding session's own prefills sit
+    /// below.
+    ///
+    /// Warm and swept both ways, and the sort is taken off both columns.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_block_of_each_height_costs_where_the_runs_do_not_divide_it() {
+        let Some(device) = device() else { return };
+
+        distinct(&SWEPT_HEIGHTS);
+        let arms: Vec<(Block, PackedMatmul)> = SWEPT_HEIGHTS
+            .iter()
+            .filter_map(|&block| a_block_of(&device, block).map(|matmul| (block, matmul)))
+            .collect();
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+
+        for tokens in BLOCKED_LENGTHS {
+            let whole = Blocked::at(tokens, BOUND_SHAPES[1]);
+            let sorts = whole.sorts(&device, &grouping);
+            // **The layouts are held at the shipped block's height and not at
+            // each arm's**, because the run boundaries are the bank's own. A
+            // ragged layout cut against every height in turn would be three
+            // different callers rather than three blocks under one.
+            let ways = each_way_runs_can_land(whole.rows, whole.experts, Block::SHIPPED.rows);
+            let shapes: Vec<(&str, Blocked)> = ways
+                .iter()
+                .map(|(what, chosen)| {
+                    (
+                        *what,
+                        Blocked::at(tokens, BOUND_SHAPES[1]).named(chosen.clone()),
+                    )
+                })
+                .collect();
+
+            let banks: Vec<PackedBank<'_>> = arms
+                .iter()
+                .map(|(_, matmul)| whole.upload(&device, matmul))
+                .collect();
+            crate::testing::warmed(|| {
+                whole.costs_on(&device, &banks[0], &grouping);
+            });
+            let listed: Vec<usize> = (0..arms.len()).collect();
+            let (up, down) = crate::testing::both_ways(&listed, |at| {
+                shapes
+                    .iter()
+                    .map(|(_, shape)| shape.costs_on(&device, &banks[at], &grouping))
+                    .collect::<Vec<Duration>>()
+            });
+
+            eprintln!("\n  a routed bank at {tokens} tokens");
+            eprintln!(
+                "  {:<22}{:>10}{}",
+                "a block of",
+                "reaches",
+                shapes
+                    .iter()
+                    .map(|(what, _)| format!("{:>32}", *what))
+                    .collect::<String>()
+            );
+            for (at, (block, _)) in arms.iter().enumerate() {
+                let cells: String = (0..shapes.len())
+                    .map(|column| {
+                        let taken = up[at][column]
+                            .max(down[at][column])
+                            .saturating_sub(sorts)
+                            .as_secs_f64();
+                        let (_, shape) = &shapes[column];
+                        format!(
+                            "{:>17}{:>15}",
+                            format!("{:.2}ms", 1e3 * taken),
+                            format!("{:.1} TFLOP/s", 1e-12 * shape.flops() / taken),
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "  {:<22}{:>10}{cells}",
+                    format!("{} rows", block.rows),
+                    // The shortest prompt whose routing feeds this height, which
+                    // is the gate read as a prompt rather than as a row count.
+                    format!(
+                        "{} tokens",
+                        (whole.experts * block.runs_an_expert()).div_ceil(6)
+                    ),
+                );
+            }
         }
     }
 
