@@ -4559,6 +4559,29 @@ mod tests {
     /// afford three passes of.
     const BOUND_TOKENS: [usize; 2] = [2048, 8192];
 
+    /// The key spans the decode-shaped limiter table is taken at — the shortest
+    /// and the longest context `what_a_decode_step_costs_as_the_context_grows`
+    /// reads a step at.
+    const BOUND_KEYS: [usize; 2] = [385, 8192];
+
+    /// The four dispatches the decode-shaped table is read across: one query row
+    /// over each span, on both kinds of layer.
+    ///
+    /// **One query row is the whole of what makes this a decode shape.** Every
+    /// other table in this file is `n` queries over `n` keys, which is a prefill;
+    /// a decode step asks one row against every key the sequence holds, and the
+    /// terms that are a per-key cost paid by one lane are the ones whose share
+    /// that changes.
+    fn decode_cells() -> Vec<(usize, usize, &'static str)> {
+        BOUND_KEYS
+            .iter()
+            .flat_map(|&keys| {
+                [("global", 0), ("window 512", SLIDING_WINDOW)]
+                    .map(|(what, sliding)| (keys, sliding, what))
+            })
+            .collect()
+    }
+
     /// The four dispatches every table below is read across: both prompt lengths
     /// on both kinds of layer, as `(tokens, sliding, what to call it)`.
     fn bound_cells() -> Vec<(usize, usize, &'static str)> {
@@ -5177,6 +5200,94 @@ mod tests {
             let taken: Vec<Duration> = cells
                 .iter()
                 .map(|&(tokens, sliding, _)| cost(&mutant, tokens, sliding))
+                .collect();
+            row(arm.what, &taken);
+        }
+    }
+
+    /// **What a decode step's attention is bound by, one term at a time** — A4's
+    /// instrument at the shape A4 never pointed it at.
+    ///
+    /// **The table above is four prefills and has been read as though one of its
+    /// columns were a decode step.** Its cells are 2048 and 8192 *tokens* on a
+    /// global and on a windowed layer, and the band's row there is 28% of the
+    /// windowed column against 23% and 9% of the global one. Those are two kinds
+    /// of layer at one regime, not two regimes — a decode step appears nowhere in
+    /// it — and the split is the band's own extent: a windowed layer's live keys
+    /// are all inside the 1024-distance band where a global layer at 8192 reads
+    /// mostly keys further back and takes the early return.
+    ///
+    /// So the question is open rather than answered, and this is what asks it.
+    /// **One query row over the keys the sequence holds**, which is the shape a
+    /// step has and the shape whose share of a step
+    /// `which_kernels_own_a_decode_step_at_each_context` puts at 4% of the device
+    /// at 97 keys and most of the growth after that.
+    ///
+    /// **What could move between the two regimes is what a term costs per key
+    /// against what it costs per query row.** The band is `d_rel` device reads
+    /// and `d_rel` multiplies made by lane 0 while its 31 lanes wait, once for
+    /// every key scored — so a call scoring the same keys for one row rather than
+    /// for a block of them pays the same band and less of everything the rows
+    /// share. The shares do not sum to one and are not meant to, for the reason
+    /// the prefill table gives.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_decode_steps_attention_is_bound_by() {
+        let Some(device) = device() else { return };
+
+        let shipped = FusedAttention::new(&device).expect("the kernel compiles");
+        // Answered at a decode shape rather than at the prefill one the table
+        // above checks against, so that an arm which is only a mutation at a
+        // block of query rows is caught here rather than measured.
+        let answered = |attention: &FusedAttention| {
+            blocked(385, SLIDING_WINDOW, 1).on_the_device(&device, attention)
+        };
+        let want = answered(&shipped);
+        let cost = |attention: &FusedAttention, keys, sliding| {
+            a_call_costs(&device, attention, &blocked(keys, sliding, 1), None)
+        };
+
+        let cells = decode_cells();
+        let header: String = cells
+            .iter()
+            .map(|(keys, _, what)| format!("{:>21}", format!("{keys} keys {what}")))
+            .collect();
+        eprintln!("  {:<28}{header}", "without");
+
+        let whole: Vec<Duration> = cells
+            .iter()
+            .map(|&(keys, sliding, _)| cost(&shipped, keys, sliding))
+            .collect();
+        let row = |what: &str, taken: &[Duration]| {
+            let cells: String = taken
+                .iter()
+                .zip(&whole)
+                .map(|(each, whole)| {
+                    format!(
+                        "{:>12}{:>9}",
+                        format!("{each:.2?}"),
+                        format!("{:.0}%", 1e2 * each.as_secs_f64() / whole.as_secs_f64()),
+                    )
+                })
+                .collect();
+            eprintln!("  {what:<28}{cells}");
+        };
+        row("nothing — the kernel", &whole);
+
+        for arm in without_each_term() {
+            let mutant =
+                FusedAttention::from_source(&device, &arm.source).expect("the mutant compiles");
+            if arm.answers_differently {
+                assert_ne!(
+                    answered(&mutant),
+                    want,
+                    "{}: the mutation answered what the kernel answers",
+                    arm.what
+                );
+            }
+            let taken: Vec<Duration> = cells
+                .iter()
+                .map(|&(keys, sliding, _)| cost(&mutant, keys, sliding))
                 .collect();
             row(arm.what, &taken);
         }
