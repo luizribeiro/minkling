@@ -3784,8 +3784,6 @@ kernel void __ENTRY__(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             for (uint k = 0; k < MMA_CODES_A_STEP / MMA_FRAGMENT; ++k) {
-                // `sums` stays float: the instruction takes the mixed form, so a
-                // narrowed operand rounds the product and not the chain.
                 simdgroup_matrix<MMA_OPERAND, 8, 8> lhs[MMA_FRAGMENTS_DOWN];
                 simdgroup_matrix<MMA_OPERAND, 8, 8> rhs[MMA_FRAGMENTS_ACROSS];
                 for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
@@ -8646,12 +8644,20 @@ kernel void mma_lane_probe___T__(
             // says whether that amortisation finished the term or only moved it.
             (
                 "the table it decodes through",
+                // The two decoded halves of a byte, taken one at a time and by
+                // the gather alone. Matching the pair as one string would tie
+                // this arm to how the two lines are laid out and to whatever
+                // stands between them, which is what put it on the operand
+                // word's cast; `element(…) * by` is the block's own decode and
+                // appears nowhere else in the source.
                 crate::testing::instead_of(
-                    &shipped,
-                    "staged_w[at] = element(code & CODE_MASK) * by;\n                \
-                     staged_w[at + 1] = element((code >> BITS) & CODE_MASK) * by;",
-                    "staged_w[at] = (float)(code & CODE_MASK) * by;\n                \
-                     staged_w[at + 1] = (float)((code >> BITS) & CODE_MASK) * by;",
+                    &crate::testing::instead_of(
+                        &shipped,
+                        "element(code & CODE_MASK) * by",
+                        "(float)(code & CODE_MASK) * by",
+                    ),
+                    "element((code >> BITS) & CODE_MASK) * by",
+                    "(float)((code >> BITS) & CODE_MASK) * by",
                 ),
             ),
             // **Three of every four fragment loads, which is the reuse question
@@ -8763,15 +8769,15 @@ kernel void mma_lane_probe___T__(
     /// reduction and feeds four multiply-accumulates.
     const EVERY_STEP_LOADS: &str = r#"
             for (uint k = 0; k < MMA_CODES_A_STEP / MMA_FRAGMENT; ++k) {
-                simdgroup_float8x8 lhs[MMA_FRAGMENTS_DOWN];
-                simdgroup_float8x8 rhs[MMA_FRAGMENTS_ACROSS];
+                simdgroup_matrix<MMA_OPERAND, 8, 8> lhs[MMA_FRAGMENTS_DOWN];
+                simdgroup_matrix<MMA_OPERAND, 8, 8> rhs[MMA_FRAGMENTS_ACROSS];
 "#;
 
     /// The same with the declarations hoisted above the loop and the loads put
     /// behind `k == 0`, so one set of fragments feeds sixteen.
     const ONE_STEP_LOADS: &str = r#"
-            simdgroup_float8x8 lhs[MMA_FRAGMENTS_DOWN];
-            simdgroup_float8x8 rhs[MMA_FRAGMENTS_ACROSS];
+            simdgroup_matrix<MMA_OPERAND, 8, 8> lhs[MMA_FRAGMENTS_DOWN];
+            simdgroup_matrix<MMA_OPERAND, 8, 8> rhs[MMA_FRAGMENTS_ACROSS];
             for (uint k = 0; k < MMA_CODES_A_STEP / MMA_FRAGMENT; ++k) {
                 if (k == 0) {
 "#;
