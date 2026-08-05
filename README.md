@@ -1204,6 +1204,368 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## The block a short prompt could not have
+
+**The thirteen points between 2048 and 8192 are the pass loop, and the largest
+thing this milestone found is what that same term was costing underneath them.**
+A routed bank at 321 tokens — the length a coding session's per-turn delta
+prefill actually is — was 72% of the prefill and ran at a fifth of the
+instruction ceiling, because the block was refused there outright. It is not
+refused any more: **that prefill's device time is 34.3% lower and its wall 63.2%,
+seven pairs of seven with the ranges apart, and the 8192 and 16384 rows read no
+claim on either.**
+
+### The divergence, which is what decides it
+
+**Reported first, because a speed figure read before it would be an argument
+rather than a measurement.**
+
+    just diverge                     # the reference against production
+    just diverge --against rounded   # the reference against the operand word
+
+    six prompts, six distributions, 64 to 6439 tokens, 64 argmaxes each
+    the reference against production      384 of 384 agreed, no prompt parted
+    the reference against rounded         320 of 384 agreed, one prompt parted
+
+**`production` is unmoved. `rounded` is not, and that is the corpus rather than
+this change.** D5's dispatch-list differential refused the run before it reported
+a token: the corpus reached three of the four entries behind the flag, because a
+grouped call now takes one of two blocked entries by run length and the longest
+prompt in the corpus was 2123 tokens where the second wants about 5462. So the
+list of primes goes to 14000, which is 6439 tokens, and the code listing goes
+from 77 tokens to 1199. With both lengths present the corpus selects all four.
+
+**The parting is on the code listing at token 6, under `rounded` alone**, and it
+is the first parting this corpus has recorded. `production` forms exact products
+and agrees 384 of 384 through the same four entries, and
+`the_two_grouped_entries_answer_one_call_the_same_bits` holds the two grouped
+entries to **equality** rather than to a tolerance — a row's reduction is over
+the same codes of the same weight in the same order whichever block it lands in.
+So what the parting says is that T4's 384/384 for `rounded` was taken over a
+corpus whose code member was 77 tokens and never reached the arithmetic. **It
+stays opt-in and this is a reason more.**
+
+**The recorded continuation is unmoved under all three words.**
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` off the device under `reference`,
+`production` and `rounded` alike, and off `--backend cpu`.
+
+### Where the thirteen points go
+
+**They are the pass loop, and the arithmetic usually offered for them predicts
+the wrong sign.** T4 left the routed bank at 49.0% of the instruction ceiling at
+2048 tokens and 62.2 and 62.5% at 4096 and 8192; the story on offer was that an
+expert is named by 48 rows at 2048 and 192 at 8192, so fixed costs amortise over
+a quarter as much work. But A3 measured expert-weight re-reading at 96× costing
+10.4%, and *fewer* rows an expert is *fewer* re-reads.
+
+**What decides a grouped call's cost is where the bank's 255 run boundaries fall
+against a block 32 rows tall, and not the prompt.** A block whose rows name
+several experts runs the whole reduction once per expert they name. At 2048 an
+expert gets 48 rows, which is a block and a half, so every other boundary lands
+inside a block and that block walks 4096 codes twice. At 4096 and 8192 an expert
+gets 96 and 192 — three blocks and six exactly — and **the fixture's own even
+runs put every boundary on a block edge.** The plateau was the divisibility of
+the fixture.
+
+`where_a_grouped_calls_run_boundaries_land_against_a_block` is the reading: same
+kernel, same rows, same weights, same multiply-adds, and what moves is where the
+boundaries land. The block alone, with the sort taken off, at the commit this
+milestone opened at:
+
+    a routed bank at 2048 tokens               blocks   passes   the block   of it
+    as the routing gives them                     384      512     16.24ms    100%
+    the same rows, runs cut to whole blocks       384      384     12.68ms     78%
+    the same rows, runs ragged                    384      631     19.53ms    120%
+    one pass a block, which answers wrongly       384      384     12.60ms     78%
+
+**49.0% × 16.24 / 12.68 is 62.8%, which is the plateau.** The bound arm agrees
+from the other side — the pass loop stopped after its first pass, which answers
+zeros for every row that named some other expert, reads the same 78%.
+
+**And in the model the term is at every length, because a router's runs are not
+the fixture's.** The shipped build against a build whose pass loop stops after
+the first pass, one prefill a length under `production`:
+
+    tokens   the grouped row   one pass a block   the term
+      2048           1.81 s          1.37 s         23.4%
+      4096           3.15 s          2.73 s         13.3%
+      8192           5.87 s          5.44 s          7.3%
+     16384          11.30 s         10.86 s          3.9%
+
+**A constant 3.6 ms a grouped dispatch at every length**, which is 255 boundaries
+meeting a block that does not move. `mma_matmul_rows` is the control and does not
+move — 1.21, 2.37, 4.66 and 9.23 s against 1.22, 2.38, 4.66 and 9.27 — because a
+tiled call's rows are one run and its pass loop has nothing to find.
+
+### What the block was refused, which is three quarters of a session's prefill
+
+**The same term is why a routed bank under 1366 tokens ran no block at all.** A
+32-row block over runs of twelve straddles three of them and walks the reduction
+three times, so the gate kept a grouped call on the reference tile until an
+expert averaged a block of rows. **A coding session's per-turn prefills are 321
+tokens** — `bench session` prefills exactly that at every turn after the first.
+What it cost, one prefill a length under `production`:
+
+    tokens   the routed bank   of the prefill   of the instruction
+       321        769.03ms          71.9%              19.9%
+       512          1.37 s          75.8%              17.8%
+      2048          1.81 s          52.6%              54.0%
+
+**Three quarters of a 512-token prefill, at a third of the rate the same bank
+runs at 2048.** No table in this file had read that column, because every table
+on this kernel is taken at 2048 and above.
+
+### What changed, which is where a block's rows come from
+
+**The sort cuts the blocks at its own run boundaries.** `group_by_expert` has
+every run's length in a threadgroup array by the time it places a row, so writing
+out where each block starts and how many rows it holds costs it a second walk of
+counts it already has — and the entry that reads that plan is given one expert's
+rows and never runs a second pass.
+
+**The rows stay where the sort put them.** A layout padded to whole blocks would
+move every row after the first short run, and every reader of `order` would have
+to know it; a plan moves nothing and is read by one dispatch.
+
+**Correctness does not turn on it.** The pass loop is still what makes the kernel
+right for any expert list — a block handed rows that disagree still answers them.
+What the plan changes is that it never is.
+
+**Two entries and not one, and a cost is what decides that.** The plan is a load
+in front of everything a threadgroup does, and the short-row branch it enables is
+a branch full blocks do not want: together they read **5.3%** of the entry on a
+call whose runs already cover a block, against the 3.9% the cutting buys there.
+So `mma_matmul_grouped` is unchanged and `mma_matmul_planned` stands beside it,
+and the line between them is a value the entries carry rather than a module
+constant — which is what lets both be arms of one table at every length.
+
+**And the gate is now four rows an expert, which is the tile's own height.**
+`what_a_grouped_call_costs_through_each_entry_as_the_runs_shorten`, the block
+alone:
+
+    tokens   an expert   it picks       the tile        over the rows       over the runs
+      97      2.3 rows   the tile     3.74ms  2.6 TF     3.74ms  2.6 TF     4.00ms  2.4 TF
+     171      4.0 rows   the runs     6.61ms  2.6 TF     9.37ms  1.8 TF     5.08ms  3.4 TF
+     321      7.5 rows   the runs     8.29ms  3.9 TF     9.39ms  3.4 TF     5.20ms  6.2 TF
+     512     12.0 rows   the runs     8.49ms  6.1 TF     9.56ms  5.4 TF     5.40ms  9.5 TF
+    1024     24.0 rows   the runs    16.91ms  6.1 TF    11.59ms  8.9 TF     8.59ms 12.0 TF
+    2048     48.0 rows   the runs    33.66ms  6.1 TF    16.24ms 12.7 TF    14.67ms 14.1 TF
+    4096     96.0 rows   the runs    67.23ms  6.1 TF    25.31ms 16.3 TF    26.49ms 15.6 TF
+    8192    192.0 rows   the rows   134.24ms  6.1 TF    50.47ms 16.3 TF    52.78ms 15.6 TF
+
+**The line between the two blocked entries is set from the model and not from
+that table, and the reason is this milestone's own finding.** Its runs are all
+one length, so its rows-laid arm never straddles a block and never pays the term
+the cut exists to remove; against the real routing the crossing is between three
+blocks a run and six rather than between one and a half and three. The tile's own
+line is set from the table, because there both arms are honest at every length.
+
+### What it is worth, at the six lengths a session has
+
+**Paired and alternating, one build a side, the order flipped every pair**, under
+`production`. Seven pairs at the four shorter lengths and three at the two
+longest. **The null pair was run first** — the same commit both arms, seven pairs
+at 2048: **0.0% on the wall and 0.0% on the device, ranges across, no claim.**
+
+    tokens         device                change   ranges   pairs         the wall
+      321   1042.5 ->   686.0            -34.3%   apart    7 of 7   2284.2 ->   841.2
+      512   1546.2 ->   942.4            -39.0%   apart    7 of 7   3111.0 ->  2517.0
+     2048   3232.2 ->  3042.4             -5.9%   apart    7 of 7   5546.8 ->  5308.4
+     4096   5997.7 ->  5886.3             -1.9%   apart    7 of 7   9106.7 ->  9065.9
+     8192  11741.5 -> 11744.6              0.0%   across   1 of 3  16944.9 -> 16949.0
+    16384  23691.4 -> 23720.3              0.1%   across   3 of 3  32519.7 -> 32351.3
+
+**The wall is a claim at the three shortest and no claim above them** — −63.2%,
+−19.1% and −4.3% with the ranges apart at seven of seven, then across. **The two
+longest rows read no claim on either, which is what this milestone had to protect
+and did**: there the grouped call takes the entry that was already there, and
+`mma_matmul_grouped` and `group_by_expert` read 5.87 and 11.30 s and 282.46 and
+567.06 ms against the 5.87, 11.30, 282.34 and 567.04 they read before it.
+
+**One row moved the wrong way and it is not one of the six.** At 97 tokens a
+routed bank averages 2.3 rows an expert, stays on the reference tile and does no
+grouped blocked work at all — and its device time reads **+1.3%, seven of seven
+with the ranges apart**. What changed for a prompt that reaches none of this is
+that the model now creates a third production pipeline at load, and D1 measured
+merely *reordering* which entries are created first at 2.4% of a prefill. It is
+the same term and it is not diagnosed further here.
+
+### What it is against the instruction ceiling
+
+**The instruction issues where it issued** — 25.3 TFLOP/s on four held matrix
+arms, within a tenth of the four sittings before this. The routed bank against
+it, in the model, one prefill a length under `production`, the sort taken off as
+its own row:
+
+    tokens        before        after      of the instruction
+       321      5.04 TF/s   9.03 TF/s      19.9% -> 35.7%
+       512      4.51 TF/s  10.95 TF/s      17.8% -> 43.3%
+      2048     13.67 TF/s  14.99 TF/s      54.0% -> 59.3%
+      4096     15.71 TF/s  16.12 TF/s      62.1% -> 63.7%
+      8192     16.86 TF/s  16.86 TF/s      66.6% -> 66.6%
+     16384     17.51 TF/s  17.51 TF/s      69.2% -> 69.2%
+
+**Twice the rate at 512 tokens and not a percent at 8192**, which is the shape of
+the term: 255 boundaries and 256 part-empty blocks are both counts of *experts*,
+so what they cost is a share of a prefill that falls as the prompt grows.
+
+**The fixture's own column is beside it and disagrees at 4096**, which is worth
+printing rather than hiding: `what_the_matrix_instruction_issues_at` reads 24.1,
+36.9, 53.9, 59.5, 62.5 and 62.6% at the six lengths, where the 4096 row is 2.7
+points *under* T4's. Its runs are all one length and divide the block exactly at
+4096, so its rows-laid arm pays no straddle there and the cut pays its part-empty
+blocks for nothing. **That is the same artefact the thirteen points were**, met
+a second time in the same table, and it is why the line was set from the model.
+
+### What `gather_qmm` does that holds 79% at both ends, which is nothing
+
+**It does not hold 79% at both ends, and the reason the column read that way is
+this milestone's own finding one directory over.** `qmm_probe.py` has always
+built its indices as `arange(rows) * experts // rows`, which gives every expert
+the same run — 48 rows at 2048, 96 at 4096, 192 at 8192 — and every one of those
+is a whole number of `fp_gather_qmm_rhs`'s own 16-row tile. **So the flat column
+was the one run layout that never lands a boundary inside that kernel's tile.**
+
+Its source says why that matters. `fp_gather_qmm_rhs` walks the sorted index list
+inside its tile, cuts at each boundary it finds, and runs a **whole gemm over `K`
+for every run**, storing only that run's slice through `store_result_slice`. That
+is the same second walk this engine's block pays as a second pass. **mlx does not
+avoid it — it pays it at half the height.**
+
+The same rows and the same experts with the boundaries where a router puts them,
+one dispatch each, float32 MXFP4, indices declared sorted either way:
+
+    a routed bank       even runs            runs a router gives     of the ceiling
+     2048          10.71ms  19.3 TFLOP/s     14.40ms  14.3 TFLOP/s   76.3% -> 56.5%
+     4096          21.22ms  19.4 TFLOP/s     24.50ms  16.8 TFLOP/s   76.7% -> 66.4%
+     8192          41.31ms  20.0 TFLOP/s     44.52ms  18.5 TFLOP/s   79.1% -> 73.1%
+
+**It loses twenty points at 2048 and six at 8192, and the shape is the shape this
+kernel had.** Ours loses 0.540, 0.275 and 0.138 of itself at the three lengths
+against its 0.345, 0.155 and 0.078 — **a ratio of 1.57, 1.77 and 1.77**, which is
+the two tile heights. So what `gather_qmm` does differently is that its tile is
+16 rows where this one's is 32, and the same 255 boundaries cost it half as much.
+
+**And a shorter tile is a trade rather than a lever**, which
+`what_a_block_of_each_height_costs_where_the_runs_do_not_divide_it` is what says.
+Now that the runs are cut, a block of 16 rows here is behind a 32-row one at
+every length — level at 2048 and 6 to 8% behind at 4096 and 8192 on the run
+lengths a router gives. **The height moves the term and the layout removes it**,
+and once it is removed the height is free to go the other way. See the floor
+below, where it does.
+
+### Against the other engine, one sitting
+
+**Seven pairs, one sitting, the order flipped each pair**, on the packed heads,
+our arm under `--numerics production`. **The reference column reproduces to the
+millisecond** — 283.9, 703.8 and 1167.9 ms of prefill against T4's 283, 706 and
+1170 — which is what says the two sittings are comparable at all.
+
+    prompt × generated   ours k = 0   ours k = 2    mlx-vlm   k = 2 against it
+     97 × 128               2.524 s      2.305 s    3.219 s       1.40× ahead
+    385 × 128               3.212 s      3.073 s    3.680 s       1.20× ahead
+    769 × 128               5.394 s      5.391 s    4.203 s       0.78×
+     97 × 512               9.221 s      7.827 s   12.260 s       1.57× ahead
+
+    to the first token       ours    mlx-vlm     gap
+       97                  439.9ms    283.9ms   ×1.55
+      385                  966.5ms    703.8ms   ×1.37
+      769                 2250.9ms   1167.9ms   ×1.93
+
+**The 385 × 128 row has changed sign**, and the paired sitting is what attributes
+it: our own prefill at 385 tokens reads **1211.3 → 773.3 ms of device time,
+−36.2%, seven of seven with the ranges apart**, and at 769 **2270.4 → 1311.2 ms,
+−42.3%**.
+
+**Our column here is not T4's and the difference is not this change.** T4's
+cross-engine table was taken before `--numerics production` went onto the arm —
+the commit that put it there is the one this milestone opened at — so the 541,
+2481 and 4858 ms it records are the *reference* word. This is the first sitting
+of that table under the word the recipe passes.
+
+### The session, both engines
+
+**`just bench-session kept-production reference`, three pairs, the 8192
+opening**, ours keeping against mlx-vlm keeping its own Automatic Prefix Cache:
+
+    turn            ours     mlx-vlm
+    0 (8192)     17.784 s    12.975 s
+    1 (+321)      0.870 s     0.823 s
+    2 (+321)      0.880 s     0.830 s
+    3 (+321)      0.880 s     0.839 s
+    4 (+321)      0.882 s     0.849 s
+    the session  29.715 s    25.565 s    1.16× behind
+
+**1.16× where K1 recorded 1.25×**, and the other engine reproduces — 25.57 s
+against K1's 25.44. **The per-turn wall is ours by 8 to 10%** — 2.462 s against
+2.663 at turn one — because our decode step is the faster one; what is left is
+the opening prefill and the delta prefill, and the delta is now 0.870 s against
+0.823 where it used to be most of the gap.
+
+**K1's kept cache is unmoved.** `just bench-session cold kept` reads the turns
+after the first at 321 tokens prefilled apiece against 8512, 8832, 9152 and 9472
+cold, the session **73.3% under the cold arm**, and the per-turn bookkeeping at
+**1.138 ms** — inside the 1.013 to 1.267 this file records.
+
+### What did not move
+
+- **Every token, under every word and both backends**, above.
+- **The two long prefills and the whole decode path.** Nothing here is reachable
+  from a decode step: a routed bank's six rows are under both the block's own
+  floor and the gate, and
+  `neither_a_decode_step_nor_a_speculative_round_reaches_a_block` holds that at
+  every depth a speculative round runs.
+- **Speculation**, which the timing tier re-reads at `k = 3` best and acceptance
+  84.85 / 86.96-78.26 / 85-65-55 / 82.35-64.71-52.94-47.06.
+- **`mma_matmul_rows`**, which takes no plan: 1.19, 2.38, 4.65 and 9.31 s at the
+  four longest lengths against 1.20, 2.37, 4.66 and 9.24.
+- **`reference` is still the default and still bit-exact, `production` still
+  forms exact products, `rounded` is still opt-in.**
+- **696 hermetic, 696 gated, 77 timing**, against 692, 692 and 74.
+
+### The floor this stops at, and its arithmetic
+
+**What is left on a grouped call is the part-empty block each run ends in, and
+there is one a run at every length.** Cut at the boundaries, a run of `L` rows is
+`ceil(L / 32)` blocks and the last holds `L mod 32`; a block decodes its expert's
+64 columns of the reduction once whether it has thirty-two rows or one. So the
+wasted decode is 256 blocks — one an expert — against the `rows / 32` the call
+needs: **8% of the blocks at 8192 tokens, 33% at 2048 and 267% at 512.**
+
+**Both terms of the trade are `experts` and neither is the prompt.** The
+straddles the cut removes are 255 and the part-empty blocks it makes are 256, so
+which way a length falls is decided by how many blocks the call has — and the two
+cross at about four blocks a run, which is measured rather than derived.
+
+**What is left, priced and not taken, is a taller block — and that is the
+finding rather than the guess.** T2 and T3 both stopped short of one, and the
+height sweep is why: a block twice as tall met the same 255 boundaries and paid
+twice as much for each. With the boundaries cut it does not. The same table, on
+the run lengths a router gives:
+
+    a routed bank, ragged runs      16 rows    32 rows    64 rows
+     2048                           15.53ms    15.41ms    14.76ms
+     4096                           32.54ms    30.04ms    28.01ms
+     8192                           60.96ms    57.33ms    54.31ms
+
+**Four to seven percent, in the same direction at all three lengths**, and it is
+the arithmetic intensity the height was always worth: a weight byte decoded once
+and driven through sixty-four rows instead of thirty-two. What it costs is the
+part-empty block, which doubles — 64 rows against runs of 48 at 2048 is a block
+per expert with two thirds of it empty — and that is why the two ends of the
+table are 4% apart and not 7%.
+
+**This milestone did not take it**, and the reason is scope rather than doubt:
+the height is a value the entries carry, so it is one more arm and not one more
+mechanism, but it is a sweep of its own and it wants the model's own routing
+rather than this fixture's. **It is the next thing on this kernel**, and it is
+the first time a taller block has read ahead on any table in this file.
+
+**What is not left is the pass loop**, which is what this milestone removed and
+which the bound arm now prices at nothing: stopping the pass loop after its first
+pass reads 100% of the shipped kernel at every length in the table it used to
+read 78% of.
+
 ## The operand door, opened as a third word, and prefill's ordering
 
 **The door T3 left open is now two numbers, and the first is that no token
