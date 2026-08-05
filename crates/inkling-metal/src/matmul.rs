@@ -1598,7 +1598,19 @@ impl PackedMatmul {
     /// [`what_a_grouped_call_costs_through_each_entry_as_the_runs_shorten`]
     /// rather than from that arithmetic.
     fn plans(&self, rows: usize, experts: usize) -> bool {
-        match self.mma.as_ref() {
+        // **Asked of the same predicate the entry is chosen by**, and not of the
+        // line alone. A call under [`RUNS_A_BLOCKED_CALL`] reaches no blocked
+        // entry at all — a routed bank at 97 tokens averages 2.3 rows an expert
+        // and stays on the reference tile — and the line on its own says yes
+        // there, which would have the sort cutting a plan nothing reads. That is
+        // 1.6% of a 97-token prefill's device time and it was measured.
+        let grouped = Layout::Grouped {
+            order: Arg::Inline(&[]),
+            plan: Arg::Inline(&[]),
+            blocks: 0,
+            through: Through::Gathered,
+        };
+        match self.blocks(&grouped, rows, experts) {
             None => false,
             Some(mma) => rows < experts.saturating_mul(mma.plans_under * mma.block.rows),
         }
@@ -9251,9 +9263,9 @@ kernel void mma_lane_probe___T__(
         );
         crate::testing::instead_of(
             &opened,
-            "            threadgroup_barrier(mem_flags::mem_threadgroup);\n\n            for \
-             (uint k = 0;",
-            "            for (uint k = 0;",
+            "            threadgroup_barrier(mem_flags::mem_threadgroup);\n\n            if \
+             (!works) {",
+            "            if (!works) {",
         )
     }
 
@@ -9615,6 +9627,17 @@ kernel void mma_lane_probe___T__(
     /// this is the range a claim about the workload has to be made in, and 16384
     /// is a check rather than a target.
     const BLOCKED_LENGTHS: [usize; 3] = [2048, 4096, 8192];
+
+    /// The lengths the block is read against the instruction's own ceiling at.
+    ///
+    /// **Six where the tables above read three, because the rate is not flat in
+    /// the prompt and the two ends are where it is not.** A routed bank's runs
+    /// are 7.5 rows an expert at 321 tokens and 384 at 16384, which is the whole
+    /// range this kernel is asked over — and the tables above are sweeps of
+    /// arms, where six lengths would be six times a sitting, against this one,
+    /// which is two shapes under two words and is what the milestone's own
+    /// column is quoted from.
+    const CEILING_LENGTHS: [usize; 6] = [321, 512, 2048, 4096, 8192, 16384];
 
     /// Both of [`BOUND_SHAPES`] at a prompt of `tokens`, which is what a column
     /// of either of the block's tables is.
@@ -11086,7 +11109,7 @@ kernel void scalar_held(
             .collect();
         for numerics in words {
             let block = PackedMatmul::under(&device, numerics).expect("the block compiles");
-            for tokens in BLOCKED_LENGTHS {
+            for tokens in CEILING_LENGTHS {
                 let shapes = shapes_at(tokens);
                 crate::testing::warmed(|| {
                     shapes[0].costs(&device, &block, &grouping);
