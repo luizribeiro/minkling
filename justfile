@@ -160,6 +160,15 @@ bench-weights a b *measurement:
 # the README's table is taken over and is not this file's default checkpoint:
 #
 #   just checkpoint=models/Inkling-Small-mxfp4-mtp4 bench-engines
+#
+# **Our arm carries `--numerics production` and the flag cannot travel in the
+# shared arguments.** Everything after `--` is handed to both arms, and the other
+# arm is a Python script that has never heard of this flag — so a cross-engine
+# figure asked for the word that way exits 2, and one asked for nothing reads
+# this engine's prefill under the reference numerics: 2.4 s at 385 tokens against
+# the other engine's 0.7, which is a measurement of the numerics rather than of
+# the engines. It is on the arm for the reason `bench-session`'s `kept-production`
+# is on the arm.
 bench-engines *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -172,7 +181,7 @@ bench-engines *args:
     # is still running.
     cp "$root/target/debug/bench" "$bin"
     "$root/target/debug/bench" alternate --pairs {{ pairs }} \
-        "$bin" "$root/reference/scripts/bench_engines" \
+        "$bin --numerics production" "$root/reference/scripts/bench_engines" \
         -- engines {{ args }} "{{ absolute_path(checkpoint) }}"
 
 # A simulated coding session, two arms of it in one sitting:
