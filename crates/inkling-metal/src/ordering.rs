@@ -170,6 +170,28 @@ impl Groups {
         }
     }
 
+    /// How many groups the sequence divided into at each width, narrowest
+    /// first.
+    ///
+    /// **The one figure that says whether a sequence has concurrency to find or
+    /// merely a wide group somewhere in it.** [`Groups::widest`] is a maximum and
+    /// [`Groups::average`] is a mean, and a sequence of 546 singletons beside a
+    /// handful of eights reads the same on both as one with its work spread
+    /// evenly — where the first has nothing for a concurrent pass to overlap and
+    /// the second has all of it. A prefill and a decode step are exactly that
+    /// comparison, which is what this exists for.
+    pub fn widths(&self) -> Vec<(usize, usize)> {
+        let mut counted: Vec<(usize, usize)> = Vec::new();
+        for group in &self.groups {
+            match counted.iter_mut().find(|(width, _)| *width == group.len()) {
+                Some((_, count)) => *count += 1,
+                None => counted.push((group.len(), 1)),
+            }
+        }
+        counted.sort_unstable();
+        counted
+    }
+
     /// Every distinct group the sequence divided into, widest first, with how
     /// many of each — which is what turns a width into a finding: 42 groups of
     /// `packed_matmul, packed_matmul, packed_matmul, packed_matmul` is one a
@@ -297,6 +319,50 @@ mod tests {
         assert_eq!((groups.dispatches(), groups.widest()), (4, 4));
         assert_eq!(groups.barriers(), 0);
         assert_eq!(groups.average(), 4.0);
+        assert_eq!(groups.widths(), [(4, 1)]);
+    }
+
+    /// **A mean says the same thing about two sequences that are nothing
+    /// alike**, which is what the distribution is for. Both of these hold eight
+    /// dispatches in five groups — 1.6 to a group either way — and one is a
+    /// four-wide fan-out in front of a chain where the other is three pairs.
+    #[test]
+    fn the_width_distribution_separates_sequences_a_mean_reads_alike() {
+        // Four dispatches reading one buffer and writing four, then a chain of
+        // four off the first of them.
+        let fanned: Vec<Encoded> = (0..4)
+            .map(|out| dispatch(&[100], &[out]))
+            .chain((0..4).map(|at| dispatch(&[10 * at], &[10 * (at + 1)])))
+            .collect();
+        // Pairs, each pair reading what the pair before it wrote, then two that
+        // cannot pair with anything.
+        let paired = [
+            dispatch(&[0], &[1]),
+            dispatch(&[0], &[2]),
+            dispatch(&[1], &[3]),
+            dispatch(&[1], &[4]),
+            dispatch(&[3], &[5]),
+            dispatch(&[3], &[6]),
+            dispatch(&[5], &[7]),
+            dispatch(&[7], &[8]),
+        ];
+
+        let (fanned, paired) = (Groups::over(&fanned, &[]), Groups::over(&paired, &[]));
+
+        assert_eq!((fanned.dispatches(), fanned.groups()), (8, 5));
+        assert_eq!((paired.dispatches(), paired.groups()), (8, 5));
+        assert_eq!(fanned.average(), paired.average());
+        assert_eq!(fanned.widths(), [(1, 4), (4, 1)]);
+        assert_eq!(paired.widths(), [(1, 2), (2, 3)]);
+    }
+
+    /// A distribution over a chain is every group at width one, which is the
+    /// reading that says a sequence has nothing to overlap.
+    #[test]
+    fn a_chain_is_every_group_at_one() {
+        let sequence: Vec<Encoded> = (0..5).map(|at| dispatch(&[at], &[at + 1])).collect();
+
+        assert_eq!(Groups::over(&sequence, &[]).widths(), [(1, 5)]);
     }
 
     /// The shape the rest of a layer is: each dispatch reads what the one
