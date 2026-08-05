@@ -1479,7 +1479,7 @@ fn source(staged: usize, residency: usize, numerics: Numerics) -> String {
     // Appended where the flag asked and nowhere else, so that a reference run
     // hands the compiler the string it handed before this entry existed —
     // `the_reference_source_does_not_carry_the_block` is where that is held.
-    if numerics.is_production() {
+    if numerics.compiles_the_entries() {
         let keys = usize::from(MMA_STAGES_KEYS);
         let values = usize::from(MMA_STAGES_VALUES);
         written.push_str(&format!(
@@ -3249,6 +3249,33 @@ mod tests {
             production[..reference.len()],
             "the production source is not the reference one with the entry after it"
         );
+    }
+
+    /// **The operand word does not reach this kernel, and the reason to state it
+    /// here is that it now reaches this file's flag.**
+    ///
+    /// `--numerics rounded` narrows the *packed matmul's* two staged tiles, and
+    /// it compiles the entries behind the flag everywhere — so this block is
+    /// built and dispatched under it exactly as it is under `production`. That
+    /// is the intent and it is one edit away from not being: a `numerics`
+    /// reaching any width decision here would give the word a second meaning
+    /// nothing in this repo has measured.
+    ///
+    /// Byte for byte, because there is no other bound worth having: two sources
+    /// that agreed to a tolerance would be two kernels.
+    #[test]
+    fn the_two_words_behind_the_flag_compile_one_attention_block() {
+        let under = |numerics| super::source(STAGED_BY_AN_UNSPLIT_CALL, RESIDENCY, numerics);
+        for numerics in Numerics::EVERY
+            .into_iter()
+            .filter(|numerics| numerics.compiles_the_entries())
+        {
+            assert_eq!(
+                under(numerics),
+                under(Numerics::Production),
+                "{numerics:?} compiles an attention block of its own"
+            );
+        }
     }
 
     /// **A decode step is one query row and a block computes sixty-four**, so

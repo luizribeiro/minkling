@@ -1853,10 +1853,15 @@ mod tests {
     /// than "the innermost compute only" allows. Read off the compiled kernels
     /// rather than off the constructor, because what a caller can check is what
     /// was built.
+    ///
+    /// **Every word the flag has**, walked off `Numerics::EVERY` rather than
+    /// spelled here: this is the only case that reaches `Block::under` through a
+    /// whole layer's kernels rather than through the matmul alone, so a word it
+    /// did not run is a word nothing checks at that level.
     #[test]
     fn only_a_layers_matmul_is_compiled_under_the_numerics_it_was_given() {
         let Some(device) = device() else { return };
-        for numerics in [Numerics::Reference, Numerics::Production] {
+        for numerics in Numerics::EVERY {
             let kernels = LayerKernels::compiling(&device, numerics).expect("the kernels compile");
             assert_eq!(kernels.matmul().numerics(), numerics);
         }

@@ -267,12 +267,26 @@ const MMA_FRAGMENTS: Fragments = Fragments::PerLane;
 /// the bank count.
 const MMA_STAGED_PADDING: usize = 4;
 
+/// The same, where a staged element is two bytes rather than four.
+///
+/// **The argument above does not reach this and the sweep is what set it.** At
+/// two bytes a fragment's eight rows land on eight distinct banks at 4, at 8 and
+/// at 12 alike — 36, 40 and 44 elements of stride put row `r` on bank
+/// `(r × stride / 2) mod 32`, which is eight distinct ones for all three — so
+/// nothing about bank conflicts separates them and something does:
+/// [`what_the_operand_width_costs_and_what_it_gives_up`] reads 12 at 6 to 8%
+/// under 4 and 8 at every shape and every length. **Set from that sweep and not
+/// from the arithmetic**, which is the same discipline
+/// [`MMA_STAGED_PADDING`]'s own derivation is checked by.
+const MMA_ROUNDED_PADDING: usize = 12;
+
 /// **Every division a block's layout makes has to be exact**, and a block whose
 /// staging left a remainder would leave part of a tile holding whatever the last
 /// step put there — a wrong answer rather than a failure, and one no shape check
-/// downstream could catch. Checked here for the shipped shape and again at
-/// compile time for a swept one, out of [`Block::holds`]'s one reading.
+/// downstream could catch. Checked here for the two shapes anything ships and
+/// again at compile time for a swept one, out of [`Block::holds`]'s one reading.
 const _: () = Block::SHIPPED.holds();
+const _: () = Block::ROUNDED.holds();
 
 /// The shape one threadgroup of the production entries covers, and the threads
 /// that cover it.
@@ -299,6 +313,28 @@ pub(crate) struct Block {
     simds_across: usize,
     step: usize,
     fragments: Fragments,
+    operands: Operands,
+    padding: usize,
+}
+
+/// How wide a staged element is when the matrix instruction reads it.
+///
+/// **The one axis of the block that changes what the answer is**, which is why
+/// it is the axis [`Numerics::Rounded`] exists to select rather than one a sweep
+/// may set freely. Every other value here — the height, the width, the
+/// threadgroup, the step, the fragment read, the padding — moves which thread
+/// touches which byte and leaves the arithmetic where it was, and
+/// `a_block_cut_to_another_shape_answers_what_the_shipped_one_answers` holds
+/// them all to the shipped block's own bits. This one cannot be in that case:
+/// `element × scale` is exact in f32 and is not exact in half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operands {
+    /// Four bytes, which is what the staging has always held and what makes
+    /// every product this kernel forms exact.
+    Exact,
+    /// Two, which rounds the product of a code and its scale to eleven bits of
+    /// significand and halves the threadgroup traffic a lane's own read pulls.
+    Rounded,
 }
 
 /// How a fragment gets out of the staging and into the registers the matrix
@@ -341,7 +377,53 @@ impl Block {
         simds_across: MMA_SIMDS_ACROSS,
         step: MMA_CODES_A_STEP,
         fragments: MMA_FRAGMENTS,
+        operands: Operands::Exact,
+        padding: MMA_STAGED_PADDING,
     };
+
+    /// The same block with its two staged tiles narrowed, which is the whole of
+    /// what [`Numerics::Rounded`] selects.
+    ///
+    /// **Two fields and no others.** The height, the width, the threadgroup, the
+    /// step and the fragment read are the shipped block's, so what a run under
+    /// the operand word dispatches is the same grid of the same threadgroups
+    /// through the same predicates — and the padding moves with the operand
+    /// because it is derived against a staged element's width and the width
+    /// changed. `the_operand_word_moves_the_operand_and_the_padding_and_nothing
+    /// _else` is where that is held.
+    const ROUNDED: Self = Self {
+        operands: Operands::Rounded,
+        padding: MMA_ROUNDED_PADDING,
+        ..Self::SHIPPED
+    };
+
+    /// Which word of the flag compiles this block, which is
+    /// [`Block::under`] read the other way — and the reason a sweep needs it is
+    /// that an arm is a block and a block decides its own arithmetic.
+    ///
+    /// A block with exact operands is `production`'s and never the reference's:
+    /// a reference run compiles no block at all, so there is no block for that
+    /// word to answer.
+    const fn numerics(&self) -> Numerics {
+        match self.operands {
+            Operands::Exact => Numerics::Production,
+            Operands::Rounded => Numerics::Rounded,
+        }
+    }
+
+    /// The block a word of the flag compiles, which is the one place the mapping
+    /// is written.
+    ///
+    /// A reference run compiles no block at all, and this answering the shipped
+    /// one for that word is what lets [`source_blocked`] take the two together
+    /// without a caller deciding which — the entries are not in the string it
+    /// writes.
+    const fn under(numerics: Numerics) -> Self {
+        match numerics.rounds_operands() {
+            false => Self::SHIPPED,
+            true => Self::ROUNDED,
+        }
+    }
 
     /// Rows an expert needs, on average, before a grouped call is dispatched
     /// through the production entries.
@@ -393,10 +475,23 @@ impl Block {
         (self.step / CODES_PER_BYTE) / self.bytes_a_thread()
     }
 
-    /// Floats between two staged rows, which is the step and
-    /// [`MMA_STAGED_PADDING`].
+    /// Elements between two staged rows, which is the step and the block's own
+    /// padding.
+    ///
+    /// **Elements rather than floats**, because a rounded block stages halves —
+    /// the declaration below stays the width the answer wants and the two tiles
+    /// are read out of it narrow, so what this counts is the stride the fragment
+    /// reads index at and not the bytes the threadgroup declares.
     const fn staged_stride(&self) -> usize {
-        self.step + MMA_STAGED_PADDING
+        self.step + self.padding
+    }
+
+    /// What one staged element is, spelled as the kernel's own typedef.
+    const fn operand(&self) -> &'static str {
+        match self.operands {
+            Operands::Exact => "float",
+            Operands::Rounded => "half",
+        }
     }
 
     /// Bytes of threadgroup memory the two staged tiles declare, which is what
@@ -447,7 +542,10 @@ impl Block {
         // narrower than the block is tall would leave part of it unread.
         assert!(self.threads >= self.rows);
         // The answer is written over the two staged tiles, so a block whose
-        // answer were the larger of the two would write past them.
+        // answer were the larger of the two would write past them. Both sides
+        // are floats: the declaration is `(rows + cols) * staged_stride` of
+        // them whatever the operand is, and a rounded block reads its two tiles
+        // out of that array narrow rather than shrinking it.
         assert!(self.rows * self.answer_stride() <= (self.rows + self.cols) * self.staged_stride());
     }
 
@@ -456,6 +554,7 @@ impl Block {
     fn declares(&self) -> String {
         format!(
             "
+typedef {} MMA_OPERAND;
 constant uint MMA_FRAGMENT = {MMA_FRAGMENT};
 constant uint MMA_ROWS_A_BLOCK = {};
 constant uint MMA_COLS_A_BLOCK = {};
@@ -471,6 +570,7 @@ constant uint MMA_BYTES_A_THREAD = {};
 constant uint MMA_THREADS_A_WEIGHT_ROW = {};
 constant uint THREADS_PER_GROUP = {};
 ",
+            self.operand(),
             self.rows,
             self.cols,
             self.simds_across,
@@ -493,10 +593,10 @@ constant uint THREADS_PER_GROUP = {};
     /// **One call site apiece in the kernel whichever this is**, which is what
     /// makes the axis a value rather than a second copy of the inner loop.
     ///
-    /// Templated on the matrix and on what the staging holds because the 16-bit
-    /// arm reads narrow tiles through these same two calls — see
-    /// [`through_sixteen_bit_operands`], which swaps the fragment declarations
-    /// and nothing else.
+    /// Templated on the matrix and on what the staging holds because a rounded
+    /// block reads narrow tiles through these same two calls — see
+    /// [`Operands`], which moves the type the declarations name and nothing
+    /// else.
     fn reads_a_fragment(&self) -> &'static str {
         match self.fragments {
             Fragments::Loaded => MMA_LOADED_FRAGMENTS,
@@ -894,9 +994,12 @@ impl PackedMatmul {
     ///
     /// **One place holds the default**, which is [`PackedMatmul::tiling`]
     /// below, so that "reference unless asked" is a fact about one line rather
-    /// than a convention twenty-eight call sites keep.
+    /// than a convention twenty-eight call sites keep. **And one place holds
+    /// which block a word names**, which is [`Block::under`], so that the
+    /// operand word reaching the engine and the operand word reaching a sweep
+    /// are the same block rather than two spellings of one.
     pub fn under(device: &Device, numerics: Numerics) -> Result<Self, MetalError> {
-        Self::blocked(device, numerics, Block::SHIPPED)
+        Self::blocked(device, numerics, Block::under(numerics))
     }
 
     /// The same, where the production entries are cut to a block of another
@@ -931,6 +1034,12 @@ impl PackedMatmul {
     /// **The block is the caller's too**, because an arm that rewrites the
     /// prelude and an arm that rewrites the body are the same kind of mutation
     /// and only one of them can be spotted by reading the source string here.
+    ///
+    /// The word is `production`'s and is not the caller's, so a `block` with
+    /// rounded operands panics in [`PackedMatmul::compiled`] rather than
+    /// compiling under a word that says its products are exact. An arm that
+    /// wants the operand word wants [`PackedMatmul::blocked`], which reads it
+    /// off the block.
     #[cfg(test)]
     pub(crate) fn blocked_from_source(
         device: &Device,
@@ -999,12 +1108,25 @@ impl PackedMatmul {
         // The block reaches the grid as well as the kernel, so what says the two
         // agree is that the source declares the shape this side will dispatch
         // it at — the same check the tile gets, for the same reason.
-        if numerics.is_production() {
+        if numerics.compiles_the_entries() {
             declared.extend([
                 format!("constant uint MMA_ROWS_A_BLOCK = {};", block.rows),
                 format!("constant uint MMA_COLS_A_BLOCK = {};", block.cols),
                 format!("constant uint THREADS_PER_GROUP = {};", block.threads),
             ]);
+            // **The word and the block have to agree about the operand**, and
+            // this is the one mistake here a dispatch would not catch: a rounded
+            // block compiled under `production` answers rounded products under a
+            // word documented on exact ones, at the right shapes, through the
+            // right predicates, off by a part in ten thousand. Nothing
+            // downstream reads the operand — [`PackedMatmul::numerics`] is what
+            // a report prints — so this is where the two are held together.
+            assert_eq!(
+                numerics.rounds_operands(),
+                block.numerics().rounds_operands(),
+                "{numerics:?} compiles {:?} operands",
+                block.operands
+            );
         }
         for declares in declared {
             assert!(
@@ -1018,7 +1140,7 @@ impl PackedMatmul {
         // through the same three pipelines it went through before this flag
         // existed — the sources are byte for byte the same string, and the two
         // entries below are not in it to compile.
-        let mma = match numerics.is_production() {
+        let mma = match numerics.compiles_the_entries() {
             false => None,
             true => Some(Mma::of(
                 device.compile(source, MMA_TILED_ENTRY)?,
@@ -2710,7 +2832,7 @@ constant float ELEMENTS[] = {{ {} }};
 /// [`PackedMatmul::blocked`] is the only way to compile one, and it takes both.
 pub(crate) fn source_blocked(numerics: Numerics, block: Block) -> String {
     let mut written = source();
-    if numerics.is_production() {
+    if numerics.compiles_the_entries() {
         block.holds();
         written.push_str(&block.declares());
         written.push_str(&mma_entry(MMA_TILED_ENTRY, false));
@@ -3564,9 +3686,11 @@ kernel void __ENTRY__(
     // threadgroups a core at a declaration of 24 KiB and four at 20.
     //
     // `Block::holds` is where the answer is held to fitting inside the staging.
+    // Declared in floats whatever MMA_OPERAND is: the answer tile is floats and
+    // wants this much, so a narrowed staging costs no occupancy and buys none.
     threadgroup float staged[(MMA_ROWS_A_BLOCK + MMA_COLS_A_BLOCK) * MMA_STAGED_STRIDE];
-    threadgroup float *staged_x = staged;
-    threadgroup float *staged_w = staged + MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE;
+    threadgroup MMA_OPERAND *staged_x = (threadgroup MMA_OPERAND *)staged;
+    threadgroup MMA_OPERAND *staged_w = staged_x + MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE;
     threadgroup float *answered = staged;
     threadgroup uint held[MMA_ROWS_A_BLOCK];
     threadgroup bool opens[MMA_ROWS_A_BLOCK];
@@ -3638,7 +3762,8 @@ kernel void __ENTRY__(
             // gains nothing from them.
             device const float *values = x + source + b * CODES_PER_BYTE + x_at;
             for (uint i = 0; i < MMA_FLOATS_A_THREAD; ++i) {
-                staged_x[x_row * MMA_STAGED_STRIDE + x_at + i] = live ? values[i] : 0.0f;
+                staged_x[x_row * MMA_STAGED_STRIDE + x_at + i] =
+                    live ? (MMA_OPERAND)values[i] : (MMA_OPERAND)0.0f;
             }
 
             // The weight, decoded. One scale byte covers every code this thread
@@ -3651,14 +3776,18 @@ kernel void __ENTRY__(
             for (uint i = 0; i < MMA_BYTES_A_THREAD; ++i) {
                 const uint code = packed[b + w_at + i];
                 const uint at = w_col * MMA_STAGED_STRIDE + (w_at + i) * CODES_PER_BYTE;
-                staged_w[at] = element(code & CODE_MASK) * by;
-                staged_w[at + 1] = element((code >> BITS) & CODE_MASK) * by;
+                // Formed in float and narrowed on the way in, so MMA_OPERAND
+                // decides the operand's width and not the decode's.
+                staged_w[at] = (MMA_OPERAND)(element(code & CODE_MASK) * by);
+                staged_w[at + 1] = (MMA_OPERAND)(element((code >> BITS) & CODE_MASK) * by);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             for (uint k = 0; k < MMA_CODES_A_STEP / MMA_FRAGMENT; ++k) {
-                simdgroup_float8x8 lhs[MMA_FRAGMENTS_DOWN];
-                simdgroup_float8x8 rhs[MMA_FRAGMENTS_ACROSS];
+                // `sums` stays float: the instruction takes the mixed form, so a
+                // narrowed operand rounds the product and not the chain.
+                simdgroup_matrix<MMA_OPERAND, 8, 8> lhs[MMA_FRAGMENTS_DOWN];
+                simdgroup_matrix<MMA_OPERAND, 8, 8> rhs[MMA_FRAGMENTS_ACROSS];
                 for (uint i = 0; i < MMA_FRAGMENTS_DOWN; ++i) {
                     mma_read(
                         lhs[i],
@@ -3936,6 +4065,28 @@ mod tests {
     /// is the reduction every projection and every expert in the checkpoint has,
     /// so nothing in the model reaches past it.
     const MMA_TOLERANCE: f32 = 1e-5;
+
+    /// How far [`Numerics::Rounded`] may land from exact over the same
+    /// reduction.
+    ///
+    /// **Two decades above [`MMA_TOLERANCE`], and that gap is the finding
+    /// rather than a slack bound.** What separates the two words behind the flag
+    /// is that one forms exact products and the other does not, so a tolerance
+    /// that admitted both would be a tolerance saying nothing about either.
+    /// Measured at 1.5 to 2.1e-4 across reductions of 32 to 4096; twice the
+    /// widest of those, the way [`MMA_TOLERANCE`] is set from its own.
+    const ROUNDED_TOLERANCE: f32 = 5e-4;
+
+    /// How much the rounded drift may spread across
+    /// [`CONDITIONING_REDUCTIONS`] before it is a chain rather than an operand.
+    ///
+    /// **The shape is the assertion and this is what makes it one.** Between the
+    /// shortest of those reductions and the longest the block's own drift grows
+    /// twenty-six fold, because its accumulator carries the whole reduction; the
+    /// rounded word's stays inside a factor of two, because the operand is
+    /// already rounded before the first product. Four leaves room for a sitting
+    /// and none for a chain.
+    const FLAT_ENOUGH_TO_BE_THE_OPERAND: f64 = 4.0;
 
     /// The eight E2M1 magnitudes, written out here rather than read off the
     /// table the kernel is built from, so that a case computed by hand is
@@ -4416,6 +4567,72 @@ kernel void decoded_elements(
         assert!(deviation <= MMA_TOLERANCE, "deviation {deviation:e}");
     }
 
+    /// **The operand word moves the operand and the padding it is derived
+    /// against, and nothing else.**
+    ///
+    /// This is the assertion that keeps the third word a question about
+    /// arithmetic. Everything a reader of the two tables below has to take on
+    /// trust — that the two words dispatch the same grid of the same
+    /// threadgroups over the same shapes through the same predicates — is a
+    /// property of the block, and a block is nine values. Eight of the nine
+    /// have to be the shipped ones or the clock beside the drift is a
+    /// measurement of some other change.
+    #[test]
+    fn the_operand_word_moves_the_operand_and_the_padding_and_nothing_else() {
+        let (shipped, rounded) = (Block::SHIPPED, Block::ROUNDED);
+        assert_eq!(rounded.operands, Operands::Rounded);
+        assert_eq!(shipped.operands, Operands::Exact);
+        assert_ne!(rounded.padding, shipped.padding);
+        assert_eq!(
+            rounded,
+            Block {
+                operands: rounded.operands,
+                padding: rounded.padding,
+                ..shipped
+            },
+            "the operand word changed a value that is not the operand or its padding"
+        );
+        // And the block a word compiles is read off one place, so that a run of
+        // the engine under the word and a sweep of the word measure one block.
+        assert_eq!(Block::under(Numerics::Rounded), rounded);
+        assert_eq!(Block::under(Numerics::Production), shipped);
+        assert_eq!(Block::under(Numerics::Reference), shipped);
+    }
+
+    /// **`production` still forms exact products, which is what the third word
+    /// exists so as not to change.**
+    ///
+    /// Stated on the source rather than on a dispatch, because that is where it
+    /// is decided: the two staged tiles and the two fragment declarations are
+    /// the only places a width could enter the arithmetic, and under
+    /// `production` every one of them says `float`.
+    #[test]
+    fn the_production_source_stages_and_multiplies_in_full_width() {
+        let production = source_blocked(Numerics::Production, Block::under(Numerics::Production));
+        let rounded = source_blocked(Numerics::Rounded, Block::under(Numerics::Rounded));
+        assert!(production.contains("typedef float MMA_OPERAND;"));
+        assert!(rounded.contains("typedef half MMA_OPERAND;"));
+        // The staged tiles and the two fragment declarations name the typedef
+        // and never a width, so the line above is the whole of what decides it.
+        assert!(
+            !production.contains("simdgroup_half"),
+            "the production source declares a 16-bit fragment"
+        );
+        // The one byte of the two sources that differs beside the typedef is the
+        // staged stride, which the padding moved — so a source that had picked
+        // up any other difference would fail here.
+        assert_eq!(
+            rounded
+                .replace("typedef half MMA_OPERAND;", "typedef float MMA_OPERAND;")
+                .replace(
+                    &format!("MMA_STAGED_STRIDE = {};", Block::ROUNDED.staged_stride()),
+                    &format!("MMA_STAGED_STRIDE = {};", Block::SHIPPED.staged_stride()),
+                ),
+            production,
+            "the two words behind the flag compile more than an operand apart"
+        );
+    }
+
     /// **What cutting a walk costs the answer**, which is the question the
     /// deviation above cannot settle: two orders differing says nothing about
     /// which of them is further from the sum.
@@ -4496,6 +4713,78 @@ kernel void decoded_elements(
         // And what production adds is added rather than substituted, so no byte
         // of the reference source moved under it.
         assert!(source_blocked(Numerics::Production, Block::SHIPPED).starts_with(&source()));
+    }
+
+    /// **What the operand word costs the answer, and the shape of it.**
+    ///
+    /// The size of the drift is the smaller half of this. The block's own drift
+    /// *grows* with the reduction, because a fragment accumulator is one running
+    /// sum and a longer chain is a worse one. A drift that is flat in the
+    /// reduction is not a chain at all — it is the operand, arriving already
+    /// rounded and staying that far off however few products are summed. **That
+    /// shape is what separates "the operand word is less accurate" from "this
+    /// word has a bug"**, and it is why the two columns are printed together.
+    ///
+    /// The bound is [`ROUNDED_TOLERANCE`], and the assertion beside it is the
+    /// one with teeth: the drift has to be *outside* the block's own bound. A
+    /// rounded operand that landed inside [`MMA_TOLERANCE`] would mean the
+    /// staging never narrowed, which is a word that compiles, dispatches, agrees
+    /// with everything and is not what it says it is.
+    #[test]
+    fn what_the_operand_word_costs_the_answer_is_flat_in_the_reduction() {
+        let Some(device) = device() else { return };
+        let reference = matmul(&device);
+        let compiled =
+            |numerics| PackedMatmul::under(&device, numerics).expect("the packed matmul compiles");
+        let (block, rounded) = (compiled(Numerics::Production), compiled(Numerics::Rounded));
+        assert_eq!(rounded.numerics(), Numerics::Rounded);
+
+        eprintln!(
+            "  {:<14}{:>16}{:>16}{:>18}",
+            "a reduction", "the reference", "the block", "rounded operands"
+        );
+        let (mut narrowest, mut widest) = (f64::MAX, 0.0f64);
+        for reduction in CONDITIONING_REDUCTIONS {
+            let case = Case::noisy(reduction, OUT_DIM, 77);
+            let exact = case.exactly();
+            let through = |matmul: &PackedMatmul| {
+                drift(
+                    &case
+                        .upload(&device, matmul)
+                        .multiply(&case.x)
+                        .expect("the dispatch completes"),
+                    &exact,
+                )
+            };
+            let (theirs, ours, narrow) = (through(&reference), through(&block), through(&rounded));
+            narrowest = narrowest.min(narrow);
+            widest = widest.max(narrow);
+            eprintln!(
+                "  {reduction:<14}{:>16}{:>16}{:>18}",
+                format!("{theirs:.1e}"),
+                format!("{ours:.1e}"),
+                format!("{narrow:.1e}")
+            );
+        }
+
+        assert!(
+            widest > f64::from(MMA_TOLERANCE),
+            "the operand word drifts {widest:e}, inside the block's own {MMA_TOLERANCE:e} — so the \
+             staging is not narrowed and this word is not what it says it is"
+        );
+        assert!(
+            widest <= f64::from(ROUNDED_TOLERANCE),
+            "the operand word drifts {widest:e}"
+        );
+        // **Flat, and this is the number that says so.** A chain would spread
+        // over two decades across these five reductions the way the block's own
+        // does; an operand arriving rounded spreads by a factor of a few.
+        assert!(
+            widest < FLAT_ENOUGH_TO_BE_THE_OPERAND * narrowest,
+            "the operand word drifts {narrowest:e} to {widest:e} across reductions of \
+             {CONDITIONING_REDUCTIONS:?}, which grows like a chain rather than sitting where a \
+             rounded operand sits"
+        );
     }
 
     /// **The bytes a split walk reads are the bytes the walk it cuts reads**,
@@ -5041,8 +5330,8 @@ kernel void mma_lane_probe___T__(
 
     /// [`LANE_PROBE`] at both widths a fragment of this kernel is ever read at.
     ///
-    /// **The narrow one is here because [`through_sixteen_bit_operands`] puts the
-    /// same two calls through `simdgroup_half8x8`**, and the map they compute
+    /// **The narrow one is here because [`Operands::Rounded`] puts the same two
+    /// calls through `simdgroup_matrix<half, 8, 8>`**, and the map they compute
     /// takes no notice of what the staging holds. That independence is the claim,
     /// and a claim about a lane layout is what this whole case exists not to
     /// inherit.
@@ -5071,8 +5360,8 @@ kernel void mma_lane_probe___T__(
     /// So the same tile goes through both forms and the two are held equal
     /// element for element, transposed as well as plain, **at both widths a
     /// fragment of this kernel is ever read at** — the map takes no notice of
-    /// what the staging holds, and `through_sixteen_bit_operands` is where that
-    /// independence is relied on.
+    /// what the staging holds, and [`Numerics::Rounded`] is the shipped word
+    /// that relies on it.
     ///
     /// **And the tile's own coverage is checked beside the agreement, because
     /// the two forms share the tile if not the map.** They read one threadgroup
@@ -5952,12 +6241,12 @@ kernel void mma_lane_probe___T__(
     #[test]
     fn a_paired_dispatch_answers_what_the_two_dispatches_it_replaces_answer() {
         let Some(device) = device() else { return };
-        // **Both words, and the equality is exact under each.** The paired
+        // **Every word, and the equality is exact under each.** The paired
         // entry is the untiled one emitted a second time on either side of the
         // flag, so what a pair can get wrong — pointing half the grid at the
         // wrong bank — is the same mistake whichever walk it is a second
-        // emission of, and a tolerance would hide it under both.
-        for numerics in [Numerics::Reference, Numerics::Production] {
+        // emission of, and a tolerance would hide it under any of them.
+        for numerics in Numerics::EVERY {
             let matmul =
                 PackedMatmul::under(&device, numerics).expect("the packed matmul compiles");
             let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
@@ -8790,75 +9079,6 @@ kernel void mma_lane_probe___T__(
     /// is a check rather than a target.
     const BLOCKED_LENGTHS: [usize; 3] = [2048, 4096, 8192];
 
-    /// The shipped production source with both staged tiles, and the fragments
-    /// loaded out of them, carried as 16-bit floats.
-    ///
-    /// **The accumulator stays `simdgroup_float8x8` and that is the whole of
-    /// what makes this arguable at all.** Metal's matrix instruction takes a
-    /// mixed form on this family — half operands into a float accumulator — so
-    /// what a 16-bit operand costs here is a rounding of the two *operands* and
-    /// nothing about the summation order, which is already the instruction's.
-    /// A half accumulator compiles too and is not what this is: 512 accumulate
-    /// steps into a 10-bit significand is a different claim and a much worse
-    /// one.
-    ///
-    /// **What is rounded is a product that used to be exact.** A code is one of
-    /// sixteen table values and a group scale is a power of two, so `element ×
-    /// by` is exact in f32 and every MXFP4 element is exactly representable in
-    /// half — but their product carries eleven bits of significand where it had
-    /// twenty-four, and that rounding is what the table below prices.
-    ///
-    /// `stride` is what a staged row is padded to, and it is a parameter here
-    /// for one reason: [`MMA_STAGED_PADDING`]'s argument is derived
-    /// against 32 banks of *four* bytes and a staged element that is four bytes
-    /// wide. At two bytes the same 36 puts a fragment's eight rows on banks 0,
-    /// 18, 4, 22, 8, 26, 12 and 30 — still eight distinct ones, so the argument
-    /// survives — but "survives by arithmetic" is what this repo's own history
-    /// says to distrust, and a second stride measured beside the first is what
-    /// says the clock below is about the operand width rather than about a bank
-    /// conflict.
-    fn through_sixteen_bit_operands(shipped: &str, stride: usize) -> String {
-        let staged = crate::testing::instead_of(
-            shipped,
-            "    threadgroup float staged[(MMA_ROWS_A_BLOCK + MMA_COLS_A_BLOCK) * \
-             MMA_STAGED_STRIDE];\n    threadgroup float *staged_x = staged;\n    \
-             threadgroup float *staged_w = staged + MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE;",
-            // The scratch stays the width the answer wants and the two staged
-            // tiles are read out of it narrow, so that what this arm changes is
-            // the operand and not how many threadgroups a core holds.
-            "    threadgroup float staged[(MMA_ROWS_A_BLOCK + MMA_COLS_A_BLOCK) * \
-             MMA_STAGED_STRIDE];\n    threadgroup half *staged_x = (threadgroup half *)staged;\n  \
-             \x20 threadgroup half *staged_w = staged_x + MMA_ROWS_A_BLOCK * MMA_STAGED_STRIDE;",
-        );
-        let staged = crate::testing::instead_of(
-            &staged,
-            &format!(
-                "constant uint MMA_STAGED_STRIDE = {};",
-                Block::SHIPPED.staged_stride()
-            ),
-            &format!("constant uint MMA_STAGED_STRIDE = {stride};"),
-        );
-        let filled = crate::testing::instead_of(
-            &staged,
-            "staged_x[x_row * MMA_STAGED_STRIDE + x_at + i] = live ? values[i] : 0.0f;",
-            "staged_x[x_row * MMA_STAGED_STRIDE + x_at + i] = live ? (half)values[i] : 0.0h;",
-        );
-        let decoded = crate::testing::instead_of(
-            &filled,
-            "staged_w[at] = element(code & CODE_MASK) * by;\n                staged_w[at + 1] = \
-             element((code >> BITS) & CODE_MASK) * by;",
-            "staged_w[at] = (half)(element(code & CODE_MASK) * by);\n                staged_w[at + \
-             1] = (half)(element((code >> BITS) & CODE_MASK) * by);",
-        );
-        crate::testing::instead_of(
-            &decoded,
-            "                simdgroup_float8x8 lhs[MMA_FRAGMENTS_DOWN];\n                \
-             simdgroup_float8x8 rhs[MMA_FRAGMENTS_ACROSS];",
-            "                simdgroup_half8x8 lhs[MMA_FRAGMENTS_DOWN];\n                \
-             simdgroup_half8x8 rhs[MMA_FRAGMENTS_ACROSS];",
-        )
-    }
-
     /// Both of [`BOUND_SHAPES`] at a prompt of `tokens`, which is what a column
     /// of either of the block's tables is.
     fn shapes_at(tokens: usize) -> Vec<Blocked> {
@@ -8868,13 +9088,39 @@ kernel void mma_lane_probe___T__(
             .collect()
     }
 
-    /// The reductions the conditioning table below is taken across, which are
+    /// The reductions the conditioning table is taken across, which are
     /// `a_block_answers_the_reference_tile_where_neither_extent_divides_it`'s
     /// own — so a third column can be read straight down beside the two that
     /// case already records.
     const CONDITIONING_REDUCTIONS: [usize; 5] = [32, 128, 512, 2048, 4096];
 
-    /// **What 16-bit operands cost and what they give up** — the lever Apple's
+    /// How far under the block the best padding has to stay for the table below
+    /// to be read as "the operand width buys something".
+    ///
+    /// **Loose, because what it guards is a sign and a size rather than a
+    /// figure.** The measured margin is 6 to 8% at the padding that wins and the
+    /// host's own spread on this instrument is a tenth of that, so a reading that
+    /// has crossed this has changed by more than any noise here.
+    const AHEAD_ENOUGH_TO_QUOTE: f64 = 0.97;
+
+    /// The paddings a rounded block is measured at, as floats between two staged
+    /// rows.
+    ///
+    /// **Three rather than one, and the reason turned out to matter.**
+    /// [`MMA_STAGED_PADDING`]'s argument is derived against 32 banks of *four*
+    /// bytes and a staged element that is four bytes wide. At two bytes 4, 8 and
+    /// 12 all land a fragment's eight rows on eight distinct banks, so on the
+    /// argument alone they should read alike. They do not — which is what says a
+    /// single-padding reading of this word would have been a measurement of the
+    /// padding rather than of the operand width, and why
+    /// [`MMA_ROUNDED_PADDING`] is set from the sweep instead.
+    const SWEPT_PADDINGS: [usize; 3] = [
+        MMA_STAGED_PADDING,
+        MMA_STAGED_PADDING + 4,
+        MMA_STAGED_PADDING + 8,
+    ];
+
+    /// **What the operand width costs and what it gives up** — the lever Apple's
     /// guidance for this hardware is most emphatic about, and the one mlx's
     /// quantised matmul takes completely: the metallib in `reference/.venv` at
     /// mlx 0.32.0 carries `qmm` in `bfloat16` and `float16` and in no `float32`
@@ -8886,8 +9132,8 @@ kernel void mma_lane_probe___T__(
     /// A8 declined it and named the reason to respect: "this flag's two sides
     /// sum the same exact products in different orders, and a 16-bit operand
     /// **rounds the product itself**. It would have to move into the
-    /// conditioning table, not sit beside it." So it is here, in the
-    /// conditioning table, with the clock beside it rather than instead of it.
+    /// conditioning table, not sit beside it." **That is what a third word is**,
+    /// and [`Numerics::Rounded`] is where it went; this is the clock beside it.
     ///
     /// **What is given up is exactness of the operand, not of the sum.** The
     /// accumulator stays `simdgroup_float8x8` — the instruction takes that mixed
@@ -8896,129 +9142,55 @@ kernel void mma_lane_probe___T__(
     /// stops being exact: it carries eleven bits of significand where it carried
     /// twenty-four.
     ///
-    /// **Which is why the shape of the drift column is the finding and not its
-    /// size.** The block's own drift grows with the reduction, because its
-    /// fragment accumulator is one running sum and a longer chain is a worse
-    /// one. A drift that is *flat* in the reduction is not a chain at all — it
-    /// is the operand, arriving already rounded and staying that far off however
-    /// few products are summed. That is the column this prints, and it is what
-    /// separates "16-bit operands are worse here" from "this arm has a bug".
+    /// **The drift is not printed here and that is a move rather than an
+    /// omission.** It was a column beside this clock while a 16-bit operand was
+    /// an arm this case built by hand. It is a property of a shipped word now,
+    /// so `what_the_operand_word_costs_the_answer_is_flat_in_the_reduction`
+    /// asserts it — its size *and* its flatness in the reduction, which is what
+    /// says the drift is the operand and not a chain — in the tier that runs
+    /// after every edit rather than in the one that needs a clock to itself.
     ///
-    /// **Both halves of the question in one case, because either alone would be
-    /// misread.** A drift with no clock beside it cannot say whether the
-    /// accuracy was worth anything, and a clock with no drift beside it is the
-    /// claim A8 refused.
+    /// **Each padding under both fragment reads, which is what turned this arm
+    /// over.** A per-lane read pulls the two elements a lane owns out of
+    /// threadgroup memory itself, so at half those are four bytes where at float
+    /// they are eight; a `simdgroup_load` is one instruction over the whole
+    /// fragment either way. So the operand width reaches the traffic under one
+    /// read and not under the other, and an arm measured against only the
+    /// shipped read could not say which of the two it had measured. Each column
+    /// is against the block compiled with its own read, so what a cell reports is
+    /// the operand and not the read.
     ///
     /// The clock is warm and swept both ways, for the reason
     /// [`what_a_prefills_blocked_matmul_is_bound_by`] gives: the arms it
     /// separates are a few percent apart, and an arm measured always second is
     /// an arm measured on whatever clock the one before it left.
-    /// How far under the block the best padding has to stay for the table above
-    /// to be read as "the operand width buys something".
-    ///
-    /// **Loose, because what it guards is a sign and a size rather than a
-    /// figure.** The measured margin is 6 to 8% at the padding that wins and the
-    /// host's own spread on this instrument is a tenth of that, so a reading that
-    /// has crossed this has changed by more than any noise here.
-    const AHEAD_ENOUGH_TO_QUOTE: f64 = 0.97;
-
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
-    fn what_sixteen_bit_operands_cost_and_what_they_give_up() {
+    fn what_the_operand_width_costs_and_what_it_gives_up() {
         let Some(device) = device() else { return };
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
 
-        let reference = matmul(&device);
-        let shipped =
-            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
-        // Three strides rather than one, and the reason turned out to matter.
-        // The shipped padding is derived against a *four*-byte staged element;
-        // at two bytes 36, 40 and 44 all land a fragment's eight rows on eight
-        // distinct banks, so on the argument alone they should read alike. They
-        // do not — which is what says a single-stride reading of this arm would
-        // have been a measurement of the padding rather than of the operand
-        // width, and why the refusal is stated against the best of them.
-        let shipped_stride = Block::SHIPPED.staged_stride();
-        let strides = [shipped_stride, shipped_stride + 4, shipped_stride + 8];
-        // **And each of them under both fragment reads, which is what turned this
-        // arm over.** A per-lane read pulls the two elements a lane owns out of
-        // threadgroup memory itself, so at half those are four bytes where at
-        // float they are eight; a `simdgroup_load` is one instruction over the
-        // whole fragment either way. So the operand width reaches the traffic
-        // under one read and not under the other, and an arm measured against
-        // only the shipped read could not say which of the two it had measured.
-        // Each column is against the block compiled with its own read, so what a
-        // cell reports is the operand and not the read.
-        let halved: Vec<(Fragments, usize, PackedMatmul)> = SWEPT_FRAGMENTS
-            .iter()
-            .flat_map(|&block| strides.map(move |stride| (block, stride)))
-            .map(|(block, stride)| {
-                let arm = PackedMatmul::blocked_from_source(
-                    &device,
-                    &through_sixteen_bit_operands(
-                        &source_blocked(Numerics::Production, block),
-                        stride,
-                    ),
-                    block,
-                )
-                .expect("the 16-bit arm compiles");
-                (block.fragments, stride, arm)
-            })
-            .collect();
-        let reads: Vec<(Fragments, PackedMatmul)> = SWEPT_FRAGMENTS
-            .iter()
-            .map(|&block| {
-                (
-                    block.fragments,
-                    PackedMatmul::blocked(&device, Numerics::Production, block)
-                        .expect("the block compiles at either read"),
-                )
-            })
-            .collect();
-
-        // The conditioning table first, because it is what decides whether the
-        // clock is worth reading at all. The padding reaches no arithmetic, so
-        // one arm answers for both.
-        eprintln!(
-            "  {:<14}{:>16}{:>16}{:>18}",
-            "a reduction", "the reference", "the block", "16-bit operands"
-        );
-        let mut worst = 0.0f64;
-        for reduction in CONDITIONING_REDUCTIONS {
-            let case = Case::noisy(reduction, OUT_DIM, 77);
-            let exact = case.exactly();
-            let through = |matmul: &PackedMatmul| {
-                drift(
-                    &case
-                        .upload(&device, matmul)
-                        .multiply(&case.x)
-                        .expect("the dispatch completes"),
-                    &exact,
-                )
-            };
-            let (theirs, block, half) = (
-                through(&reference),
-                through(&shipped),
-                through(&halved[0].2),
-            );
-            worst = worst.max(half);
-            eprintln!(
-                "  {reduction:<14}{:>16}{:>16}{:>18}",
-                format!("{theirs:.1e}"),
-                format!("{block:.1e}"),
-                format!("{half:.1e}")
-            );
+        // An arm is a block the generator writes rather than a source this case
+        // rewrites, which is what makes the column the engine ships under
+        // `--numerics rounded` the same column this sweep reads.
+        let arms = |read: Block| -> Vec<Block> {
+            std::iter::once(read)
+                .chain(SWEPT_PADDINGS.map(|padding| Block {
+                    operands: Operands::Rounded,
+                    padding,
+                    ..read
+                }))
+                .collect()
+        };
+        for read in SWEPT_FRAGMENTS {
+            distinct(&arms(read));
         }
 
-        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
-        let named = |fragments: Fragments| match fragments {
-            Fragments::Loaded => "simdgroup_load",
-            Fragments::PerLane => "per lane",
-        };
         let mut ahead_of_the_shipped_read = 0.0f64;
-        for (read, block) in &reads {
+        for read in SWEPT_FRAGMENTS {
             eprintln!(
                 "\n  a fragment read {}",
-                match read {
+                match read.fragments {
                     Fragments::Loaded => "through simdgroup_load",
                     Fragments::PerLane => "per lane, which is the shipped one",
                 }
@@ -9028,27 +9200,29 @@ kernel void mma_lane_probe___T__(
                 "at",
                 "",
                 "the block",
-                format!("16-bit at {}", strides[0]),
-                format!("at {}", strides[1]),
-                format!("at {}", strides[2])
+                format!("rounded at {}", SWEPT_PADDINGS[0]),
+                format!("at {}", SWEPT_PADDINGS[1]),
+                format!("at {}", SWEPT_PADDINGS[2])
             );
-            let mine: Vec<&PackedMatmul> = halved
+            let blocks = arms(read);
+            let compiled: Vec<PackedMatmul> = blocks
                 .iter()
-                .filter(|(fragments, ..)| fragments == read)
-                .map(|(.., arm)| arm)
+                .map(|&block| {
+                    PackedMatmul::blocked(&device, block.numerics(), block)
+                        .expect("every arm of the sweep compiles")
+                })
                 .collect();
+
             for tokens in BLOCKED_LENGTHS {
                 let shapes = shapes_at(tokens);
-                let arms: Vec<&PackedMatmul> =
-                    std::iter::once(block).chain(mine.iter().copied()).collect();
                 crate::testing::warmed(|| {
-                    shapes[0].costs(&device, block, &grouping);
+                    shapes[0].costs(&device, &compiled[0], &grouping);
                 });
-                let listed: Vec<usize> = (0..arms.len()).collect();
+                let listed: Vec<usize> = (0..compiled.len()).collect();
                 let (up, down) = crate::testing::both_ways(&listed, |at| {
                     shapes
                         .iter()
-                        .map(|shape| shape.costs(&device, arms[at], &grouping))
+                        .map(|shape| shape.costs(&device, &compiled[at], &grouping))
                         .collect::<Vec<Duration>>()
                 });
 
@@ -9059,13 +9233,13 @@ kernel void mma_lane_probe___T__(
                     let taken = |arm: usize| up[arm][at].max(down[arm][at]).as_secs_f64();
                     let whole = taken(0);
                     let against = |arm: usize| taken(arm) / whole;
-                    if *read == MMA_FRAGMENTS {
+                    if read.fragments == MMA_FRAGMENTS {
                         // The best padding at this shape, kept as the worst such
                         // over all of them — so what the bound below reads is
                         // the shape where the best padding does least well, and
                         // not the one cell that happened to do most.
-                        let best =
-                            (1..arms.len()).fold(f64::MAX, |least, arm| least.min(against(arm)));
+                        let best = (1..compiled.len())
+                            .fold(f64::MAX, |least, arm| least.min(against(arm)));
                         ahead_of_the_shipped_read = ahead_of_the_shipped_read.max(best);
                     }
                     eprintln!(
@@ -9080,22 +9254,15 @@ kernel void mma_lane_probe___T__(
             }
         }
 
-        // **The refusal is the drift, and the clock is what says how much the
-        // drift is being asked to buy.** Under the shipped read the operand is
-        // ahead of the block rather than behind it, so both bounds state a
-        // reading rather than a refusal, and either turning would mean the table
+        // **The word costs a drift and the clock is what says how much the drift
+        // is being asked to buy.** Under the shipped read the operand is ahead of
+        // the block rather than behind it; a turning here would mean the table
         // above wants re-reading before anything quotes it.
         assert!(
-            worst > f64::from(MMA_TOLERANCE),
-            "16-bit operands drift {worst:e}, which is inside the block's own {MMA_TOLERANCE:e} — \
-             the reason this arm is refused has changed and the table above wants re-reading"
-        );
-        assert!(
             ahead_of_the_shipped_read < AHEAD_ENOUGH_TO_QUOTE,
-            "under the {} read the best padding is {:.0}% of the block at its weakest shape, where \
-             it is under {:.0}% at every one — so what the operand width buys has changed and the \
-             table above wants re-reading",
-            named(MMA_FRAGMENTS),
+            "under the per-lane read the best padding is {:.0}% of the block at its weakest shape, \
+             where it is under {:.0}% at every one — so what the operand width buys has changed \
+             and the table above wants re-reading",
             1e2 * ahead_of_the_shipped_read,
             1e2 * AHEAD_ENOUGH_TO_QUOTE,
         );
@@ -9510,16 +9677,24 @@ kernel void mma_lane_probe___T__(
         );
         // Deduplicated, because the shipped shape is an arm of both sweeps and
         // a row printed three times reads as three measurements of nothing.
+        // **The operand word is here too and it is the row that matters most**:
+        // it is the one arm anything ships, so what it costs to compile is a
+        // price the engine pays at every load under that word rather than a
+        // price a sweep pays once.
         let mut swept: Vec<Block> = Vec::new();
-        for block in SWEPT_STEPS.into_iter().chain(SWEPT_FRAGMENTS) {
+        for block in SWEPT_STEPS
+            .into_iter()
+            .chain(SWEPT_FRAGMENTS)
+            .chain([Block::ROUNDED])
+        {
             if !swept.contains(&block) {
                 swept.push(block);
             }
         }
         for block in swept {
-            let source = source_blocked(Numerics::Production, block);
+            let source = source_blocked(block.numerics(), block);
             let taken = Instant::now();
-            let Ok(matmul) = PackedMatmul::blocked(&device, Numerics::Production, block) else {
+            let Ok(matmul) = PackedMatmul::blocked(&device, block.numerics(), block) else {
                 eprintln!("  {block:?} is refused by this part");
                 continue;
             };
@@ -9537,12 +9712,13 @@ kernel void mma_lane_probe___T__(
             eprintln!(
                 "  {:<44}{:>12}{:>12}{:>12}",
                 format!(
-                    "{} codes a step, {}",
+                    "{} codes a step, {}, {} operands",
                     block.step,
                     match block.fragments {
                         Fragments::Loaded => "through simdgroup_load",
                         Fragments::PerLane => "the elements a lane owns",
-                    }
+                    },
+                    block.operand(),
                 ),
                 entries,
                 format!("{:.0} us", 1e6 * whole.as_secs_f64()),
@@ -9851,38 +10027,50 @@ kernel void scalar_held(
             1e-12 * fastest,
         );
 
-        let shipped =
-            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
+        // **Every word behind the flag against the one ceiling**, because the
+        // denominator is the instruction's issue rate and the instruction is the
+        // same one either way — a rounded operand narrows what it reads and not
+        // what it issues. A column read against a ceiling measured in another
+        // sitting is what this arrangement exists to refuse.
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
-        for tokens in BLOCKED_LENGTHS {
-            let shapes = shapes_at(tokens);
-            crate::testing::warmed(|| {
-                shapes[0].costs(&device, &shipped, &grouping);
-            });
-            eprintln!("\n  a prefill of {tokens} tokens");
-            eprintln!(
-                "  {:<38}{:>10}{:>16}{:>22}",
-                "", "device", "achieved", "of the instruction"
-            );
-            for shape in &shapes {
-                let taken = shape.costs(&device, &shipped, &grouping);
-                let rate = shape.flops() / taken.as_secs_f64();
-                assert!(
-                    rate < ceiling,
-                    "{} at {tokens} tokens reads {:.1} TFLOP/s against a matrix instruction that \
-                     issues at {:.1} — a kernel cannot outrun the instruction it is made of, so \
-                     the clock is measuring something other than this dispatch",
-                    shape.what,
-                    1e-12 * rate,
-                    1e-12 * ceiling,
-                );
+        let words: Vec<Numerics> = Numerics::EVERY
+            .into_iter()
+            .filter(|numerics| numerics.compiles_the_entries())
+            .collect();
+        for numerics in words {
+            let block = PackedMatmul::under(&device, numerics).expect("the block compiles");
+            for tokens in BLOCKED_LENGTHS {
+                let shapes = shapes_at(tokens);
+                crate::testing::warmed(|| {
+                    shapes[0].costs(&device, &block, &grouping);
+                });
+                eprintln!("\n  a prefill of {tokens} tokens, {}", numerics.named());
                 eprintln!(
                     "  {:<38}{:>10}{:>16}{:>22}",
-                    shape.what,
-                    format!("{:.2}ms", 1e3 * taken.as_secs_f64()),
-                    format!("{:.1} TFLOP/s", 1e-12 * rate),
-                    format!("{:.0}%", 1e2 * rate / ceiling),
+                    "", "device", "achieved", "of the instruction"
                 );
+                for shape in &shapes {
+                    let taken = shape.costs(&device, &block, &grouping);
+                    let rate = shape.flops() / taken.as_secs_f64();
+                    assert!(
+                        rate < ceiling,
+                        "{} at {tokens} tokens under {} reads {:.1} TFLOP/s against a matrix \
+                         instruction that issues at {:.1} — a kernel cannot outrun the instruction \
+                         it is made of, so the clock is measuring something other than this \
+                         dispatch",
+                        shape.what,
+                        numerics.named(),
+                        1e-12 * rate,
+                        1e-12 * ceiling,
+                    );
+                    eprintln!(
+                        "  {:<38}{:>10}{:>16}{:>22}",
+                        shape.what,
+                        format!("{:.2}ms", 1e3 * taken.as_secs_f64()),
+                        format!("{:.1} TFLOP/s", 1e-12 * rate),
+                        format!("{:.1}%", 1e2 * rate / ceiling),
+                    );
+                }
             }
         }
     }
