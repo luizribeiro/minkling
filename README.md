@@ -1360,6 +1360,238 @@ an estimate, and that **it does not need an indirect command buffer** —
 `computeCommandEncoderWithDispatchType:` offers the same concurrency to the
 encoder this engine already has, without the 2.02× an indirect command costs.
 
+## The three pairs a decode step had left
+
+**A decode step made 1000 dispatches and it makes 876**, and this time the wall
+followed the device: **17.301 ms to 16.978**, device **16.292 to 15.970**, seven
+alternating pairs, every pair the same way and the ranges apart, against a null
+pair that read −0.1% on both and a host settled to 0.8% on the wall before the
+sitting. A step's submissions go from 14 to 11 with it.
+
+The 124 are the three pairs D2 priced and left. Each is two calls that read
+different rows against different weights into different places, neither reading
+anything the other writes:
+
+    what                                      merges   dispatches   the entry
+    a layer's query norm and key norm             42           42   rms_norm_pair
+    a layer's key and value convolutions          42           42   short_conv_pair
+    a MoE layer's routed and shared SwiGLU        40           40   swiglu_pair
+
+**All three keep the bits by construction rather than within a tolerance**, and
+each has a case holding the merged dispatch against the two it replaces exactly.
+The branch is on the thread's or the threadgroup's own position, so a thread runs
+the walk it ran alone over the same values in the same order; what a merge
+changes is which of two shapes it reads.
+
+### What a dispatch's fixed cost actually is, which is 2.6 µs
+
+D2 put it at 4.15 microseconds, from 80 dispatches removed for 0.332 ms of
+device time. **124 removed here take 0.322 ms, which is 2.60 µs each** — and the
+difference is not noise, it is that the two are not the same shape of merge.
+
+D2's pair doubled the output elements of the dispatch that survived — a routed
+bank's 12288 to 24576 — and every shape a decode step has is on the steep part of
+that kernel's rate curve, so its 4.15 was a launch *and* a width. **None of the
+three here wins any width**: a norm's threadgroups, a convolution's threads and
+an activation's threads are the same threads over the same elements whichever
+dispatch they are in. 2.60 µs is the launch alone, and it is the number a
+count-based estimate should be built on.
+
+It also prices what is left. **876 dispatches at 2.60 µs is 2.28 ms of a 15.97 ms
+device step** — still the largest single thing a decode step pays for that no
+kernel computes.
+
+### Why the wall moved, where D2's did not
+
+D2 took 0.33 ms off the device and the wall moved 0.06. This takes 0.32 off and
+**the wall moves 0.32** — the same saving, transmitted where the other was not.
+
+What separates them is which side of the step each landed on. The encode is 31.9%
+of a step against a device executing for 92.5% of it, so the wall follows the
+device and only the device. D2's fusion moved both — 0.33 ms of device and about
+0.3 of encode — and the encode half bought nothing, because a host that finishes
+early only waits longer. **A device saving is worth its whole self here and a
+host saving is worth almost nothing**, which is the same arithmetic the section
+above draws the 8% ceiling from.
+
+The step table either side, one sitting each, says the same thing from the other
+end:
+
+    a decode step               dispatches   submit and wait   dispatch encode   device
+    before                            1000    10.33ms  58.3%    6.14ms  34.7%   16.29ms
+    after                              876    11.04ms  62.0%    5.67ms  31.9%   16.47ms
+
+**The encode row falls by 0.47 ms and the wait rises by 0.71**, which is a host
+that ran out of things to do sooner rather than a step that got slower — the two
+sittings are unpaired and the claim is the paired figure above.
+
+### What each merge is, and the one that is not a kernel
+
+**The query norm and the key norm** read `[queries, heads, head_dim]` and
+`[queries, kv_heads, head_dim]` against two weights into two landings — one a
+buffer the attention step reads, one the span the layer keeps. What they have to
+share is the threadgroup, which the width decides, and both are `head_dim` here.
+A checkpoint that made them differ would want two threadgroup shapes out of one
+grid, which Metal cannot dispatch — so `norm::encode_pair` makes the two
+dispatches it always made, and that arm is a case rather than a hope.
+
+**The key and value convolutions** need nothing to agree. That kernel gives a
+thread to a channel of a timestep, declares no threadgroup memory and takes no
+barrier, so there is no threadgroup shape for two calls to disagree about. What
+its case has to hold instead is the *window*: a convolution carries two and
+alternates between them, and one that answered the right rows while swapping the
+wrong window would pass on the first call and be wrong on every one after it.
+Three consecutive calls of one sequence, each way, is what pins it.
+
+**The two banks' SwiGLU is the only one of the three that is a change to the
+layer.** A bank's activation sits between its pair and its `down`, so a layer
+that finished one bank before starting the other had a `down` between the two
+activations and nothing to merge. Both banks' pairs are dispatched first now,
+then one activation over both, then both downs — the same order every read
+already required, and the reason this one is in `experts.rs` rather than in a
+kernel.
+
+The per-kernel table shows all three arriving, at a step's own shapes:
+
+    kernel              calls      device   share   what it replaced
+    rms_norm_pair          42    520.68µs    2.8%   84 of the 169 rms_norm calls
+    short_conv_pair        42    383.24µs    2.0%   84 of the 126 short_conv calls
+    swiglu_pair            40    220.04µs    1.2%   80 of the 82 swiglu calls
+
+### What a decode step costs now, at every context
+
+`what_a_decode_step_costs_as_the_context_grows`, one sitting, against D2's:
+
+    context     before      after   tokens/s   of floor   device before   device after
+       97      18.06ms    17.60ms  55.4→56.8    45%→46%        16.68ms        16.35ms
+      385      19.37ms    18.86ms  51.6→53.0    42%→43%        18.01ms        17.57ms
+      769      20.04ms    19.79ms  49.9→50.5    41%→41%        18.69ms        18.47ms
+     2048      22.82ms    22.68ms  43.8→44.1    36%→36%        21.45ms        21.20ms
+     4096      24.03ms    23.90ms  41.6→41.8    34%→34%        22.61ms        22.54ms
+     8192      26.86ms    26.54ms  37.2→37.7    30%→31%        25.47ms        25.18ms
+
+The mean and the median agree to six hundredths of a millisecond at every row —
+17.60 against 17.64, 26.54 against 26.59 — which is what says no row has a step
+in it that is not a decode step.
+
+**The two sides are two sittings and the claim is the paired instrument**, which
+was taken at each of the same six contexts, three pairs each, and reads the
+device down every one of them:
+
+    context   device before   device after   change   pairs
+         97        16.597ms       16.275ms    -1.9%   3 of 3, ranges apart
+        385        18.066ms       17.677ms    -2.1%   3 of 3, ranges apart
+        769        18.696ms       18.385ms    -1.7%   3 of 3, ranges apart
+       2048        21.419ms       21.000ms    -2.0%   3 of 3, ranges apart
+       4096        22.752ms       22.408ms    -1.5%   3 of 3, ranges apart
+       8192        25.559ms       25.250ms    -1.2%   3 of 3, ranges apart
+
+A fixed 0.31 to 0.42 ms at every length, which is what removing a count rather
+than a rate has to look like. The wall column of that instrument is not quoted,
+for the reason `bench decode --context` carries: it charges the step a prefill
+deferred, which at 8192 is 47 ms against a true 26.5.
+
+### What speculation costs now
+
+Five alternating pairs on the packed heads:
+
+    depth    a token before   a token after   tokens/s   device before   device after
+    k = 0         17.568ms        17.188ms   56.9→58.2        16.510ms       16.151ms
+    k = 1         15.816ms        15.465ms   63.2→64.7        14.468ms       14.251ms
+    k = 2         15.502ms        15.291ms   64.5→65.4        13.995ms       13.865ms
+    k = 3         16.409ms        16.135ms   60.9→62.0        14.639ms       14.474ms
+    k = 4         18.599ms        18.745ms   53.8→53.3        16.670ms       16.645ms
+
+**The device row is a claim at `k` of 0 through 3 and no claim at 4**, and the
+wall is a claim at 0 and 1. The depth that pays best is still two.
+
+`k = 4` is where the sitting runs out of resolution rather than where the merge
+stops applying: its wall ranges are 17.98–19.18 against 18.43–19.16 and two of
+five pairs go each way. Nothing about the three merges depends on the depth — a
+round of `k + 1` rows dispatches the same 876 kernels over taller calls, so what
+falls is the *share* a launch is of each, from 2.0% of a step at `k = 0` to
+0.15% at four.
+
+**Acceptance did not move and could not have**: 84.85 at `k = 1`; 86.96 and 78.26
+at two; 85.00, 65.00 and 55.00 at three; 82.35, 64.71, 52.94 and 47.06 at four —
+identical in both arms of all five pairs, as is the tokens-a-round column, which
+is what a change that moves no token has to read as.
+
+### Against the reference, one sitting
+
+`just bench-engines` on the packed heads, three pairs, both engines alternating,
+every row of the four with its ranges apart:
+
+    prompt × answer   ours mean   ours p50   mlx-vlm mean   mlx-vlm p50   ahead on p50
+        97 × 128        17.29ms    17.32ms       23.05ms       22.90ms          1.32×
+       385 × 128        24.78ms    18.64ms       23.44ms       23.22ms          1.25×
+       769 × 128        25.86ms    19.47ms       23.80ms       23.64ms          1.21×
+        97 × 512        18.03ms    18.48ms       23.24ms       23.15ms          1.25×
+
+Ahead of D2's 1.30, 1.23, 1.19 and 1.24 at every row. The two long prompts' means
+still carry the deferred step — 772 to 881 ms at step 1 — and the medians are the
+decode step. Speculating two deep, the same sitting: **15.06 ms a token at 97 ×
+128 and 14.81 at 97 × 512 against the reference's 23.05 and 23.24**, which is
+1.53× and 1.57×. Both engines wrote the same first eight tokens at every one of
+the four prompts.
+
+### What did not move
+
+**No token changed.** All 657 gated cases pass against a real checkpoint and all
+66 of the timing tier pass after them, `--backend cpu` included; the recorded
+continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what both
+backends write. The counts are 646 and 61 plus the eleven gated and five timing
+cases these three commits and the probe above add. The numerics flag stays
+defaulted to reference.
+
+**Prefill did not move.** Three pairs each, against the commit before the merges:
+
+    tokens     wall    device   ranges
+     2048     -0.1%     +0.0%   across, no claim
+     4096     +0.1%     -0.0%   across, no claim
+     8192     +0.2%     +0.0%   across, no claim
+
+Which is what a decode-step lever should read as: a prefill's dispatches are
+hundreds of rows each, so 124 launches out of a call that already runs for
+eleven seconds is four decades under its own noise.
+
+**K1's kept cache is untouched**: a simulated coding session, three pairs, every
+pair the same way and the ranges apart, reads **71.20 s kept against 265.23 s
+cold** — every turn prefilling the same 321 tokens where the cold arm re-prefills
+9472 — and the per-turn bookkeeping is **1.143 ms**, inside the 1.013 to 1.267
+this file has at the two ends of a context sweep. It is a kept-against-cold
+sitting rather than a before-against-after one: what it says is that the
+arrangement is where it was.
+
+**Both MMA floors,
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert`,
+`the_bounded_loop_is_the_unbounded_one_bit_for_bit` and
+`a_call_splits_its_span_only_where_the_grid_is_short_of_the_machine` are where
+they were**, and so is
+`a_paired_dispatch_answers_what_the_two_dispatches_it_replaces_answer`.
+
+### The floor this stops at, and what is under it
+
+**A decode step still reads 5.91 GB of packed weight once, and at 725 GB/s that
+is 8.15 ms.** The step is at **51% of it on the device where it was at 50%**,
+over the paired sitting above.
+
+    term                                        cost   what it is
+    the weights, at the bus                   8.15ms   the floor
+    876 launches, at 2.60µs each              2.28ms   being 876 dispatches
+    everything else                           5.54ms   the walk, and the bytes above the floor
+
+**The second row is what the next lever has to be, and it is no longer a count.**
+Three milestones have taken the thousand to 876 by merging what could be merged,
+and what is left does not merge: the dispatches a step makes now are the model's
+own shape. What is under them is the ordering — `what_the_device_makes_of_a_
+thousand_indirect_commands` reads a barrier at **91% of what a dispatch costs the
+device when it computes nothing**, measured this milestone from inside a
+mechanism that can address one command at a time, where D2 had it as an estimate.
+
+It stays left, for D2's reason and now with a number on it: it puts a wrong
+answer one missing barrier away with nothing in the arithmetic to catch it.
+
 ## A decode step's thousand dispatches
 
 **A decode step made 1080 dispatches and it makes 1000.** The eighty are every
