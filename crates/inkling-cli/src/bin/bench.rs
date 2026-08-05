@@ -31,6 +31,7 @@
 //! one Metal device, which at a second apiece is the reason a run measures as
 //! much as it can once it has one.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,7 @@ use inkling_core::workload::{
 use inkling_core::{
     Checkpoint, CheckpointWeights, Ending, ModelCache, TextConfig, Tokenizer, profile,
 };
+use inkling_metal::trace;
 use inkling_metal::{FusedAttention, Numerics, PackedMatmul};
 
 /// How long a prefill's prompt is, when nobody says. The middle of the three
@@ -1061,11 +1063,13 @@ fn diverge(dir: &Path, tokens: usize) -> Result<Vec<Reading>> {
     }
 
     let mut answers = Vec::new();
+    let mut dispatched = Vec::new();
     for numerics in [Numerics::Reference, Numerics::Production] {
         let gpu = backend::open(Backend::Metal, numerics)?;
         let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0)?;
         let generator = weights.generator();
         let mut ran = Vec::new();
+        let mut ran_entries = Dispatched::default();
         for (at, ids) in prompts.iter().enumerate() {
             let cache = &mut ModelCache::speculating(text, 0);
             let mut continued = Vec::new();
@@ -1076,10 +1080,36 @@ fn diverge(dir: &Path, tokens: usize) -> Result<Vec<Reading>> {
                 budget: tokens,
                 eos: None,
             };
+            // **Every prompt, and the first two steps of each.** Which entries
+            // a step goes through is decided by the shapes it dispatches, and a
+            // decode step's shapes are the step before it's — so the third step
+            // of a generation is the second described again. The *prompt* is a
+            // shape and is the one that decides whether a call clears a blocked
+            // entry's height, which is why the record is per prompt rather than
+            // taken once: the corpus is six lengths as well as six
+            // distributions, and only its longest member reaches the grouped
+            // entry.
+            //
+            // **What this would miss is an entry gated on the context rather
+            // than on the call**, and what says there is none is that neither
+            // gate is handed the context to read: `PackedMatmul::blocks` turns
+            // on a call's rows and `splits_for` on its output elements, and both
+            // are the checkpoint's own shapes at every length a sequence
+            // reaches. An entry that took such a gate would need a record over
+            // more than the two regimes, and this is the line that would have to
+            // move.
+            let mut steps = 0;
+            trace::record(true);
             generator.stream(cache, ids, ending, &weights, &mut |token| {
+                if steps < REGIMES {
+                    steps += 1;
+                    ran_entries.step(steps, trace::take());
+                    trace::record(steps < REGIMES);
+                }
                 continued.push(token);
                 ControlFlow::Continue(())
             });
+            trace::record(false);
             eprintln!(
                 "{}: prompt {} of {}, {} tokens from {} prompted",
                 numerics.named(),
@@ -1090,10 +1120,27 @@ fn diverge(dir: &Path, tokens: usize) -> Result<Vec<Reading>> {
             );
             ran.push(continued);
         }
+        eprintln!(
+            "{}: a prefill ran {}; a decode step ran {}",
+            numerics.named(),
+            named_entries(&ran_entries.prefill),
+            named_entries(&ran_entries.decode),
+        );
         answers.push(ran);
+        dispatched.push(ran_entries);
     }
     let [reference, production] = <[Vec<Vec<usize>>; 2]>::try_from(answers)
         .map_err(|_| anyhow::anyhow!("a differential run answers twice"))?;
+    let [under_reference, under_production] = <[Dispatched; 2]>::try_from(dispatched)
+        .map_err(|_| anyhow::anyhow!("a differential run answers twice"))?;
+
+    let selected = under_production.beyond(&under_reference);
+    eprintln!(
+        "the flag selected {} at a prefill and {} at a decode step",
+        named_entries(&selected.prefill),
+        named_entries(&selected.decode),
+    );
+    unreached(&selected)?;
 
     for (at, (was, is)) in reference.iter().zip(&production).enumerate() {
         let agreed = agreement(was, is);
@@ -1108,7 +1155,131 @@ fn diverge(dir: &Path, tokens: usize) -> Result<Vec<Reading>> {
             false => eprintln!("prompt {} agreed for all {} tokens", at + 1, was.len()),
         }
     }
-    Ok(parted(&reference, &production))
+    let mut taken = parted(&reference, &production);
+    taken.extend(reached(&selected));
+    Ok(taken)
+}
+
+/// The entries one arm of a differential run dispatched, kept apart by the two
+/// regimes a generation has.
+///
+/// **A prefill and a decode step reach different entries and are gated
+/// differently**, which is the whole reason this is two sets and not one. A
+/// prefill's calls bring rows and clear a height; a decode step's bring one row
+/// and clear nothing, so an entry it reaches is reached by every generation
+/// there has ever been and by no prompt in particular. A single set would report
+/// the union and hide which of the two was empty.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Dispatched {
+    prefill: BTreeSet<String>,
+    decode: BTreeSet<String>,
+}
+
+/// Steps of a generation the record is kept over, which is one of each regime.
+///
+/// A third step is the second described again — a decode step's shapes are the
+/// step before it's — so what a longer record would add is `Encoded` and not
+/// entries.
+const REGIMES: usize = 2;
+
+impl Dispatched {
+    /// Step `at` of one generation folded in, counting from one: the first is
+    /// that generation's prefill, the second its first decode step, and every
+    /// later one is the second over again.
+    ///
+    /// The prompt enters the cache on the first step — a generation prefills
+    /// there rather than in a step of its own — so the two regimes are the first
+    /// two steps of one generation rather than two generations.
+    fn step(&mut self, at: usize, encoded: Vec<inkling_metal::trace::Encoded>) {
+        let into = match at {
+            1 => &mut self.prefill,
+            _ => &mut self.decode,
+        };
+        into.extend(encoded.into_iter().map(|dispatch| dispatch.symbol));
+    }
+
+    /// What this arm ran that `other` did not, which under the production
+    /// numerics is exactly the entries the flag selected.
+    fn beyond(&self, other: &Self) -> Self {
+        let apart = |a: &BTreeSet<String>, b: &BTreeSet<String>| a.difference(b).cloned().collect();
+        Self {
+            prefill: apart(&self.prefill, &other.prefill),
+            decode: apart(&self.decode, &other.decode),
+        }
+    }
+}
+
+/// A set of entries as a line of a report, and `nothing` where it is empty —
+/// which is a reading and not a blank.
+fn named_entries(entries: &BTreeSet<String>) -> String {
+    match entries.is_empty() {
+        true => "nothing".to_string(),
+        false => entries.iter().cloned().collect::<Vec<_>>().join(", "),
+    }
+}
+
+/// That the corpus reached every entry the flag selects, or which of them it
+/// did not.
+///
+/// **This is the check the token-length floor above cannot make.** That floor
+/// asks whether a *prompt* is long enough to be given a blocked entry, which is
+/// the only question while every entry behind the flag is gated on a height.
+/// An entry a decode step dispatches is gated on nothing — a call of one row
+/// reaches it — so no length says whether a differential run ran it, and a run
+/// that never did would report its 384 agreeing argmaxes exactly as loudly as
+/// one that ran it at every step.
+///
+/// So what is held is what was *dispatched*, against the list each kernel keeps
+/// of what it put behind the flag. A corpus that reaches nothing fails here
+/// rather than passing quietly, and so does an entry added behind the flag and
+/// never given a shape that reaches it.
+fn unreached(selected: &Dispatched) -> Result<()> {
+    let ran: BTreeSet<&str> = selected
+        .prefill
+        .iter()
+        .chain(&selected.decode)
+        .map(String::as_str)
+        .collect();
+    let missing: Vec<&str> = behind_the_flag()
+        .filter(|entry| !ran.contains(entry))
+        .collect();
+    match missing.is_empty() {
+        true => Ok(()),
+        false => bail!(
+            "the corpus reached {} of the {} entries behind the flag: nothing in it dispatched {}, \
+             so its agreement is a check on this harness rather than on that arithmetic",
+            ran.len(),
+            behind_the_flag().count(),
+            missing.join(", "),
+        ),
+    }
+}
+
+/// Every entry the two kernels that take the flag put behind it.
+///
+/// One reading of the two lists, because a check against them and a count of
+/// them are the same question asked twice — and a refusal that said "3 of 3"
+/// while naming a missing entry is the shape that drift would take.
+fn behind_the_flag() -> impl Iterator<Item = &'static str> {
+    PackedMatmul::BEHIND_THE_FLAG
+        .iter()
+        .chain(FusedAttention::BEHIND_THE_FLAG)
+        .copied()
+}
+
+/// What the flag reached, as readings.
+///
+/// **Counts rather than names, because the protocol between an arm and the
+/// harness is `name value unit`** — the names go to stderr, where a human reads
+/// them, and what crosses to a report is how many of each there were. A run that
+/// reached the flag at a decode step and one that did not are two different
+/// measurements, and a report that could not tell them apart would quote the
+/// second under the first's heading.
+fn reached(selected: &Dispatched) -> Vec<Reading> {
+    vec![
+        Reading::new("selected.prefill", selected.prefill.len() as f64, "n"),
+        Reading::new("selected.decode", selected.decode.len() as f64, "n"),
+    ]
 }
 
 /// How many tokens two continuations agreed on before the first that they did
@@ -1354,6 +1525,8 @@ fn report(arms: &[Vec<String>; 2], compared: &[Comparison]) -> String {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    use inkling_metal::trace::Encoded;
 
     use super::*;
 
@@ -1653,6 +1826,180 @@ mod tests {
         assert!((read("agreed.share") - 100.0 * 5.0 / 12.0).abs() < 1e-9);
         assert_eq!(read("prompt2.agreed"), 1.0);
         assert_eq!(read("prompt3.tokens"), 4.0);
+    }
+
+    /// The two regimes of a generation, out of the two steps that are them:
+    /// the prompt enters the cache on the first step, so step one is a prefill
+    /// and every step after it is a decode step.
+    #[test]
+    fn the_first_step_of_a_generation_is_the_prefill_and_the_rest_are_decode_steps() {
+        let mut ran = Dispatched::default();
+        ran.step(1, vec![encoded("mma_matmul_rows"), encoded("rms_norm")]);
+        assert_eq!(
+            ran.decode,
+            BTreeSet::new(),
+            "a prefill is not a decode step"
+        );
+        ran.step(2, vec![encoded("packed_matmul"), encoded("rms_norm")]);
+        ran.step(3, vec![encoded("packed_matmul_pair")]);
+        assert_eq!(ran.prefill, named(&["mma_matmul_rows", "rms_norm"]));
+        assert_eq!(
+            ran.decode,
+            named(&["packed_matmul", "packed_matmul_pair", "rms_norm"]),
+        );
+    }
+
+    /// **The corpus's six prompts fold into one pair of sets**, because what a
+    /// prompt decides is which entries it reaches and not which entries exist:
+    /// only the longest member is given the grouped entry, and a run holding a
+    /// set per prompt would have to say which of the six the flag was checked
+    /// against.
+    #[test]
+    fn what_every_prompt_reached_folds_into_one_pair_of_sets() {
+        let mut ran = Dispatched::default();
+        ran.step(1, vec![encoded("mma_matmul_rows")]);
+        ran.step(2, vec![encoded("packed_matmul")]);
+        ran.step(1, vec![encoded("mma_matmul_grouped")]);
+        ran.step(2, vec![encoded("packed_matmul")]);
+        assert_eq!(
+            ran.prefill,
+            named(&["mma_matmul_grouped", "mma_matmul_rows"]),
+        );
+        assert_eq!(ran.decode, named(&["packed_matmul"]));
+    }
+
+    /// **What the flag selected is what one arm ran and the other did not**,
+    /// per regime — a kernel both arms dispatch is a kernel the flag does not
+    /// reach, whichever of the two is running it.
+    #[test]
+    fn the_entries_the_flag_selected_are_the_ones_only_the_production_arm_ran() {
+        let mut reference = Dispatched::default();
+        reference.step(1, vec![encoded("packed_matmul_rows"), encoded("rms_norm")]);
+        reference.step(2, vec![encoded("packed_matmul"), encoded("rms_norm")]);
+        let mut production = Dispatched::default();
+        production.step(1, vec![encoded("mma_matmul_rows"), encoded("rms_norm")]);
+        production.step(2, vec![encoded("packed_matmul"), encoded("rms_norm")]);
+
+        let selected = production.beyond(&reference);
+        assert_eq!(selected.prefill, named(&["mma_matmul_rows"]));
+        assert_eq!(
+            selected.decode,
+            BTreeSet::new(),
+            "a decode step both arms ran the same way selected nothing"
+        );
+    }
+
+    /// **The same on the axis the floor cannot watch**, which is the whole of
+    /// what this milestone put behind the flag: two arms whose prefills are
+    /// identical and whose decode steps are not, and an entry selected there and
+    /// nowhere else. A run reaching the flag only at a decode step is a run this
+    /// has to accept, and one reaching it nowhere is a run it has to refuse —
+    /// so the two are the same fixture with one entry moved.
+    #[test]
+    fn an_entry_only_a_decode_step_ran_is_selected_there_and_reported_there() {
+        let mut reference = Dispatched::default();
+        reference.step(1, vec![encoded("packed_matmul_rows")]);
+        reference.step(2, vec![encoded("packed_matmul"), encoded("rms_norm")]);
+        let mut production = Dispatched::default();
+        production.step(1, vec![encoded("packed_matmul_rows")]);
+        production.step(2, vec![encoded("split_matmul"), encoded("rms_norm")]);
+
+        let selected = production.beyond(&reference);
+        assert_eq!(selected.prefill, BTreeSet::new());
+        assert_eq!(selected.decode, named(&["split_matmul"]));
+        assert_eq!(
+            reached(&selected)
+                .iter()
+                .map(|reading| (reading.name.as_str(), reading.value))
+                .collect::<Vec<_>>(),
+            vec![("selected.prefill", 0.0), ("selected.decode", 1.0)],
+        );
+    }
+
+    /// **The check the token-length floor cannot make.** Every entry each kernel
+    /// says it put behind the flag has to have been dispatched by something the
+    /// corpus ran, or the run's agreement is a check on this harness.
+    #[test]
+    fn a_run_that_reached_every_entry_behind_the_flag_is_the_one_that_passes() {
+        let every: Vec<Encoded> = PackedMatmul::BEHIND_THE_FLAG
+            .iter()
+            .chain(FusedAttention::BEHIND_THE_FLAG)
+            .map(|entry| encoded(entry))
+            .collect();
+        let mut selected = Dispatched::default();
+        selected.step(1, every.clone());
+        // The second regime is where a decode-path entry would land, and an
+        // empty one is not a failure on its own: what fails is an entry
+        // *nothing* reached, wherever it should have been reached.
+        selected.step(2, Vec::new());
+        assert!(unreached(&selected).is_ok());
+
+        assert_eq!(
+            reached(&selected)
+                .iter()
+                .map(|reading| reading.value)
+                .collect::<Vec<_>>(),
+            vec![every.len() as f64, 0.0],
+        );
+    }
+
+    /// And the failure it exists for, one entry at a time: a corpus that reached
+    /// everything but one is a corpus that says nothing about that one.
+    #[test]
+    fn a_run_that_reached_no_entry_behind_the_flag_is_refused() {
+        assert!(
+            unreached(&Dispatched::default()).is_err(),
+            "a run that dispatched nothing the reference did not is not a differential run"
+        );
+        let behind: Vec<&str> = PackedMatmul::BEHIND_THE_FLAG
+            .iter()
+            .chain(FusedAttention::BEHIND_THE_FLAG)
+            .copied()
+            .collect();
+        assert!(behind.len() > 1, "one entry cannot leave one unreached");
+        for left in &behind {
+            let mut selected = Dispatched::default();
+            selected.step(
+                1,
+                behind
+                    .iter()
+                    .filter(|entry| entry != &left)
+                    .map(|entry| encoded(entry))
+                    .collect(),
+            );
+            let refused = unreached(&selected).expect_err("{left} was left unreached");
+            assert!(
+                format!("{refused}").contains(left),
+                "the refusal does not name {left}: {refused}"
+            );
+        }
+    }
+
+    /// A set of entries reads as a line either way round, and an empty one reads
+    /// as a word rather than as a blank — which is what a report of "a decode
+    /// step ran " would be.
+    #[test]
+    fn an_empty_set_of_entries_is_named_rather_than_left_blank() {
+        assert_eq!(named_entries(&BTreeSet::new()), "nothing");
+        assert_eq!(named_entries(&named(&["b", "a"])), "a, b");
+    }
+
+    /// One dispatch of `entry`, as the trace would have recorded it. Only the
+    /// symbol is read here; the rest is what an `Encoded` has to carry.
+    fn encoded(entry: &str) -> Encoded {
+        Encoded {
+            entry: entry.to_string(),
+            symbol: entry.to_string(),
+            pipeline: 0,
+            slots: Vec::new(),
+            threads: 0,
+            threads_per_group: 0,
+            encoding: Duration::ZERO,
+        }
+    }
+
+    fn named(entries: &[&str]) -> BTreeSet<String> {
+        entries.iter().map(|entry| entry.to_string()).collect()
     }
 
     /// Nothing generated is not agreement, and the share it would be divided by

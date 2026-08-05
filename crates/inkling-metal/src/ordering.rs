@@ -264,6 +264,7 @@ mod tests {
     fn named(entry: &str, reads: &[usize], writes: &[usize]) -> Encoded {
         Encoded {
             entry: entry.to_owned(),
+            symbol: entry.to_owned(),
             pipeline: 1,
             slots: reads
                 .iter()

@@ -361,6 +361,7 @@ impl<'a> Batch<'a> {
             let encoding = opened.elapsed();
             crate::trace::encoded(|| crate::trace::Encoded {
                 entry: kernel.label.clone(),
+                symbol: kernel.entry.clone(),
                 pipeline: Retained::as_ptr(&kernel.pipeline) as usize,
                 slots: args
                     .iter()

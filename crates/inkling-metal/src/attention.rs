@@ -531,6 +531,17 @@ impl FusedAttention {
     /// report perfect agreement between a thing and itself.
     pub const SHORTEST_BLOCKED_CALL: usize = MMA_ROWS_A_CALL;
 
+    /// Every entry this module puts behind [`Numerics::Production`], which is
+    /// the one.
+    ///
+    /// **The list rather than the height, for the reason
+    /// [`PackedMatmul::BEHIND_THE_FLAG`](crate::PackedMatmul::BEHIND_THE_FLAG)
+    /// gives.** This entry is still gated on a height, so the floor above still
+    /// says what a corpus has to clear to reach it; what the list adds is that a
+    /// differential run can check it *did*, on a kernel whose two entries are
+    /// charged to one profile row and cannot be told apart by the label.
+    pub const BEHIND_THE_FLAG: &'static [&'static str] = &[BLOCK];
+
     /// The block, where this call's shape is one it should run.
     ///
     /// **The block is correct for every shape it is compiled for and fast for

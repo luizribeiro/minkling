@@ -72,6 +72,16 @@ impl Slot {
 pub struct Encoded {
     /// What the profile calls the entry that ran.
     pub entry: String,
+    /// The entry the kernel was compiled from, which is what the source string
+    /// names and the label above may not.
+    ///
+    /// **Two kernels are charged to one row wherever the row is the work rather
+    /// than the arithmetic** — a layer's attention step is `windowed attention`
+    /// whichever entry carried it, which is what lets a per-kernel table taken
+    /// under one numerics be read against the same table taken under the other.
+    /// So the label cannot say which kernel ran, and a differential run's whole
+    /// question is which kernel ran.
+    pub symbol: String,
     /// The compute pipeline's own address, which is what an indirect command
     /// names and what a kernel chosen by shape would change.
     pub pipeline: usize,
@@ -251,6 +261,7 @@ mod tests {
     fn dispatch(pipeline: usize, slots: Vec<Slot>) -> Encoded {
         Encoded {
             entry: "saxpy".to_owned(),
+            symbol: "saxpy".to_owned(),
             pipeline,
             slots,
             threads: 4096,

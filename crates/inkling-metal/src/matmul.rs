@@ -891,6 +891,23 @@ impl PackedMatmul {
     /// flag had changed. Whoever assembles a corpus has to be able to ask.
     pub const SHORTEST_BLOCKED_CALL: usize = MMA_BLOCKS_A_CALL * MMA_ROWS_A_BLOCK;
 
+    /// Every entry this module puts behind [`Numerics::Production`].
+    ///
+    /// **A height is not a reach and this milestone is why.** While the flag
+    /// selected the two blocked entries alone, a corpus that cleared
+    /// [`PackedMatmul::SHORTEST_BLOCKED_CALL`] reached everything behind it and
+    /// a length was the whole of the question. An entry a *decode step*
+    /// dispatches is reached by a call of one row, so no prompt length gates it
+    /// and no floor can say whether a differential run ever ran it — which is
+    /// the same "a thing agreeing with itself" the floor exists to refuse,
+    /// arriving on the axis the floor does not watch.
+    ///
+    /// So a differential run holds what it *dispatched* against this list rather
+    /// than holding its prompts against a number. See
+    /// [`Encoded::symbol`](crate::trace::Encoded::symbol), which is what lets a
+    /// trace name the entry rather than the row it is charged to.
+    pub const BEHIND_THE_FLAG: &'static [&'static str] = &[MMA_TILED_ENTRY, MMA_GROUPED_ENTRY];
+
     /// Which arithmetic this one accumulates with.
     ///
     /// Read back rather than only obeyed, because the first thing a report about
