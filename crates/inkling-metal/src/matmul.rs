@@ -5828,6 +5828,73 @@ kernel void mma_lane_probe___T__(
         assert!(tokens(2048) && tokens(16384));
     }
 
+    /// **The two grouped entries answer the same bits**, which is what makes the
+    /// line between them a rate and never an answer.
+    ///
+    /// They differ in which rows a threadgroup is given and in nothing else: a
+    /// row's own reduction is over the same codes of the same weight in the same
+    /// order whichever block it lands in, because the `k` loop is the block's and
+    /// the block is the same block. So this is not a tolerance — it is equality,
+    /// and a deviation of any size would mean a row had moved between two
+    /// accumulations rather than between two threadgroups.
+    ///
+    /// The two are reached by a line neither the shape nor the flag can move, so
+    /// the arms are two matmuls built at two lines over one call.
+    #[test]
+    fn the_two_grouped_entries_answer_one_call_the_same_bits() {
+        let Some(device) = device() else { return };
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const EXPERTS: usize = 7;
+        const ROWS: usize = 12 * EXPERTS + 5;
+
+        let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, ROWS);
+        // Runs that neither divide the block nor fill one, which is the layout
+        // the two entries disagree most about: laid over the rows nearly every
+        // block straddles, and cut at the runs nearly every block is part empty.
+        let chosen: Vec<u32> = (0..ROWS).map(|row| (row % EXPERTS) as u32).collect();
+        let through = |plans_under: usize| {
+            let matmul = PackedMatmul::planning_under(
+                &device,
+                Numerics::Production,
+                Block::SHIPPED,
+                plans_under,
+            )
+            .expect("the block compiles");
+            let bank = PackedBank::upload(
+                &device,
+                &matmul,
+                EXPERTS,
+                IN_DIM,
+                OUT_DIM,
+                &case.packed(),
+                &case.scales,
+            )
+            .expect("the bank's shapes pair");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let mut picked = device.buffer(&chosen).expect("the selection uploads");
+            let mut x = device.buffer(&case.x).expect("the rows upload");
+            let mut sorted = grouping
+                .encode(&mut batch, &mut picked, EXPERTS, bank.rows_a_block())
+                .expect("the grouping encodes");
+            let pending = bank
+                .encode_grouped(&mut batch, &mut sorted, &mut x, 1, Through::Gathered)
+                .expect("the dispatch encodes");
+            batch.wait().expect("the dispatches complete");
+            (matmul, pending.take())
+        };
+        let (rows, over_the_rows) = through(0);
+        let (runs, over_the_runs) = through(usize::MAX / (2 * Block::SHIPPED.rows));
+        assert!(
+            !rows.plans(ROWS, EXPERTS) && runs.plans(ROWS, EXPERTS),
+            "both arms reached the same entry, so this is one of them measured twice"
+        );
+        assert_eq!(
+            over_the_rows, over_the_runs,
+            "the two grouped entries answered one call differently, so a row's reduction depends \
+             on which block it landed in"
+        );
+    }
+
     /// **The plan is bound to the entry that takes it and to no other**, which
     /// is a claim about two predicates one inside the other rather than about
     /// either of them.
