@@ -9412,6 +9412,91 @@ kernel void mma_lane_probe___T__(
         }
     }
 
+    /// **What each shape the block is swept at costs to compile**, which is the
+    /// price a lever pays before any call reaches it.
+    ///
+    /// **D1 is why this is priced at all.** Merely reordering which of this
+    /// source's entries are created first was worth 2.4% of a 2048-token
+    /// prefill's device time — a fixed cost this side had not thought to have —
+    /// so a shape that made the entries longer to build owes the same figure, and
+    /// the more so at a short prompt where a fixed cost is a larger share.
+    ///
+    /// **Neither of the two production entries is added or removed by any arm
+    /// here**, which is the first thing the count column says: every row builds
+    /// the same three pipelines a model load builds, out of a source that differs
+    /// in the block's own prelude. So what a row prices is a longer or shorter
+    /// body rather than a fourth kernel, and a row that grew a pipeline would
+    /// show in the count rather than only in the clock.
+    ///
+    /// **The clock is a warm compile and says so.** The first build in a process
+    /// carries the compiler's own start-up and this part's shader cache is cold
+    /// for it, so what every row here is timed behind is one shipped build — which
+    /// is the arrangement a model load is in for its second entry and after, and
+    /// not the one it is in for its first.
+    ///
+    /// Nothing asserts a duration. What is asserted is the count, which is the
+    /// part of this that is a fact rather than a measurement.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_each_shape_the_block_is_swept_at_costs_to_compile() {
+        let Some(device) = device() else { return };
+
+        // The first compile a process runs carries the compiler's own start-up
+        // and reads several times what the ones behind it do, which would land
+        // the whole of it on whichever arm this loop happened to try first.
+        PackedMatmul::under(&device, Numerics::Production).expect("the shipped source compiles");
+
+        eprintln!(
+            "\n  {:<44}{:>12}{:>12}{:>12}",
+            "a block of", "entries", "compiling", "the source"
+        );
+        // Deduplicated, because the shipped shape is an arm of both sweeps and
+        // a row printed three times reads as three measurements of nothing.
+        let mut swept: Vec<Block> = Vec::new();
+        for block in SWEPT_STEPS.into_iter().chain(SWEPT_FRAGMENTS) {
+            if !swept.contains(&block) {
+                swept.push(block);
+            }
+        }
+        for block in swept {
+            let source = source_blocked(Numerics::Production, block);
+            let taken = Instant::now();
+            let Ok(matmul) = PackedMatmul::blocked(&device, Numerics::Production, block) else {
+                eprintln!("  {block:?} is refused by this part");
+                continue;
+            };
+            let whole = taken.elapsed();
+            let mma = matmul
+                .mma
+                .as_ref()
+                .expect("the production entries compiled");
+            let entries = 1 + usize::from(mma.tiled.entry() != mma.grouped.entry());
+            assert_eq!(
+                entries, MMA_ENTRIES,
+                "a block of {block:?} compiled {entries} production entries where a model load \
+                 builds {MMA_ENTRIES}"
+            );
+            eprintln!(
+                "  {:<44}{:>12}{:>12}{:>12}",
+                format!(
+                    "{} codes a step, {}",
+                    block.step,
+                    match block.fragments {
+                        Fragments::Loaded => "through simdgroup_load",
+                        Fragments::PerLane => "the elements a lane owns",
+                    }
+                ),
+                entries,
+                format!("{:.0} us", 1e6 * whole.as_secs_f64()),
+                format!("{:.1} KiB", source.len() as f64 / 1024.0),
+            );
+        }
+    }
+
+    /// Production entries a model load builds, which is the pair
+    /// [`PackedMatmul::compiled`] creates and no arm of any sweep changes.
+    const MMA_ENTRIES: usize = 2;
+
     /// **What a table here reports has to be one dispatch of the shape it
     /// names**, and the way it stops being one is silent.
     ///
