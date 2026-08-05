@@ -68,7 +68,7 @@ impl Backend {
 /// `bench` refuses a `--context` on a prefill under.
 fn numerics(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<Numerics, ArgError> {
     let name = value(flag, args)?;
-    Numerics::parse(&name).ok_or(ArgError::UnknownNumerics(name))
+    Numerics::parse(&name).ok_or(ArgError::UnknownNumerics { word: name })
 }
 
 /// A generation, as a command line describes one.
@@ -139,13 +139,33 @@ pub const DEFAULT_SERVE_MAX_TOKENS: usize = 64;
 /// omission.
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
 
-pub const USAGE: &str = "usage:\n  \
-    inklingrs inspect <config.json>\n  \
-    inklingrs generate <checkpoint-dir> --prompt <text> [--max-tokens <n>] \
-        [--backend cpu|metal] [--numerics reference|production] [--speculate <k>]\n  \
-    inklingrs serve <checkpoint-dir> [--address <host:port>] [--max-tokens <n>] \
-        [--backend cpu|metal] [--numerics reference|production] \
-        [--reuse-tokens <n>]";
+/// The words `--numerics` takes, spelled as a command line offers them.
+///
+/// **Read off [`Numerics::EVERY`] rather than written out**, so that a word
+/// added to the flag reaches the usage line, the refusal below and the two
+/// commands' help at once. A third word arrived with nothing but this function
+/// and one match arm, and the two places that used to spell the list are what
+/// would otherwise have gone on offering two.
+fn every_numerics() -> String {
+    Numerics::EVERY
+        .into_iter()
+        .map(Numerics::named)
+        .collect::<Vec<&str>>()
+        .join("|")
+}
+
+pub fn usage() -> String {
+    let numerics = every_numerics();
+    format!(
+        "usage:\n  \
+        inklingrs inspect <config.json>\n  \
+        inklingrs generate <checkpoint-dir> --prompt <text> [--max-tokens <n>] \
+            [--backend cpu|metal] [--numerics {numerics}] [--speculate <k>]\n  \
+        inklingrs serve <checkpoint-dir> [--address <host:port>] [--max-tokens <n>] \
+            [--backend cpu|metal] [--numerics {numerics}] \
+            [--reuse-tokens <n>]"
+    )
+}
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ArgError {
@@ -179,8 +199,8 @@ pub enum ArgError {
     #[error("{0} is not a backend, which is cpu or metal")]
     UnknownBackend(String),
 
-    #[error("{0} is not numerics, which is reference or production")]
-    UnknownNumerics(String),
+    #[error("{word} is not numerics, which is one of {}", every_numerics())]
+    UnknownNumerics { word: String },
 
     #[error("--numerics {0} takes a device: the cpu backend has one arithmetic")]
     NumericsOffDevice(&'static str),
@@ -530,13 +550,15 @@ mod tests {
     }
 
     /// The numerics are a word the same way the backend is, and each command
-    /// reads the same two.
+    /// reads the same list.
+    ///
+    /// **Walked off [`Numerics::EVERY`] rather than spelled here**, so that a
+    /// fourth word is a case that runs it rather than a case that keeps passing
+    /// without it.
     #[test]
     fn either_command_takes_its_numerics_by_name() {
-        for (name, want) in [
-            ("reference", Numerics::Reference),
-            ("production", Numerics::Production),
-        ] {
+        for want in Numerics::EVERY {
+            let name = want.named();
             assert_eq!(
                 generated(&["generate", "models/small", "-p", "Once", "--numerics", name])
                     .expect("parses")
@@ -549,6 +571,25 @@ mod tests {
                     .numerics,
                 want
             );
+        }
+    }
+
+    /// **Every word the flag takes is offered by the line that says what it
+    /// takes**, which is the drift a usage string spelled by hand invites: a
+    /// word reachable on the command line and absent from the help is one
+    /// nobody finds.
+    #[test]
+    fn the_usage_line_and_the_refusal_offer_every_word() {
+        let (usage, refused) = (
+            usage(),
+            ArgError::UnknownNumerics {
+                word: "half".into(),
+            }
+            .to_string(),
+        );
+        for numerics in Numerics::EVERY {
+            assert!(usage.contains(numerics.named()), "usage: {numerics:?}");
+            assert!(refused.contains(numerics.named()), "refusal: {numerics:?}");
         }
     }
 
@@ -577,7 +618,9 @@ mod tests {
         for name in ["fast", "mma", "Reference", "reference ", ""] {
             assert_eq!(
                 parse(&["generate", "models/small", "-p", "Once", "--numerics", name]),
-                Err(ArgError::UnknownNumerics(name.to_string())),
+                Err(ArgError::UnknownNumerics {
+                    word: name.to_string()
+                }),
                 "{name:?}"
             );
         }
@@ -589,7 +632,7 @@ mod tests {
     /// did — and this flag's whole job is to be readable off the line that ran.
     #[test]
     fn numerics_asked_of_the_cpu_backend_are_refused() {
-        for name in ["reference", "production"] {
+        for name in Numerics::EVERY.map(Numerics::named) {
             for command in [
                 vec!["generate", "models/small", "-p", "Once"],
                 vec!["serve", "models/small"],

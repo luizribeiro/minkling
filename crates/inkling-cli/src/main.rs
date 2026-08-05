@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use inkling_cli::args::{Command, USAGE};
+use inkling_cli::args::{Command, usage};
 use inkling_cli::{generate, inspect, serve};
 
 /// What an invocation that was never understood exits with, apart from one that
@@ -12,7 +12,7 @@ fn main() -> ExitCode {
     let command = match Command::parse(std::env::args().skip(1)) {
         Ok(command) => command,
         Err(err) => {
-            eprintln!("{err}\n\n{USAGE}");
+            eprintln!("{err}\n\n{}", usage());
             return ExitCode::from(MISUSED);
         }
     };
