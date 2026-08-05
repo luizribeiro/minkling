@@ -68,7 +68,7 @@ const USAGE: &str = "usage:\n  \
     bench engines <checkpoint> [--depth <k>] [--numerics <which>]\n  \
     bench session <checkpoint> [--tokens <n>] [--reuse-tokens <n>] [--numerics <which>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
-    bench diverge <checkpoint> [--tokens <n>]\n  \
+    bench diverge <checkpoint> [--tokens <n>] [--against <which>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
 
 /// What an invocation nobody could parse exits with, apart from one that ran and
@@ -205,9 +205,22 @@ enum Job {
         tokens: usize,
         depth: usize,
     },
-    /// The same prompts through both numerics, and where their tokens part
-    /// company.
-    Diverge { checkpoint: PathBuf, tokens: usize },
+    /// The same prompts through the reference and one word behind the flag, and
+    /// where their tokens part company.
+    Diverge {
+        checkpoint: PathBuf,
+        tokens: usize,
+        /// Which word the reference is held against, which is `production`
+        /// unless a command line says otherwise.
+        ///
+        /// **A word rather than both words**, because the two behind the flag
+        /// are two different questions. `production` asks what summation order
+        /// is worth and has answered 384 of 384 at every milestone; `rounded`
+        /// asks what a rounded operand is worth, which is a larger perturbation
+        /// and need not answer the same. A run that put both through at once
+        /// would report one line for two claims.
+        against: Numerics,
+    },
 }
 
 impl Job {
@@ -326,15 +339,17 @@ impl Job {
         })
     }
 
-    /// `diverge`, which takes one checkpoint and runs both numerics itself —
-    /// so it is the one measurement here that names neither of them.
+    /// `diverge`, which takes one checkpoint and opens both arms itself — so
+    /// the word it takes names the second of them rather than the run.
     fn diverging(args: impl Iterator<Item = String>) -> Result<Self> {
         let mut args = args.into_iter();
         let mut checkpoints = Vec::new();
         let mut tokens = DIFFERENTIAL;
+        let mut against = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--tokens" | "-n" => tokens = count(&arg, &mut args)?,
+                "--against" => against = Some(which(&arg, &mut args)?),
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
                 _ => checkpoints.push(PathBuf::from(arg)),
             }
@@ -346,7 +361,23 @@ impl Job {
                     given.len()
                 )
             })?;
-        Ok(Self::Diverge { checkpoint, tokens })
+        let against = against.unwrap_or(Numerics::Production);
+        // **The reference is one arm of this and cannot be the other.** A run
+        // that took it would compare a path to itself and report perfect
+        // agreement, which is what a differential run looks like when it has
+        // measured nothing.
+        if !against.compiles_the_entries() {
+            bail!(
+                "--against {} is the arm every run of this already has: a differential run of the \
+                 reference against itself agrees perfectly and says nothing",
+                against.named()
+            );
+        }
+        Ok(Self::Diverge {
+            checkpoint,
+            tokens,
+            against,
+        })
     }
 
     fn alternating(args: impl Iterator<Item = String>) -> Result<Self> {
@@ -414,8 +445,12 @@ impl Job {
                 }
                 Ok(())
             }
-            Self::Diverge { checkpoint, tokens } => {
-                for reading in diverge(checkpoint, *tokens)? {
+            Self::Diverge {
+                checkpoint,
+                tokens,
+                against,
+            } => {
+                for reading in diverge(checkpoint, *tokens, *against)? {
                     println!("{}", reading.line());
                 }
                 Ok(())
@@ -429,8 +464,13 @@ fn which(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<Numerics
     let name = args
         .next()
         .with_context(|| format!("{flag} takes a value"))?;
-    Numerics::parse(&name)
-        .with_context(|| format!("{name} is not numerics, which is reference or production"))
+    Numerics::parse(&name).with_context(|| {
+        let every: Vec<&str> = Numerics::EVERY.into_iter().map(Numerics::named).collect();
+        format!(
+            "{name} is not numerics, which is one of {}",
+            every.join("|")
+        )
+    })
 }
 
 /// A count of positions to keep, which may be zero: keeping nothing is the arm
@@ -993,20 +1033,27 @@ fn guesses(dirs: &[PathBuf; 2], tokens: usize, depth: usize) -> Result<Vec<Readi
     Ok(taken)
 }
 
-/// The corpus through both numerics, and where the two continuations part
-/// company.
+/// The corpus through the reference and one word behind the flag, and where the
+/// two continuations part company.
 ///
 /// **This is the instrument the flag exists for.** Under the reference the
 /// engine's answer is checkable against a recorded array of bits, and every
-/// gated case in the tree checks it. Under the production numerics there is no
-/// such array and there cannot be one — a matrix instruction's summation order
-/// is not this side's to record — so what stands in for the oracle is a second
+/// gated case in the tree checks it. Behind the flag there is no such array and
+/// there cannot be one — a matrix instruction's summation order is not this
+/// side's to record — so what stands in for the oracle is a second
 /// implementation: two GPU paths that share every tiling decision, every
 /// predicate and every dispatch, and differ only in how the innermost sum is
 /// carried. Where those two agree, the structure around the sum is agreed by two
 /// independent accumulations; where they disagree, the disagreement is between
 /// the arithmetic and nothing else, and the position it first appears at is
 /// where to look.
+///
+/// **What `--against rounded` asks is a different question in the same shape.**
+/// There the two paths differ by a rounded operand rather than by a summation
+/// order, so a parting is not evidence of a bug — it is the answer. The corpus,
+/// the floors, the dispatch-list check and the reported leading agreement are
+/// the same either way, which is the point of taking the word as an argument
+/// rather than writing a second instrument.
 ///
 /// **What is reported is leading agreement and not a count of differing
 /// tokens.** Two free-running generations that part company at step 12 have
@@ -1020,7 +1067,7 @@ fn guesses(dirs: &[PathBuf; 2], tokens: usize, depth: usize) -> Result<Vec<Readi
 /// side: each wraps the whole model, and holding two of those at once would
 /// double a resident set this repo bounds a test on for nothing — nothing here
 /// is timed.
-fn diverge(dir: &Path, tokens: usize) -> Result<Vec<Reading>> {
+fn diverge(dir: &Path, tokens: usize, against: Numerics) -> Result<Vec<Reading>> {
     let config = config::of_checkpoint(dir)?;
     let text = &config.text_config;
     let tokenizer = Tokenizer::open(dir, &config)?;
@@ -1064,7 +1111,7 @@ fn diverge(dir: &Path, tokens: usize) -> Result<Vec<Reading>> {
 
     let mut answers = Vec::new();
     let mut dispatched = Vec::new();
-    for numerics in [Numerics::Reference, Numerics::Production] {
+    for numerics in [Numerics::Reference, against] {
         let gpu = backend::open(Backend::Metal, numerics)?;
         let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0)?;
         let generator = weights.generator();
@@ -1129,33 +1176,35 @@ fn diverge(dir: &Path, tokens: usize) -> Result<Vec<Reading>> {
         answers.push(ran);
         dispatched.push(ran_entries);
     }
-    let [reference, production] = <[Vec<Vec<usize>>; 2]>::try_from(answers)
+    let [reference, behind] = <[Vec<Vec<usize>>; 2]>::try_from(answers)
         .map_err(|_| anyhow::anyhow!("a differential run answers twice"))?;
-    let [under_reference, under_production] = <[Dispatched; 2]>::try_from(dispatched)
+    let [under_reference, under_flag] = <[Dispatched; 2]>::try_from(dispatched)
         .map_err(|_| anyhow::anyhow!("a differential run answers twice"))?;
 
-    let selected = under_production.beyond(&under_reference);
+    let selected = under_flag.beyond(&under_reference);
     eprintln!(
-        "the flag selected {} at a prefill and {} at a decode step",
+        "{} selected {} at a prefill and {} at a decode step",
+        against.named(),
         named_entries(&selected.prefill),
         named_entries(&selected.decode),
     );
     unreached(&selected)?;
 
-    for (at, (was, is)) in reference.iter().zip(&production).enumerate() {
+    for (at, (was, is)) in reference.iter().zip(&behind).enumerate() {
         let agreed = agreement(was, is);
         match agreed < was.len() {
             true => eprintln!(
-                "prompt {} parted at token {}: reference {:?}, production {:?}",
+                "prompt {} parted at token {}: reference {:?}, {} {:?}",
                 at + 1,
                 agreed + 1,
                 &was[agreed..was.len().min(agreed + 4)],
+                against.named(),
                 &is[agreed..is.len().min(agreed + 4)],
             ),
             false => eprintln!("prompt {} agreed for all {} tokens", at + 1, was.len()),
         }
     }
-    let mut taken = parted(&reference, &production);
+    let mut taken = parted(&reference, &behind);
     taken.extend(reached(&selected));
     Ok(taken)
 }
@@ -1749,8 +1798,9 @@ mod tests {
         ));
     }
 
-    /// **The differential run is the one measurement that names neither**, since
-    /// it runs both itself — so a word choosing one of them is a mistake there.
+    /// **The differential run opens both arms itself**, so `--numerics` — which
+    /// every other measurement takes to mean "run under this" — is a mistake
+    /// here. What it takes instead is `--against`, which names the *second* arm.
     #[test]
     fn a_differential_run_takes_one_checkpoint_and_no_numerics() {
         assert_eq!(
@@ -1758,16 +1808,41 @@ mod tests {
             Job::Diverge {
                 checkpoint: PathBuf::from("models/small"),
                 tokens: DIFFERENTIAL,
+                against: Numerics::Production,
             }
         );
-        for name in ["reference", "production"] {
+        for name in Numerics::EVERY.map(Numerics::named) {
             assert!(
                 Job::parse(["diverge", "models/small", "--numerics", name].map(str::to_string))
                     .is_err(),
-                "{name} was taken by a measurement that runs both"
+                "{name} was taken by a measurement that opens both arms"
             );
         }
         assert!(Job::parse(["diverge".to_string()]).is_err());
+    }
+
+    /// **Every word behind the flag is an arm this can be pointed at, and the
+    /// reference is not one.** A differential run of the reference against
+    /// itself agrees perfectly, which is what a run that measured nothing looks
+    /// like — so it is refused rather than reported.
+    #[test]
+    fn a_differential_run_is_pointed_at_a_word_behind_the_flag() {
+        for against in Numerics::EVERY {
+            let parsed = Job::parse(
+                ["diverge", "models/small", "--against", against.named()].map(str::to_string),
+            );
+            match against.compiles_the_entries() {
+                true => assert_eq!(
+                    parsed.expect("parses"),
+                    Job::Diverge {
+                        checkpoint: PathBuf::from("models/small"),
+                        tokens: DIFFERENTIAL,
+                        against,
+                    }
+                ),
+                false => assert!(parsed.is_err(), "{against:?} was taken as a second arm"),
+            }
+        }
     }
 
     /// The same refusal on `guesses`, and **about whether the word was given
