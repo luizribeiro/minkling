@@ -541,10 +541,11 @@ impl<'a> LayerProjections<'a> {
 
         // **The span grows here rather than when the batch completes**, because
         // the step below is what has to see this call's keys and it is in the
-        // same command buffer as the two dispatches that wrote them. Metal's
-        // default dispatch type is serial, so those writes are done before the
-        // step reads them — and a span that grew after the wait would attend
-        // over the previous step's keys and leave this token out of its own row.
+        // same command buffer as the two dispatches that wrote them. The step
+        // binds the span those two write, so the batch puts a barrier between
+        // them and those writes are done before it reads them — and a span that
+        // grew after the wait would attend over the previous step's keys and
+        // leave this token out of its own row.
         span.appended(queries);
         let mut attended = self.attention.encode_over(
             batch,
@@ -596,12 +597,13 @@ impl Projections for LayerProjections<'_> {
     /// with the normed state never leaving the device.
     ///
     /// **This is the pattern the rest of the residency is made of.** The four
-    /// dispatches read the buffer the norm's dispatch wrote — Metal's default
-    /// dispatch type is serial, so the ordering is the command buffer's — and
-    /// what used to be a `Vec<f32>` formed on the CPU, copied over four times
-    /// and dropped is now a value that exists only in device memory. The
-    /// submission count does not move: five dispatches where there were four,
-    /// in the one command buffer that already held them.
+    /// dispatches read the buffer the norm's dispatch wrote — the batch puts a
+    /// barrier between the norm and them, and none between the four, which is
+    /// what [`crate::ordering`] is for — and what used to be a `Vec<f32>` formed
+    /// on the CPU, copied over four times and dropped is now a value that exists
+    /// only in device memory. The submission count does not move: five
+    /// dispatches where there were four, in the one command buffer that already
+    /// held them.
     ///
     /// `weight` and `eps` arrive and are checked rather than used: this holds
     /// the same norm already, uploaded once at wrap time where the CPU path

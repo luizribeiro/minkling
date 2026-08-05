@@ -8,10 +8,22 @@
 //! nothing orders them but the encoder.
 //!
 //! `computeCommandEncoderWithDispatchType:` takes that ordering off and asks for
-//! it back one `memoryBarrierWithScope:` at a time. What decides whether that is
-//! worth doing is a count — how many barriers a sequence still needs — and
-//! `what_a_barrier_costs_the_device_against_the_dispatches_it_separates` is what
-//! turns that count into microseconds.
+//! it back one `memoryBarrierWithScope:` at a time, and what a step needs is
+//! decided here.
+//!
+//! **What this does not do is price it.** A count of barriers times what a
+//! barrier costs an empty dispatch is a model, and the model is wrong:
+//! `what_a_barrier_costs_the_device_against_the_dispatches_it_separates` reads
+//! the ordering at 1.215 microseconds a dispatch and a barrier at 2.062, which
+//! says a sequence averaging under 1.70 dispatches to a group pays for the
+//! mechanism — and this one averages 1.37, so the arithmetic predicted a decode
+//! step 0.237 ms *slower*. It is 0.98 ms faster. What a serial pass costs a
+//! dispatch that computes something is not its launch, it is the execution it
+//! keeps from overlapping: the same step with every barrier taken out — which
+//! races, and writes the wrong tokens — runs the device in 9.25 ms against
+//! 16.16, so the ordering is worth 6.90 ms and not the 1.12 the fixed cost
+//! implies. So the value is measured by `just bench` and the count is reported
+//! here, and neither is derived from the other.
 //!
 //! **The count has to be derived rather than read off the code.** A barrier
 //! removed by inspection is a race that is correct most of the time, and the
@@ -53,35 +65,7 @@
 //! is taken as written, which is a barrier kept. See
 //! [`Kernel::writes`](crate::Kernel::writes).
 
-use std::time::Duration;
-
 use crate::trace::{Encoded, Slot};
-
-/// What Metal's serial dispatch type costs the device per dispatch, over and
-/// above what the same dispatch costs in a pass that orders nothing.
-///
-/// **This is the whole of what a concurrent pass has to sell.** Measured by
-/// `what_a_barrier_costs_the_device_against_the_dispatches_it_separates` at 1.554
-/// microseconds a serial dispatch against 0.339 for the same dispatch with the
-/// ordering off — a thousand empty dispatches, one grid, the driver's own clock.
-const SERIAL_ORDERING: Duration = Duration::from_nanos(1215);
-
-/// What one `memoryBarrierWithScope:` costs the device, from the same sweep:
-/// 2.401 microseconds a dispatch with a barrier after every one of them, less
-/// the 0.339 the dispatch costs alone.
-///
-/// **It is larger than the ordering it replaces**, which is the fact the whole
-/// arithmetic turns on: a barrier kept is dearer than the serial dispatch type,
-/// so only a barrier *removed* is worth anything, and a sequence pays for the
-/// mechanism unless its groups average about 1.7 dispatches.
-///
-/// Confirmed on a real decode step rather than only on empty dispatches: every
-/// pass made concurrent with a barrier after every dispatch — which is the same
-/// ordering the serial type gives, and so the same tokens — reads 16.121 ms of
-/// device against 16.825, seven alternating pairs, every pair the same way. That
-/// is 0.804 microseconds a dispatch over the 876 a step at that context makes,
-/// against the 0.847 these two figures predict.
-const A_BARRIER: Duration = Duration::from_nanos(2062);
 
 /// A sequence of dispatches divided into groups whose members can run at the
 /// same time as each other.
@@ -118,27 +102,32 @@ impl Groups {
     pub fn over(dispatches: &[Encoded], boundaries: &[usize]) -> Self {
         let mut groups: Vec<Vec<String>> = Vec::new();
         let mut passes: Vec<usize> = Vec::new();
-        let mut open: Vec<&Encoded> = Vec::new();
+        let mut open = Open::default();
+        let mut held: Vec<String> = Vec::new();
         let mut in_pass = 0usize;
-        let close =
-            |open: &mut Vec<&Encoded>, groups: &mut Vec<Vec<String>>, in_pass: &mut usize| {
-                if !open.is_empty() {
-                    groups.push(open.iter().map(|held| held.entry.clone()).collect());
-                    *in_pass += 1;
-                    open.clear();
-                }
-            };
+        let close = |held: &mut Vec<String>, groups: &mut Vec<Vec<String>>, at: &mut usize| {
+            if !held.is_empty() {
+                groups.push(std::mem::take(held));
+                *at += 1;
+            }
+        };
         for (at, dispatch) in dispatches.iter().enumerate() {
             if at > 0 && boundaries.contains(&at) {
-                close(&mut open, &mut groups, &mut in_pass);
+                close(&mut held, &mut groups, &mut in_pass);
+                open.clear();
                 passes.push(std::mem::take(&mut in_pass));
             }
-            if open.iter().any(|held| hazard(held, dispatch)) {
-                close(&mut open, &mut groups, &mut in_pass);
+            // **The same call the encoder makes**, so that what this counts and
+            // what a concurrent pass would encode are one rule rather than two
+            // that can drift — see [`Open::admits`].
+            if !open.admits(touches(dispatch)) {
+                close(&mut held, &mut groups, &mut in_pass);
+                open.clear();
             }
-            open.push(dispatch);
+            open.extend(touches(dispatch));
+            held.push(dispatch.entry.clone());
         }
-        close(&mut open, &mut groups, &mut in_pass);
+        close(&mut held, &mut groups, &mut in_pass);
         if in_pass > 0 {
             passes.push(in_pass);
         }
@@ -172,36 +161,13 @@ impl Groups {
         self.groups.iter().map(Vec::len).max().unwrap_or(0)
     }
 
-    /// Dispatches to a group, which is the figure the break-even in
-    /// `what_a_barrier_costs_the_device_against_the_dispatches_it_separates` is
-    /// stated in.
+    /// Dispatches to a group, which is how much concurrency the division found
+    /// and the one figure that says it in a number.
     pub fn average(&self) -> f64 {
         match self.groups.is_empty() {
             true => 0.0,
             false => self.dispatches() as f64 / self.groups.len() as f64,
         }
-    }
-
-    /// What encoding this sequence concurrently would be worth: the ordering it
-    /// would stop paying for, less the barriers it would still have to encode.
-    ///
-    /// Negative where the barriers cost more than the ordering, which is what a
-    /// sequence of mostly-chained dispatches comes to — see [`A_BARRIER`], which
-    /// is dearer than [`SERIAL_ORDERING`] and so makes the sign a question about
-    /// the count rather than about the mechanism.
-    pub fn worth(&self) -> f64 {
-        SERIAL_ORDERING.as_secs_f64() * self.dispatches() as f64
-            - A_BARRIER.as_secs_f64() * self.barriers() as f64
-    }
-
-    /// Dispatches to a group at which encoding concurrently starts to pay,
-    /// which is what [`Groups::average`] has to be above.
-    ///
-    /// One barrier separates two groups, so a sequence of `g` dispatches to a
-    /// group pays `A_BARRIER / g` where it saves `SERIAL_ORDERING` — and the
-    /// break-even is their ratio.
-    pub fn break_even() -> f64 {
-        A_BARRIER.as_secs_f64() / SERIAL_ORDERING.as_secs_f64()
     }
 
     /// Every distinct group the sequence divided into, widest first, with how
@@ -225,23 +191,61 @@ impl Groups {
     }
 }
 
-/// Whether two dispatches have to be ordered: an allocation both name, that at
-/// least one of them may write.
+/// What the dispatches encoded since the last barrier touch, and whether one
+/// more may join them.
+///
+/// **This is the rule, and it is one rule.** The division
+/// [`Groups::over`] reports and the barrier a concurrent [`Batch`](crate::Batch)
+/// encodes are the same question asked at two times — once of a recorded step
+/// and once as the step is encoded — and a second implementation of it would be
+/// a second thing to get right. So the encoder holds one of these and so does
+/// the analysis, and neither knows anything the other does not.
+///
+/// A flat list rather than a map: a group is a handful of dispatches of a dozen
+/// slots, so what a hash would buy is nothing and what it would cost is an
+/// allocation on a path a step takes 918 times.
+#[derive(Debug, Default)]
+pub(crate) struct Open {
+    /// Every allocation the open group names, and whether anything in the group
+    /// may write it. Duplicated entries are left duplicated: the scan is over
+    /// tens of items and de-duplicating would cost more than it saves.
+    touched: Vec<(usize, bool)>,
+}
+
+impl Open {
+    /// Whether a dispatch touching `slots` may join the group without a barrier
+    /// in front of it.
+    ///
+    /// A hazard is an allocation both name that at least one of them may write,
+    /// which covers all three orderings that matter — a read after a write, a
+    /// write after a read, and two writes.
+    pub(crate) fn admits(&self, slots: impl Iterator<Item = (usize, bool)>) -> bool {
+        !slots.into_iter().any(|(at, writes)| {
+            self.touched
+                .iter()
+                .any(|(held, written)| *held == at && (*written || writes))
+        })
+    }
+
+    pub(crate) fn extend(&mut self, slots: impl Iterator<Item = (usize, bool)>) {
+        self.touched.extend(slots);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.touched.clear();
+    }
+}
+
+/// The allocations a recorded dispatch names, and whether it may write each.
 ///
 /// **An inline argument is never a hazard.** `setBytes:` copies the value into
 /// the command buffer as the dispatch is encoded, so there is no memory two
 /// dispatches could disagree about — which is what makes a shape struct free to
 /// share a group with anything.
-fn hazard(before: &Encoded, after: &Encoded) -> bool {
-    before.slots.iter().any(|held| match held {
-        Slot::Inline(_) => false,
-        Slot::Bound { at, written } => after.slots.iter().any(|slot| match slot {
-            Slot::Inline(_) => false,
-            Slot::Bound {
-                at: other,
-                written: writes,
-            } => at == other && (*written || *writes),
-        }),
+fn touches(dispatch: &Encoded) -> impl Iterator<Item = (usize, bool)> + '_ {
+    dispatch.slots.iter().filter_map(|slot| match slot {
+        Slot::Inline(_) => None,
+        Slot::Bound { at, written } => Some((*at, *written)),
     })
 }
 
@@ -378,52 +382,6 @@ mod tests {
             (2, 0),
             "two passes of two, and no barrier inside either"
         );
-    }
-
-    /// **The arithmetic, at the break-even the two measured constants imply.**
-    /// A sequence whose groups sit exactly on it is worth nothing either way,
-    /// and the two either side of it are worth what their counts say — which is
-    /// the whole of how a dispatch count and a barrier count become a verdict.
-    #[test]
-    fn what_a_sequence_is_worth_follows_its_groups_against_the_break_even() {
-        // Two dispatches to a group is above the break-even of about 1.7, and a
-        // group a dispatch is below it. A pair writes two buffers and the pair
-        // behind it reads the first of them, which is what closes each group
-        // after exactly two.
-        let paired: Vec<Encoded> = (0..8)
-            .map(|at| match at {
-                0 | 1 => dispatch(&[], &[10 + at]),
-                _ => dispatch(&[10 + 2 * (at / 2 - 1)], &[10 + at]),
-            })
-            .collect();
-        let chained: Vec<Encoded> = (0..8).map(|at| dispatch(&[at], &[at + 1])).collect();
-
-        let paired = Groups::over(&paired, &[]);
-        let chained = Groups::over(&chained, &[]);
-
-        assert_eq!((paired.groups(), paired.barriers()), (4, 3));
-        assert!(paired.average() > Groups::break_even(), "{paired:?}");
-        assert!(paired.worth() > 0.0, "{}", paired.worth());
-
-        assert_eq!((chained.groups(), chained.barriers()), (8, 7));
-        assert!(chained.average() < Groups::break_even(), "{chained:?}");
-        assert!(
-            chained.worth() < 0.0,
-            "a chain pays for the mechanism: {}",
-            chained.worth()
-        );
-    }
-
-    /// A sequence already in one group is worth its whole ordering, and it is
-    /// the ceiling every other answer sits under.
-    #[test]
-    fn a_sequence_with_no_barriers_left_is_worth_its_whole_ordering() {
-        let sequence: Vec<Encoded> = (0..10).map(|out| dispatch(&[100], &[out])).collect();
-
-        let groups = Groups::over(&sequence, &[]);
-
-        assert_eq!(groups.barriers(), 0);
-        assert!((groups.worth() - 10.0 * SERIAL_ORDERING.as_secs_f64()).abs() < 1e-12);
     }
 
     #[test]

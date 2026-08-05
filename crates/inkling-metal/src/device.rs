@@ -139,6 +139,7 @@ pub struct Device {
     raw: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     dispatches: Cell<u64>,
+    barriers: Cell<u64>,
     submissions: Cell<u64>,
     allocations: Cell<u64>,
     allocated_bytes: Cell<u64>,
@@ -163,6 +164,7 @@ impl Device {
             raw,
             queue,
             dispatches: Cell::new(0),
+            barriers: Cell::new(0),
             submissions: Cell::new(0),
             allocations: Cell::new(0),
             allocated_bytes: Cell::new(0),
@@ -310,9 +312,23 @@ impl Device {
         self.submissions.get()
     }
 
-    pub(crate) fn counted(&self, dispatches: usize) {
+    /// How many barriers those dispatches needed, which is the whole of what a
+    /// concurrent pass buys back the ordering with.
+    ///
+    /// Counted for the reason the dispatches are, and for one more: it is what
+    /// says the division [`Groups`](crate::ordering::Groups) reports and the one
+    /// the engine encoded are the same division. Both come out of the same
+    /// [`Open`](crate::ordering), so they cannot disagree — and a count nothing
+    /// checked is a claim rather than a fact, which is not what this milestone
+    /// can afford.
+    pub fn barriers(&self) -> u64 {
+        self.barriers.get()
+    }
+
+    pub(crate) fn counted(&self, dispatches: usize, barriers: usize) {
         self.dispatches
             .set(self.dispatches.get() + dispatches as u64);
+        self.barriers.set(self.barriers.get() + barriers as u64);
         self.submissions.set(self.submissions.get() + 1);
     }
 

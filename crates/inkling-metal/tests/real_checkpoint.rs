@@ -780,6 +780,9 @@ struct OnTheDevice {
     /// groups are barriers somebody has to encode. See
     /// [`Groups::over`](inkling_metal::ordering::Groups::over).
     boundaries: Vec<Vec<usize>>,
+    /// Barriers the engine encoded over the steps the profile charges, which is
+    /// what the division derived from those steps has to agree with.
+    barriers: u64,
 }
 
 impl OnTheDevice {
@@ -887,6 +890,7 @@ impl OnTheDevice {
             round_trips: Vec::new(),
             traces: Vec::new(),
             boundaries: Vec::new(),
+            barriers: 0,
         };
         device.record_round_trips(true);
         trace::record(asked.tracing);
@@ -900,6 +904,10 @@ impl OnTheDevice {
 
         let read = |run: &mut Self| run.submitted.push(counters(device));
         read(&mut run);
+        // Where the charged steps start, on the counter the barriers are read
+        // off. It moves with every step the profile discards and stops when the
+        // profile does, so what is left is the barriers of the steps charged.
+        let mut charged_barriers = device.barriers();
         let mut step = Instant::now();
         generator.stream(
             &mut ModelCache::new(&config),
@@ -922,11 +930,13 @@ impl OnTheDevice {
                 if run.steps.len() <= asked.discarded() && !asked.charges_the_prefill() {
                     profile::take();
                     device.round_trips();
+                    charged_barriers = device.barriers();
                 }
                 step = Instant::now();
                 ControlFlow::Continue(())
             },
         );
+        run.barriers = device.barriers() - charged_barriers;
         run.profile = profile::take().per_step(run.charged_steps());
         run.round_trips = device.round_trips();
         device.record_round_trips(false);
@@ -2052,16 +2062,21 @@ fn what_changes_between_two_decode_steps() {
     }
 }
 
-/// **What a decode step's dispatches actually have to wait for**, which is the
-/// count the concurrency lever lives or dies by.
+/// **What a decode step's dispatches actually have to wait for**, which is where
+/// a concurrent pass puts a barrier and nowhere else.
 ///
-/// `what_a_barrier_costs_the_device_against_the_dispatches_it_separates` prices
-/// the two sides — Metal's serial ordering at about 1.2 microseconds a dispatch,
-/// an explicit barrier at about 2.1 — and says a concurrent pass overtakes a
-/// serial one only where its groups average about 1.7 dispatches. This is what
-/// a step's own groups average, derived rather than read off the layer code:
-/// which allocations filled each dispatch's slots, and which of those slots the
-/// kernel's own source declares it may write. See [`inkling_metal::ordering`].
+/// This is what a step's groups come to, derived rather than read off the
+/// layer code: which allocations filled each dispatch's slots, and which of
+/// those slots the kernel's own source declares it may write. It is the same
+/// division [`Batch`](inkling_metal::Batch) encodes, through the same
+/// [`Open`](inkling_metal::ordering) — so a count here that moved without the
+/// engine moving with it is not possible.
+///
+/// **The counts and not a price.** What removing these barriers is worth is a
+/// paired benchmark and not a count times a constant, for the reason
+/// [`inkling_metal::ordering`] gives at length: the fixed-cost reading of
+/// `what_a_barrier_costs_the_device_against_the_dispatches_it_separates` gets
+/// the sign wrong.
 ///
 /// **At three contexts, because a span that grows is the one thing that could
 /// change the shape.** `what_changes_between_two_decode_steps` says the sequence
@@ -2082,7 +2097,7 @@ fn what_a_decode_steps_dispatches_have_to_wait_for() {
 
     eprintln!(
         "{:>8}{:>12}{:>8}{:>9}{:>10}{:>9}{:>9}{:>11}",
-        "context", "dispatches", "passes", "groups", "barriers", "a group", "widest", "worth"
+        "context", "dispatches", "passes", "groups", "barriers", "a group", "widest", "of them"
     );
     for context in TRACED_CONTEXTS {
         let run = OnTheDevice::running(&dir, &device, Asked::decoding_at(context).traced());
@@ -2101,6 +2116,26 @@ fn what_a_decode_steps_dispatches_have_to_wait_for() {
         );
         let step = &steps[0];
 
+        // **The one assertion that makes this a fact about the engine rather
+        // than a report about a recording.** The division here and the barriers
+        // `Batch` encoded come out of the same `Open` asked the same question,
+        // so they have to be the same number — and a milestone whose whole
+        // claim is that the barriers left are the ones a dependency needs
+        // cannot leave that unchecked.
+        // Every charged step and not their average: the sequence is the same
+        // commands every step — `what_changes_between_two_decode_steps` is what
+        // says so — so the barriers are the same count every step, and an
+        // average would let one deviant step hide behind the others.
+        assert_eq!(
+            run.barriers,
+            step.barriers() as u64 * u64::from(run.charged_steps()),
+            "at {context} keys the engine encoded {} barriers over {} steps where the division \
+             needs {} each",
+            run.barriers,
+            run.charged_steps(),
+            step.barriers()
+        );
+
         eprintln!(
             "{context:>8}{:>12}{:>8}{:>9}{:>10}{:>9}{:>9}{:>11}",
             step.dispatches(),
@@ -2109,17 +2144,15 @@ fn what_a_decode_steps_dispatches_have_to_wait_for() {
             step.barriers(),
             format!("{:.2}", step.average()),
             step.widest(),
-            format!("{:+.3}ms", step.worth() * 1e3),
+            format!(
+                "{:.0}%",
+                100.0 * step.barriers() as f64 / step.dispatches() as f64
+            ),
         );
         for (held, group) in step.shapes() {
             eprintln!("  {held:>6} of {}", group.join(", "));
         }
     }
-
-    eprintln!(
-        "  a group has to average {:.2} dispatches before a concurrent pass is worth encoding",
-        Groups::break_even()
-    );
 }
 
 /// The three prompt lengths this file's prefill figures are quoted at, and the

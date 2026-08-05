@@ -9,13 +9,14 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary,
-    MTLPipelineOption, MTLSize,
+    MTLBarrierScope, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice,
+    MTLDispatchType, MTLFunction, MTLLibrary, MTLPipelineOption, MTLSize,
 };
 
 use crate::buffer::Arg;
 use crate::device::{Device, MetalError, RoundTrip};
+use crate::ordering::Open;
 use crate::sampling::Sampled;
 
 /// Entries in one compute function's buffer argument table. Every Apple GPU
@@ -174,6 +175,8 @@ impl Device {
             samples,
             entry: None,
             dispatches: 0,
+            open: Open::default(),
+            barriers: 0,
         })
     }
 }
@@ -201,12 +204,19 @@ impl Device {
 /// None of them is the same number twice, so a plan that turns on the
 /// difference between 156 and 172 is a plan that has over-fitted.
 ///
-/// **The dispatches are ordered.** Metal's default dispatch type is serial, so
-/// each one here runs after the one before it and reads what it wrote. That is
-/// not what makes batching worth doing — the four projections that consume a
-/// layer's normed hidden state are independent — but it is what a layer's
-/// attention now rests on end to end: eleven dispatches where each reads what
-/// the one before it wrote, including into a span that outlives the call.
+/// **The dispatches are ordered where they read each other and nowhere else.**
+/// The pass is opened `MTLDispatchTypeConcurrent`, which gives no ordering at
+/// all, and [`Batch::add`] encodes a `memoryBarrierWithScope:` in front of any
+/// dispatch that touches something the dispatches since the last barrier wrote.
+/// So a layer's attention still rests on it end to end — eleven dispatches where
+/// each reads what the one before it wrote, including into a span that outlives
+/// the call — and the four projections that consume the normed hidden state,
+/// which never did, run together.
+///
+/// **Where the barrier goes is derived and not decided here**: see
+/// [`crate::ordering`], which holds the rule, and [`Kernel::writes`], which is
+/// where "wrote" comes from. What it is worth is 0.98 ms of a 16.16 ms device
+/// step.
 ///
 /// Waiting is still what makes [`Buffer::as_slice`](crate::Buffer::as_slice)
 /// safe to read afterwards. What a batch removes is the *number* of waits, not
@@ -226,6 +236,12 @@ pub struct Batch<'a> {
     /// inside it did, so naming the first is as precise as this can be.
     entry: Option<String>,
     dispatches: usize,
+    /// What the dispatches encoded since the last barrier touch, which is what
+    /// decides whether the next one needs another — see [`crate::ordering`].
+    open: Open,
+    /// How many barriers this has encoded, which is what a caller asking
+    /// whether the ordering was worth taking off has to go on.
+    barriers: usize,
 }
 
 impl<'a> Batch<'a> {
@@ -288,10 +304,32 @@ impl<'a> Batch<'a> {
             });
         }
 
-        let encoder = self.encoder(kernel)?;
+        // Asked before the pass is, because [`Batch::encoder`] may open a new
+        // one and this has to read what the last one left. **A dispatch that
+        // opens its own pass needs no barrier**: a pass boundary already
+        // orders, so a sampled run — where every dispatch is a pass — encodes
+        // none at all, and neither does the first dispatch of a command buffer.
+        let fresh = self.samples.is_some() || self.encoder.is_none();
+        let ordered = !fresh && !self.open.admits(touches(kernel, args));
+
+        let (opened, encoder) = self.encoder(kernel)?;
+        // **The two predictions of the same thing, held against each other.**
+        // `fresh` is worked out above because the pass cannot be asked for
+        // first — the encoder borrows this batch for the rest of the call — so
+        // it is a second reading of what [`Batch::encoder`] is about to do, and
+        // a second reading that drifted would drop a barrier rather than add
+        // one. Which is the failure this module is arranged to make impossible
+        // everywhere else.
+        debug_assert_eq!(
+            fresh, opened,
+            "the pass a dispatch was going to open is not the one it opened"
+        );
         // Read before the encoding rather than around it, so that a run nobody
         // is tracing pays a branch and not a clock. See [`crate::trace`].
         let described = crate::trace::recording().then(std::time::Instant::now);
+        if ordered {
+            encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
         encoder.setComputePipelineState(&kernel.pipeline);
         for (slot, arg) in args.iter().enumerate() {
             // SAFETY: the memory outlives the encoding through `Arg`'s borrow,
@@ -335,6 +373,12 @@ impl<'a> Batch<'a> {
             });
         }
 
+        if ordered {
+            self.open.clear();
+            self.barriers += 1;
+        }
+        self.open.extend(touches(kernel, args));
+
         self.entry.get_or_insert_with(|| kernel.entry.clone());
         self.dispatches += 1;
         if let Some(samples) = &mut self.samples {
@@ -349,42 +393,61 @@ impl<'a> Batch<'a> {
     /// **A pass of its own is not a command buffer of its own.** The passes
     /// still go into the one submission the batch is, so a sampled step makes
     /// the same round trips an unsampled one does; what it adds is a boundary
-    /// between dispatches that Metal's serial dispatch type already puts a
-    /// barrier at.
+    /// where an unsampled run has a barrier or nothing.
+    ///
+    /// **A sampled pass is concurrent too**, and it has to be: a run whose
+    /// passes ordered what an unsampled run leaves unordered would be timing an
+    /// engine nobody runs, which is the same argument that keeps a sampled
+    /// dispatch out of a command buffer of its own. Each holds one dispatch, so
+    /// the dispatch type decides nothing about what it answers — but a pass
+    /// boundary already orders, so a sampled run needs no barrier and the open
+    /// group is cleared with the pass.
+    /// Answers whether the pass is one this call opened, which is what says
+    /// no barrier is owed in front of the dispatch going into it.
     fn encoder(
         &mut self,
         kernel: &Kernel,
-    ) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>, MetalError> {
+    ) -> Result<(bool, &ProtocolObject<dyn MTLComputeCommandEncoder>), MetalError> {
         let sampled = match &self.samples {
             None => None,
             Some(samples) => Some(samples.pass()?.retain()),
         };
+        let opened = sampled.is_some() || self.encoder.is_none();
         match sampled {
             Some(pass) => {
                 self.end();
+                pass.setDispatchType(MTLDispatchType::Concurrent);
                 self.encoder = Some(
                     self.commands
                         .computeCommandEncoderWithDescriptor(&pass)
                         .ok_or(MetalError::NoCommandEncoder)?,
                 );
+                self.open.clear();
                 self.samples.as_mut().expect("sampling").ran(&kernel.label);
             }
             None if self.encoder.is_none() => {
                 self.encoder = Some(
                     self.commands
-                        .computeCommandEncoder()
+                        .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
                         .ok_or(MetalError::NoCommandEncoder)?,
                 );
+                self.open.clear();
             }
             None => {}
         }
-        Ok(self.encoder.as_ref().expect("a pass is open"))
+        Ok((opened, self.encoder.as_ref().expect("a pass is open")))
     }
 
     /// How many dispatches are in this so far, which is what a caller deciding
     /// whether it is worth committing yet has to go on.
     pub fn dispatches(&self) -> usize {
         self.dispatches
+    }
+
+    /// How many barriers those dispatches needed, which is what the ordering
+    /// this pass no longer gives away for free had to be bought back with.
+    pub fn barriers(&self) -> usize {
+        self.barriers
     }
 
     /// Submit everything encoded and wait for all of it.
@@ -412,7 +475,7 @@ impl<'a> Batch<'a> {
         self.end();
         self.commands.commit();
         crate::trace::submitted();
-        self.device.counted(self.dispatches);
+        self.device.counted(self.dispatches, self.barriers);
         Submitted {
             device: self.device,
             commands: self.commands.clone(),
@@ -664,6 +727,29 @@ impl Grid {
 /// dispatch a grid for the wrong shape over buffers of the right one.
 pub(crate) fn extent(value: usize, what: &str) -> u32 {
     u32::try_from(value).unwrap_or_else(|_| panic!("{value} is wider than a kernel's uint: {what}"))
+}
+
+/// The allocations a dispatch names, and whether its kernel may write each —
+/// which is everything [`Open`] asks of it.
+///
+/// **The address of the binding is the identity**, which is the same one
+/// [`Slot`](crate::trace::Slot) records and is sound for the same reason: a
+/// command buffer retains what is bound into it, so nothing named in an open
+/// pass can be freed under it. See [`crate::ordering`], where both directions
+/// the identity can be wrong in are written down.
+fn touches<'a>(
+    kernel: &'a Kernel,
+    args: &'a [Arg<'_>],
+) -> impl Iterator<Item = (usize, bool)> + 'a {
+    args.iter()
+        .enumerate()
+        .filter_map(move |(slot, arg)| match arg {
+            Arg::Inline(_) => None,
+            Arg::Bound(buffer) => Some((
+                std::ptr::from_ref(*buffer) as *const () as usize,
+                kernel.writes(slot),
+            )),
+        })
 }
 
 /// Which of `entry`'s argument slots it may write, indexed by slot.
@@ -1278,13 +1364,15 @@ kernel void streaming_copy4(
         assert_eq!(device.submissions() - submissions, 1, "one command buffer");
     }
 
-    /// A batch is a sequence and not a race: Metal's default dispatch type is
-    /// serial, so a dispatch reads what the one before it wrote.
+    /// A batch is a sequence and not a race: a dispatch reads what the one
+    /// before it wrote, and the barrier that makes it so is one [`Batch::add`]
+    /// derived rather than one the encoder gave away.
     ///
-    /// Nothing batched today depends on that — the projections that share a
-    /// submission are independent of each other — but a dependent pair in one
-    /// command buffer is the next thing anyone will reach for, and whether that
-    /// is allowed is a property of Metal rather than of this crate.
+    /// **The barrier count is asserted beside the answer**, because the answer
+    /// alone does not distinguish an ordering that was arranged from one that
+    /// happened: two dispatches this small can finish in order by luck on any
+    /// run, and a barrier this test did not check for is exactly the race the
+    /// concurrent pass makes possible.
     #[test]
     fn a_dispatch_reads_what_the_one_before_it_in_the_batch_wrote() {
         let Some(device) = device() else { return };
@@ -1318,6 +1406,7 @@ kernel void streaming_copy4(
                 saxpy_moves(LEN),
             )
             .expect("the dispatch encodes");
+        assert_eq!(batch.barriers(), 1, "the second reads what the first wrote");
         batch.wait().expect("the batch completes");
 
         let want: Vec<f32> = saxpy
@@ -1327,6 +1416,99 @@ kernel void streaming_copy4(
             .map(|(x, y)| ALPHA * x + y)
             .collect();
         assert_eq!(chained.out.to_vec(), want);
+    }
+
+    /// **The shape a layer's four projections are**, and the whole of what the
+    /// concurrent pass is for: four dispatches reading one buffer and writing
+    /// four of their own, with nothing between them.
+    ///
+    /// The mirror of the case above. That one says a barrier appears where a
+    /// dispatch reads what another wrote; this says none appears where it does
+    /// not — and both are needed, because a batch that barriered everything
+    /// would pass the first and be the engine this milestone replaced.
+    #[test]
+    fn a_batch_puts_no_barrier_between_dispatches_that_only_share_what_they_read() {
+        let Some(device) = device() else { return };
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        let mut shared = Saxpy::new(&device, LEN);
+        let mut outs: Vec<Buffer<f32>> = (0..4)
+            .map(|_| device.zeroed(LEN).expect("an output allocates"))
+            .collect();
+
+        let mut batch = device.batch().expect("a command buffer opens");
+        for out in &mut outs {
+            let args = [
+                shared.alpha.arg(),
+                shared.count.arg(),
+                shared.x.arg(),
+                shared.y.arg(),
+                out.arg(),
+            ];
+            batch
+                .add(
+                    &kernel,
+                    &args,
+                    Grid::new(LEN, THREADS_PER_GROUP),
+                    saxpy_moves(LEN),
+                )
+                .expect("the dispatch encodes");
+        }
+
+        assert_eq!(
+            batch.barriers(),
+            0,
+            "four reads of one buffer order nothing"
+        );
+        assert_eq!(batch.dispatches(), 4);
+        batch.wait().expect("the batch completes");
+        for out in &outs {
+            assert_eq!(out.to_vec(), shared.on_the_cpu());
+        }
+    }
+
+    /// **A pass that writes one buffer twice is ordered even though neither
+    /// dispatch reads it**, which is the hazard a rule looking only for
+    /// reads-after-writes would let through — and the one that decides whether
+    /// two dispatches landing in one span may share a group.
+    #[test]
+    fn a_batch_orders_two_dispatches_that_write_one_allocation() {
+        let Some(device) = device() else { return };
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+        let mut first = Saxpy::new(&device, LEN);
+        let mut second = Saxpy::new(&device, LEN);
+
+        let mut batch = device.batch().expect("a command buffer opens");
+        batch
+            .add(
+                &kernel,
+                &first.args(),
+                Grid::new(LEN, THREADS_PER_GROUP),
+                saxpy_moves(LEN),
+            )
+            .expect("the dispatch encodes");
+        let args = [
+            second.alpha.arg(),
+            second.count.arg(),
+            second.x.arg(),
+            second.y.arg(),
+            first.out.arg(),
+        ];
+        batch
+            .add(
+                &kernel,
+                &args,
+                Grid::new(LEN, THREADS_PER_GROUP),
+                saxpy_moves(LEN),
+            )
+            .expect("the dispatch encodes");
+
+        assert_eq!(batch.barriers(), 1, "both write `first.out`");
+        batch.wait().expect("the batch completes");
+        assert_eq!(
+            first.out.to_vec(),
+            second.on_the_cpu(),
+            "the second's answer"
+        );
     }
 
     /// **The same sequence across two command buffers, the first committed and

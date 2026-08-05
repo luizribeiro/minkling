@@ -10,10 +10,13 @@
 //! input. That is a submission, two readbacks and an allocation a bank, and
 //! eighty banks a step.
 //!
-//! Encoded between them it is none of those. Metal's default dispatch type is
-//! serial, so a dispatch reads what the one before it wrote — which is what
-//! makes an activation a third dispatch in the command buffer the pair already
-//! opened rather than a reason to close it.
+//! Encoded between them it is none of those. This reads what the pair wrote and
+//! writes what `down` reads, so the batch puts a barrier either side of it — see
+//! [`crate::ordering`] — which is what makes an activation a third dispatch in
+//! the command buffer the pair already opened rather than a reason to close it.
+//! The ordering is derived rather than free: the gate is bound to a slot this
+//! kernel declares `device float *`, so nothing has to be asserted for it to
+//! hold.
 //!
 //! **In place, into the gate's own buffer.** Each thread reads one element of
 //! each and writes the one it read, so nothing here needs a fourth allocation
