@@ -320,9 +320,9 @@ const _: () = Block::ROUNDED.holds();
 /// could reach the width or the height while these were constants and why this
 /// carries them together.
 ///
-/// [`Mma`] holds one of these beside the two entries it compiled from it, so
-/// what a dispatch is covered by is read off the entry that runs rather than off
-/// this module.
+/// [`Mma`] holds one of these beside the entries it compiled from it, so what a
+/// dispatch is covered by is read off the entry that runs rather than off this
+/// module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Block {
     rows: usize,
@@ -699,14 +699,10 @@ const RUNS_A_GROUPING: usize = 2;
 /// Rows an expert needs, on average, before a grouped call is dispatched
 /// through the production entries.
 ///
-/// **This used to be the block's own height and the plan is why it is not.** A
-/// block laid over the rows as they lie holds whatever sits at its offset, so a
-/// call whose runs were shorter than a block handed it rows naming several
-/// experts and it ran the whole reduction once for each of them — a dozen walks
-/// a block where the routing is spread thin, which is what the height-sized bar
-/// was keeping out. A block laid over the runs the sort left holds one expert's
-/// rows and however few of them there are, so what a short run costs is a block
-/// that is part empty rather than a block walked twice.
+/// **A block's rows are one expert's**, because a grouped call's blocks are cut
+/// at the sort's own run boundaries — so what a run shorter than a block costs
+/// is a block that is part empty rather than a block walked once per expert its
+/// rows disagree about.
 ///
 /// **What is left to pay is the weight**, which a block decodes once for its
 /// whole height however many rows it has: a run of four rows in a 32-row block
@@ -1208,7 +1204,7 @@ impl PackedMatmul {
         }
         // Compiled only where the flag asked, which is what puts a reference run
         // through the same three pipelines it went through before this flag
-        // existed — the sources are byte for byte the same string, and the two
+        // existed — the sources are byte for byte the same string, and the
         // entries below are not in it to compile.
         let mma = match numerics.compiles_the_entries() {
             false => None,
@@ -8962,22 +8958,46 @@ kernel void mma_lane_probe___T__(
         /// takes the same difference for the same reason.
         ///
         /// Ungrouped shapes dispatch no sort, so for them this is zero.
-        fn sorts(&self, device: &Device, grouping: &ExpertGrouping) -> Duration {
+        ///
+        /// **The height is `bank`'s and not the shipped block's**, because what
+        /// the sort costs depends on it: a call whose entry reads no plan asks
+        /// for none and the sort skips a walk of its counts. A table subtracting
+        /// one arm's sort from another's would be subtracting a dispatch that
+        /// did not run.
+        fn sorts(
+            &self,
+            device: &Device,
+            bank: &PackedBank<'_>,
+            grouping: &ExpertGrouping,
+        ) -> Duration {
             if !self.grouped {
                 return Duration::ZERO;
             }
             const CALLS: usize = 4;
             const ROUNDS: usize = 3;
+            let cut = bank.rows_a_block(self.rows);
             let mut best = Duration::MAX;
             for _ in 0..ROUNDS {
                 best = best.min(crate::testing::device_time(device, CALLS, |batch| {
                     let mut picked = device.buffer(&self.chosen).expect("the selection uploads");
                     grouping
-                        .encode(batch, &mut picked, self.experts, Block::SHIPPED.rows)
+                        .encode(batch, &mut picked, self.experts, cut)
                         .expect("the grouping encodes");
                 }));
             }
             best
+        }
+
+        /// What this call costs `bank` with the sort dispatched beside it taken
+        /// off, which is a figure about the block rather than about the pair.
+        fn costs_alone(
+            &self,
+            device: &Device,
+            bank: &PackedBank<'_>,
+            grouping: &ExpertGrouping,
+        ) -> Duration {
+            self.costs_on(device, bank, grouping)
+                .saturating_sub(self.sorts(device, bank, grouping))
         }
 
         fn upload<'a>(&self, device: &'a Device, matmul: &'a PackedMatmul) -> PackedBank<'a> {
@@ -10402,7 +10422,7 @@ kernel void mma_lane_probe___T__(
                 shape.costs_on(&device, held, &grouping)
             });
 
-            let sorts = whole.sorts(&device, &grouping);
+            let sorts = whole.sorts(&device, &bank, &grouping);
             eprintln!("\n  a routed bank at {tokens} tokens — {routed}");
             eprintln!(
                 "  {:<46}{:>9}{:>9}{:>10}{:>15}{:>12}{:>9}",
@@ -10540,19 +10560,18 @@ kernel void mma_lane_probe___T__(
                 .iter()
                 .map(|(_, matmul)| shape.upload(&device, matmul))
                 .collect();
-            let sorts = shape.sorts(&device, &grouping);
             crate::testing::warmed(|| {
                 shape.costs_on(&device, &banks[0], &grouping);
             });
             let listed: Vec<usize> = (0..arms.len()).collect();
             let (up, down) = crate::testing::both_ways(&listed, |at| {
-                shape.costs_on(&device, &banks[at], &grouping)
+                shape.costs_alone(&device, &banks[at], &grouping)
             });
 
             let cells: String = listed
                 .iter()
                 .map(|&at| {
-                    let taken = (up[at].max(down[at]) - sorts).as_secs_f64();
+                    let taken = up[at].max(down[at]).as_secs_f64();
                     format!(
                         "{:>12}{:>15}",
                         format!("{:.2}ms", 1e3 * taken),
@@ -10640,7 +10659,6 @@ kernel void mma_lane_probe___T__(
 
         for tokens in BLOCKED_LENGTHS {
             let whole = Blocked::at(tokens, BOUND_SHAPES[1]);
-            let sorts = whole.sorts(&device, &grouping);
             // **The layouts are held at the shipped block's height and not at
             // each arm's**, because the run boundaries are the bank's own. A
             // ragged layout cut against every height in turn would be three
@@ -10667,7 +10685,7 @@ kernel void mma_lane_probe___T__(
             let (up, down) = crate::testing::both_ways(&listed, |at| {
                 shapes
                     .iter()
-                    .map(|(_, shape)| shape.costs_on(&device, &banks[at], &grouping))
+                    .map(|(_, shape)| shape.costs_alone(&device, &banks[at], &grouping))
                     .collect::<Vec<Duration>>()
             });
 
@@ -10684,10 +10702,7 @@ kernel void mma_lane_probe___T__(
             for (at, (block, _)) in arms.iter().enumerate() {
                 let cells: String = (0..shapes.len())
                     .map(|column| {
-                        let taken = up[at][column]
-                            .max(down[at][column])
-                            .saturating_sub(sorts)
-                            .as_secs_f64();
+                        let taken = up[at][column].max(down[at][column]).as_secs_f64();
                         let (_, shape) = &shapes[column];
                         format!(
                             "{:>17}{:>15}",
@@ -10773,7 +10788,12 @@ kernel void mma_lane_probe___T__(
                 .mma
                 .as_ref()
                 .expect("the production entries compiled");
-            let entries = 1 + usize::from(mma.tiled.entry() != mma.grouped.entry());
+            let named = [mma.tiled.entry(), mma.grouped.entry(), mma.planned.entry()];
+            let entries = named
+                .iter()
+                .enumerate()
+                .filter(|(at, entry)| !named[..*at].contains(entry))
+                .count();
             assert_eq!(
                 entries, MMA_ENTRIES,
                 "a block of {block:?} compiled {entries} production entries where a model load \
@@ -10797,9 +10817,11 @@ kernel void mma_lane_probe___T__(
         }
     }
 
-    /// Production entries a model load builds, which is the pair
-    /// [`PackedMatmul::compiled`] creates and no arm of any sweep changes.
-    const MMA_ENTRIES: usize = 2;
+    /// Production entries a model load builds, which are the three
+    /// [`PackedMatmul::compiled`] creates and no arm of any sweep changes: the
+    /// tiled walk, the grouped walk laid over the rows, and the grouped walk
+    /// laid over the runs the sort left.
+    const MMA_ENTRIES: usize = 3;
 
     /// **What a table here reports has to be one dispatch of the shape it
     /// names**, and the way it stops being one is silent.
@@ -11216,14 +11238,20 @@ kernel void scalar_held(
                     let mut x = device.buffer(&shape.case.x).expect("the rows upload");
                     shape.encode(batch, &device, &bank, &mut x, &grouping);
                 });
-                let blocked = match shape.grouped {
-                    false => MMA_TILED_ENTRY,
-                    true => MMA_GROUPED_ENTRY,
+                // **Either of the two grouped entries**, because which of them a
+                // call reaches is its run length's to say — see
+                // [`PackedMatmul::plans`] — and both are the block. What this
+                // column must not be about is the reference tile.
+                let blocked: &[&str] = match shape.grouped {
+                    false => &[MMA_TILED_ENTRY],
+                    true => &[MMA_GROUPED_ENTRY, MMA_PLANNED_ENTRY],
                 };
                 assert!(
-                    entries.iter().any(|entry| entry == blocked),
-                    "{} at {tokens} tokens dispatched {entries:?} and not {blocked}, so this \
-                     column is about the reference tile",
+                    entries
+                        .iter()
+                        .any(|entry| blocked.contains(&entry.as_str())),
+                    "{} at {tokens} tokens dispatched {entries:?} and none of {blocked:?}, so \
+                     this column is about the reference tile",
                     shape.what
                 );
             }
