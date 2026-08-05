@@ -136,6 +136,11 @@ fn either_backend_writes_the_oracles_continuation_of_the_recorded_prompt() {
 /// the second one, where the heads stand on a cache the first round rewound.
 /// Metal only, because the CPU path widens 1.1 GB a head to multiply against
 /// and would put a minute on each of the eight tokens.
+///
+/// **Every depth the engine reports a figure at**, which is what makes this the
+/// gate a change to a dispatch has to pass: how many rows a round puts through
+/// the stack decides which entry a shape lands on and how much of a window a
+/// rejection reaches back into, so a depth left out is a rewind nobody drove.
 #[test]
 fn speculating_writes_the_text_that_decoding_one_token_at_a_time_writes() {
     let Some(dir) = checkpoint_dir() else { return };
@@ -173,7 +178,7 @@ fn speculating_writes_the_text_that_decoding_one_token_at_a_time_writes() {
 
     let (alone, _) = generated(0);
     assert_eq!(alone, want, "the oracle's own continuation");
-    for depth in [1, 2, 4] {
+    for depth in [1, 2, 3, 4] {
         let (text, report) = generated(depth);
         assert_eq!(text, want, "speculating {depth} deep");
         assert!(

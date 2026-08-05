@@ -1544,6 +1544,17 @@ backends write. The counts are 646 and 61 plus the eleven gated and five timing
 cases these three commits and the probe above add. The numerics flag stays
 defaulted to reference.
 
+**And it is the same continuation through a rewind at every depth**, which is
+the one thing on this list a merged dispatch could break quietly. The
+convolutions carry a window between calls and a rejected guess reaches back into
+it, so a pair that swapped the wrong one would answer this step correctly and
+every step after it wrongly.
+`speculating_writes_the_text_that_decoding_one_token_at_a_time_writes` now drives
+`k` of 1, 2, 3 and 4 where it drove 1, 2 and 4 — a depth left out is a rewind
+nobody drove — and every one of them rejects guesses on the way through: 2 of 3
+accepted at one, 2 of 6 at two, 2 of 8 at three, 2 of 10 at four, and the
+oracle's own text out of all five runs.
+
 **Prefill did not move.** Three pairs each, against the commit before the merges:
 
     tokens     wall    device   ranges
