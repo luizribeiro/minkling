@@ -8913,6 +8913,15 @@ kernel void mma_lane_probe___T__(
     /// [`what_a_prefills_blocked_matmul_is_bound_by`] gives: the arms it
     /// separates are a few percent apart, and an arm measured always second is
     /// an arm measured on whatever clock the one before it left.
+    /// How far under the block the best padding has to stay for the table above
+    /// to be read as "the operand width buys something".
+    ///
+    /// **Loose, because what it guards is a sign and a size rather than a
+    /// figure.** The measured margin is 6 to 8% at the padding that wins and the
+    /// host's own spread on this instrument is a tenth of that, so a reading that
+    /// has crossed this has changed by more than any noise here.
+    const AHEAD_ENOUGH_TO_QUOTE: f64 = 0.97;
+
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
     fn what_sixteen_bit_operands_cost_and_what_they_give_up() {
@@ -8929,22 +8938,42 @@ kernel void mma_lane_probe___T__(
         // have been a measurement of the padding rather than of the operand
         // width, and why the refusal is stated against the best of them.
         let shipped_stride = Block::SHIPPED.staged_stride();
-        let halved: Vec<(usize, PackedMatmul)> =
-            [shipped_stride, shipped_stride + 4, shipped_stride + 8]
-                .into_iter()
-                .map(|stride| {
-                    let arm = PackedMatmul::blocked_from_source(
-                        &device,
-                        &through_sixteen_bit_operands(
-                            &source_blocked(Numerics::Production, Block::SHIPPED),
-                            stride,
-                        ),
-                        Block::SHIPPED,
-                    )
-                    .expect("the 16-bit arm compiles");
-                    (stride, arm)
-                })
-                .collect();
+        let strides = [shipped_stride, shipped_stride + 4, shipped_stride + 8];
+        // **And each of them under both fragment reads, which is what turned this
+        // arm over.** A per-lane read pulls the two elements a lane owns out of
+        // threadgroup memory itself, so at half those are four bytes where at
+        // float they are eight; a `simdgroup_load` is one instruction over the
+        // whole fragment either way. So the operand width reaches the traffic
+        // under one read and not under the other, and an arm measured against
+        // only the shipped read could not say which of the two it had measured.
+        // Each column is against the block compiled with its own read, so what a
+        // cell reports is the operand and not the read.
+        let halved: Vec<(Fragments, usize, PackedMatmul)> = SWEPT_FRAGMENTS
+            .iter()
+            .flat_map(|&block| strides.map(move |stride| (block, stride)))
+            .map(|(block, stride)| {
+                let arm = PackedMatmul::blocked_from_source(
+                    &device,
+                    &through_sixteen_bit_operands(
+                        &source_blocked(Numerics::Production, block),
+                        stride,
+                    ),
+                    block,
+                )
+                .expect("the 16-bit arm compiles");
+                (block.fragments, stride, arm)
+            })
+            .collect();
+        let reads: Vec<(Fragments, PackedMatmul)> = SWEPT_FRAGMENTS
+            .iter()
+            .map(|&block| {
+                (
+                    block.fragments,
+                    PackedMatmul::blocked(&device, Numerics::Production, block)
+                        .expect("the block compiles at either read"),
+                )
+            })
+            .collect();
 
         // The conditioning table first, because it is what decides whether the
         // clock is worth reading at all. The padding reaches no arithmetic, so
@@ -8969,7 +8998,7 @@ kernel void mma_lane_probe___T__(
             let (theirs, block, half) = (
                 through(&reference),
                 through(&shipped),
-                through(&halved[0].1),
+                through(&halved[0].2),
             );
             worst = worst.max(half);
             eprintln!(
@@ -8981,65 +9010,94 @@ kernel void mma_lane_probe___T__(
         }
 
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
-        eprintln!(
-            "  {:<8}{:<24}{:>16}{:>14}{:>10}{:>10}",
-            "at",
-            "",
-            "the block",
-            format!("16-bit at {}", halved[0].0),
-            format!("at {}", halved[1].0),
-            format!("at {}", halved[2].0)
-        );
-        let mut slowest = f64::MAX;
-        for tokens in BLOCKED_LENGTHS {
-            let shapes = shapes_at(tokens);
-            let arms: Vec<&PackedMatmul> = std::iter::once(&shipped)
-                .chain(halved.iter().map(|(_, arm)| arm))
+        let named = |fragments: Fragments| match fragments {
+            Fragments::Loaded => "simdgroup_load",
+            Fragments::PerLane => "per lane",
+        };
+        let mut ahead_of_the_shipped_read = 0.0f64;
+        for (read, block) in &reads {
+            eprintln!(
+                "\n  a fragment read {}",
+                match read {
+                    Fragments::Loaded => "through simdgroup_load",
+                    Fragments::PerLane => "per lane, which is the shipped one",
+                }
+            );
+            eprintln!(
+                "  {:<8}{:<24}{:>16}{:>14}{:>10}{:>10}",
+                "at",
+                "",
+                "the block",
+                format!("16-bit at {}", strides[0]),
+                format!("at {}", strides[1]),
+                format!("at {}", strides[2])
+            );
+            let mine: Vec<&PackedMatmul> = halved
+                .iter()
+                .filter(|(fragments, ..)| fragments == read)
+                .map(|(.., arm)| arm)
                 .collect();
-            crate::testing::warmed(|| {
-                shapes[0].costs(&device, &shipped, &grouping);
-            });
-            let listed: Vec<usize> = (0..arms.len()).collect();
-            let (up, down) = crate::testing::both_ways(&listed, |at| {
-                shapes
-                    .iter()
-                    .map(|shape| shape.costs(&device, arms[at], &grouping))
-                    .collect::<Vec<Duration>>()
-            });
+            for tokens in BLOCKED_LENGTHS {
+                let shapes = shapes_at(tokens);
+                let arms: Vec<&PackedMatmul> =
+                    std::iter::once(block).chain(mine.iter().copied()).collect();
+                crate::testing::warmed(|| {
+                    shapes[0].costs(&device, block, &grouping);
+                });
+                let listed: Vec<usize> = (0..arms.len()).collect();
+                let (up, down) = crate::testing::both_ways(&listed, |at| {
+                    shapes
+                        .iter()
+                        .map(|shape| shape.costs(&device, arms[at], &grouping))
+                        .collect::<Vec<Duration>>()
+                });
 
-            for (shape, at) in shapes.iter().zip(0..) {
-                // The slower of the two passes per arm, so that what is reported
-                // is not whichever direction the clock happened to favour.
-                let taken = |arm: usize| up[arm][at].max(down[arm][at]).as_secs_f64();
-                let block = taken(0);
-                let against = |arm: usize| taken(arm) / block;
-                slowest = (1..arms.len()).fold(slowest, |least, arm| least.min(against(arm)));
-                eprintln!(
-                    "  {tokens:<8}{:<24}{:>16}{:>14}{:>10}{:>10}",
-                    shape.what,
-                    format!("{:.2}ms", 1e3 * block),
-                    format!("{:+.0}%", 1e2 * (against(1) - 1.0)),
-                    format!("{:+.0}%", 1e2 * (against(2) - 1.0)),
-                    format!("{:+.0}%", 1e2 * (against(3) - 1.0))
-                );
+                for (shape, at) in shapes.iter().zip(0..) {
+                    // The slower of the two passes per arm, so that what is
+                    // reported is not whichever direction the clock happened to
+                    // favour.
+                    let taken = |arm: usize| up[arm][at].max(down[arm][at]).as_secs_f64();
+                    let whole = taken(0);
+                    let against = |arm: usize| taken(arm) / whole;
+                    if *read == MMA_FRAGMENTS {
+                        // The best padding at this shape, kept as the worst such
+                        // over all of them — so what the bound below reads is
+                        // the shape where the best padding does least well, and
+                        // not the one cell that happened to do most.
+                        let best =
+                            (1..arms.len()).fold(f64::MAX, |least, arm| least.min(against(arm)));
+                        ahead_of_the_shipped_read = ahead_of_the_shipped_read.max(best);
+                    }
+                    eprintln!(
+                        "  {tokens:<8}{:<24}{:>16}{:>14}{:>10}{:>10}",
+                        shape.what,
+                        format!("{:.2}ms", 1e3 * whole),
+                        format!("{:+.0}%", 1e2 * (against(1) - 1.0)),
+                        format!("{:+.0}%", 1e2 * (against(2) - 1.0)),
+                        format!("{:+.0}%", 1e2 * (against(3) - 1.0))
+                    );
+                }
             }
         }
 
-        // **Both halves of the refusal are asserted, because either could turn
-        // on its own and the table would still print.** The drift bound is the
-        // one with teeth; the clock bound is loose on purpose — the best padding
-        // reads one to three percent the wrong way, and what this refuses is a
-        // reading that has changed sign by more than any noise on this host.
+        // **The refusal is the drift, and the clock is what says how much the
+        // drift is being asked to buy.** Under the shipped read the operand is
+        // ahead of the block rather than behind it, so both bounds state a
+        // reading rather than a refusal, and either turning would mean the table
+        // above wants re-reading before anything quotes it.
         assert!(
             worst > f64::from(MMA_TOLERANCE),
             "16-bit operands drift {worst:e}, which is inside the block's own {MMA_TOLERANCE:e} — \
              the reason this arm is refused has changed and the table above wants re-reading"
         );
         assert!(
-            slowest > 0.95,
-            "16-bit operands came back {:.0}% of the block at some shape, so the clock half of \
-             this refusal has changed and the table above wants re-reading",
-            1e2 * slowest
+            ahead_of_the_shipped_read < AHEAD_ENOUGH_TO_QUOTE,
+            "under the {} read the best padding is {:.0}% of the block at its weakest shape, where \
+             it is under {:.0}% at every one — so what the operand width buys has changed and the \
+             table above wants re-reading",
+            named(MMA_FRAGMENTS),
+            1e2 * ahead_of_the_shipped_read,
+            1e2 * AHEAD_ENOUGH_TO_QUOTE,
         );
     }
 
