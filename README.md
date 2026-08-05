@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **672 of the 740 tests, no
+`just test` is the one to run while iterating: **681 of the 751 tests, no
 checkpoint, twelve seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,8 +32,8 @@ a crate's tests in one process: opening a Metal device costs a second, so the 24
 kernel tests are 11.9 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 740 against a
-real checkpoint, thirteen minutes.** The 672 the gated tier runs and the 68 the
+`just test-full` is what has to pass at the ends of a series: **all 751 against a
+real checkpoint, thirteen minutes.** The 681 the gated tier runs and the 70 the
 timing tier does. The 53 gated tests — the 38 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -203,6 +203,18 @@ other side of the line": **19.4× on the two attention rows at 16384 tokens**, a
 prefill of that length at 33.33 s against 109.11, and again nothing at all on a
 decode step. **No token has moved over 384 sampled argmaxes with both of them
 behind the flag.**
+
+**A decode step reaches neither, and D5 is where that stopped being a fact about
+the predicates and became one the instrument states.** Both entries are given a
+call only where its rows are two blocks' worth, so a corpus of long enough
+prompts reached everything the flag selects and a prompt-length floor was a
+sufficient guard. An entry a *decode step* dispatches would be gated on nothing —
+a call of one row reaches it — so no length could say whether a differential run
+had ever run it. `just diverge` now holds what it *dispatched* against the list
+each kernel keeps of what it put behind the flag, and prints which entries the
+flag selected at a prefill and at a decode step. See "The walk a decode step
+could stop doing serially", where the one candidate for that second list was
+built, measured at 31% the wrong way, and taken off the path.
 
 **It is not the default and the recommendation is still that it should not be**,
 and the reasoning is in that second section, kept apart from the numbers — but it
@@ -1175,6 +1187,353 @@ and 769 tokens cost 2.04, 5.45 and 10.1 s before the budget replaced the row
 count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
+
+## The walk a decode step could stop doing serially, and why it cannot
+
+**Splitting an output element's walk between simdgroups is the one decode lever
+D1 named and would not take, it is built and measured here, and it does not
+land.** A decode step under it is **21.080 ms against 16.289**, device **19.949
+against 15.203** — seven alternating pairs of one build under the two words,
+every pair the same way, ranges apart, against a null pair that read +0.1% and
+0.0%. The lever is 31% the wrong way, and the reason is not the summation order
+it was held back for. It is that this kernel's whole speed is that a threadgroup
+of it shares nothing, and a cross-simdgroup reduction has to share something.
+
+**Twice, on two builds and at two cut bounds.** The figure above is the best the
+lever was made to read, at four cuts. The first build allowed eight, and seven
+pairs of it against the tree that removed it — two refs, both arms under
+`--numerics production` — read **23.494 ms against 16.258** and **22.337 against
+15.141** on the device, 7 of 7 with the ranges apart. Bounding the cut at four
+recovered a third of the loss and none of the lever.
+
+**Nothing ships.** The two entries are compiled out of a source only the sweep
+builds, which is where D3 left the indirect command buffer for the same reason:
+mechanism sound, arithmetic against it, did not build. The reference path and the
+production path are both where they were, to the bit.
+
+### Why it looked like the lever, and it was not a bad reading
+
+An output element is one simdgroup here, and
+`whether_a_decode_dispatch_is_short_of_the_machine` puts the rate on the element
+count and nothing else: 512 elements reach 12% of the bus and 131072 reach 95%.
+Every shape a decode step has is on the steep part of that curve — its widest
+bank is 24576 elements and its narrowest projection 512 — and the head is the
+only call it makes that is not.
+
+So the arithmetic was: `n` simdgroups on one element are `n` times the simdgroups
+in flight over the same bytes, each holding `1/n` of the row and issuing its own
+loads, and what the walk waits on is the loads it has outstanding rather than the
+bandwidth behind them — which
+`what_a_decode_steps_packed_matmul_is_bound_by` measured at a fifth to two fifths
+a term. **That reading still stands. What it left out is what holding a partial
+costs.**
+
+### What a cut costs, which is not the cut
+
+`what_a_packed_multiply_costs_at_each_count_its_walk_is_cut_into` is the sweep,
+warm and both ways, against the entry the cut stands in front of. **The column
+that decides it is the first one**: a cut of *one*, which partitions nothing —
+the same lanes, the same width, the same chunks, and
+`the_cuts_of_a_split_walk_read_each_byte_of_the_row_exactly_once` holds that the
+bytes are the same bytes.
+
+    shape             elements     uncut     1 cut    2 cuts    3 cuts    4 cuts   1 cut, no barrier
+    r_proj                 512     3.7µs      108%      118%      139%      139%       110%
+    k_proj, v_proj        1024     5.3µs      118%      119%      146%      152%       126%
+    q_proj, o_proj        4096    14.9µs      127%      137%      168%      174%       139%
+    routed gate, up      12288    41.3µs      128%      138%      169%      177%       138%
+    lm_head             200058   638.6µs      130%      140%      175%      182%       140%
+
+**A cut of one is already 8 to 30% and it has cut nothing.** So the sweep divides
+into two questions, and both have answers.
+
+**The barrier is not it.** The last column is the same source with
+`threadgroup_barrier` taken out — which races, and is here to be priced rather
+than run — and taking it out gives none of the cut of one back: 110 to 142%
+against that column's 108 to 130%, which is no better and on four of the five
+shapes a little worse. **Read across two sittings rather than down one column**,
+because that is what the arm's own spread needs: the first sitting had the two at
+115-143% and 116-142% and the second at 108-130% and 110-142%, so the pair moves
+together and the gap between them is inside what either moves by.
+
+**The threadgroup width is not it either.** A cut of one puts a threadgroup at 32
+threads where the plain entry takes 64, and
+`what_a_packed_multiply_costs_at_each_threadgroup_an_untiled_call_takes` has had
+those two as one arm since D1: 3.6 against 3.6 µs, 5.3 against 5.1, 14.5 against
+14.2, 39.0 against 38.9.
+
+**What is left is the threadgroup array.** Thirty-two bytes of it, written once
+and read once by the same thread at a cut of one, costs 27 to 30% at the shapes
+with elements enough to be near the bus. **That is a term this file has priced
+before on the other kernel and never on this one**: A8's residency sweep found a
+threadgroup staging *two keys* of a tile costing what one staging nineteen costs,
+and wrote down that what the left arm of that curve punishes is the staging
+rather than the amount of it. This is the same shape of answer at 32 bytes, which
+is as small as the amount gets.
+
+**And it is exactly what `THREADS_AN_ELEMENTS_GROUP` has said about this entry
+since D1**, in a sentence written to explain why its threadgroup is only a
+scheduling knob: *a threadgroup of `packed_matmul` is that many independent
+simdgroups and nothing else — no threadgroup memory, no barrier, no shared load,
+no fragment anything shares.* That is the property being spent, and there is no
+version of a cross-simdgroup reduction that keeps it.
+
+**And the cut on top of that is real too**: four cuts are another 31 to 52 points
+over one, which is the walk falling under `CHUNKS_IN_FLIGHT`. A lane holds
+four chunks before it adds any, the held loop needs four strides to fit under the
+row, and the checkpoint's 4096-code row is sixteen steps — so past four cuts each
+lane is back to issuing four bytes and waiting a memory round trip for them,
+which is exactly the wait D1 removed.
+
+### The other way to hold a partial, priced and not built
+
+Attention folds its splits with a second dispatch, and that version needs no
+threadgroup memory at all: each cut writes its partial to device memory and a
+fold reads them. **The arithmetic is against it before it is built.** A decode
+step makes **377** of these calls — 297 untiled and 80 paired, which is what D2's
+and D3's merges left of D1's 457 — and a fold apiece is 2.60 µs of device time.
+That is **0.98 ms added to a 15.20 ms step, 6.4%, before the fold does any
+work**, and per call it is 70% of the narrowest one it would fold and 6% of a
+routed bank's. D2, D3 and D4 spent three milestones removing 204 dispatches to
+buy 1.00 ms between them; this would put 377 back to buy something the sweep
+above says is negative.
+
+### What the cut is worth to the answer, which is the column it does not lose
+
+The block this flag puts in front of the matmul is the worse-conditioned of the
+two orders, by a factor that grows with the reduction: a fragment accumulator
+carries the whole thing as one running sum, and at 4096 codes it drifts 4.1e-6
+against the reference's 1.4e-7. **A cut is the other direction** — `n` partials,
+each a lane-strided walk of `1/n` of the row, added at the end — and it is the
+first alternative accumulation of this walk that stays inside the *reference's*
+own bound rather than needing `MMA_TOLERANCE`. Against an f64 accumulation of the
+same products:
+
+    reduction   the reference   four cuts
+         1024      7.8e-8         9.2e-8
+         4096      1.3e-7         9.2e-8
+
+**Which of the two is nearer is a wash at the short reduction and the cut at the
+checkpoint's own**, and the reason is in the shapes: at 1024 codes each cut holds
+one chunk and the tail that adds the four partials is as long as the walk that
+fed it. `a_cut_walk_is_f32_noise_at_every_reduction` therefore asserts
+`TOLERANCE` and reports the pair rather than asserting an ordering between them.
+
+**It is the column nobody was asking about**, and it is recorded because a lever
+refused on speed should still say what it was worth on everything else — and
+because it is the one thing here that would matter if the cost above ever moved.
+
+### The second candidate, which was a misreading and is measured anyway
+
+**A4's limiter table has been read as putting the band at 28% of a decode step
+against 9 to 23% at a prefill.** Its four cells are 2048 and 8192 *tokens* on a
+global and on a windowed layer — two kinds of layer at one regime — and 28% is
+the windowed column at both lengths where 23% and 9% are the global one. A decode
+step appears nowhere in it. What separates those columns is the band's own
+extent: a windowed layer's live keys are all inside the 1024-distance band where
+a global layer at 8192 reads mostly keys further back and takes the early return.
+
+So the question was open rather than answered, and
+`what_a_decode_steps_attention_is_bound_by` is A4's instrument at one query row
+over the keys a sequence holds, which is the shape a step has.
+
+    without                     385 global   385 window   8192 global   8192 window
+    nothing — the kernel          104.75µs     106.88µs      812.79µs      265.33µs
+    the keys and values           78.38µs 75%  77.62µs 73%  499.25µs 61%  225.58µs 85%
+    the band it derives           71.12µs 68%  70.75µs 66%  640.79µs 79%  256.25µs 97%
+    the exp's precision           84.92µs 81%  84.46µs 79%  708.00µs 87%  283.38µs 107%
+    the exp                       85.75µs 82%  86.38µs 81%  686.62µs 84%  157.12µs 59%
+    the barriers                  45.75µs 44%  45.92µs 43%  424.25µs 52%  161.25µs 61%
+    the tile's two reductions     43.83µs 42%  42.62µs 40%  385.67µs 47%  147.58µs 56%
+    the weighting                 49.50µs 47%  43.38µs 41%  305.83µs 38%  133.88µs 50%
+    three quarters of the dot     50.92µs 49%  47.88µs 45%  402.96µs 50%  158.50µs 60%
+    the simd_sum                  55.29µs 53%  57.62µs 54%  523.50µs 64%  188.12µs 71%
+
+**Two rows did not reproduce and are printed rather than dropped**, which is the
+discipline A4's own `simd_sum` row is under: a second sitting reads the barriers
+at 78% where this one has 44%, and the exp at 108% where this one has 59%. The
+band's four cells repeat to a point across both sittings, and so do the tile's
+two reductions, the weighting and the dot.
+
+**The band at a decode shape is 32 to 34% at 385 keys, 21% at 8192 global and 3%
+at 8192 windowed** — so it is bigger than the prefill's windowed 28% at short
+context and collapses at long context on the layers that are 35 of 42. Against
+the in-model share `which_kernels_own_a_decode_step_at_each_context` gives it —
+windowed attention 9.1% of a step at 385 keys and global 2.0% — removing the band
+*entirely* is an upper bound of **3.7% of a decode step**, and removing it
+entirely answers wrongly, because it is the mask.
+
+**It is not the term with most to gain and it is not close.** The tile's two
+reductions are 44 to 60% of a decode-shaped call at every cell, ahead of the band
+at all four, and that is a trade this file made deliberately at 32 entries and
+against a barrier. **What the decode column actually says is that no term here is
+free** — the cross-lane reduction, which A4 measured at 100% of a prefill and
+called nothing, is 29 to 47% here, and the transcendental is 16 to 19% on the
+three cells that reproduced where A4 read 101%. A decode step's attention is 32
+threadgroups on an 80-core part; it is waiting on itself, and every instruction
+taken out of it shows.
+
+### What the instrument gained, which is the thing that would have caught this
+
+**Every entry behind this flag had been gated on a height until this milestone
+tried to put one on the decode path**, and that is what made a prompt-length
+floor a sufficient guard: `bench diverge` held each of the corpus's six prompts
+against `SHORTEST_BLOCKED_CALL` before it ran anything, and a corpus that cleared
+it reached everything the flag selects.
+
+**An entry a decode step dispatches is gated on nothing.** A call of one row
+reaches it, so no prompt length says whether a differential run ever ran it — and
+a run that never did would report its 384 agreeing argmaxes exactly as loudly as
+one that ran it at every step. That is the same "a thing agreeing with itself"
+the floor exists to refuse, arriving on the axis the floor does not watch.
+
+So each kernel now names what it put behind the flag, and a differential run
+holds what it *dispatched* against those lists, over the two regimes a generation
+has — a prefill and a decode step — per prompt, because only the corpus's longest
+member reaches the grouped entry. `Encoded` gains the compiled entry beside the
+label it is charged to, because a layer's attention step is `windowed attention`
+whichever kernel carried it and the label cannot answer which one ran.
+
+It reports, and this run reports:
+
+    the flag selected mma_attention, mma_matmul_grouped, mma_matmul_rows
+    at a prefill and nothing at a decode step
+
+**Which is the true sentence about this tree**, and was the true sentence about
+every tree before it — stated by the instrument rather than inferred from the
+predicates. While the cut was on the path it read `split_matmul,
+split_matmul_pair` at a decode step, which is how the run that measured the
+divergence knew it had measured anything.
+
+### What did not move
+
+**No token moved.** `just diverge` over the corpus: six prompts, 64 tokens each,
+**384 of 384 agreed**, nothing parted. That is the same figure A7 recorded and it
+is the same figure for the same reason — with the cut off the path the flag
+reaches no decode dispatch, and the reference and production paths run the same
+untiled kernel.
+
+**The reference path compiles the string it compiled before**, which
+`the_reference_source_does_not_carry_the_production_entries` holds against the
+list the flag itself keeps rather than against a second copy of it — so an entry
+put behind the flag and left out of that list is a case that fails rather than a
+check that quietly shrank. `a_call_under_either_numerics_answers_what_the_other_
+answers` asserts an untiled call is the same *bits* under both words again, which
+is what the cut's removal restores and what its presence correctly broke.
+
+**A decode step is where D4 left it**, on a host settled to 0.32% on the wall and
+0.25% on the device before the sitting. `what_a_decode_step_costs_as_the_context
+_grows`, one sitting, beside D4's own row:
+
+    context   D4's step   here   median   D4's device   here   tokens/s   peak
+        97     16.80ms  16.50ms  16.47ms     15.37ms  15.11ms     60.6   0.28 GiB
+       385     18.40ms  17.87ms  17.79ms     16.99ms  16.32ms     56.0   1.31 GiB
+       769     18.81ms  18.65ms  18.65ms     17.42ms  17.10ms     53.6   1.32 GiB
+      2048     21.23ms  21.40ms  21.46ms     19.81ms  20.07ms     46.7   2.05 GiB
+      4096     22.77ms  23.08ms  22.93ms     21.38ms  21.62ms     43.3   2.81 GiB
+      8192     25.69ms  25.47ms  25.44ms     24.26ms  24.05ms     39.3   4.30 GiB
+
+**The mean and the median agree to fifteen hundredths of a millisecond at every
+row**, which is what says no row has a step in it that is not a decode step. The
+385 row reads 17.87 against the four sittings this file records at 17.95 to
+18.77, and it is the row this file has already said not to read absolutely.
+
+**And both words agree at a long context**, which is what the flag reaching no
+decode dispatch looks like from the outside: seven pairs at 8192 keys read the
+device at **24.241 ms against 24.174**, ranges across, no claim. The wall row on
+that measurement reads 47.396 against 48.270 and also claims nothing — it is the
+row `bench decode --context` charges a prefill's deferred step to, and the device
+column is the one to read there.
+
+**Speculation is where it was, on the checkpoint whose row it is.** `bench sweep`
+on the packed heads, one sitting:
+
+    k    a token   tokens/s   speedup   accepted
+    0    16.061ms     62.3      1.000
+    1    14.847ms     67.4      1.082   84.85%
+    2    14.704ms     68.0      1.092   86.96 78.26%
+    3    14.459ms     69.2      1.111   85.00 65.00 55.00%
+    4    17.785ms     56.2      0.903   82.35 64.71 52.94 47.06%
+
+**`k = 3` is still the best depth** and the acceptance rows are digit for digit
+the ones this file records, at 1.829, 2.560, 2.909 and 3.368 tokens a round. The
+default checkpoint's bfloat16 heads were run too and reproduce *their* row —
+84.8%, 91-74%, 84-74-63%, 82-65-53-47% — which is the two-depths-apart signature
+this file uses to catch a swapped checkpoint, landing where it should.
+
+**Prefill is unmoved**, one sitting under the production flag against the three
+lengths this file quotes: **5.561 s** wall and 3.239 s device at 2048 against the
+recorded 5.74 and 3.39, **9.092** and 6.021 at 4096 against 9.33 and 6.26, and
+**16.827** and 11.772 at 8192 against 17.29 and 12.19 — every one of them a few
+percent under, uniformly, which is a sitting rather than a change.
+
+**And K1's kept cache is where K1 left it**, which is the one architectural
+advantage this engine has measured. `just bench-session`, three pairs, cold
+against kept, every pair the same way and the ranges apart:
+
+                        K1's figure     here    range
+    a cold session         265.53 s   263.739  263.672-263.783
+    a kept session          71.36 s    71.162   70.666- 71.440
+    a kept turn's marks     1.135ms     1.124    1.095-  1.177
+
+**Every row reproduces to under a percent**, which is what a milestone that
+touched nothing between two requests should read. What the pair itself says is
+−73.0% on the session, and −36.7% on the per-turn bookkeeping against the cold
+arm's own 1.775 ms — that second figure is cold against kept and not either
+against K1, which is the comparison the third row above makes.
+
+**The tiers are 681, 681 and 70**, against the 672, 672 and 68 this milestone
+opened on: seven cases hold the differential run's new reach check, two hold the
+cut's partition and its drift, and the two measurements are the cut's sweep and
+the decode-shaped limiter table. `cargo nextest run` against a real checkpoint is
+681 of 681 in 819 s with nothing skipped but the measurements, and the recorded
+continuation, D4's derived barrier count, both block floors and
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert` are all inside
+it.
+
+### The floor this stops at, which is the one D1 left
+
+**The matmul is where D1 left it: 5.91 GB of packed weight read once a token,
+8.15 ms of it at 725 GB/s, and 71% of that reached.** Nothing here moved it in
+either direction, because nothing here shipped. The sampled per-kernel table puts
+the matmul's two entries at 377 calls, 5932 MB and 67.5% of a step's device time
+— which is the *share* D1 quotes, and is read as a share rather than as an
+absolute for the reason that table states about itself.
+
+**What the cut would have done to that column is the finding rather than a
+footnote.** Its rate falls at every shape it touches — 302 to 218 GB/s on
+`r_proj`, 421 to 276 on `k_proj`, 598 to 343 on `q_proj`, 648 to 367 on a routed
+bank — so the lever aimed at the gap between 67% and 100% takes the kernel to
+about 55% of where it was. D1's arithmetic that a matmul at the bus leaves a step
+at 13.5 ms device still stands, and this is one fewer way to get there.
+
+**What is left under it is what D1 said and one thing more.** D1 named the
+remaining 3.4 ms above floor as per-dispatch fixed cost and unhidden walk, and
+took the dispatch half over three milestones. The walk half now has a measured
+obstacle rather than an untried lever: **the walk cannot be shortened by sharing
+it, because sharing costs more than the walk does.** What is not ruled out is
+shortening it by giving one simdgroup *more than one output element* — a tile
+across columns, where the rows a decode step has are one and the columns are
+thousands, and where what is shared is the input read rather than a partial sum.
+`what_a_decode_steps_packed_matmul_is_bound_by` puts the input's loads at 21 to
+43%, and that is the term such a tile would reach. **Nothing here measures it**,
+and it is written down because this milestone is what makes it the next question
+rather than the second one.
+
+### What this milestone leaves
+
+**Two refusals and an instrument.** The cut is refused on a measurement rather
+than on an argument, and the band is refused on a measurement that also corrects
+what the argument was. What is left behind is the differential run knowing which
+entries it actually exercised, which is the thing that would have caught a decode
+entry behind the flag that no corpus ever ran — and which now prints, on every
+run, the sentence that says so.
+
+**The decode-shaped limiter table is the thing to read next.** No term in it is
+free where A4's prefill table had two that were nothing, and the largest is a
+reduction this engine took on purpose at 32 entries. That is a share and not a
+lever, which is exactly the distance A4's own 29% was from a kernel — and the
+milestone after prefill's ceiling work is still continuous batching.
 
 ## The ordering under the dispatches
 
