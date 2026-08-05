@@ -17,11 +17,11 @@
 //! the ordering at 1.215 microseconds a dispatch and a barrier at 2.062, which
 //! says a sequence averaging under 1.70 dispatches to a group pays for the
 //! mechanism — and this one averages 1.37, so the arithmetic predicted a decode
-//! step 0.237 ms *slower*. It is 0.98 ms faster. What a serial pass costs a
+//! step 0.237 ms *slower*. It is 1.00 ms faster. What a serial pass costs a
 //! dispatch that computes something is not its launch, it is the execution it
 //! keeps from overlapping: the same step with every barrier taken out — which
-//! races, and writes the wrong tokens — runs the device in 9.25 ms against
-//! 16.16, so the ordering is worth 6.90 ms and not the 1.12 the fixed cost
+//! races, and writes the wrong tokens — runs the device in 9.252 ms against
+//! 16.101, so the ordering is worth 6.85 ms and not the 1.12 the fixed cost
 //! implies. So the value is measured by `just bench` and the count is reported
 //! here, and neither is derived from the other.
 //!

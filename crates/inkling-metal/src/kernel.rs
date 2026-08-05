@@ -215,7 +215,7 @@ impl Device {
 ///
 /// **Where the barrier goes is derived and not decided here**: see
 /// [`crate::ordering`], which holds the rule, and [`Kernel::writes`], which is
-/// where "wrote" comes from. What it is worth is 0.98 ms of a 16.16 ms device
+/// where "wrote" comes from. What it is worth is 1.00 ms of a 16.20 ms device
 /// step.
 ///
 /// Waiting is still what makes [`Buffer::as_slice`](crate::Buffer::as_slice)

@@ -23,17 +23,18 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **642 of the 690 tests, no
+`just test` is the one to run while iterating: **672 of the 740 tests, no
 checkpoint, twelve seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
 38 that need weights report a skip and pass. It runs through libtest, which puts
-a crate's tests in one process: opening a Metal device costs a second, so the 215
-kernel tests are 11.2 s sharing a process and minutes with one each. Nothing in this
+a crate's tests in one process: opening a Metal device costs a second, so the 245
+kernel tests are 11.9 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 690 against a
-real checkpoint, nine minutes.** The 53 gated tests — the 38 above and fifteen
+`just test-full` is what has to pass at the ends of a series: **all 740 against a
+real checkpoint, thirteen minutes.** The 672 the gated tier runs and the 68 the
+timing tier does. The 53 gated tests — the 38 above and fifteen
 of the measurements below, which need weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
@@ -43,7 +44,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the forty-eight tests whose result *is* a number — a duration
+`just test-timing` is the sixty-eight tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -116,8 +117,8 @@ Text in, text out, streamed to stdout as each token is decoded:
 
     inklingrs generate models/Inkling-Small-mxfp4 --prompt 'The lighthouse keeper' -n 4
 
-A decode step is about 17.6 ms — 15.4 ms a token speculating two deep, which is
-65.1 tokens a second — and the timings go to stderr so stdout stays pipeable.
+A decode step is about 16.3 ms — 14.6 ms a token speculating three deep, which is
+68.3 tokens a second — and the timings go to stderr so stdout stays pipeable.
 **Both of those are taken at an eight-token context and neither is what a user
 feels**; "Against the reference, end to end" and "Where a decode step goes as the
 context grows" below are the figures that are, and they do not read the same way
@@ -1175,6 +1176,278 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## The ordering under the dispatches
+
+**A decode step's 918 dispatches were ordered end to end, and 656 of the 904 gaps
+between them needed to be.** Metal's pass is `MTLDispatchTypeConcurrent` now,
+with a `memoryBarrierWithScope:` in front of any dispatch that touches something
+the dispatches since the last barrier wrote: **17.254 ms to 16.287**, device
+**16.204 to 15.200**, seven alternating pairs, every pair the same way and the
+ranges apart, against a null pair that read 0.0% and −0.1%. That is **−5.6% on
+the wall and −6.2% on the device**, and the wall follows the device again for
+D3's reason — the device is 92% of a step, so it is the only side worth being on.
+
+### Where the barrier goes, which is derived and not decided
+
+A barrier removed by inspection is a race that is correct most of the time. This
+engine's kernels carry state between calls — a convolution's window, the
+attention span, the router's selection — so a missing one answers the step it was
+made on correctly and a later step wrongly, which is a rejection away rather than
+a token away. So nothing in `crate::ordering` asks what a dispatch is *for*. It
+asks two things:
+
+- **which allocations filled its slots**, which the command buffer's own bindings
+  say; and
+- **which of those slots the kernel may write**, which the kernel's own Metal
+  source says — `constant T &x` is an address space that cannot be written,
+  `device const T *x` is a pointer that cannot, `device T *out` is one that may,
+  and `device T *const out` is one that may as well, since `const` counts only
+  where it qualifies the pointee. `Kernel::writes` parses that at compile time
+  off the string the pipeline was built from, and the Metal compiler is what
+  enforces it. A parameter it does not recognise comes back written, which is a
+  barrier kept; an entry it cannot find at all is a panic, because the silent
+  failure would be a step that reads as fully ordered.
+
+Two dispatches may share a group when no allocation they both name is written by
+either — a read after a write, a write after a read and two writes are all
+hazards, and all three close a group. The identity is the binding's address,
+which is sound for as long as it has to be: **a command buffer retains everything
+bound into it**, so nothing named in an open pass can be freed under it. Both
+ways that identity can be wrong are written down where it is used, and the only
+one that could *drop* a barrier needs two `MTLBuffer`s over one writable region —
+which this engine never makes, since the one wrap it does is a checkpoint's
+read-only pages.
+
+**The same `Open` answers for the analysis and for the encoder.** The division
+`crate::ordering` reports offline and the barriers `Batch` encodes as it goes are
+one rule asked at two times rather than two that can drift, and
+`what_a_decode_steps_dispatches_have_to_wait_for` asserts the two counts are
+equal on a real step at all three contexts. A count nothing checked is a claim.
+
+### What the division comes to
+
+Identical at 97, 2048 and 8192 keys:
+
+    918 dispatches, 14 passes, 670 groups, 656 barriers, 1.37 to a group
+
+Every group wider than one is nameable, which is what says the division found the
+model rather than an artefact of the analysis:
+
+    42 of packed_matmul x4                   a layer's q, k, v and r
+    40 of packed_matmul, packed_matmul,      both banks' down, beside the softmax
+          router_weights                     over the eight logits the top-k named
+    40 of router_top_k, packed_matmul_pair   the selection, beside the shared
+                                             bank's pair, which does not need it
+     2 of packed_matmul, packed_matmul       a dense layer's gate and up
+
+and **546 of the 670 groups are one dispatch**: a decode step at one row is a
+chain, and what concurrency there is to find is 124 places wide.
+
+### Why the arithmetic said this would lose
+
+**The lever was priced before it was built and the price had the wrong sign.**
+`what_a_barrier_costs_the_device_against_the_dispatches_it_separates` is a
+thousand empty dispatches through one pass on the driver's own clock, swept by
+how many of them share a group:
+
+    a thousand empty dispatches                barriers        each   disagreed
+    a serial pass                                     0     1.554µs          1%
+    a concurrent pass, a barrier each              1000     2.401µs         27%
+    a concurrent pass, 2 to a group                 500     1.216µs          3%
+    a concurrent pass, 3 to a group                 333     0.809µs          1%
+    a concurrent pass, 4 to a group                 250     0.621µs          2%
+    a concurrent pass, 8 to a group                 125     0.384µs          1%
+    a concurrent pass, no barriers                    0     0.339µs          0%
+
+**An explicit barrier is dearer than the ordering it replaces** — 2.06
+microseconds against 1.22 — so only a barrier *removed* is worth anything, and a
+group has to average 1.70 dispatches before a concurrent pass overtakes a serial
+one. A decode step's groups average **1.37**. That arithmetic says a step would
+get **0.24 ms slower**, and D3's own closing figure — the barrier at 91% of what
+an empty dispatch costs — says the same thing from the other mechanism.
+
+It is 1.00 ms faster. **What a serial pass costs a dispatch that computes
+something is not its launch, it is the execution it keeps from overlapping**, and
+a probe over dispatches that compute nothing cannot see that term because there
+is nothing to overlap. Three arms on the real step, each its own sitting of seven
+alternating pairs against the serial pass, every pair the same way and the ranges
+apart:
+
+    what the pass was                       serial   this arm   change   tokens
+    concurrent, a barrier after every one  16.121ms  16.825ms    +4.4%   right
+    concurrent, the derived 656 barriers   16.204ms  15.200ms    -6.2%   right
+    concurrent, no barriers at all         16.101ms   9.252ms   -42.5%   wrong
+
+Each row carries its own serial arm because each is a paired sitting of its own,
+and the three agree on it to half a percent.
+
+**The bottom row is the ceiling and it is not a milestone**: it races, and it
+writes `!!! ruhig.Statement!! presa` where the oracle writes `'s daughter is
+the`. What it prices is the ordering — **6.85 ms of a 16.10 ms device step,
+against the 1.12 ms the fixed cost implies** — and the factor of six between them
+is the term the empty-dispatch sweep is blind to.
+
+**The second row is the control, and it costs nothing to be sure of**: a
+concurrent pass with a barrier after every dispatch is the same ordering the
+serial type gives, so it writes the same tokens, and what it measures is the
+mechanism alone. 0.70 ms over 904 barriers is **0.78 microseconds a barrier**, so
+the 656 that stay hand about 0.51 ms back — which puts the overlap the 124 wide
+groups recover at about **1.51 ms of the 6.85 available, 1.00 of which survives
+the mechanism.**
+
+**The finer barrier buys nothing.** `memoryBarrierWithResources:count:` naming
+only the allocations the open group touched, rather than every buffer the pass
+may have written, reads **−6.1% against −6.0%** in two sittings taken back to
+back, and 2.457 µs against 2.401 on the empty sweep. It is the sharper instrument, the
+hardware does not make the distinction, and the coarse one ships: it hands Metal
+no pointer back and it orders strictly more.
+
+### What a decode step costs now, at every context
+
+The paired instrument, three pairs at each of six contexts, device only for the
+reason `bench decode --context` carries — it charges the step a prefill deferred:
+
+    context   device before   device after   change   pairs
+         97        16.235ms       15.242ms    -6.1%   3 of 3, ranges apart
+        385        17.510ms       16.618ms    -5.1%   3 of 3, ranges apart
+        769        18.382ms       17.408ms    -5.3%   3 of 3, ranges apart
+       2048        20.939ms       19.940ms    -4.8%   3 of 3, ranges apart
+       4096        22.293ms       21.312ms    -4.4%   3 of 3, ranges apart
+       8192        25.020ms       24.102ms    -3.7%   3 of 3, ranges apart
+
+**A fixed 0.89 to 1.00 ms at every length**, which is what removing a count of
+orderings rather than a rate has to look like: the same absolute saving, shrinking
+as a fraction only because attention grows underneath it.
+
+`what_a_decode_step_costs_as_the_context_grows`, one sitting, against D3's:
+
+    context     before      after   tokens/s   of floor   device before   device after
+       97      17.60ms    16.80ms  56.8→59.5    46%→49%        16.35ms        15.37ms
+      385      18.86ms    18.40ms  53.0→54.3    43%→44%        17.57ms        16.99ms
+      769      19.79ms    18.81ms  50.5→53.2    41%→43%        18.47ms        17.42ms
+     2048      22.68ms    21.23ms  44.1→47.1    36%→38%        21.20ms        19.81ms
+     4096      23.90ms    22.77ms  41.8→43.9    34%→36%        22.54ms        21.38ms
+     8192      26.54ms    25.69ms  37.7→38.9    31%→32%        25.18ms        24.26ms
+
+The two sides are two sittings and the claim is the paired table above it. The
+mean and the median agree to fifteen hundredths of a millisecond at every row,
+and to two hundredths on five of the six — 18.40 against 18.55 is the widest and
+25.69 against 25.68 the closest — which is what says no row has a step in it that
+is not a decode step.
+
+**The 385 row is the noisy one and this file should say so**: four sittings of it
+read 17.95, 18.01, 18.40 and 18.77 ms where every other row repeats to within a
+tenth. The paired instrument above, which is the claim, reads it at 16.618 ms of
+device against 17.510 and does not share the spread.
+
+### What speculation costs now
+
+Five alternating pairs on the packed heads:
+
+    depth    a token before   a token after   tokens/s   device before   device after
+    k = 0         17.186ms        16.274ms   58.2→61.4        16.137ms        15.174ms
+    k = 1         15.474ms        14.919ms   64.6→67.0        14.263ms        13.765ms
+    k = 2         15.312ms        14.763ms   65.3→67.7        13.880ms        13.434ms
+    k = 3         16.296ms        14.645ms   61.4→68.3        14.536ms        13.036ms
+    k = 4         18.726ms        17.317ms   53.4→57.7        16.627ms        15.517ms
+
+**The depth that pays best moves from two to three.** Against that run's own
+`k = 0` the speedups are 1.091, 1.102, **1.112** and 0.940, where they were
+1.111, 1.122, 1.055 and 0.918 — so `k = 3` gains where the shallower depths give
+a little back, and the reason is the same one the whole section is about: a
+deeper round puts more rows through each dispatch, so `k = 0` is the arm with the
+most idle machine to fill and it is the arm that improves most.
+
+**Acceptance is identical in both arms at every depth** — 84.85% at one; 86.96
+and 78.26 at two; 85, 65 and 55 at three; 82.35, 64.71, 52.94 and 47.06 at four —
+and so is what a round banks. Which is what a scheduling change has to read as:
+the heads guess what they guessed and the model verifies what it verified.
+
+### Against the reference, one sitting
+
+Three pairs, both engines alternating, the packed heads:
+
+    prompt x generated    ours p50   the reference p50   ahead
+    97 x 128              16.42ms              22.90ms   1.39x
+    385 x 128             17.68ms              23.12ms   1.31x
+    769 x 128             18.53ms              23.52ms   1.27x
+    97 x 512              17.52ms              23.08ms   1.32x
+
+Ahead of D3's 1.32, 1.25, 1.21 and 1.25 at every row. Speculating two deep, the
+same sitting: **14.67 ms a token at 97 × 128 and 14.39 at 97 × 512 against the
+reference's 23.01 and 23.16**, which is **1.57× and 1.61×** where D3 read 1.53
+and 1.57. Both engines wrote the same first eight tokens at every one of the four
+prompts.
+
+### What did not move
+
+**No token changed, on any run.** The recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what both backends write,
+`--backend cpu` included, and the numerics flag stays defaulted to reference.
+
+**And it is the same continuation through a rewind at every depth, over and over.**
+This is the first change here that can produce a race rather than a wrong number,
+and bit-identity on one run does not prove it. So
+`speculating_writes_the_text_that_decoding_one_token_at_a_time_writes` was driven
+**ten times** — five on an idle host and five with another process holding the
+GPU — which is fifty generations across `k` of 0, 1, 2, 3 and 4, every one of
+them writing the oracle's own text. Every depth rejects guesses on the way
+through: 2 of 3 accepted at one, 2 of 6 at two, 2 of 8 at three, 2 of 10 at four.
+Beside that, **116 further generations** driven straight through the binary at
+`k` of 1 to 4 over three prompts, under one and then two concurrent MLX matmul
+loops, each held against its own `k = 0` oracle: all 116 matched.
+
+**Prefill did not move.** Three pairs each:
+
+    tokens     wall    device   ranges
+     2048     +0.2%     -0.1%   across on the wall, no claim
+     4096     -0.0%     -0.0%   across, no claim
+     8192     +0.2%     -0.1%   across, no claim
+
+Which is what a decode-step lever should read as, and for a sharper reason than
+D2's count: a prefill's dispatches are hundreds of rows each, so they already
+fill the machine and there is no overlap for a concurrent pass to recover.
+
+**K1's kept cache is untouched**: a simulated coding session reads **265.53 s
+cold against 71.36 s kept** — every turn prefilling the same 321 tokens where the
+cold arm re-prefills 8832 to 9472 — against D3's 265.23 and 71.20, and the
+per-turn bookkeeping is **1.135 ms**, inside the 1.013 to 1.267 this file has at
+the two ends of a context sweep.
+
+**Both MMA floors,
+`a_calls_rows_share_a_weight_read_only_where_they_name_one_expert`,
+`the_bounded_loop_is_the_unbounded_one_bit_for_bit` and
+`a_call_splits_its_span_only_where_the_grid_is_short_of_the_machine` are where
+they were**, and so is
+`a_paired_dispatch_answers_what_the_two_dispatches_it_replaces_answer`.
+
+### The floor this stops at, and what is under it
+
+**A decode step still reads 5.91 GB of packed weight once, and at 725 GB/s that
+is 8.15 ms.** Taken at 97 keys, where the dispatch count and the barrier count
+are both known, the step is at **53% of it on the device where it was at 50%**:
+
+    term                                        cost   what it is
+    the weights, at the bus                   8.15ms   the floor
+    918 launches, at 2.60µs each              2.39ms   being 918 dispatches
+    the 656 barriers, at 0.78µs each          0.51ms   the ordering that is real
+    everything else                           4.19ms   the walk, and the bytes above the floor
+    the step                                 15.24ms
+
+The second row is D3's figure and is not re-measured here: 2.60 µs was taken by
+removing dispatches from a *serial* pass, and what a launch costs in a concurrent
+one is a different measurement that nothing in this milestone turns on.
+
+**What is under the third row is not another 0.51 ms.** The ceiling arm says the
+ordering is worth 6.85 ms; this step's own paired saving of 0.99 ms plus the 0.51
+its barriers hand back recovers **1.50** of it; the rest is held by 546
+groups of one dispatch, and those are a real dependency chain rather than a count
+that has not been merged yet. Taking more of it would mean changing what a decode
+step computes rather than how it is submitted — which is what the next milestone
+is: **continuous batching**, the original differentiator, still unbuilt, and the
+only thing left that changes the engine's category rather than its constant
+factor. A second sequence in flight is exactly the thing that fills the 546.
+
 ## The encode a decode step could stop doing, and what it would be worth
 
 **A decode step encodes the same thousand dispatches every step, that sequence
@@ -1359,6 +1632,14 @@ nothing in the arithmetic to catch it. What has changed is that it is no longer
 an estimate, and that **it does not need an indirect command buffer** —
 `computeCommandEncoderWithDispatchType:` offers the same concurrency to the
 encoder this engine already has, without the 2.02× an indirect command costs.
+
+**That last sentence is what the next milestone took up, and it held** — see "The
+ordering under the dispatches", where the ordering comes off and the barriers
+that remain are derived from what each dispatch reads. The 4.2 ms above is what a
+step pays for being a thousand dispatches at all; the ordering alone turns out to
+be **6.85 ms**, larger than the whole of it, for the reason that section gives: an
+empty dispatch pays the barrier's launch and a real one pays the overlap it
+loses.
 
 ## The three pairs a decode step had left
 
@@ -1602,6 +1883,15 @@ mechanism that can address one command at a time, where D2 had it as an estimate
 
 It stays left, for D2's reason and now with a number on it: it puts a wrong
 answer one missing barrier away with nothing in the arithmetic to catch it.
+
+**It did not stay left, and the number above is the one that had to be
+re-measured.** See "The ordering under the dispatches": the ordering came off,
+the barriers that remain are derived rather than judged, and a decode step is
+6.2% shorter on the device for it. What this paragraph got right is the risk;
+what it got wrong is that 91% of an *empty* dispatch is the whole cost. On
+dispatches that compute something the ordering is worth six times that, because
+what it costs is the execution it prevents from overlapping rather than the
+launch it delays.
 
 ## A decode step's thousand dispatches
 
