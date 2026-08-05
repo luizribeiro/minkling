@@ -107,6 +107,24 @@ const PAIRED_ENTRY: &str = "packed_matmul_pair";
 const MMA_TILED_ENTRY: &str = "mma_matmul_rows";
 const MMA_GROUPED_ENTRY: &str = "mma_matmul_grouped";
 
+/// The two entries behind [`Numerics::Production`] that stand in front of the
+/// *untiled* pair, which is the decode path.
+///
+/// **The same walk over the same bytes, cut between several simdgroups.**
+/// [`ENTRY`] gives one simdgroup to an output element and has it reduce a whole
+/// weight row from end to end; here several share the row and their partials are
+/// added afterwards. That is the one thing about the walk that nothing this
+/// module has shipped was allowed to change — every other lever on it kept the
+/// bits, and the chunks a lane holds are read and added in the order the walk
+/// visits them for exactly that reason — because two lane-strided partitions of
+/// one row, summed and then added, do not associate the way one does.
+///
+/// So the flag is what lets it be written, and it is the first entry behind the
+/// flag a decode step reaches: both blocked entries refuse a call under 64 rows,
+/// and a decode step's widest is nine.
+const SPLIT_ENTRY: &str = "split_matmul";
+const SPLIT_PAIRED_ENTRY: &str = "split_matmul_pair";
+
 /// Rows one simdgroup of [`TILED_ENTRY`] multiplies against one weight row.
 ///
 /// **What this is worth is the whole of the prefill gap and none of the decode
@@ -486,6 +504,48 @@ const THREADS_PER_GROUP: usize = 256;
 /// two want opposite widths.
 const THREADS_AN_ELEMENTS_GROUP: usize = 64;
 
+/// Simdgroups a split call may cut one element's walk between, which bounds the
+/// threadgroup array their partials land in.
+///
+/// **A bound and not the number.** How many a call actually takes is
+/// [`splits_for`], which reads the call's own width; this is what the kernel has
+/// to declare an array for before it knows. Eight floats is 32 bytes of a
+/// threadgroup's 32 KiB, so declaring the bound rather than the number costs
+/// nothing that a residency sweep could measure — which is what makes the split
+/// count free to be a runtime value.
+const MOST_SPLITS: usize = 8;
+
+/// Output elements a call aims to give the machine, which is what decides how
+/// many simdgroups it cuts an element's walk between.
+///
+/// **An output element is one simdgroup, and a decode step never gives the
+/// kernel elements enough.** `whether_a_decode_dispatch_is_short_of_the_machine`
+/// swept the same one-row call at nine widths and the rate follows the count:
+///
+/// ```text
+/// elements   achieved   of bus
+///      512    85 GB/s      12%
+///     1024   168 GB/s      23%
+///     4096   397 GB/s      55%
+///    16384   588 GB/s      81%
+///    65536   674 GB/s      93%
+///   131072   687 GB/s      95%
+/// ```
+///
+/// A decode step's widest bank is 24576 elements and its narrowest projection is
+/// 512, so every shape it has is on the steep part of that curve and the head is
+/// the only one off it. **The kernel reaches 95% of the bus and a decode step
+/// never gives it a call wide enough to** — which is the sentence this constant
+/// exists to act on.
+///
+/// Cutting the walk is what buys the elements the shapes do not have: `n`
+/// simdgroups on one element are `n` times the simdgroups in flight, each
+/// walking `1/n` of the row, and the bytes and the arithmetic are the same
+/// either way. **Swept rather than reasoned about** — see
+/// `what_a_packed_multiply_costs_at_each_element_count_a_call_is_cut_to` and the
+/// paired figures the README quotes beside it.
+const WANTED_ELEMENTS: usize = 32768;
+
 /// Floats of threadgroup memory a tile declares and never reads for anything,
 /// which is what puts the two tiled entries on the fast side of their occupancy
 /// turn.
@@ -668,6 +728,9 @@ pub struct PackedMatmul {
     /// is what makes "nothing changes for a caller who does not ask" a fact
     /// about the pipeline cache rather than about a branch nobody takes.
     mma: Option<Mma>,
+    /// The two that stand in front of `kernel` and `paired` on the same terms,
+    /// which is the decode path — see [`SPLIT_ENTRY`].
+    split: Option<Split>,
     /// Which arithmetic the innermost accumulation is allowed to use, which is
     /// [`Numerics::Reference`] unless a command line asked otherwise.
     numerics: Numerics,
@@ -685,6 +748,27 @@ pub struct PackedMatmul {
     /// no sweep can turn, and a value the entry carries is one arm rather than a
     /// milestone.
     threads_an_elements_group: usize,
+    /// The output elements a call aims to give the machine, which is
+    /// [`WANTED_ELEMENTS`] for every caller but the sweep that chose it.
+    ///
+    /// **Carried for the reason the width above is**, and it is the one number
+    /// the split has: how far a walk is cut is this over the call's own element
+    /// count, so a sweep of the split turns this and nothing else.
+    wanted_elements: usize,
+}
+
+/// The two untiled entries behind [`Numerics::Production`], which are
+/// [`PackedMatmul::kernel`] and [`PackedMatmul::paired`] with an element's walk
+/// cut between the simdgroups of a threadgroup.
+///
+/// **A pair rather than one**, because a decode step dispatches both: a
+/// projection is one bank and a SwiGLU's gate and up are the pair D2 fused, and
+/// the second is 55% of what a step reads. Cutting the walk on one of them would
+/// leave the other where it was.
+#[derive(Debug)]
+struct Split {
+    kernel: Kernel,
+    paired: Kernel,
 }
 
 impl PackedMatmul {
@@ -852,16 +936,49 @@ impl PackedMatmul {
         // order exists to protect.
         let tiled = device.compile(source, TILED_ENTRY)?;
         let grouped = device.compile(source, GROUPED_ENTRY)?;
+        // **After the tiled two and before the untiled two**, which is where the
+        // entries they stand in front of are created. What the order above
+        // protects is a prefill, and these run no prefill dispatch at all.
+        let split = match numerics.is_production() {
+            false => None,
+            true => Some(Split {
+                kernel: device.compile(source, SPLIT_ENTRY)?,
+                paired: device.compile(source, SPLIT_PAIRED_ENTRY)?,
+            }),
+        };
         Ok(Self {
             kernel: device.compile(source, ENTRY)?,
             paired: device.compile(source, PAIRED_ENTRY)?,
             tiled,
             grouped,
             mma,
+            split,
             numerics,
             rows_a_tile,
             cols_a_tile,
             threads_an_elements_group: THREADS_AN_ELEMENTS_GROUP,
+            wanted_elements: WANTED_ELEMENTS,
+        })
+    }
+
+    /// The same, cutting a walk at an element count of the caller's own — which
+    /// is what makes [`WANTED_ELEMENTS`] swept rather than asserted.
+    ///
+    /// **Nothing about the kernel moves, which is why this is a field and not a
+    /// source string.** How far a walk is cut is read off the threadgroup the
+    /// dispatch was given — see [`SPLIT`] — so the count reaches the grid and the
+    /// kernel takes it from there, and a sweep cannot write one and dispatch
+    /// another. A `wanted` of zero is every call unsplit, which is the arm that
+    /// prices the entry against the one it stands in front of.
+    #[cfg(test)]
+    pub(crate) fn cutting_at(
+        device: &Device,
+        numerics: Numerics,
+        wanted: usize,
+    ) -> Result<Self, MetalError> {
+        Ok(Self {
+            wanted_elements: wanted,
+            ..Self::under(device, numerics)?
         })
     }
 
@@ -906,7 +1023,12 @@ impl PackedMatmul {
     /// than holding its prompts against a number. See
     /// [`Encoded::symbol`](crate::trace::Encoded::symbol), which is what lets a
     /// trace name the entry rather than the row it is charged to.
-    pub const BEHIND_THE_FLAG: &'static [&'static str] = &[MMA_TILED_ENTRY, MMA_GROUPED_ENTRY];
+    pub const BEHIND_THE_FLAG: &'static [&'static str] = &[
+        MMA_TILED_ENTRY,
+        MMA_GROUPED_ENTRY,
+        SPLIT_ENTRY,
+        SPLIT_PAIRED_ENTRY,
+    ];
 
     /// Which arithmetic this one accumulates with.
     ///
@@ -931,12 +1053,14 @@ impl PackedMatmul {
     /// differs is only how many threads cover a call and how many of them share a
     /// threadgroup, which is the one thing a caller cannot work out from the
     /// kernel alone. A tile takes [`THREADS_PER_GROUP`], a block takes its own,
-    /// and an untiled call takes [`THREADS_AN_ELEMENTS_GROUP`].
+    /// and an untiled call takes [`THREADS_AN_ELEMENTS_GROUP`] — or, cut, one
+    /// element's cuts.
     fn entry(
         &self,
         layout: &Layout<'_>,
         rows: usize,
         out_dim: usize,
+        in_dim: usize,
         experts: usize,
     ) -> (&Kernel, Grid) {
         // Off the entry that will run rather than off this module, which is the
@@ -947,10 +1071,7 @@ impl PackedMatmul {
         };
         let tiles = rows.div_ceil(self.rows_a_tile) * out_dim.div_ceil(self.cols_a_tile);
         match (self.blocks(layout, rows, experts), layout) {
-            (_, Layout::Each) => (
-                &self.kernel,
-                simdgroups(&self.kernel, rows * out_dim, self.threads_an_elements_group),
-            ),
+            (_, Layout::Each) => self.each(rows * out_dim, in_dim, false),
             (None, Layout::Tiled) => (
                 &self.tiled,
                 simdgroups(&self.tiled, tiles, THREADS_PER_GROUP),
@@ -973,15 +1094,41 @@ impl PackedMatmul {
     /// the machine and what a tile carries is registers rather than a launch —
     /// so the pair there is two dispatches and stays two. See
     /// [`PackedPair::listed`].
-    fn paired(&self, rows: usize, out_dim: usize) -> (&Kernel, Grid) {
-        (
-            &self.paired,
-            simdgroups(
-                &self.paired,
-                2 * rows * out_dim,
-                self.threads_an_elements_group,
-            ),
-        )
+    fn paired(&self, rows: usize, out_dim: usize, in_dim: usize) -> (&Kernel, Grid) {
+        self.each(2 * rows * out_dim, in_dim, true)
+    }
+
+    /// An untiled call's entry and grid, cut where the flag asked and the call is
+    /// short of the machine.
+    ///
+    /// **One reading for the bank and for the pair**, because the question is the
+    /// same question about the same call: a pair is the untiled entry over twice
+    /// the elements, and how far a walk is worth cutting is decided by how many
+    /// of them there are. `paired` is which of the two a call is, and it selects
+    /// on both sides of the flag — a call that stays uncut has to stay on the
+    /// entry taking the bindings it was given, and the two entries against one
+    /// bank and against two do not take the same ones.
+    fn each(&self, elements: usize, in_dim: usize, paired: bool) -> (&Kernel, Grid) {
+        let whole = match paired {
+            false => &self.kernel,
+            true => &self.paired,
+        };
+        let uncut = |kernel: &_| simdgroups(kernel, elements, self.threads_an_elements_group);
+        let Some(split) = self.split.as_ref() else {
+            return (whole, uncut(whole));
+        };
+        let cut = match paired {
+            false => &split.kernel,
+            true => &split.paired,
+        };
+        // Off the entry that will run rather than off this module, for the
+        // reason the block's shape is: the grid is sized from the width, and a
+        // width this side assumed would leave the kernel dividing by another.
+        let width = cut.simd_width();
+        match splits_for(elements, in_dim, self.wanted_elements, width) {
+            1 => (whole, uncut(whole)),
+            splits => (cut, Grid::new(elements * splits * width, splits * width)),
+        }
     }
 
     /// The production entries, where this call's shape is one they should run.
@@ -1209,6 +1356,34 @@ enum Layout<'a> {
 /// this would be a second place for the simdgroup width to be left out.
 fn simdgroups(kernel: &Kernel, elements: usize, threads: usize) -> Grid {
     Grid::new(elements * kernel.simd_width(), threads)
+}
+
+/// How many simdgroups a call of `elements` output elements over a reduction of
+/// `in_dim` codes cuts each element's walk between.
+///
+/// **One where the call already fills the machine**, which is the discipline
+/// `attention::splits_for` is under and for the same reason: an output element
+/// is one simdgroup, so a call with elements enough has nothing to win from more
+/// of them and would pay a threadgroup array, a barrier and a fold for it. The
+/// head is that call — 200058 elements at 96% of the bus — and it is the only
+/// dispatch a decode step makes that is.
+///
+/// **And never more cuts than the row has steps to give them.** A lane covers
+/// [`BYTES_PER_LANE`] bytes and a cut covers `width` lanes of that, so a row of
+/// `in_dim / 2` bytes has that many over `width * BYTES_PER_LANE` of them. A cut
+/// past the end is a simdgroup whose walk finds no chunk: correct, since it sums
+/// nothing and adds zero, and a threadgroup's worth of launch for it. The
+/// checkpoint's narrowest reduction is 4096 codes, which is sixteen steps, so
+/// [`MOST_SPLITS`] is what binds in practice and this is what keeps a narrower
+/// one safe.
+///
+/// **A `wanted` of zero cuts nothing**, which is the arm a sweep prices the
+/// entry against the entry it stands in front of with.
+fn splits_for(elements: usize, in_dim: usize, wanted: usize, width: usize) -> usize {
+    let steps = (in_dim / CODES_PER_BYTE) / (width * BYTES_PER_LANE);
+    wanted
+        .div_ceil(elements.max(1))
+        .clamp(1, MOST_SPLITS.min(steps.max(1)))
 }
 
 /// How a call over an expert list this side holds is cut up, which is the tile
@@ -1896,7 +2071,9 @@ impl<'a> PackedBank<'a> {
         let resident = &mut *resident;
         let mut out = self.device.zeroed::<f32>(rows * self.out_dim)?;
 
-        let (kernel, grid) = self.matmul.entry(&layout, rows, self.out_dim, self.experts);
+        let (kernel, grid) =
+            self.matmul
+                .entry(&layout, rows, self.out_dim, self.in_dim, self.experts);
         let moves = self.moves(rows, x.len(), &layout);
         let bound = [
             shape.arg(),
@@ -2222,7 +2399,7 @@ impl<'a> PackedPair<'a> {
         let mut out = device.zeroed::<f32>(rows * out_dim)?;
         let mut beside_out = device.zeroed::<f32>(rows * out_dim)?;
 
-        let (kernel, grid) = self.gate.matmul.paired(rows, out_dim);
+        let (kernel, grid) = self.gate.matmul.paired(rows, out_dim, self.gate.in_dim);
         let moves = self.gate.moves(rows, x.len(), &Layout::Each)
             + self.up.moves(rows, x.len(), &Layout::Each);
         batch.add(
@@ -2417,8 +2594,8 @@ constant float ELEMENTS[] = {{ {} }};
 {BODY}{}{}{}{}",
         (1u32 << BITS) - 1,
         elements.join(", "),
-        element_entry(ENTRY, false),
-        element_entry(PAIRED_ENTRY, true),
+        element_entry(ELEMENT, ENTRY, false),
+        element_entry(ELEMENT, PAIRED_ENTRY, true),
         tiled_entry(TILED_ENTRY, false),
         tiled_entry(GROUPED_ENTRY, true),
     )
@@ -2442,6 +2619,11 @@ pub(crate) fn source_blocked(numerics: Numerics, block: Block) -> String {
         written.push_str(&block.declares());
         written.push_str(&mma_entry(MMA_TILED_ENTRY, false));
         written.push_str(&mma_entry(MMA_GROUPED_ENTRY, true));
+        // The bound on the partials array rather than the count that fills it,
+        // which is what lets `splits_for` answer per call — see [`MOST_SPLITS`].
+        written.push_str(&format!("\nconstant uint MOST_SPLITS = {MOST_SPLITS};\n"));
+        written.push_str(&element_entry(SPLIT, SPLIT_ENTRY, false));
+        written.push_str(&element_entry(SPLIT, SPLIT_PAIRED_ENTRY, true));
     }
     written
 }
@@ -2588,23 +2770,29 @@ inline uint tile_source(constant Shape &shape, uint row) {
 
 "#;
 
-/// The untiled kernel, which is emitted twice: once against one bank and once
-/// against the two a SwiGLU reads the same rows through.
+/// An untiled kernel, emitted twice: once against one bank and once against the
+/// two a SwiGLU reads the same rows through.
 ///
 /// **Written once and compiled twice**, for the reason [`tiled_entry`] gives.
-/// The two differ in what a simdgroup's element index is taken modulo, and in
-/// nothing else at all — the same walk, the same reduction, the same one output
-/// element a simdgroup. So the paired entry's answer is the plain one's bit for
-/// bit by construction rather than within a tolerance, and
+/// The two differ in what an element index is taken modulo, and in nothing else
+/// at all — the same walk, the same reduction, the same one output element. So
+/// the paired entry's answer is the plain one's bit for bit by construction
+/// rather than within a tolerance, and
 /// `a_paired_dispatch_answers_what_the_two_dispatches_it_replaces_answer` is
 /// where that is held.
-fn element_entry(entry: &str, paired: bool) -> String {
+///
+/// **One reading of the pair for both untiled walks**, which is what
+/// [`over_the_rows`] is to the two tiled ones: [`ELEMENT`] and [`SPLIT`] differ
+/// in how many simdgroups reduce a row and in nothing about which of a pair's
+/// weights one of them walks, so a second copy of these two would be a second
+/// place for a pair to be pointed at the wrong bank.
+fn element_entry(walk: &str, entry: &str, paired: bool) -> String {
     let (beside, picks) = match paired {
         false => ("", ALONE),
         true => (BESIDE, BOTH),
     };
     substituted(
-        ELEMENT,
+        walk,
         &[
             ("__ENTRY__", entry),
             ("__BESIDE__", beside),
@@ -2729,6 +2917,113 @@ __PICKS__
     if (lane == 0) {
         written[index] = sum;
     }
+}
+"#;
+
+/// The untiled kernel with an element's walk cut between the simdgroups of its
+/// threadgroup, with the two expressions [`element_entry`] decides written as
+/// placeholders.
+const SPLIT: &str = r#"
+/// `packed_matmul` with one element's weight row walked by several simdgroups
+/// rather than by one.
+///
+/// **A threadgroup is one output element here, where a threadgroup of
+/// `packed_matmul` is several independent ones.** That is the whole of the
+/// difference in shape: the simdgroups of this threadgroup all reduce the same
+/// row, so they have something to say to each other and need somewhere to say
+/// it, and `partial` and the barrier below are that.
+///
+/// **What it buys is simdgroups in flight.** An output element is one simdgroup,
+/// so a call of 512 elements is 512 simdgroups over 80 cores whatever else is
+/// true of it — and `whether_a_decode_dispatch_is_short_of_the_machine` puts
+/// that call at 12% of the bus where 131072 elements reach 95%. Cutting the walk
+/// `n` ways is `n` times the simdgroups over the same bytes, each holding `1/n`
+/// of the row and each issuing its own loads: the term the walk waits on is the
+/// loads it has outstanding, which `what_a_decode_steps_packed_matmul_is_bound
+/// _by` measured at a fifth to two fifths a term, and not the bandwidth behind
+/// them.
+///
+/// **The split is the lane stride widened and nothing else.** Simdgroup `cut`
+/// takes the lanes `cut * width` to `(cut + 1) * width` of one walk `splits *
+/// width` lanes wide, so the bytes the whole threadgroup reads are exactly the
+/// bytes one simdgroup read, in the same chunks, under the same scales. It is
+/// the same `weight_dot` — one reading of the walk, as there has only ever been
+/// one.
+///
+/// **And it is the order that moves, which is why this is behind the flag.** The
+/// unsplit walk is one `simd_sum` over 32 lanes each holding every 32nd chunk;
+/// this is `splits` of those over a coarser partition, added afterwards in the
+/// order the cuts lie. Both sum the same exact products — a code is one of
+/// sixteen table values and a group scale is a power of two, so nothing either
+/// forms is rounded — and they associate them differently. There is no array of
+/// bits to hold this to and there cannot be one.
+kernel void __ENTRY__(
+    constant Shape &shape [[buffer(0)]],
+    device const uint *experts [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device const uchar *codes [[buffer(3)]],
+    device const uchar *scales [[buffer(4)]],
+    device float *out [[buffer(5)]],__BESIDE__
+    uint element [[threadgroup_position_in_grid]],
+    uint cut [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint width [[threads_per_simdgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    /// **Read off the dispatch rather than taken as a constant**, which is what
+    /// makes the count a value the host may choose per call: a threadgroup is
+    /// one element's cuts, so the width it was dispatched at *is* the count, and
+    /// the two cannot disagree the way a source constant and a grid can.
+    const uint splits = threads / width;
+    threadgroup float partial[MOST_SPLITS];
+
+    const uint elements = shape.rows * shape.out_dim;
+__PICKS__
+    // **Uniform across the threadgroup, which is what the barrier below needs**:
+    // a threadgroup is one element, so this returns all of the cuts or none of
+    // them. The grid is an exact multiple of the threadgroup — `elements` of
+    // them, one apiece — so nothing reaches it; it is here because the bound is
+    // the kernel's to state and a grid this side sized differently would find
+    // it.
+    if (index >= elements) {
+        return;
+    }
+
+    const uint row = index / shape.out_dim;
+    const uint col = index % shape.out_dim;
+    const uint expert = experts[row];
+    const uint source = (row / shape.per_source) % shape.sources;
+    const uint bytes = shape.in_dim / CODES_PER_BYTE;
+
+    float sum = weight_dot(
+        packed + code_base + (ulong)expert * shape.code_stride + (ulong)col * bytes,
+        scaled + scale_base + (ulong)expert * shape.scale_stride
+            + (ulong)col * (bytes / BYTES_PER_GROUP),
+        x + (ulong)source * shape.in_dim,
+        bytes,
+        cut * width + lane,
+        splits * width
+    );
+
+    sum = simd_sum(sum);
+    if (lane == 0) {
+        partial[cut] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (cut != 0 || lane != 0) {
+        return;
+    }
+
+    // In the order the cuts lie, which is the order the row does. Nothing about
+    // the answer needs it — the cuts are added, and a sum is a sum — but a
+    // reduction whose order is a scheduling accident is one whose answer moves
+    // between two runs of the same build, and a differential instrument cannot
+    // tell that apart from the arithmetic it is there to measure.
+    float whole = 0.0f;
+    for (uint c = 0; c < splits; ++c) {
+        whole += partial[c];
+    }
+    written[index] = whole;
 }
 "#;
 
@@ -3453,6 +3748,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
     use super::testing::{Case, Noise, pack};
@@ -3955,20 +4251,24 @@ kernel void decoded_elements(
     /// **Both numerics answer the same call, and the flag reaches the kernel
     /// that ran it.**
     ///
-    /// The two entries this flag selects between are the tiled ones, so the case
-    /// is taken through both of the shapes that reach them — an untiled
-    /// projection, which no flag touches, and a tiled call over a bank, which is
-    /// where a kernel behind the flag would run.
+    /// The flag selects between the tiled entries and between the untiled ones,
+    /// so the case is taken through both of the shapes that reach them — an
+    /// untiled call, which is a decode step's, and a tiled call over a bank,
+    /// which is a prefill's.
     ///
-    /// **The two arms are bounded differently and that is the finding rather
-    /// than an oversight.** The projection goes through [`Layout::Each`], which
-    /// no flag reaches, so the two paths run the same kernel and the deviation
-    /// there is a zero this asserts rather than tolerates. The tile goes through
-    /// the entry the flag selects, where equality of bits is exactly what cannot
-    /// be asserted: a production kernel accumulates in an order the instruction
-    /// picks. Both are summing the same exact products — nothing either path
-    /// forms is rounded — so the two may only differ by what summation order is
-    /// worth, which is [`MMA_TOLERANCE`].
+    /// **Neither arm can assert bits and the third one can, which is what says
+    /// the flag reaches exactly what it claims to.** Both selected entries
+    /// accumulate in an order this side does not pick — the tiled ones the
+    /// matrix instruction's, the untiled ones a partition of the row between
+    /// simdgroups — and both sum the same exact products as the reference, since
+    /// nothing either path forms is rounded. So the two may differ by what a
+    /// summation order is worth and by nothing else, which is [`MMA_TOLERANCE`].
+    ///
+    /// The third arm is the production build with `wanted` at zero: the same
+    /// source, the same word, every call left uncut. It runs the entry the split
+    /// stands in front of, so it answers the reference's own bits — and it is
+    /// what separates "the walk was cut" from "something else under the flag
+    /// moved the decode path".
     #[test]
     fn a_call_under_either_numerics_answers_what_the_other_answers() {
         let Some(device) = device() else { return };
@@ -3992,14 +4292,21 @@ kernel void decoded_elements(
                 .multiply(&case.x)
                 .expect("the dispatch completes")
         };
-        // An untiled call is the same kernel either way, so the two answer the
-        // same bits — asserted rather than tolerated, which is what would catch
-        // a future predicate that let the decode path drift onto a block.
+        let uncut = PackedMatmul::cutting_at(&device, Numerics::Production, 0).expect("compiles");
         assert_eq!(
-            bit_patterns(&untiled(&production)),
+            bit_patterns(&untiled(&uncut)),
             bit_patterns(&untiled(&reference)),
-            "a projection is the same kernel under either word"
+            "an uncut production call is not the kernel the reference runs"
         );
+
+        let (was, is) = (untiled(&reference), untiled(&production));
+        let cut = deviation(&is, &was);
+        eprintln!("an untiled call: the two numerics deviate {cut:e}");
+        assert!(
+            cut > 0.0,
+            "a cut walk is not summing independently of the walk it cuts"
+        );
+        assert!(cut <= MMA_TOLERANCE, "deviation {cut:e}");
 
         let (was, is) = (
             a_tiled_call_answers(&device, &reference),
@@ -4009,6 +4316,58 @@ kernel void decoded_elements(
         eprintln!("a tile: the two numerics deviate {deviation:e}");
         assert!(deviation > 0.0, "a tile is not the same kernel either way");
         assert!(deviation <= MMA_TOLERANCE, "deviation {deviation:e}");
+    }
+
+    /// **What cutting a walk costs the answer**, which is the question the
+    /// deviation above cannot settle: two orders differing says nothing about
+    /// which of them is further from the sum.
+    ///
+    /// Against an f64 accumulation of the same products, at the reduction the
+    /// checkpoint has and at a short one.
+    ///
+    /// **This is the one entry behind the flag that holds the reference's own
+    /// bound**, and that is the finding rather than the tolerance being generous.
+    /// A cut is a *shorter* chain than the walk it cuts — `n` partials, each a
+    /// lane-strided walk of `1/n` of the row, added at the end — where the block
+    /// carries the whole reduction as one running sum and needs
+    /// [`MMA_TOLERANCE`] for it. So what is asserted here is [`TOLERANCE`]: the
+    /// cut walk is f32 noise at every reduction, not a chain that grows with one.
+    ///
+    /// **Which of the two is nearer is a wash at a short reduction and the cut
+    /// at a long one**, which is what the reported pair is for rather than a
+    /// second assertion. At 1024 codes each cut holds one chunk and the tail
+    /// that adds the partials is as long as the walk that fed it; at 4096 the
+    /// cut is 9.2e-8 against the uncut walk's 1.3e-7.
+    #[test]
+    fn a_cut_walk_is_f32_noise_at_every_reduction() {
+        let Some(device) = device() else { return };
+        let reference = matmul(&device);
+        let production =
+            PackedMatmul::under(&device, Numerics::Production).expect("the production compiles");
+
+        // Both cut: a reduction of 1024 codes is four steps of a walk and so
+        // four cuts, where 256 has one step and `splits_for` clamps it to the
+        // uncut entry — which is the arm
+        // `a_call_cuts_its_walk_by_what_the_machine_is_short_of` holds.
+        for in_dim in [IN_DIM, MMA_CODES_A_STEP * 32] {
+            let case = Case::noisy(in_dim, OUT_DIM, 1);
+            let exact = case.exactly();
+            let through = |matmul: &PackedMatmul| {
+                drift(
+                    &case
+                        .upload(&device, matmul)
+                        .multiply(&case.x)
+                        .expect("the dispatch completes"),
+                    &exact,
+                )
+            };
+            let (cut, whole) = (through(&production), through(&reference));
+            eprintln!("a reduction of {in_dim}: cut {cut:e} against the uncut walk's {whole:e}");
+            assert!(
+                cut <= f64::from(TOLERANCE),
+                "a cut walk drifts {cut:e} where the walk it cuts drifts {whole:e}"
+            );
+        }
     }
 
     /// **A reference run compiles the string it compiled before the flag
@@ -4025,7 +4384,10 @@ kernel void decoded_elements(
             source_blocked(Numerics::Reference, Block::SHIPPED),
             source()
         );
-        for entry in [MMA_TILED_ENTRY, MMA_GROUPED_ENTRY] {
+        // Held against the list the flag itself keeps rather than against a
+        // second copy of it, so that an entry put behind the flag and left out
+        // here is a case that fails rather than a check that shrank.
+        for entry in PackedMatmul::BEHIND_THE_FLAG.iter().copied() {
             assert!(
                 !source().contains(entry),
                 "{entry} is in the reference source"
@@ -4038,6 +4400,104 @@ kernel void decoded_elements(
         // And what production adds is added rather than substituted, so no byte
         // of the reference source moved under it.
         assert!(source_blocked(Numerics::Production, Block::SHIPPED).starts_with(&source()));
+    }
+
+    /// **The bytes a split walk reads are the bytes the walk it cuts reads**,
+    /// which is the one thing about the cut that could be wrong without being
+    /// visibly wrong: a partition that dropped a chunk would answer a little
+    /// low, and one that read a chunk twice a little high, and both are inside
+    /// the tolerance a differential run holds the two orders to.
+    ///
+    /// So it is asserted as a set rather than measured as a deviation. A cut is
+    /// the lane stride widened — simdgroup `cut` takes lanes `cut * width` to
+    /// `(cut + 1) * width` of one walk `splits * width` lanes wide — so the union
+    /// over the cuts has to be the whole row, once each, at every count.
+    #[test]
+    fn the_cuts_of_a_split_walk_read_each_byte_of_the_row_exactly_once() {
+        /// Which bytes of a row of `bytes` the lane at `lane` of a walk `width`
+        /// lanes wide reads, which is `weight_dot`'s two loops as a set: both
+        /// step by the same stride and the first is only the second four chunks
+        /// at a time.
+        fn visits(bytes: usize, lane: usize, width: usize) -> Vec<usize> {
+            let step = width * BYTES_PER_LANE;
+            (lane * BYTES_PER_LANE..bytes)
+                .step_by(step)
+                .flat_map(|at| at..at + BYTES_PER_LANE)
+                .collect()
+        }
+
+        // The checkpoint's own reduction, one that is not a whole number of
+        // held chunks, and one short enough that the clamp is what answers.
+        for in_dim in [IN_DIM, 4096 + 2 * GROUP_SIZE, GROUP_SIZE] {
+            let bytes = in_dim / CODES_PER_BYTE;
+            let width = NARROWEST_SIMD;
+            let whole: Vec<usize> = (0..width)
+                .flat_map(|lane| visits(bytes, lane, width))
+                .collect();
+            assert_eq!(
+                whole.iter().copied().collect::<BTreeSet<_>>().len(),
+                bytes,
+                "the unsplit walk does not read {bytes} bytes once each"
+            );
+
+            for splits in 1..=MOST_SPLITS {
+                let cut: Vec<usize> = (0..splits * width)
+                    .flat_map(|lane| visits(bytes, lane, splits * width))
+                    .collect();
+                let (mut sorted, mut against) = (cut.clone(), whole.clone());
+                sorted.sort_unstable();
+                against.sort_unstable();
+                assert_eq!(
+                    sorted, against,
+                    "{splits} cuts of a {bytes}-byte row read other bytes"
+                );
+            }
+        }
+    }
+
+    /// How far a call cuts its walk, which is what the machine is short of over
+    /// what the call brings.
+    ///
+    /// The rows are a decode step's ten shapes, whose element counts
+    /// `what_each_shape_of_a_decode_steps_packed_calls_costs` records, plus the
+    /// head — which is the one call a step makes that already fills the machine
+    /// and the one this has to leave alone.
+    #[test]
+    fn a_call_cuts_its_walk_by_what_the_machine_is_short_of() {
+        let cuts = |elements| splits_for(elements, IN_DIM, WANTED_ELEMENTS, NARROWEST_SIMD);
+        assert_eq!(cuts(512), MOST_SPLITS, "r_proj is the narrowest call");
+        assert_eq!(cuts(1024), MOST_SPLITS, "k_proj and v_proj");
+        assert_eq!(cuts(4096), 8, "q_proj, o_proj and a shared gate");
+        assert_eq!(cuts(12288), 3, "a routed gate and up");
+        assert_eq!(cuts(24576), 2, "a routed down");
+        assert_eq!(cuts(200058), 1, "the head fills the machine already");
+        assert_eq!(cuts(WANTED_ELEMENTS), 1, "and so does the count it wants");
+
+        // Never more cuts than the row has steps to give them, which is what
+        // keeps a cut from being a simdgroup with no chunk in it.
+        let steps = |in_dim: usize| in_dim / CODES_PER_BYTE / (NARROWEST_SIMD * BYTES_PER_LANE);
+        assert_eq!(steps(GROUP_SIZE * 8), 1);
+        assert_eq!(
+            splits_for(1, GROUP_SIZE * 8, WANTED_ELEMENTS, NARROWEST_SIMD),
+            1
+        );
+        assert_eq!(steps(GROUP_SIZE * 32), 4);
+        assert_eq!(
+            splits_for(1, GROUP_SIZE * 32, WANTED_ELEMENTS, NARROWEST_SIMD),
+            4
+        );
+
+        // And the arm that prices the entry against the one it stands in front
+        // of, which is every call uncut.
+        for elements in [1, 512, 4096, 200058] {
+            assert_eq!(splits_for(elements, IN_DIM, 0, NARROWEST_SIMD), 1);
+        }
+        // A call of nothing is a dispatch that returns, and the division it
+        // would be is the one number here that could be a zero.
+        assert_eq!(
+            splits_for(0, IN_DIM, WANTED_ELEMENTS, NARROWEST_SIMD),
+            MOST_SPLITS
+        );
     }
 
     /// **The production entries against the reference ones over a shape that
@@ -5228,149 +5688,200 @@ kernel void decoded_elements(
     #[test]
     fn a_paired_dispatch_answers_what_the_two_dispatches_it_replaces_answer() {
         let Some(device) = device() else { return };
-        let matmul = matmul(&device);
-        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
-        const EXPERTS: usize = 3;
-        const ROWS: usize = TOKENS * TOP_K;
+        // **Both words, and the equality is exact under each.** The paired
+        // entry is the untiled one emitted a second time on either side of the
+        // flag, so what a pair can get wrong — pointing half the grid at the
+        // wrong bank — is the same mistake whichever walk it is a second
+        // emission of, and a tolerance would hide it under both.
+        //
+        // **What the two dispatches have to be given to be comparable is the
+        // same cut count**, and that is a fact about the fusion rather than a
+        // convenience here: a fused call is twice the output elements of either
+        // half, so `splits_for` reads it as twice as far from being short of the
+        // machine and cuts each element's walk half as far. Two walks cut
+        // differently sum in different orders and cannot be held to bits. So
+        // the lone banks are built asking for half of what the pair asks for,
+        // which is the count the pair's own halves get — `div_ceil(w, 2n)` is
+        // `div_ceil(w / 2, n)` for the even `w` this ships.
+        for numerics in [Numerics::Reference, Numerics::Production] {
+            let matmul =
+                PackedMatmul::under(&device, numerics).expect("the packed matmul compiles");
+            let halved = PackedMatmul::cutting_at(&device, numerics, WANTED_ELEMENTS / 2)
+                .expect("the packed matmul compiles");
+            let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+            const EXPERTS: usize = 3;
+            const ROWS: usize = TOKENS * TOP_K;
 
-        let upload = |case: &Case| {
-            PackedBank::upload(
-                &device,
-                &matmul,
-                EXPERTS,
-                IN_DIM,
-                OUT_DIM,
-                &case.packed(),
-                &case.scales,
-            )
-            .expect("the bank's shapes pair")
-        };
-        // **What the second bank costs the pipeline, which is nothing.** A
-        // threadgroup of either entry is that many independent simdgroups with
-        // no threadgroup memory between them, and what the paired one adds is
-        // four bindings and two selections above the walk — so the widest
-        // threadgroup the device gives it is the widest it gives the entry it is
-        // a second emission of. A pair that had cost occupancy would say so
-        // here, and would have to be weighed against the launch it saves rather
-        // than simply taken.
-        assert_eq!(
-            (
-                matmul.paired.max_threads_per_group(),
-                matmul.paired.threadgroup_memory()
-            ),
-            (
-                matmul.kernel.max_threads_per_group(),
-                matmul.kernel.threadgroup_memory()
-            ),
-            "a paired dispatch is not the threadgroup an untiled one is"
-        );
+            fn uploaded<'a>(
+                device: &'a Device,
+                matmul: &'a PackedMatmul,
+                experts: usize,
+                case: &Case,
+            ) -> PackedBank<'a> {
+                PackedBank::upload(
+                    device,
+                    matmul,
+                    experts,
+                    IN_DIM,
+                    OUT_DIM,
+                    &case.packed(),
+                    &case.scales,
+                )
+                .expect("the bank's shapes pair")
+            }
+            let upload = |case: &Case| uploaded(&device, &matmul, EXPERTS, case);
+            // **What the second bank costs the pipeline, which is nothing.** A
+            // threadgroup of either entry is that many independent simdgroups with
+            // no threadgroup memory between them, and what the paired one adds is
+            // four bindings and two selections above the walk — so the widest
+            // threadgroup the device gives it is the widest it gives the entry it is
+            // a second emission of. A pair that had cost occupancy would say so
+            // here, and would have to be weighed against the launch it saves rather
+            // than simply taken.
+            assert_eq!(
+                (
+                    matmul.paired.max_threads_per_group(),
+                    matmul.paired.threadgroup_memory()
+                ),
+                (
+                    matmul.kernel.max_threads_per_group(),
+                    matmul.kernel.threadgroup_memory()
+                ),
+                "a paired dispatch is not the threadgroup an untiled one is"
+            );
 
-        let gate_case = Case::seeded(0x9a1e_0001, IN_DIM, EXPERTS * OUT_DIM, ROWS);
-        let up_case = Case::seeded(0x9a1e_0002, IN_DIM, EXPERTS * OUT_DIM, ROWS);
-        let pair =
-            PackedPair::new(upload(&gate_case), upload(&up_case)).expect("the pair's shapes pair");
-        let (gate, up) = (upload(&gate_case), upload(&up_case));
+            let gate_case = Case::seeded(0x9a1e_0001, IN_DIM, EXPERTS * OUT_DIM, ROWS);
+            let up_case = Case::seeded(0x9a1e_0002, IN_DIM, EXPERTS * OUT_DIM, ROWS);
+            let pair = PackedPair::new(upload(&gate_case), upload(&up_case))
+                .expect("the pair's shapes pair");
+            let (gate, up) = (
+                uploaded(&device, &halved, EXPERTS, &gate_case),
+                uploaded(&device, &halved, EXPERTS, &up_case),
+            );
 
-        let alone = |bank: &PackedBank<'_>, chosen: &[u32], x: &[f32], per_source: usize| {
-            let mut selection = device.buffer(chosen).expect("the selection uploads");
-            let mut x = device.buffer(x).expect("the rows upload");
-            let mut batch = device.batch().expect("a command buffer opens");
-            let pending = bank
-                .encode_picked(&mut batch, &mut selection, &mut x, per_source)
-                .expect("the dispatch encodes");
-            batch.wait().expect("the dispatch completes");
-            pending.take()
-        };
-        let together = |chosen: &[u32], x: &[f32], per_source: usize| {
-            let mut selection = device.buffer(chosen).expect("the selection uploads");
-            let mut x = device.buffer(x).expect("the rows upload");
-            let mut batch = device.batch().expect("a command buffer opens");
-            let pending = pair
-                .encode_picked(&mut batch, &mut selection, &mut x, per_source)
-                .expect("the dispatch encodes");
-            batch.wait().expect("the dispatch completes");
-            pending.map(Pending::take)
-        };
+            let alone = |bank: &PackedBank<'_>, chosen: &[u32], x: &[f32], per_source: usize| {
+                let mut selection = device.buffer(chosen).expect("the selection uploads");
+                let mut x = device.buffer(x).expect("the rows upload");
+                let mut batch = device.batch().expect("a command buffer opens");
+                let pending = bank
+                    .encode_picked(&mut batch, &mut selection, &mut x, per_source)
+                    .expect("the dispatch encodes");
+                batch.wait().expect("the dispatch completes");
+                pending.take()
+            };
+            let together = |chosen: &[u32], x: &[f32], per_source: usize| {
+                let mut selection = device.buffer(chosen).expect("the selection uploads");
+                let mut x = device.buffer(x).expect("the rows upload");
+                let mut batch = device.batch().expect("a command buffer opens");
+                let pending = pair
+                    .encode_picked(&mut batch, &mut selection, &mut x, per_source)
+                    .expect("the dispatch encodes");
+                batch.wait().expect("the dispatch completes");
+                pending.map(Pending::take)
+            };
 
-        // The routed bank's layout: a token's row read once per slot, the slots
-        // naming different experts.
-        let chosen = routing(EXPERTS);
-        assert!(
-            !tiles(&chosen, ROWS_A_TILE),
-            "a routing a tile could reach is not the layout a decode step has"
-        );
-        let tokens = &gate_case.x[..TOKENS * IN_DIM];
-        let [fused_gate, fused_up] = together(&chosen, tokens, TOP_K);
-        let want_gate = alone(&gate, &chosen, tokens, TOP_K);
-        let want_up = alone(&up, &chosen, tokens, TOP_K);
-        assert_ne!(
-            want_gate, want_up,
-            "two banks that agreed would prove nothing"
-        );
-        assert_eq!(fused_gate, want_gate, "the pair's first half");
-        assert_eq!(fused_up, want_up, "the pair's second half");
-        assert_eq!(fused_gate.len(), ROWS * OUT_DIM);
+            // The routed bank's layout: a token's row read once per slot, the slots
+            // naming different experts.
+            let chosen = routing(EXPERTS);
+            assert!(
+                !tiles(&chosen, ROWS_A_TILE),
+                "a routing a tile could reach is not the layout a decode step has"
+            );
+            let tokens = &gate_case.x[..TOKENS * IN_DIM];
+            let [fused_gate, fused_up] = together(&chosen, tokens, TOP_K);
+            let want_gate = alone(&gate, &chosen, tokens, TOP_K);
+            let want_up = alone(&up, &chosen, tokens, TOP_K);
+            assert_ne!(
+                want_gate, want_up,
+                "two banks that agreed would prove nothing"
+            );
+            assert_eq!(fused_gate, want_gate, "the pair's first half");
+            assert_eq!(fused_up, want_up, "the pair's second half");
+            assert_eq!(fused_gate.len(), ROWS * OUT_DIM);
 
-        // The shared bank's layout: every row of the input read once per expert
-        // in turn, which is what the modulo is for. Short enough that no run
-        // reaches a tile, which is what keeps this the arm that fuses — a
-        // decode step's shared bank is one token through two experts, so its
-        // runs are one row.
-        const REPEATED_TOKENS: usize = ROWS_A_TILE - 1;
-        let repeated: Vec<u32> = (0..EXPERTS * REPEATED_TOKENS)
-            .map(|row| (row / REPEATED_TOKENS) as u32)
-            .collect();
-        assert!(
-            !tiles(&repeated, ROWS_A_TILE),
-            "a repeat a tile could reach is not the arm that fuses"
-        );
-        let repeated_x = &gate_case.x[..REPEATED_TOKENS * IN_DIM];
-        let repeat_alone = |bank: &PackedBank<'_>| {
+            // The shared bank's layout: every row of the input read once per expert
+            // in turn, which is what the modulo is for. Short enough that no run
+            // reaches a tile, which is what keeps this the arm that fuses — a
+            // decode step's shared bank is one token through two experts, so its
+            // runs are one row.
+            const REPEATED_TOKENS: usize = ROWS_A_TILE - 1;
+            let repeated: Vec<u32> = (0..EXPERTS * REPEATED_TOKENS)
+                .map(|row| (row / REPEATED_TOKENS) as u32)
+                .collect();
+            assert!(
+                !tiles(&repeated, ROWS_A_TILE),
+                "a repeat a tile could reach is not the arm that fuses"
+            );
+            let repeated_x = &gate_case.x[..REPEATED_TOKENS * IN_DIM];
+            let repeat_alone = |bank: &PackedBank<'_>| {
+                let mut x = device.buffer(repeated_x).expect("the rows upload");
+                let mut batch = device.batch().expect("a command buffer opens");
+                let pending = bank
+                    .encode_repeating(&mut batch, &repeated, &mut x)
+                    .expect("the dispatch encodes");
+                batch.wait().expect("the dispatch completes");
+                pending.take()
+            };
             let mut x = device.buffer(repeated_x).expect("the rows upload");
             let mut batch = device.batch().expect("a command buffer opens");
-            let pending = bank
+            let fused = pair
                 .encode_repeating(&mut batch, &repeated, &mut x)
                 .expect("the dispatch encodes");
             batch.wait().expect("the dispatch completes");
-            pending.take()
-        };
-        let mut x = device.buffer(repeated_x).expect("the rows upload");
-        let mut batch = device.batch().expect("a command buffer opens");
-        let fused = pair
-            .encode_repeating(&mut batch, &repeated, &mut x)
-            .expect("the dispatch encodes");
-        batch.wait().expect("the dispatch completes");
-        let [fused_gate, fused_up] = fused.map(Pending::take);
-        assert_eq!(fused_gate, repeat_alone(&gate), "the repeated gate");
-        assert_eq!(fused_up, repeat_alone(&up), "the repeated up");
-        assert_eq!(fused_gate.len(), EXPERTS * REPEATED_TOKENS * OUT_DIM);
+            let [fused_gate, fused_up] = fused.map(Pending::take);
+            assert_eq!(fused_gate, repeat_alone(&gate), "the repeated gate");
+            assert_eq!(fused_up, repeat_alone(&up), "the repeated up");
+            assert_eq!(fused_gate.len(), EXPERTS * REPEATED_TOKENS * OUT_DIM);
 
-        // And the layout the pair does not fuse, which still has to answer the
-        // same two tensors.
-        let mut selection = device.buffer(&chosen).expect("the selection uploads");
-        let mut x = device.buffer(tokens).expect("the rows upload");
-        let mut batch = device.batch().expect("a command buffer opens");
-        let mut sorted = grouping
-            .encode(&mut batch, &mut selection, EXPERTS)
-            .expect("the grouping encodes");
-        let grouped = pair
-            .encode_grouped(&mut batch, &mut sorted, &mut x, TOP_K)
-            .expect("the dispatches encode");
-        batch.wait().expect("the dispatches complete");
-        let [grouped_gate, grouped_up] = grouped.map(Pending::take);
-        let order = grouping
-            .group(&device, &chosen, EXPERTS)
-            .expect("the dispatch completes")
-            .0;
-        let row = |rows: &[f32], i: usize| rows[i * OUT_DIM..][..OUT_DIM].to_vec();
-        for (at, from) in order.iter().enumerate() {
-            let from = *from as usize;
-            assert_eq!(
-                row(&grouped_gate, at),
-                row(&want_gate, from),
-                "gate row {at}"
+            // And the layout the pair does not fuse, which still has to answer the
+            // same two tensors.
+            //
+            // **Held against an uncut walk rather than against the two above**,
+            // because a grouped call is a tile and no tile is cut: the flag
+            // selects a block there, and a routing this short does not reach one.
+            // So what the rows are compared to is the entry a grouped call would
+            // have been compared to before any of this — which is the same claim
+            // `a_tiled_dispatch_answers_row_for_row_what_the_untiled_one_answers`
+            // makes, at the layout that scatters.
+            let uncut =
+                PackedMatmul::cutting_at(&device, numerics, 0).expect("the packed matmul compiles");
+            let want_gate = alone(
+                &uploaded(&device, &uncut, EXPERTS, &gate_case),
+                &chosen,
+                tokens,
+                TOP_K,
             );
-            assert_eq!(row(&grouped_up, at), row(&want_up, from), "up row {at}");
+            let want_up = alone(
+                &uploaded(&device, &uncut, EXPERTS, &up_case),
+                &chosen,
+                tokens,
+                TOP_K,
+            );
+            let mut selection = device.buffer(&chosen).expect("the selection uploads");
+            let mut x = device.buffer(tokens).expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let mut sorted = grouping
+                .encode(&mut batch, &mut selection, EXPERTS)
+                .expect("the grouping encodes");
+            let grouped = pair
+                .encode_grouped(&mut batch, &mut sorted, &mut x, TOP_K)
+                .expect("the dispatches encode");
+            batch.wait().expect("the dispatches complete");
+            let [grouped_gate, grouped_up] = grouped.map(Pending::take);
+            let order = grouping
+                .group(&device, &chosen, EXPERTS)
+                .expect("the dispatch completes")
+                .0;
+            let row = |rows: &[f32], i: usize| rows[i * OUT_DIM..][..OUT_DIM].to_vec();
+            for (at, from) in order.iter().enumerate() {
+                let from = *from as usize;
+                assert_eq!(
+                    row(&grouped_gate, at),
+                    row(&want_gate, from),
+                    "gate row {at}"
+                );
+                assert_eq!(row(&grouped_up, at), row(&want_up, from), "up row {at}");
+            }
         }
     }
 
@@ -6635,6 +7146,145 @@ kernel void decoded_elements(
                 })
                 .collect();
             eprintln!("  {:<20}{other}", "  the other way");
+        }
+    }
+
+    /// The element counts a call is cut towards, one of which is the shipped
+    /// one and one of which is no cut at all.
+    const CUTS_SWEPT: [usize; 6] = [0, 8192, 16384, 32768, 65536, 131072];
+
+    /// **What a packed multiply costs at each element count a call is cut to**,
+    /// and the sweep [`WANTED_ELEMENTS`] was chosen from.
+    ///
+    /// The zero arm is the entry the cut stands in front of — every call left
+    /// uncut, out of the same build under the same word — so what the table
+    /// prices is the cut alone and not the flag.
+    ///
+    /// **The shapes are a decode step's, which is the whole of where this can
+    /// pay.** Every one of them is on the steep part of
+    /// [`whether_a_decode_dispatch_is_short_of_the_machine`]'s curve, and the
+    /// head is the one call a step makes that is not — so it is here as the row
+    /// that should not move, and a sweep that improved it would be measuring
+    /// something other than what it claims to.
+    ///
+    /// **No arm answers the shipped kernel's bits and none can.** A cut is a
+    /// different partition of the row, so what is asserted instead is
+    /// [`MMA_TOLERANCE`] against the uncut arm — the same bound the block is
+    /// held to, for the same reason, and an arm outside it is a mistake rather
+    /// than an order.
+    ///
+    /// Warm and swept both ways, for the reason
+    /// [`whether_a_decode_dispatch_is_short_of_the_machine`] gives.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_packed_multiply_costs_at_each_element_count_a_call_is_cut_to() {
+        let Some(device) = device() else { return };
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        assert!(CUTS_SWEPT.contains(&WANTED_ELEMENTS), "{WANTED_ELEMENTS}");
+        assert_eq!(
+            CUTS_SWEPT[0], 0,
+            "the arm that cuts nothing is the baseline"
+        );
+
+        // `(what, rows, in_dim, out_dim, experts)`, and the elements each is.
+        let shapes: Vec<Blocked> = [
+            ("r_proj", 1, 4096, 512, 1),
+            ("k_proj, v_proj", 1, 4096, 1024, 1),
+            ("q_proj, o_proj", 1, 4096, 4096, 1),
+            ("routed gate, up", 6, 4096, 2048, 16),
+            ("lm_head", 1, 4096, 200058, 1),
+        ]
+        .into_iter()
+        .map(|(what, rows, in_dim, out_dim, experts)| {
+            Blocked::of(what, rows, in_dim, out_dim, experts, false)
+        })
+        .collect();
+        let arms: Vec<PackedMatmul> = CUTS_SWEPT
+            .iter()
+            .map(|&wanted| {
+                PackedMatmul::cutting_at(&device, Numerics::Production, wanted)
+                    .unwrap_or_else(|err| panic!("a cut towards {wanted} compiles: {err}"))
+            })
+            .collect();
+
+        let want = an_untiled_call_answers(&device, &arms[0]);
+        for (wanted, arm) in CUTS_SWEPT.into_iter().zip(&arms) {
+            let apart = deviation(&an_untiled_call_answers(&device, arm), &want);
+            assert!(
+                apart <= MMA_TOLERANCE,
+                "a cut towards {wanted} deviates {apart:e} from the uncut walk"
+            );
+        }
+
+        let at: Vec<usize> = (0..CUTS_SWEPT.len()).collect();
+        let cost = |arm: usize| -> Vec<Duration> {
+            // The banks are uploaded before the warm-up rather than inside it,
+            // for the reason the chunk sweep gives: an upload is a hundred
+            // megabytes copied with the device idle, and a warm-up loop that
+            // pays one an iteration warms the host.
+            let banks: Vec<PackedBank<'_>> = shapes
+                .iter()
+                .map(|shape| shape.upload(&device, &arms[arm]))
+                .collect();
+            let widest = shapes.len() - 1;
+            crate::testing::warmed(|| {
+                shapes[widest].costs_on(&device, &banks[widest], &grouping);
+            });
+            shapes
+                .iter()
+                .zip(&banks)
+                .map(|(shape, bank)| shape.costs_on(&device, bank, &grouping))
+                .collect()
+        };
+        let (up, down) = crate::testing::both_ways(&at, cost);
+
+        eprintln!(
+            "  {:<20}{:>10}{}",
+            "shape",
+            "cuts",
+            CUTS_SWEPT
+                .iter()
+                .map(|wanted| format!(
+                    "{:>18}",
+                    match wanted {
+                        0 => "uncut".to_string(),
+                        wanted => format!("towards {wanted}"),
+                    }
+                ))
+                .collect::<String>()
+        );
+        for (which, shape) in shapes.iter().enumerate() {
+            let moved = packed_bytes(shape.rows * shape.out_dim * shape.in_dim);
+            let taken = |arm: usize| better(&up[arm], &down[arm])[which];
+            let uncut = taken(0).as_secs_f64();
+            let cells: String = (0..CUTS_SWEPT.len())
+                .map(|arm| {
+                    format!(
+                        "{:>10}{:>8}",
+                        format!("{:.1}\u{b5}s", 1e6 * taken(arm).as_secs_f64()),
+                        format!("{:.0}%", 1e2 * taken(arm).as_secs_f64() / uncut),
+                    )
+                })
+                .collect();
+            eprintln!(
+                "  {:<20}{:>10}{cells}",
+                shape.what,
+                splits_for(
+                    shape.rows * shape.out_dim,
+                    shape.in_dim,
+                    WANTED_ELEMENTS,
+                    NARROWEST_SIMD
+                ),
+            );
+            let rate: String = (0..CUTS_SWEPT.len())
+                .map(|arm| {
+                    format!(
+                        "{:>18}",
+                        format!("{:.0} GB/s", moved / taken(arm).as_secs_f64() / 1e9)
+                    )
+                })
+                .collect();
+            eprintln!("  {:<30}{rate}", "  achieved");
         }
     }
 
