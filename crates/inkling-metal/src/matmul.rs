@@ -122,7 +122,12 @@ const MMA_GROUPED_ENTRY: &str = "mma_matmul_grouped";
 /// So the flag is what lets it be written, and it is the first entry behind the
 /// flag a decode step reaches: both blocked entries refuse a call under 64 rows,
 /// and a decode step's widest is nine.
+///
+/// **Nothing dispatches either and they are compiled only where a sweep asks**,
+/// which is what this milestone concluded — see [`source_cut`].
+#[cfg(test)]
 const SPLIT_ENTRY: &str = "split_matmul";
+#[cfg(test)]
 const SPLIT_PAIRED_ENTRY: &str = "split_matmul_pair";
 
 /// Rows one simdgroup of [`TILED_ENTRY`] multiplies against one weight row.
@@ -508,43 +513,12 @@ const THREADS_AN_ELEMENTS_GROUP: usize = 64;
 /// threadgroup array their partials land in.
 ///
 /// **A bound and not the number.** How many a call actually takes is
-/// [`splits_for`], which reads the call's own width; this is what the kernel has
-/// to declare an array for before it knows. Eight floats is 32 bytes of a
-/// threadgroup's 32 KiB, so declaring the bound rather than the number costs
-/// nothing that a residency sweep could measure — which is what makes the split
-/// count free to be a runtime value.
+/// [`PackedMatmul::cut_at`]'s, read off the threadgroup the dispatch was given;
+/// this is what the kernel has to declare an array for before it knows. Eight
+/// floats is 32 bytes of a threadgroup's 32 KiB — which is what makes the count
+/// free to be a runtime value, and, as it turned out, not what the array costs.
+#[cfg(test)]
 const MOST_SPLITS: usize = 8;
-
-/// Output elements a call aims to give the machine, which is what decides how
-/// many simdgroups it cuts an element's walk between.
-///
-/// **An output element is one simdgroup, and a decode step never gives the
-/// kernel elements enough.** `whether_a_decode_dispatch_is_short_of_the_machine`
-/// swept the same one-row call at nine widths and the rate follows the count:
-///
-/// ```text
-/// elements   achieved   of bus
-///      512    85 GB/s      12%
-///     1024   168 GB/s      23%
-///     4096   397 GB/s      55%
-///    16384   588 GB/s      81%
-///    65536   674 GB/s      93%
-///   131072   687 GB/s      95%
-/// ```
-///
-/// A decode step's widest bank is 24576 elements and its narrowest projection is
-/// 512, so every shape it has is on the steep part of that curve and the head is
-/// the only one off it. **The kernel reaches 95% of the bus and a decode step
-/// never gives it a call wide enough to** — which is the sentence this constant
-/// exists to act on.
-///
-/// Cutting the walk is what buys the elements the shapes do not have: `n`
-/// simdgroups on one element are `n` times the simdgroups in flight, each
-/// walking `1/n` of the row, and the bytes and the arithmetic are the same
-/// either way. **Swept rather than reasoned about** — see
-/// `what_a_packed_multiply_costs_at_each_element_count_a_call_is_cut_to` and the
-/// paired figures the README quotes beside it.
-const WANTED_ELEMENTS: usize = 32768;
 
 /// Floats of threadgroup memory a tile declares and never reads for anything,
 /// which is what puts the two tiled entries on the fast side of their occupancy
@@ -728,8 +702,9 @@ pub struct PackedMatmul {
     /// is what makes "nothing changes for a caller who does not ask" a fact
     /// about the pipeline cache rather than about a branch nobody takes.
     mma: Option<Mma>,
-    /// The two that stand in front of `kernel` and `paired` on the same terms,
-    /// which is the decode path — see [`SPLIT_ENTRY`].
+    /// The two that would have stood in front of `kernel` and `paired` on the
+    /// same terms, which nothing dispatches — see [`SPLIT_ENTRY`].
+    #[cfg(test)]
     split: Option<Split>,
     /// Which arithmetic the innermost accumulation is allowed to use, which is
     /// [`Numerics::Reference`] unless a command line asked otherwise.
@@ -748,13 +723,11 @@ pub struct PackedMatmul {
     /// no sweep can turn, and a value the entry carries is one arm rather than a
     /// milestone.
     threads_an_elements_group: usize,
-    /// The output elements a call aims to give the machine, which is
-    /// [`WANTED_ELEMENTS`] for every caller but the sweep that chose it.
-    ///
-    /// **Carried for the reason the width above is**, and it is the one number
-    /// the split has: how far a walk is cut is this over the call's own element
-    /// count, so a sweep of the split turns this and nothing else.
-    wanted_elements: usize,
+    /// The cuts every untiled call takes whatever its element count, which only
+    /// the sweep that separates the entry from the cut sets — see
+    /// [`PackedMatmul::cut_at`].
+    #[cfg(test)]
+    cuts: Option<usize>,
 }
 
 /// The two untiled entries behind [`Numerics::Production`], which are
@@ -765,6 +738,7 @@ pub struct PackedMatmul {
 /// projection is one bank and a SwiGLU's gate and up are the pair D2 fused, and
 /// the second is 55% of what a step reads. Cutting the walk on one of them would
 /// leave the other where it was.
+#[cfg(test)]
 #[derive(Debug)]
 struct Split {
     kernel: Kernel,
@@ -939,7 +913,11 @@ impl PackedMatmul {
         // **After the tiled two and before the untiled two**, which is where the
         // entries they stand in front of are created. What the order above
         // protects is a prefill, and these run no prefill dispatch at all.
-        let split = match numerics.is_production() {
+        // Only where the source carries them, which is the sweep's source and
+        // no other: nothing dispatches a cut walk, so a run that is not pricing
+        // one has neither entry in its pipeline cache.
+        #[cfg(test)]
+        let split = match source.contains(SPLIT_ENTRY) {
             false => None,
             true => Some(Split {
                 kernel: device.compile(source, SPLIT_ENTRY)?,
@@ -952,33 +930,14 @@ impl PackedMatmul {
             tiled,
             grouped,
             mma,
+            #[cfg(test)]
             split,
             numerics,
             rows_a_tile,
             cols_a_tile,
             threads_an_elements_group: THREADS_AN_ELEMENTS_GROUP,
-            wanted_elements: WANTED_ELEMENTS,
-        })
-    }
-
-    /// The same, cutting a walk at an element count of the caller's own — which
-    /// is what makes [`WANTED_ELEMENTS`] swept rather than asserted.
-    ///
-    /// **Nothing about the kernel moves, which is why this is a field and not a
-    /// source string.** How far a walk is cut is read off the threadgroup the
-    /// dispatch was given — see [`SPLIT`] — so the count reaches the grid and the
-    /// kernel takes it from there, and a sweep cannot write one and dispatch
-    /// another. A `wanted` of zero is every call unsplit, which is the arm that
-    /// prices the entry against the one it stands in front of.
-    #[cfg(test)]
-    pub(crate) fn cutting_at(
-        device: &Device,
-        numerics: Numerics,
-        wanted: usize,
-    ) -> Result<Self, MetalError> {
-        Ok(Self {
-            wanted_elements: wanted,
-            ..Self::under(device, numerics)?
+            #[cfg(test)]
+            cuts: None,
         })
     }
 
@@ -995,6 +954,39 @@ impl PackedMatmul {
         Ok(Self {
             threads_an_elements_group: threads,
             ..Self::new(device)?
+        })
+    }
+
+    /// The split entries, cutting every untiled call exactly `splits` ways
+    /// whatever its element count — **including one**.
+    ///
+    /// **What this separates is the entry from the cut**, which is the whole of
+    /// what the sweep found. At one cut the split entry is the plain one's own
+    /// walk — `the_cuts_of_a_split_walk_read_each_byte_of_the_row_exactly_once`
+    /// holds the partition and the answer is the same bits — so what a cut of
+    /// one costs over the plain entry is the threadgroup array, the barrier and
+    /// the combine, with no partition at all under them. It is 21 to 42%, and
+    /// the arm with the barrier taken out is the same.
+    #[cfg(test)]
+    pub(crate) fn cut_at(device: &Device, splits: usize) -> Result<Self, MetalError> {
+        Self::cut_from_source(device, &source_cut(Block::SHIPPED), splits)
+    }
+
+    /// The same out of a source string of the caller's own, which is how an arm
+    /// prices one term of the cut against the rest of it.
+    #[cfg(test)]
+    pub(crate) fn cut_from_source(
+        device: &Device,
+        source: &str,
+        splits: usize,
+    ) -> Result<Self, MetalError> {
+        assert!(
+            (1..=MOST_SPLITS).contains(&splits),
+            "{splits} cuts is outside the array their partials land in"
+        );
+        Ok(Self {
+            cuts: Some(splits),
+            ..Self::blocked_from_source(device, source, Block::SHIPPED)?
         })
     }
 
@@ -1023,12 +1015,7 @@ impl PackedMatmul {
     /// than holding its prompts against a number. See
     /// [`Encoded::symbol`](crate::trace::Encoded::symbol), which is what lets a
     /// trace name the entry rather than the row it is charged to.
-    pub const BEHIND_THE_FLAG: &'static [&'static str] = &[
-        MMA_TILED_ENTRY,
-        MMA_GROUPED_ENTRY,
-        SPLIT_ENTRY,
-        SPLIT_PAIRED_ENTRY,
-    ];
+    pub const BEHIND_THE_FLAG: &'static [&'static str] = &[MMA_TILED_ENTRY, MMA_GROUPED_ENTRY];
 
     /// Which arithmetic this one accumulates with.
     ///
@@ -1098,8 +1085,7 @@ impl PackedMatmul {
         self.each(2 * rows * out_dim, in_dim, true)
     }
 
-    /// An untiled call's entry and grid, cut where the flag asked and the call is
-    /// short of the machine.
+    /// An untiled call's entry and grid.
     ///
     /// **One reading for the bank and for the pair**, because the question is the
     /// same question about the same call: a pair is the untiled entry over twice
@@ -1114,21 +1100,21 @@ impl PackedMatmul {
             true => &self.paired,
         };
         let uncut = |kernel: &_| simdgroups(kernel, elements, self.threads_an_elements_group);
-        let Some(split) = self.split.as_ref() else {
-            return (whole, uncut(whole));
-        };
-        let cut = match paired {
-            false => &split.kernel,
-            true => &split.paired,
-        };
-        // Off the entry that will run rather than off this module, for the
-        // reason the block's shape is: the grid is sized from the width, and a
-        // width this side assumed would leave the kernel dividing by another.
-        let width = cut.simd_width();
-        match splits_for(elements, in_dim, self.wanted_elements, width) {
-            1 => (whole, uncut(whole)),
-            splits => (cut, Grid::new(elements * splits * width, splits * width)),
+        let _ = in_dim;
+        #[cfg(test)]
+        if let (Some(split), Some(splits)) = (self.split.as_ref(), self.cuts) {
+            let cut = match paired {
+                false => &split.kernel,
+                true => &split.paired,
+            };
+            // Off the entry that will run rather than off this module, for the
+            // reason the block's shape is: the grid is sized from the width, and
+            // a width this side assumed would leave the kernel dividing by
+            // another.
+            let width = cut.simd_width();
+            return (cut, Grid::new(elements * splits * width, splits * width));
         }
+        (whole, uncut(whole))
     }
 
     /// The production entries, where this call's shape is one they should run.
@@ -1356,34 +1342,6 @@ enum Layout<'a> {
 /// this would be a second place for the simdgroup width to be left out.
 fn simdgroups(kernel: &Kernel, elements: usize, threads: usize) -> Grid {
     Grid::new(elements * kernel.simd_width(), threads)
-}
-
-/// How many simdgroups a call of `elements` output elements over a reduction of
-/// `in_dim` codes cuts each element's walk between.
-///
-/// **One where the call already fills the machine**, which is the discipline
-/// `attention::splits_for` is under and for the same reason: an output element
-/// is one simdgroup, so a call with elements enough has nothing to win from more
-/// of them and would pay a threadgroup array, a barrier and a fold for it. The
-/// head is that call — 200058 elements at 96% of the bus — and it is the only
-/// dispatch a decode step makes that is.
-///
-/// **And never more cuts than the row has steps to give them.** A lane covers
-/// [`BYTES_PER_LANE`] bytes and a cut covers `width` lanes of that, so a row of
-/// `in_dim / 2` bytes has that many over `width * BYTES_PER_LANE` of them. A cut
-/// past the end is a simdgroup whose walk finds no chunk: correct, since it sums
-/// nothing and adds zero, and a threadgroup's worth of launch for it. The
-/// checkpoint's narrowest reduction is 4096 codes, which is sixteen steps, so
-/// [`MOST_SPLITS`] is what binds in practice and this is what keeps a narrower
-/// one safe.
-///
-/// **A `wanted` of zero cuts nothing**, which is the arm a sweep prices the
-/// entry against the entry it stands in front of with.
-fn splits_for(elements: usize, in_dim: usize, wanted: usize, width: usize) -> usize {
-    let steps = (in_dim / CODES_PER_BYTE) / (width * BYTES_PER_LANE);
-    wanted
-        .div_ceil(elements.max(1))
-        .clamp(1, MOST_SPLITS.min(steps.max(1)))
 }
 
 /// How a call over an expert list this side holds is cut up, which is the tile
@@ -2619,12 +2577,27 @@ pub(crate) fn source_blocked(numerics: Numerics, block: Block) -> String {
         written.push_str(&block.declares());
         written.push_str(&mma_entry(MMA_TILED_ENTRY, false));
         written.push_str(&mma_entry(MMA_GROUPED_ENTRY, true));
-        // The bound on the partials array rather than the count that fills it,
-        // which is what lets `splits_for` answer per call — see [`MOST_SPLITS`].
-        written.push_str(&format!("\nconstant uint MOST_SPLITS = {MOST_SPLITS};\n"));
-        written.push_str(&element_entry(SPLIT, SPLIT_ENTRY, false));
-        written.push_str(&element_entry(SPLIT, SPLIT_PAIRED_ENTRY, true));
     }
+    written
+}
+
+/// [`source_blocked`] with the two split entries after it, which is the source
+/// the sweep that priced them compiles and the only one that carries them.
+///
+/// **They are not in the source anything dispatches**, which is what this
+/// milestone concluded rather than what it set out to build:
+/// `what_a_packed_multiply_costs_at_each_count_its_walk_is_cut_into` reads a
+/// cut of *one* — the plain entry's own walk, over the same bytes, answering the
+/// same bits — at 121 to 142% of the entry it stands in front of, and the arm
+/// with the barrier taken out reads the same. What the untiled entry has that
+/// this cannot have is that a threadgroup of it shares nothing at all, and there
+/// is nowhere to put a partial that does not end that.
+#[cfg(test)]
+pub(crate) fn source_cut(block: Block) -> String {
+    let mut written = source_blocked(Numerics::Production, block);
+    written.push_str(&format!("\nconstant uint MOST_SPLITS = {MOST_SPLITS};\n"));
+    written.push_str(&element_entry(SPLIT, SPLIT_ENTRY, false));
+    written.push_str(&element_entry(SPLIT, SPLIT_PAIRED_ENTRY, true));
     written
 }
 
@@ -2923,6 +2896,7 @@ __PICKS__
 /// The untiled kernel with an element's walk cut between the simdgroups of its
 /// threadgroup, with the two expressions [`element_entry`] decides written as
 /// placeholders.
+#[cfg(test)]
 const SPLIT: &str = r#"
 /// `packed_matmul` with one element's weight row walked by several simdgroups
 /// rather than by one.
@@ -4251,24 +4225,20 @@ kernel void decoded_elements(
     /// **Both numerics answer the same call, and the flag reaches the kernel
     /// that ran it.**
     ///
-    /// The flag selects between the tiled entries and between the untiled ones,
-    /// so the case is taken through both of the shapes that reach them — an
-    /// untiled call, which is a decode step's, and a tiled call over a bank,
-    /// which is a prefill's.
+    /// The two entries this flag selects between are the tiled ones, so the case
+    /// is taken through both of the shapes that reach them — an untiled
+    /// projection, which no flag touches, and a tiled call over a bank, which is
+    /// where a kernel behind the flag would run.
     ///
-    /// **Neither arm can assert bits and the third one can, which is what says
-    /// the flag reaches exactly what it claims to.** Both selected entries
-    /// accumulate in an order this side does not pick — the tiled ones the
-    /// matrix instruction's, the untiled ones a partition of the row between
-    /// simdgroups — and both sum the same exact products as the reference, since
-    /// nothing either path forms is rounded. So the two may differ by what a
-    /// summation order is worth and by nothing else, which is [`MMA_TOLERANCE`].
-    ///
-    /// The third arm is the production build with `wanted` at zero: the same
-    /// source, the same word, every call left uncut. It runs the entry the split
-    /// stands in front of, so it answers the reference's own bits — and it is
-    /// what separates "the walk was cut" from "something else under the flag
-    /// moved the decode path".
+    /// **The two arms are bounded differently and that is the finding rather
+    /// than an oversight.** The projection goes through [`Layout::Each`], which
+    /// no flag reaches, so the two paths run the same kernel and the deviation
+    /// there is a zero this asserts rather than tolerates. The tile goes through
+    /// the entry the flag selects, where equality of bits is exactly what cannot
+    /// be asserted: a production kernel accumulates in an order the instruction
+    /// picks. Both are summing the same exact products — nothing either path
+    /// forms is rounded — so the two may only differ by what summation order is
+    /// worth, which is [`MMA_TOLERANCE`].
     #[test]
     fn a_call_under_either_numerics_answers_what_the_other_answers() {
         let Some(device) = device() else { return };
@@ -4292,21 +4262,11 @@ kernel void decoded_elements(
                 .multiply(&case.x)
                 .expect("the dispatch completes")
         };
-        let uncut = PackedMatmul::cutting_at(&device, Numerics::Production, 0).expect("compiles");
         assert_eq!(
-            bit_patterns(&untiled(&uncut)),
+            bit_patterns(&untiled(&production)),
             bit_patterns(&untiled(&reference)),
-            "an uncut production call is not the kernel the reference runs"
+            "an untiled call is not the same kernel under either word"
         );
-
-        let (was, is) = (untiled(&reference), untiled(&production));
-        let cut = deviation(&is, &was);
-        eprintln!("an untiled call: the two numerics deviate {cut:e}");
-        assert!(
-            cut > 0.0,
-            "a cut walk is not summing independently of the walk it cuts"
-        );
-        assert!(cut <= MMA_TOLERANCE, "deviation {cut:e}");
 
         let (was, is) = (
             a_tiled_call_answers(&device, &reference),
@@ -4342,13 +4302,11 @@ kernel void decoded_elements(
     fn a_cut_walk_is_f32_noise_at_every_reduction() {
         let Some(device) = device() else { return };
         let reference = matmul(&device);
-        let production =
-            PackedMatmul::under(&device, Numerics::Production).expect("the production compiles");
+        // Four cuts, which for the checkpoint's 4096-code row is the most that
+        // leaves each of them the four chunks `CHUNKS_IN_FLIGHT` holds — and for
+        // the 1024-code row is one chunk apiece, which is the other end of it.
+        let cut = PackedMatmul::cut_at(&device, 4).expect("four cuts compile");
 
-        // Both cut: a reduction of 1024 codes is four steps of a walk and so
-        // four cuts, where 256 has one step and `splits_for` clamps it to the
-        // uncut entry — which is the arm
-        // `a_call_cuts_its_walk_by_what_the_machine_is_short_of` holds.
         for in_dim in [IN_DIM, MMA_CODES_A_STEP * 32] {
             let case = Case::noisy(in_dim, OUT_DIM, 1);
             let exact = case.exactly();
@@ -4361,7 +4319,7 @@ kernel void decoded_elements(
                     &exact,
                 )
             };
-            let (cut, whole) = (through(&production), through(&reference));
+            let (cut, whole) = (through(&cut), through(&reference));
             eprintln!("a reduction of {in_dim}: cut {cut:e} against the uncut walk's {whole:e}");
             assert!(
                 cut <= f64::from(TOLERANCE),
@@ -4453,51 +4411,6 @@ kernel void decoded_elements(
                 );
             }
         }
-    }
-
-    /// How far a call cuts its walk, which is what the machine is short of over
-    /// what the call brings.
-    ///
-    /// The rows are a decode step's ten shapes, whose element counts
-    /// `what_each_shape_of_a_decode_steps_packed_calls_costs` records, plus the
-    /// head — which is the one call a step makes that already fills the machine
-    /// and the one this has to leave alone.
-    #[test]
-    fn a_call_cuts_its_walk_by_what_the_machine_is_short_of() {
-        let cuts = |elements| splits_for(elements, IN_DIM, WANTED_ELEMENTS, NARROWEST_SIMD);
-        assert_eq!(cuts(512), MOST_SPLITS, "r_proj is the narrowest call");
-        assert_eq!(cuts(1024), MOST_SPLITS, "k_proj and v_proj");
-        assert_eq!(cuts(4096), 8, "q_proj, o_proj and a shared gate");
-        assert_eq!(cuts(12288), 3, "a routed gate and up");
-        assert_eq!(cuts(24576), 2, "a routed down");
-        assert_eq!(cuts(200058), 1, "the head fills the machine already");
-        assert_eq!(cuts(WANTED_ELEMENTS), 1, "and so does the count it wants");
-
-        // Never more cuts than the row has steps to give them, which is what
-        // keeps a cut from being a simdgroup with no chunk in it.
-        let steps = |in_dim: usize| in_dim / CODES_PER_BYTE / (NARROWEST_SIMD * BYTES_PER_LANE);
-        assert_eq!(steps(GROUP_SIZE * 8), 1);
-        assert_eq!(
-            splits_for(1, GROUP_SIZE * 8, WANTED_ELEMENTS, NARROWEST_SIMD),
-            1
-        );
-        assert_eq!(steps(GROUP_SIZE * 32), 4);
-        assert_eq!(
-            splits_for(1, GROUP_SIZE * 32, WANTED_ELEMENTS, NARROWEST_SIMD),
-            4
-        );
-
-        // And the arm that prices the entry against the one it stands in front
-        // of, which is every call uncut.
-        for elements in [1, 512, 4096, 200058] {
-            assert_eq!(splits_for(elements, IN_DIM, 0, NARROWEST_SIMD), 1);
-        }
-        // A call of nothing is a dispatch that returns, and the division it
-        // would be is the one number here that could be a zero.
-        assert_eq!(
-            splits_for(0, IN_DIM, WANTED_ELEMENTS, NARROWEST_SIMD),
-            MOST_SPLITS
-        );
     }
 
     /// **The production entries against the reference ones over a shape that
@@ -5693,21 +5606,9 @@ kernel void decoded_elements(
         // flag, so what a pair can get wrong — pointing half the grid at the
         // wrong bank — is the same mistake whichever walk it is a second
         // emission of, and a tolerance would hide it under both.
-        //
-        // **What the two dispatches have to be given to be comparable is the
-        // same cut count**, and that is a fact about the fusion rather than a
-        // convenience here: a fused call is twice the output elements of either
-        // half, so `splits_for` reads it as twice as far from being short of the
-        // machine and cuts each element's walk half as far. Two walks cut
-        // differently sum in different orders and cannot be held to bits. So
-        // the lone banks are built asking for half of what the pair asks for,
-        // which is the count the pair's own halves get — `div_ceil(w, 2n)` is
-        // `div_ceil(w / 2, n)` for the even `w` this ships.
         for numerics in [Numerics::Reference, Numerics::Production] {
             let matmul =
                 PackedMatmul::under(&device, numerics).expect("the packed matmul compiles");
-            let halved = PackedMatmul::cutting_at(&device, numerics, WANTED_ELEMENTS / 2)
-                .expect("the packed matmul compiles");
             let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
             const EXPERTS: usize = 3;
             const ROWS: usize = TOKENS * TOP_K;
@@ -5754,10 +5655,7 @@ kernel void decoded_elements(
             let up_case = Case::seeded(0x9a1e_0002, IN_DIM, EXPERTS * OUT_DIM, ROWS);
             let pair = PackedPair::new(upload(&gate_case), upload(&up_case))
                 .expect("the pair's shapes pair");
-            let (gate, up) = (
-                uploaded(&device, &halved, EXPERTS, &gate_case),
-                uploaded(&device, &halved, EXPERTS, &up_case),
-            );
+            let (gate, up) = (upload(&gate_case), upload(&up_case));
 
             let alone = |bank: &PackedBank<'_>, chosen: &[u32], x: &[f32], per_source: usize| {
                 let mut selection = device.buffer(chosen).expect("the selection uploads");
@@ -5835,28 +5733,6 @@ kernel void decoded_elements(
 
             // And the layout the pair does not fuse, which still has to answer the
             // same two tensors.
-            //
-            // **Held against an uncut walk rather than against the two above**,
-            // because a grouped call is a tile and no tile is cut: the flag
-            // selects a block there, and a routing this short does not reach one.
-            // So what the rows are compared to is the entry a grouped call would
-            // have been compared to before any of this — which is the same claim
-            // `a_tiled_dispatch_answers_row_for_row_what_the_untiled_one_answers`
-            // makes, at the layout that scatters.
-            let uncut =
-                PackedMatmul::cutting_at(&device, numerics, 0).expect("the packed matmul compiles");
-            let want_gate = alone(
-                &uploaded(&device, &uncut, EXPERTS, &gate_case),
-                &chosen,
-                tokens,
-                TOP_K,
-            );
-            let want_up = alone(
-                &uploaded(&device, &uncut, EXPERTS, &up_case),
-                &chosen,
-                tokens,
-                TOP_K,
-            );
             let mut selection = device.buffer(&chosen).expect("the selection uploads");
             let mut x = device.buffer(tokens).expect("the rows upload");
             let mut batch = device.batch().expect("a command buffer opens");
@@ -7149,12 +7025,17 @@ kernel void decoded_elements(
         }
     }
 
-    /// The element counts a call is cut towards, one of which is the shipped
-    /// one and one of which is no cut at all.
-    const CUTS_SWEPT: [usize; 6] = [0, 8192, 16384, 32768, 65536, 131072];
+    /// The cut counts an untiled call is swept over.
+    ///
+    /// **One of them is a cut of one**, which no element count can ask for and
+    /// which is what separates the entry from the partition: at one cut the
+    /// split entry walks the row the plain entry walks, in the same chunks, and
+    /// answers the same bits — so what it costs over the plain entry is the
+    /// threadgroup array, the barrier and the combine with nothing cut.
+    const CUTS_SWEPT: [usize; 4] = [1, 2, 3, 4];
 
-    /// **What a packed multiply costs at each element count a call is cut to**,
-    /// and the sweep [`WANTED_ELEMENTS`] was chosen from.
+    /// **What a packed multiply costs at each count its walk is cut into**, and
+    /// the sweep that refused the cut.
     ///
     /// The zero arm is the entry the cut stands in front of — every call left
     /// uncut, out of the same build under the same word — so what the table
@@ -7177,14 +7058,10 @@ kernel void decoded_elements(
     /// [`whether_a_decode_dispatch_is_short_of_the_machine`] gives.
     #[test]
     #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
-    fn what_a_packed_multiply_costs_at_each_element_count_a_call_is_cut_to() {
+    fn what_a_packed_multiply_costs_at_each_count_its_walk_is_cut_into() {
         let Some(device) = device() else { return };
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
-        assert!(CUTS_SWEPT.contains(&WANTED_ELEMENTS), "{WANTED_ELEMENTS}");
-        assert_eq!(
-            CUTS_SWEPT[0], 0,
-            "the arm that cuts nothing is the baseline"
-        );
+        assert_eq!(CUTS_SWEPT[0], 1, "the arm that cuts once is the baseline");
 
         // `(what, rows, in_dim, out_dim, experts)`, and the elements each is.
         let shapes: Vec<Blocked> = [
@@ -7199,32 +7076,63 @@ kernel void decoded_elements(
             Blocked::of(what, rows, in_dim, out_dim, experts, false)
         })
         .collect();
+        // The entry the cut stands in front of, which is the row every arm is
+        // read against and the one no cut count can ask for.
+        let plain =
+            PackedMatmul::under(&device, Numerics::Production).expect("the production compiles");
+        // **And the split entry at one cut with nothing shared in it**, which is
+        // what separates the two things a cut of one adds to the plain walk: a
+        // threadgroup array and the barrier over it. The arm races and answers
+        // whatever the scheduler leaves — at one cut it happens not to, since
+        // the only partial is written and read by the same thread — so what it
+        // prices is the barrier and what the compiler may do across it.
+        let unbarriered = PackedMatmul::cut_from_source(
+            &device,
+            &crate::testing::instead_of(
+                &source_cut(Block::SHIPPED),
+                "    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+                "",
+            ),
+            1,
+        )
+        .expect("the mutant compiles");
         let arms: Vec<PackedMatmul> = CUTS_SWEPT
             .iter()
-            .map(|&wanted| {
-                PackedMatmul::cutting_at(&device, Numerics::Production, wanted)
-                    .unwrap_or_else(|err| panic!("a cut towards {wanted} compiles: {err}"))
+            .map(|&splits| {
+                PackedMatmul::cut_at(&device, splits)
+                    .unwrap_or_else(|err| panic!("{splits} cuts compile: {err}"))
             })
             .collect();
 
-        let want = an_untiled_call_answers(&device, &arms[0]);
-        for (wanted, arm) in CUTS_SWEPT.into_iter().zip(&arms) {
+        let want = an_untiled_call_answers(&device, &plain);
+        assert_eq!(
+            bit_patterns(&an_untiled_call_answers(&device, &arms[0])),
+            bit_patterns(&want),
+            "one cut is not the walk it cuts"
+        );
+        for (splits, arm) in CUTS_SWEPT.into_iter().zip(&arms) {
             let apart = deviation(&an_untiled_call_answers(&device, arm), &want);
             assert!(
                 apart <= MMA_TOLERANCE,
-                "a cut towards {wanted} deviates {apart:e} from the uncut walk"
+                "{splits} cuts deviate {apart:e} from the uncut walk"
             );
         }
 
-        let at: Vec<usize> = (0..CUTS_SWEPT.len()).collect();
+        // The uncut plain entry first, then a cut apiece, then the barrier arm.
+        let at: Vec<usize> = (0..CUTS_SWEPT.len() + 2).collect();
         let cost = |arm: usize| -> Vec<Duration> {
             // The banks are uploaded before the warm-up rather than inside it,
             // for the reason the chunk sweep gives: an upload is a hundred
             // megabytes copied with the device idle, and a warm-up loop that
             // pays one an iteration warms the host.
+            let against = match arm {
+                0 => &plain,
+                arm if arm <= CUTS_SWEPT.len() => &arms[arm - 1],
+                _ => &unbarriered,
+            };
             let banks: Vec<PackedBank<'_>> = shapes
                 .iter()
-                .map(|shape| shape.upload(&device, &arms[arm]))
+                .map(|shape| shape.upload(&device, against))
                 .collect();
             let widest = shapes.len() - 1;
             crate::testing::warmed(|| {
@@ -7241,23 +7149,18 @@ kernel void decoded_elements(
         eprintln!(
             "  {:<20}{:>10}{}",
             "shape",
-            "cuts",
-            CUTS_SWEPT
-                .iter()
-                .map(|wanted| format!(
-                    "{:>18}",
-                    match wanted {
-                        0 => "uncut".to_string(),
-                        wanted => format!("towards {wanted}"),
-                    }
-                ))
+            "elements",
+            std::iter::once("uncut, plain".to_string())
+                .chain(CUTS_SWEPT.iter().map(|splits| format!("{splits} cuts")))
+                .chain(std::iter::once("1 cut, no barrier".to_string()))
+                .map(|what| format!("{what:>18}"))
                 .collect::<String>()
         );
         for (which, shape) in shapes.iter().enumerate() {
             let moved = packed_bytes(shape.rows * shape.out_dim * shape.in_dim);
             let taken = |arm: usize| better(&up[arm], &down[arm])[which];
             let uncut = taken(0).as_secs_f64();
-            let cells: String = (0..CUTS_SWEPT.len())
+            let cells: String = (0..CUTS_SWEPT.len() + 2)
                 .map(|arm| {
                     format!(
                         "{:>10}{:>8}",
@@ -7269,14 +7172,9 @@ kernel void decoded_elements(
             eprintln!(
                 "  {:<20}{:>10}{cells}",
                 shape.what,
-                splits_for(
-                    shape.rows * shape.out_dim,
-                    shape.in_dim,
-                    WANTED_ELEMENTS,
-                    NARROWEST_SIMD
-                ),
+                shape.rows * shape.out_dim
             );
-            let rate: String = (0..CUTS_SWEPT.len())
+            let rate: String = (0..CUTS_SWEPT.len() + 2)
                 .map(|arm| {
                     format!(
                         "{:>18}",
