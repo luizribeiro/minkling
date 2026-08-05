@@ -42,16 +42,25 @@ use std::time::Duration;
 /// entries, pipelines and grids and reads no address at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Slot {
-    Bound(usize),
+    Bound {
+        at: usize,
+        /// Whether the kernel's own source declares it may write through this
+        /// slot — see [`Kernel::writes`](crate::Kernel::writes). Recorded
+        /// beside the address because a hazard between two dispatches is a
+        /// question about both, and only the pair of them answers it: see
+        /// [`crate::ordering`].
+        written: bool,
+    },
     Inline(Vec<u8>),
 }
 
 impl Slot {
-    pub(crate) fn of(arg: &crate::buffer::Arg<'_>) -> Self {
+    pub(crate) fn of(arg: &crate::buffer::Arg<'_>, written: bool) -> Self {
         match arg {
-            crate::buffer::Arg::Bound(buffer) => {
-                Self::Bound(std::ptr::from_ref(*buffer) as *const () as usize)
-            }
+            crate::buffer::Arg::Bound(buffer) => Self::Bound {
+                at: std::ptr::from_ref(*buffer) as *const () as usize,
+                written,
+            },
             crate::buffer::Arg::Inline(bytes) => Self::Inline(bytes.to_vec()),
         }
     }
@@ -133,13 +142,16 @@ impl Difference {
             }
             for (slot, (before, after)) in before.slots.iter().zip(&after.slots).enumerate() {
                 match (before, after) {
-                    (Slot::Bound(before), Slot::Bound(after)) if before != after => {
+                    (Slot::Bound { at: before, .. }, Slot::Bound { at: after, .. })
+                        if before != after =>
+                    {
                         difference.bound_changed.push((at, slot));
                     }
                     (Slot::Inline(before), Slot::Inline(after)) if before != after => {
                         difference.inline_changed.push((at, slot));
                     }
-                    (Slot::Bound(_), Slot::Inline(_)) | (Slot::Inline(_), Slot::Bound(_)) => {
+                    (Slot::Bound { .. }, Slot::Inline(_))
+                    | (Slot::Inline(_), Slot::Bound { .. }) => {
                         difference.kind_changed.push((at, slot));
                     }
                     _ => {}
@@ -169,22 +181,46 @@ thread_local! {
     /// [`Batch::add`](crate::kernel::Batch) is where a dispatch is described and
     /// a batch reaches its device only to allocate.
     static ENCODED: RefCell<Option<Vec<Encoded>>> = const { RefCell::new(None) };
+    /// How many dispatches had been encoded each time one of them was
+    /// committed, which is where one pass ends and the next begins.
+    ///
+    /// **A pass is what a barrier can reach across**, so a reader dividing a
+    /// sequence into groups needs the boundaries as much as the dispatches —
+    /// see [`Groups::over`](crate::ordering::Groups::over).
+    static SUBMITTED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Keep an [`Encoded`] for every dispatch from here, or stop and discard what
 /// was kept.
 pub fn record(recording: bool) {
     ENCODED.with(|encoded| *encoded.borrow_mut() = recording.then(Vec::new));
+    SUBMITTED.with(|submitted| submitted.borrow_mut().clear());
 }
 
 /// Every dispatch since [`record`] was switched on, in the order they were
 /// encoded, and the record cleared — so that a caller measuring one step of a
 /// loop is handed that step rather than the run so far.
 pub fn take() -> Vec<Encoded> {
+    SUBMITTED.with(|submitted| submitted.borrow_mut().clear());
     ENCODED.with(|encoded| match encoded.borrow_mut().as_mut() {
         None => Vec::new(),
         Some(taken) => std::mem::take(taken),
     })
+}
+
+/// Where the dispatches since [`record`] was switched on were committed, as
+/// indices into what [`take`] answers. Read before [`take`], which clears both.
+pub fn submissions() -> Vec<usize> {
+    SUBMITTED.with(|submitted| submitted.borrow().clone())
+}
+
+/// That a command buffer holding everything encoded so far has been committed.
+pub(crate) fn submitted() {
+    if !recording() {
+        return;
+    }
+    let at = ENCODED.with(|encoded| encoded.borrow().as_ref().map_or(0, Vec::len));
+    SUBMITTED.with(|submitted| submitted.borrow_mut().push(at));
 }
 
 /// Whether anybody is recording, which is what keeps an unmeasured run from
@@ -205,6 +241,13 @@ pub(crate) fn encoded(describe: impl FnOnce() -> Encoded) {
 mod tests {
     use super::*;
 
+    /// A slot naming an allocation, which every case here reads as one the
+    /// dispatch wrote — what the division into groups makes of the flag is
+    /// [`crate::ordering`]'s question rather than this module's.
+    fn bound(at: usize) -> Slot {
+        Slot::Bound { at, written: true }
+    }
+
     fn dispatch(pipeline: usize, slots: Vec<Slot>) -> Encoded {
         Encoded {
             entry: "saxpy".to_owned(),
@@ -221,12 +264,12 @@ mod tests {
     #[test]
     fn two_steps_differing_only_in_what_fills_their_slots_are_one_sequence() {
         let before = [
-            dispatch(1, vec![Slot::Bound(10), Slot::Inline(vec![0, 0])]),
-            dispatch(2, vec![Slot::Bound(20)]),
+            dispatch(1, vec![bound(10), Slot::Inline(vec![0, 0])]),
+            dispatch(2, vec![bound(20)]),
         ];
         let after = [
-            dispatch(1, vec![Slot::Bound(11), Slot::Inline(vec![0, 1])]),
-            dispatch(2, vec![Slot::Bound(20)]),
+            dispatch(1, vec![bound(11), Slot::Inline(vec![0, 1])]),
+            dispatch(2, vec![bound(20)]),
         ];
 
         let difference = Difference::between(&before, &after);
@@ -242,9 +285,9 @@ mod tests {
     /// number of them is not the same sequence at all.
     #[test]
     fn a_step_that_changed_a_pipeline_a_grid_or_a_count_is_not_the_same_sequence() {
-        let one = [dispatch(1, vec![Slot::Bound(10)])];
+        let one = [dispatch(1, vec![bound(10)])];
 
-        let other_pipeline = [dispatch(2, vec![Slot::Bound(10)])];
+        let other_pipeline = [dispatch(2, vec![bound(10)])];
         assert_eq!(
             Difference::between(&one, &other_pipeline).commands_changed,
             [0]
@@ -254,16 +297,13 @@ mod tests {
         other_grid[0].threads = 8192;
         assert_eq!(Difference::between(&one, &other_grid).commands_changed, [0]);
 
-        let other_slots = [dispatch(1, vec![Slot::Bound(10), Slot::Bound(11)])];
+        let other_slots = [dispatch(1, vec![bound(10), bound(11)])];
         assert_eq!(
             Difference::between(&one, &other_slots).commands_changed,
             [0]
         );
 
-        let longer = [
-            dispatch(1, vec![Slot::Bound(10)]),
-            dispatch(1, vec![Slot::Bound(10)]),
-        ];
+        let longer = [dispatch(1, vec![bound(10)]), dispatch(1, vec![bound(10)])];
         let difference = Difference::between(&one, &longer);
         assert!(!difference.reusable(), "{difference:?}");
         assert_eq!(difference.dispatches, (1, 2));
@@ -275,7 +315,7 @@ mod tests {
     #[test]
     fn a_slot_that_changed_which_kind_of_argument_it_is_refuses_the_sequence() {
         let before = [dispatch(1, vec![Slot::Inline(vec![7])])];
-        let after = [dispatch(1, vec![Slot::Bound(30)])];
+        let after = [dispatch(1, vec![bound(30)])];
 
         let difference = Difference::between(&before, &after);
 
@@ -298,11 +338,36 @@ mod tests {
         let mut one: crate::Buffer<f32> = device.zeroed(4).expect("the buffer allocates");
         let mut other: crate::Buffer<f32> = device.zeroed(4).expect("the buffer allocates");
 
-        assert_eq!(Slot::of(&one.arg()), Slot::of(&one.arg()));
-        assert_ne!(Slot::of(&one.arg()), Slot::of(&other.arg()));
+        assert_eq!(Slot::of(&one.arg(), true), Slot::of(&one.arg(), true));
+        assert_ne!(Slot::of(&one.arg(), true), Slot::of(&other.arg(), true));
 
         let mut inline = device.inline(&[7u32, 9]).expect("the values are inline");
-        assert!(matches!(Slot::of(&inline.arg()), Slot::Inline(bytes) if bytes.len() == 8));
+        assert!(matches!(Slot::of(&inline.arg(), false), Slot::Inline(bytes) if bytes.len() == 8));
+    }
+
+    /// **Where the passes fell, which no other reader of this module needs and
+    /// [`crate::ordering`] cannot do without**: a barrier reaches across a
+    /// pass and not across a command buffer, so a division into groups that did
+    /// not know where one ended would report barriers nobody has to encode.
+    ///
+    /// Recorded as how many dispatches had been encoded at the commit, which is
+    /// the index the next pass starts at.
+    #[test]
+    fn a_trace_says_where_its_dispatches_were_committed() {
+        record(true);
+        encoded(|| dispatch(1, Vec::new()));
+        submitted();
+        encoded(|| dispatch(1, Vec::new()));
+        encoded(|| dispatch(1, Vec::new()));
+        submitted();
+
+        assert_eq!(submissions(), [1, 3]);
+        assert_eq!(take().len(), 3);
+        assert!(submissions().is_empty(), "the reading clears both");
+
+        record(false);
+        submitted();
+        assert!(submissions().is_empty(), "nobody is recording");
     }
 
     /// Nobody is recording unless somebody asked, and the reading clears what

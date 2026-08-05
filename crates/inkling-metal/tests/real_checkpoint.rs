@@ -40,6 +40,7 @@ use inkling_core::{
 // drift. `what_a_streaming_read_achieves_on_this_machine` is what measures it,
 // on whatever host it runs on.
 use inkling_metal::kernel::MEMORY_BANDWIDTH;
+use inkling_metal::ordering::Groups;
 use inkling_metal::trace::{self, Difference, Encoded};
 use inkling_metal::{
     DISPATCHES_A_SUBMISSION, DenseMatmul, DenseWeight, Device, ExpertGrouping, ExpertKernels,
@@ -774,6 +775,11 @@ struct OnTheDevice {
     /// What each step encoded, dispatch by dispatch, where the run was asked to
     /// write it down. One entry a step, the prefill's first.
     traces: Vec<Vec<Encoded>>,
+    /// Where each traced step committed a command buffer, as indices into that
+    /// step's own trace — which is what says how many of the gaps between its
+    /// groups are barriers somebody has to encode. See
+    /// [`Groups::over`](inkling_metal::ordering::Groups::over).
+    boundaries: Vec<Vec<usize>>,
 }
 
 impl OnTheDevice {
@@ -880,6 +886,7 @@ impl OnTheDevice {
             profile: Profile::default(),
             round_trips: Vec::new(),
             traces: Vec::new(),
+            boundaries: Vec::new(),
         };
         device.record_round_trips(true);
         trace::record(asked.tracing);
@@ -905,6 +912,8 @@ impl OnTheDevice {
             |id| {
                 run.steps.push(step.elapsed());
                 if asked.tracing {
+                    // The boundaries first: taking the trace clears both.
+                    run.boundaries.push(trace::submissions());
                     run.traces.push(trace::take());
                 }
                 read(&mut run);
@@ -2041,6 +2050,76 @@ fn what_changes_between_two_decode_steps() {
             "at {context} tokens some pair of steps is not the same sequence: {differences:?}"
         );
     }
+}
+
+/// **What a decode step's dispatches actually have to wait for**, which is the
+/// count the concurrency lever lives or dies by.
+///
+/// `what_a_barrier_costs_the_device_against_the_dispatches_it_separates` prices
+/// the two sides — Metal's serial ordering at about 1.2 microseconds a dispatch,
+/// an explicit barrier at about 2.1 — and says a concurrent pass overtakes a
+/// serial one only where its groups average about 1.7 dispatches. This is what
+/// a step's own groups average, derived rather than read off the layer code:
+/// which allocations filled each dispatch's slots, and which of those slots the
+/// kernel's own source declares it may write. See [`inkling_metal::ordering`].
+///
+/// **At three contexts, because a span that grows is the one thing that could
+/// change the shape.** `what_changes_between_two_decode_steps` says the sequence
+/// is the same commands at 97, 2048 and 8192 keys; this says whether the
+/// dependencies between them are too.
+///
+/// The count here is 918 where `where_a_decode_step_spends_its_time` reports 876,
+/// and the gap is one `attention_combine` a layer: that table is taken at the
+/// structured prompt's own 9 to 15 keys, which is short enough that a layer's
+/// attention needs no second dispatch to fold its key tiles together. Every
+/// context this covers is past that, so 918 is what a step of any length anyone
+/// has makes.
+#[test]
+#[ignore = "needs a checkpoint: `INKLINGRS_CHECKPOINT=… cargo test -- --ignored`"]
+fn what_a_decode_steps_dispatches_have_to_wait_for() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+
+    eprintln!(
+        "{:>8}{:>12}{:>8}{:>9}{:>10}{:>9}{:>9}{:>11}",
+        "context", "dispatches", "passes", "groups", "barriers", "a group", "widest", "worth"
+    );
+    for context in TRACED_CONTEXTS {
+        let run = OnTheDevice::running(&dir, &device, Asked::decoding_at(context).traced());
+        // The prefill is a different sequence from every step behind it; the
+        // steps this is about are the ones the profile charges.
+        let from = run.charged_from();
+        let steps: Vec<Groups> = run.traces[from..]
+            .iter()
+            .zip(&run.boundaries[from..])
+            .map(|(step, boundaries)| Groups::over(step, boundaries))
+            .collect();
+        assert!(steps.len() >= 2, "two steps to hold against each other");
+        assert!(
+            steps.windows(2).all(|pair| pair[0] == pair[1]),
+            "at {context} keys two steps divide into different groups"
+        );
+        let step = &steps[0];
+
+        eprintln!(
+            "{context:>8}{:>12}{:>8}{:>9}{:>10}{:>9}{:>9}{:>11}",
+            step.dispatches(),
+            step.passes(),
+            step.groups(),
+            step.barriers(),
+            format!("{:.2}", step.average()),
+            step.widest(),
+            format!("{:+.3}ms", step.worth() * 1e3),
+        );
+        for (held, group) in step.shapes() {
+            eprintln!("  {held:>6} of {}", group.join(", "));
+        }
+    }
+
+    eprintln!(
+        "  a group has to average {:.2} dispatches before a concurrent pass is worth encoding",
+        Groups::break_even()
+    );
 }
 
 /// The three prompt lengths this file's prefill figures are quoted at, and the

@@ -58,6 +58,9 @@ pub struct Kernel {
     /// worth two rows.
     label: String,
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Which of its argument slots the source declares this kernel may write,
+    /// indexed by slot — see [`Kernel::writes`].
+    writes: Vec<bool>,
 }
 
 impl Device {
@@ -72,6 +75,7 @@ impl Device {
         let function = self.function(source, entry)?;
         Self::named(
             entry,
+            source,
             self.raw()
                 .newComputePipelineStateWithFunction_error(&function),
         )
@@ -92,6 +96,7 @@ impl Device {
 
         Self::named(
             entry,
+            source,
             self.raw()
                 .newComputePipelineStateWithDescriptor_options_reflection_error(
                     &descriptor,
@@ -119,15 +124,21 @@ impl Device {
     /// has to report for anyone to find it in the source.
     fn named(
         entry: &str,
+        source: &str,
         built: Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, Retained<NSError>>,
     ) -> Result<Kernel, MetalError> {
+        let pipeline = built.map_err(|err| MetalError::Pipeline {
+            entry: entry.to_owned(),
+            diagnostic: diagnostic(&err),
+        })?;
         Ok(Kernel {
             label: entry.to_owned(),
             entry: entry.to_owned(),
-            pipeline: built.map_err(|err| MetalError::Pipeline {
-                entry: entry.to_owned(),
-                diagnostic: diagnostic(&err),
-            })?,
+            // After the pipeline and not before it: a function that compiles
+            // and is not a kernel has no `kernel void` to find, and it is the
+            // pipeline that says which it was.
+            writes: writable_slots(source, entry),
+            pipeline,
         })
     }
 
@@ -313,7 +324,11 @@ impl<'a> Batch<'a> {
             crate::trace::encoded(|| crate::trace::Encoded {
                 entry: kernel.label.clone(),
                 pipeline: Retained::as_ptr(&kernel.pipeline) as usize,
-                slots: args.iter().map(crate::trace::Slot::of).collect(),
+                slots: args
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, arg)| crate::trace::Slot::of(arg, kernel.writes(slot)))
+                    .collect(),
                 threads: grid.threads,
                 threads_per_group: grid.threads_per_group,
                 encoding,
@@ -396,6 +411,7 @@ impl<'a> Batch<'a> {
         let _timed = profile::scope(Op::Submit);
         self.end();
         self.commands.commit();
+        crate::trace::submitted();
         self.device.counted(self.dispatches);
         Submitted {
             device: self.device,
@@ -535,8 +551,28 @@ impl Kernel {
         Self {
             entry: self.entry.clone(),
             label: label.to_owned(),
+            writes: self.writes.clone(),
             pipeline: self.pipeline.clone(),
         }
+    }
+
+    /// Whether a dispatch of this kernel may write through argument slot
+    /// `slot`.
+    ///
+    /// **Read off the source the kernel was compiled from, not stated by the
+    /// caller.** A parameter in the `constant` address space cannot be written
+    /// at all and one declared `device const` cannot either, and the Metal
+    /// compiler is what enforces both — so a slot this answers `false` for is a
+    /// slot no dispatch of this kernel can have written, whatever the call site
+    /// believed it was passing.
+    ///
+    /// **A slot nothing here recognises answers `true`**, which is every slot
+    /// past the ones the entry declares. That is the direction a mistake has to
+    /// go: a slot wrongly called written is a barrier
+    /// [`Groups`](crate::ordering::Groups) keeps, and a slot wrongly called read
+    /// is a race.
+    pub fn writes(&self, slot: usize) -> bool {
+        self.writes.get(slot).copied().unwrap_or(true)
     }
 
     /// The widest threadgroup this kernel can be dispatched in, which is a
@@ -628,6 +664,146 @@ impl Grid {
 /// dispatch a grid for the wrong shape over buffers of the right one.
 pub(crate) fn extent(value: usize, what: &str) -> u32 {
     u32::try_from(value).unwrap_or_else(|_| panic!("{value} is wider than a kernel's uint: {what}"))
+}
+
+/// Which of `entry`'s argument slots it may write, indexed by slot.
+///
+/// **The source is the only place that says.** Nothing an [`Arg`] carries
+/// distinguishes a binding a kernel reads from one it writes — a buffer is bound
+/// exclusively either way, because from this side any slot might be written —
+/// and the answer decides where a concurrent pass has to put a barrier. So it is
+/// read out of the declaration the Metal compiler is already enforcing:
+/// `constant T &x` is an address space that cannot be written, `device const
+/// T *x` is a pointer that cannot, and `device T *out` is one that may.
+///
+/// **Undecidable is written.** A parameter this does not recognise, and every
+/// slot past the ones `entry` declares, comes back `true` — which is a barrier
+/// kept where none was needed rather than a barrier dropped where one was.
+///
+/// The entry is found rather than assumed present: the pipeline was built from
+/// this same string by name, so an entry this cannot find is a failure of the
+/// parse and not of the caller, and it says so rather than answering for a
+/// kernel it did not read.
+fn writable_slots(source: &str, entry: &str) -> Vec<bool> {
+    let parameters = declaration(source, entry)
+        .unwrap_or_else(|| panic!("`{entry}` was compiled out of a source this cannot parse"));
+    let mut writes: Vec<bool> = Vec::new();
+    for parameter in split_parameters(parameters) {
+        let Some(slot) = bound_slot(parameter) else {
+            continue;
+        };
+        if writes.len() <= slot {
+            // The gaps are slots no parameter claimed, which stay written for
+            // the reason above.
+            writes.resize(slot + 1, true);
+        }
+        writes[slot] = writable(parameter);
+    }
+    writes
+}
+
+/// The text between the parentheses of `kernel void <entry>(…)`.
+///
+/// Depth-counted rather than taken to the first `)`, because a parameter's own
+/// `[[buffer(0)]]` attribute holds a pair of them.
+fn declaration<'a>(source: &'a str, entry: &str) -> Option<&'a str> {
+    let mut from = 0;
+    let opened = loop {
+        let at = from + source[from..].find(entry)?;
+        from = at + entry.len();
+        let identifier = |c: char| c.is_alphanumeric() || c == '_';
+        // The whole identifier and not a name this one is a prefix of —
+        // `packed_matmul` is a prefix of `packed_matmul_pair` — which is read
+        // off the characters beside the match rather than off the text either
+        // side of it, since `kernel void` itself ends in a letter.
+        let bounded =
+            !source[..at].ends_with(identifier) && !source[from..].starts_with(identifier);
+        let before = source[..at].trim_end();
+        let after = source[from..].trim_start();
+        if bounded && before.ends_with("kernel void") && after.starts_with('(') {
+            break from + source[from..].find('(')?;
+        }
+    };
+
+    let mut depth = 0usize;
+    for (at, c) in source[opened..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&source[opened + 1..opened + at]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A parameter list split at the commas that separate parameters, which are the
+/// ones outside any `[[…(…)]]`.
+fn split_parameters(parameters: &str) -> Vec<&str> {
+    let mut split = Vec::new();
+    let (mut depth, mut from) = (0usize, 0usize);
+    for (at, c) in parameters.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                split.push(&parameters[from..at]);
+                from = at + 1;
+            }
+            _ => {}
+        }
+    }
+    split.push(&parameters[from..]);
+    split
+}
+
+/// The buffer slot a parameter is bound at, for a parameter that is bound to
+/// one at all — a thread's position in the grid is a parameter and is not an
+/// argument.
+fn bound_slot(parameter: &str) -> Option<usize> {
+    let at = parameter.find("[[buffer(")? + "[[buffer(".len();
+    let end = at + parameter[at..].find(')')?;
+    parameter[at..end].trim().parse().ok()
+}
+
+/// Whether a dispatch may write through this parameter.
+///
+/// **`const` counts only where it qualifies what the pointer points at**, which
+/// is what it does to the left of the `*` and not to the right: `device const
+/// float *x` is a pointer to memory nothing may write, and `device float *const
+/// x` is a pointer nothing may move to memory a kernel may write as it likes. A
+/// rule that looked for the word anywhere would call the second read-only, which
+/// is the one direction a parse error here must not go.
+///
+/// Both read-only forms are recognised by a whole word, so that a parameter
+/// named `constants` or a type named `const_scale` is not mistaken for one.
+fn writable(parameter: &str) -> bool {
+    let declaration = match parameter.find('[') {
+        Some(attribute) => &parameter[..attribute],
+        None => parameter,
+    };
+    // A reference has no `*` and carries its address space in front of it,
+    // which is where `constant` is read; a pointer's pointee is everything to
+    // the left of the star.
+    let pointee = match declaration.find('*') {
+        Some(star) => &declaration[..star],
+        None => declaration,
+    };
+    let words = |text: &str| {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<String>>()
+    };
+    let addressed = words(declaration).iter().any(|word| word == "device");
+    let read_only = words(pointee)
+        .iter()
+        .any(|word| word == "constant" || word == "const");
+    addressed && !read_only
 }
 
 /// The interval between two of a command buffer's timestamps, which the driver
@@ -1609,6 +1785,78 @@ kernel void streaming_copy4(
             .map(|(x, y)| ALPHA * x + y)
             .collect();
         assert_eq!(chained.out.to_vec(), want);
+    }
+
+    /// **The one parse whose failure is a race rather than a slower step.**
+    /// A slot wrongly called written keeps a barrier nothing needed; a slot
+    /// wrongly called read drops one that was holding an ordering up, so every
+    /// form the kernels in this crate declare a binding in has a case here.
+    ///
+    /// The saxpy source is the shape all of them have: a scalar and a count in
+    /// the `constant` address space, two `device const` inputs, one `device`
+    /// output.
+    #[test]
+    fn a_kernel_reports_the_slots_its_own_source_says_it_may_write() {
+        let Some(device) = device() else { return };
+
+        let kernel = device.compile(SAXPY, SAXPY_ENTRY).expect("saxpy compiles");
+
+        let writes: Vec<bool> = (0..5).map(|slot| kernel.writes(slot)).collect();
+        assert_eq!(writes, [false, false, false, false, true]);
+        assert!(
+            kernel.writes(5),
+            "a slot the entry does not declare is one nothing here can vouch for"
+        );
+    }
+
+    /// The forms the crate's kernels actually use, and the two a careless parse
+    /// would read backwards: a parameter whose *name* holds `const`, and an
+    /// entry another entry's name is a prefix of.
+    #[test]
+    fn every_declared_form_is_read_the_way_the_metal_compiler_reads_it() {
+        let source = "\
+#include <metal_stdlib>
+kernel void narrow(
+    constant Shape &shape [[buffer(0)]],
+    device const uchar *codes [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {}
+kernel void narrow_pair(
+    device const float4 *x [[buffer(0)]],
+    device float *constants [[buffer(1)]],
+    device const Candidate *found [[buffer(2)]],
+    threadgroup float *staging [[threadgroup(0)]],
+    constant uint2 &pair [[buffer(4)]]
+) {}
+";
+
+        assert_eq!(writable_slots(source, "narrow"), [false, false, true]);
+        assert_eq!(
+            writable_slots(source, "narrow_pair"),
+            [false, true, false, true, false],
+            "slot 3 is claimed by no parameter and stays written"
+        );
+        assert!(
+            writable("device float *const out [[buffer(0)]]"),
+            "`const` right of the star fixes the pointer, not what it points at"
+        );
+        assert!(!writable("device const float *x [[buffer(0)]]"));
+        assert!(!writable("constant Shape &shape [[buffer(0)]]"));
+        assert!(
+            !writable("uint i [[thread_position_in_grid]]"),
+            "a parameter in no address space is not a binding"
+        );
+    }
+
+    /// A source the entry is not in at all is a parse that has drifted from the
+    /// kernels it reads, and it has to say so: a silent empty answer would call
+    /// every slot written, which reads as a step with no concurrency in it and
+    /// not as a failure.
+    #[test]
+    #[should_panic(expected = "cannot parse")]
+    fn an_entry_the_parse_cannot_find_is_a_failure_rather_than_an_empty_answer() {
+        writable_slots("kernel void other() {}", "saxpy");
     }
 
     #[test]

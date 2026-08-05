@@ -40,6 +40,7 @@ pub mod kernel;
 pub mod matmul;
 pub mod norm;
 pub mod numerics;
+pub mod ordering;
 pub mod projections;
 pub mod router;
 pub mod sampling;
