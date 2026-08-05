@@ -229,32 +229,28 @@ const MMA_COLS_A_BLOCK: usize = 64;
 const MMA_SIMDS_DOWN: usize = 2;
 const MMA_SIMDS_ACROSS: usize = 4;
 
-/// Codes of the reduction one staging step brings in.
+/// Codes of the reduction one staging step brings in, at the shipped shape.
 ///
-/// **[`GROUP_SIZE`] exactly, and that is what makes the staging free of a
-/// decision.** A weight row's codes share one scale byte per group of this many,
-/// so a step this wide reads exactly one scale byte per column of the block and
-/// the scale a code is decoded under is never in question at a step boundary.
+/// **[`GROUP_SIZE`], and every wider step is a whole number of groups.** A weight
+/// row's codes share one scale byte per group of this many, so a step of one
+/// group reads exactly one scale byte per column of the block; a step of two
+/// spans two, which is why the scale a thread decodes under is indexed from where
+/// that thread reads rather than from where the step starts. [`Block::step`] is
+/// what a sweep of it turns, and
+/// [`what_a_packed_multiply_costs_at_each_step_its_staging_brings_in`] is what it
+/// was set from.
 const MMA_CODES_A_STEP: usize = GROUP_SIZE;
 
-/// Floats between two staged rows.
+/// Floats of padding between two staged rows.
 ///
-/// **Padding, and it is load-bearing rather than defensive.** Threadgroup memory
-/// is 32 banks of four bytes, and a `simdgroup_load` of an 8×8 fragment reads
-/// eight rows at this stride: unpadded at 32 floats every one of the eight lands
-/// on the same bank and the load serialises eight ways. Four floats of padding
-/// puts them on banks 0, 4, 8 … 28, which are eight distinct ones.
-const MMA_STAGED_STRIDE: usize = MMA_CODES_A_STEP + 4;
-
-/// **What the staging owes the format, which no block shape can change.** A
-/// step is one scale byte a column, which is what lets the decode read the scale
-/// once outside the loop over the codes it covers; a staged row is at least as
-/// wide as the fragment reads across it; and the fragment divides the step.
-const _: () = {
-    assert!(MMA_CODES_A_STEP == GROUP_SIZE);
-    assert!(MMA_CODES_A_STEP % MMA_FRAGMENT == 0);
-    assert!(MMA_STAGED_STRIDE >= MMA_CODES_A_STEP);
-};
+/// **Load-bearing rather than defensive.** Threadgroup memory is 32 banks of four
+/// bytes, and an 8×8 fragment is read down eight rows at the staged stride:
+/// unpadded at 32 floats every one of the eight lands on the same bank and the
+/// read serialises eight ways. Four floats of padding puts them on banks 0, 4,
+/// 8 … 28, which are eight distinct ones — and it does so at every step this
+/// block admits, since a step is a multiple of 32 and four is what shifts it off
+/// the bank count.
+const MMA_STAGED_PADDING: usize = 4;
 
 /// **Every division a block's layout makes has to be exact**, and a block whose
 /// staging left a remainder would leave part of a tile holding whatever the last
@@ -286,6 +282,7 @@ pub(crate) struct Block {
     threads: usize,
     simds_down: usize,
     simds_across: usize,
+    step: usize,
 }
 
 impl Block {
@@ -297,6 +294,7 @@ impl Block {
         threads: THREADS_PER_GROUP,
         simds_down: MMA_SIMDS_DOWN,
         simds_across: MMA_SIMDS_ACROSS,
+        step: MMA_CODES_A_STEP,
     };
 
     /// Rows an expert needs, on average, before a grouped call is dispatched
@@ -332,27 +330,45 @@ impl Block {
     /// Floats of the input one thread stages a step, and the threads a staged
     /// row takes.
     const fn floats_a_thread(&self) -> usize {
-        self.rows * MMA_CODES_A_STEP / self.threads
+        self.rows * self.step / self.threads
     }
 
     const fn threads_a_staged_row(&self) -> usize {
-        MMA_CODES_A_STEP / self.floats_a_thread()
+        self.step / self.floats_a_thread()
     }
 
     /// Packed bytes of the weight one thread decodes a step, and the threads a
     /// weight row takes.
     const fn bytes_a_thread(&self) -> usize {
-        self.cols * (MMA_CODES_A_STEP / CODES_PER_BYTE) / self.threads
+        self.cols * (self.step / CODES_PER_BYTE) / self.threads
     }
 
     const fn threads_a_weight_row(&self) -> usize {
-        (MMA_CODES_A_STEP / CODES_PER_BYTE) / self.bytes_a_thread()
+        (self.step / CODES_PER_BYTE) / self.bytes_a_thread()
+    }
+
+    /// Floats between two staged rows, which is the step and
+    /// [`MMA_STAGED_PADDING`].
+    const fn staged_stride(&self) -> usize {
+        self.step + MMA_STAGED_PADDING
+    }
+
+    /// Bytes of threadgroup memory the two staged tiles declare, which is what
+    /// decides how many threadgroups of this block a core holds — and so what a
+    /// wider step is bought at.
+    ///
+    /// The sweep's own column, which is why it is behind `cfg(test)`: nothing a
+    /// dispatch does reads it, because what a threadgroup declares is declared
+    /// in the kernel's own source out of [`Block::declares`].
+    #[cfg(test)]
+    const fn staged_bytes(&self) -> usize {
+        (self.rows + self.cols) * self.staged_stride() * size_of::<f32>()
     }
 
     /// Floats between two rows of the block's answer, padded against 32 banks
-    /// for the reason [`MMA_STAGED_STRIDE`] is.
+    /// for the reason [`MMA_STAGED_PADDING`] is.
     const fn answer_stride(&self) -> usize {
-        self.cols + 4
+        self.cols + MMA_STAGED_PADDING
     }
 
     /// **Every division has to be exact**, or part of a tile holds whatever the
@@ -365,21 +381,28 @@ impl Block {
         assert!(self.simds_down * self.simds_across * NARROWEST_SIMD == self.threads);
         assert!(self.fragments_down() * self.simds_down * MMA_FRAGMENT == self.rows);
         assert!(self.fragments_across() * self.simds_across * MMA_FRAGMENT == self.cols);
-        assert!(self.floats_a_thread() * self.threads == self.rows * MMA_CODES_A_STEP);
-        assert!(self.threads_a_staged_row() * self.floats_a_thread() == MMA_CODES_A_STEP);
-        assert!(
-            self.bytes_a_thread() * self.threads == self.cols * (MMA_CODES_A_STEP / CODES_PER_BYTE)
-        );
-        assert!(
-            self.threads_a_weight_row() * self.bytes_a_thread()
-                == MMA_CODES_A_STEP / CODES_PER_BYTE
-        );
+        assert!(self.floats_a_thread() * self.threads == self.rows * self.step);
+        assert!(self.threads_a_staged_row() * self.floats_a_thread() == self.step);
+        assert!(self.bytes_a_thread() * self.threads == self.cols * (self.step / CODES_PER_BYTE));
+        assert!(self.threads_a_weight_row() * self.bytes_a_thread() == self.step / CODES_PER_BYTE);
+        // A step is whole groups of the format, so that a step boundary never
+        // falls inside the codes one scale byte covers, and whole fragments, so
+        // that the `k` loop reaches every code the staging brought in.
+        assert!(self.step % GROUP_SIZE == 0);
+        assert!(self.step % MMA_FRAGMENT == 0);
+        // **The bytes one thread decodes lie inside one group**, which is what
+        // lets the scale be read once a step rather than once a byte. A step
+        // wider than a group spans several, so what the read is indexed by is
+        // where the thread reads and not where the step starts — and a thread
+        // whose chunk straddled a boundary would decode half of it under the
+        // wrong exponent.
+        assert!(BYTES_PER_GROUP % self.bytes_a_thread() == 0);
         // The block's expert list is read by one thread a row, so a threadgroup
         // narrower than the block is tall would leave part of it unread.
         assert!(self.threads >= self.rows);
         // The answer is written over the two staged tiles, so a block whose
         // answer were the larger of the two would write past them.
-        assert!(self.rows * self.answer_stride() <= (self.rows + self.cols) * MMA_STAGED_STRIDE);
+        assert!(self.rows * self.answer_stride() <= (self.rows + self.cols) * self.staged_stride());
     }
 
     /// The prelude the two production entries are written from, which is every
@@ -391,8 +414,8 @@ constant uint MMA_FRAGMENT = {MMA_FRAGMENT};
 constant uint MMA_ROWS_A_BLOCK = {};
 constant uint MMA_COLS_A_BLOCK = {};
 constant uint MMA_SIMDS_ACROSS = {};
-constant uint MMA_CODES_A_STEP = {MMA_CODES_A_STEP};
-constant uint MMA_STAGED_STRIDE = {MMA_STAGED_STRIDE};
+constant uint MMA_CODES_A_STEP = {};
+constant uint MMA_STAGED_STRIDE = {};
 constant uint MMA_ANSWER_STRIDE = {};
 constant uint MMA_FRAGMENTS_DOWN = {};
 constant uint MMA_FRAGMENTS_ACROSS = {};
@@ -405,6 +428,8 @@ constant uint THREADS_PER_GROUP = {};
             self.rows,
             self.cols,
             self.simds_across,
+            self.step,
+            self.staged_stride(),
             self.answer_stride(),
             self.fragments_down(),
             self.fragments_across(),
@@ -3502,12 +3527,13 @@ kernel void __ENTRY__(
                 staged_x[x_row * MMA_STAGED_STRIDE + x_at + i] = live ? values[i] : 0.0f;
             }
 
-            // The weight, decoded. One scale byte covers the whole step because
-            // a step is GROUP_SIZE codes wide — see MMA_CODES_A_STEP — so this
-            // is one load for the eight codes below it and the exponent is
-            // shifted into place exactly as the reference entries shift it.
+            // The weight, decoded. One scale byte covers every code this thread
+            // reads, because `Block::holds` refuses a chunk that straddles a
+            // group — so this is one load for all of them however many groups
+            // the step spans, and the exponent is shifted into place exactly as
+            // the reference entries shift it.
             const float by =
-                as_type<float>(uint(scale[b / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
+                as_type<float>(uint(scale[(b + w_at) / BYTES_PER_GROUP]) << EXPONENT_SHIFT);
             for (uint i = 0; i < MMA_BYTES_A_THREAD; ++i) {
                 const uint code = packed[b + w_at + i];
                 const uint at = w_col * MMA_STAGED_STRIDE + (w_at + i) * CODES_PER_BYTE;
@@ -4536,6 +4562,22 @@ kernel void decoded_elements(
         },
     ];
 
+    /// The steps this file sweeps, beside the one it ships.
+    ///
+    /// **Two groups and not four, and the arithmetic is what stops at two.** The
+    /// staging is `(rows + cols)` rows of the step and its padding, so a step of
+    /// 32 declares 13.5 KiB, 64 declares 25.5 and 128 would declare 49.5 —
+    /// past the 32 KiB a threadgroup gets. So the whole of what a wider step can
+    /// be asked here is one doubling, and `a_block_of` is what would print the
+    /// refusal if a third were added.
+    const SWEPT_STEPS: [Block; 2] = [
+        Block::SHIPPED,
+        Block {
+            step: 2 * MMA_CODES_A_STEP,
+            ..Block::SHIPPED
+        },
+    ];
+
     /// **A block cut to another shape answers what the shipped one answers**,
     /// which is the whole of what makes the sweep beside it a measurement rather
     /// than a comparison of two different computations.
@@ -4546,6 +4588,14 @@ kernel void decoded_elements(
     /// the element is accumulated in, which is the instruction's over `k` inside
     /// a step and the step loop outside it. So a shape that came back merely
     /// *close* would mean something moved that this file does not think moves.
+    ///
+    /// **A wider step is the one axis here where that has to be argued rather
+    /// than observed**, since it moves what a step is and so how many of them a
+    /// reduction is cut into. It does not move the order: a fragment accumulator
+    /// is one running sum over the whole reduction and the `k` loop visits the
+    /// staged codes in the order they lie, so a step of 64 runs the same eight
+    /// accumulates the two steps of 32 ran, in the same sequence, into the same
+    /// register. What it changes is where the barriers fall between them.
     ///
     /// A shape whose threadgroup this device will not dispatch is reported and
     /// skipped rather than failed — the width is swept past what a register
@@ -4559,8 +4609,9 @@ kernel void decoded_elements(
             &PackedMatmul::under(&device, Numerics::Production).expect("the block compiles"),
         );
 
+        let swept: Vec<Block> = SWEPT_BLOCKS.into_iter().chain(SWEPT_STEPS).collect();
         let mut ran = 0;
-        for block in SWEPT_BLOCKS {
+        for block in swept.iter().copied() {
             let Some(matmul) = a_block_of(&device, block) else {
                 continue;
             };
@@ -4574,13 +4625,18 @@ kernel void decoded_elements(
         // **A case that skipped every shape would pass by comparing the shipped
         // block to itself**, which is the failure mode `a_block_of` opens by
         // treating a refusal as a skip. This part runs every shape in
-        // [`SWEPT_BLOCKS`] — the four other than the shipped one included — so
-        // the slack below is for a part that is not this one rather than for a
-        // shape this one is known to decline.
+        // [`SWEPT_BLOCKS`] and [`SWEPT_STEPS`], so the one shape of slack is for
+        // a part that is not this one rather than for a shape this one is known
+        // to decline — and it is counted off the arms rather than written down,
+        // so that an arm added to either list raises the bar with it.
+        let offered = swept
+            .iter()
+            .filter(|&&block| block != Block::SHIPPED)
+            .count();
         assert!(
-            ran >= SWEPT_BLOCKS.len() - 2,
-            "only {ran} shapes other than the shipped one ran, so this case is close to comparing \
-             the shipped block against itself"
+            ran + 1 >= offered,
+            "only {ran} shapes of the {offered} other than the shipped one ran, so this case is \
+             close to comparing the shipped block against itself"
         );
     }
 
@@ -8458,7 +8514,7 @@ kernel void decoded_elements(
     /// twenty-four, and that rounding is what the table below prices.
     ///
     /// `stride` is what a staged row is padded to, and it is a parameter here
-    /// for one reason: [`MMA_STAGED_STRIDE`]'s padding argument is derived
+    /// for one reason: [`MMA_STAGED_PADDING`]'s argument is derived
     /// against 32 banks of *four* bytes and a staged element that is four bytes
     /// wide. At two bytes the same 36 puts a fragment's eight rows on banks 0,
     /// 18, 4, 22, 8, 26, 12 and 30 — still eight distinct ones, so the argument
@@ -8481,7 +8537,10 @@ kernel void decoded_elements(
         );
         let staged = crate::testing::instead_of(
             &staged,
-            &format!("constant uint MMA_STAGED_STRIDE = {MMA_STAGED_STRIDE};"),
+            &format!(
+                "constant uint MMA_STAGED_STRIDE = {};",
+                Block::SHIPPED.staged_stride()
+            ),
             &format!("constant uint MMA_STAGED_STRIDE = {stride};"),
         );
         let filled = crate::testing::instead_of(
@@ -8574,25 +8633,23 @@ kernel void decoded_elements(
         // do not — which is what says a single-stride reading of this arm would
         // have been a measurement of the padding rather than of the operand
         // width, and why the refusal is stated against the best of them.
-        let halved: Vec<(usize, PackedMatmul)> = [
-            MMA_STAGED_STRIDE,
-            MMA_STAGED_STRIDE + 4,
-            MMA_STAGED_STRIDE + 8,
-        ]
-        .into_iter()
-        .map(|stride| {
-            let arm = PackedMatmul::blocked_from_source(
-                &device,
-                &through_sixteen_bit_operands(
-                    &source_blocked(Numerics::Production, Block::SHIPPED),
-                    stride,
-                ),
-                Block::SHIPPED,
-            )
-            .expect("the 16-bit arm compiles");
-            (stride, arm)
-        })
-        .collect();
+        let shipped_stride = Block::SHIPPED.staged_stride();
+        let halved: Vec<(usize, PackedMatmul)> =
+            [shipped_stride, shipped_stride + 4, shipped_stride + 8]
+                .into_iter()
+                .map(|stride| {
+                    let arm = PackedMatmul::blocked_from_source(
+                        &device,
+                        &through_sixteen_bit_operands(
+                            &source_blocked(Numerics::Production, Block::SHIPPED),
+                            stride,
+                        ),
+                        Block::SHIPPED,
+                    )
+                    .expect("the 16-bit arm compiles");
+                    (stride, arm)
+                })
+                .collect();
 
         // The conditioning table first, because it is what decides whether the
         // clock is worth reading at all. The padding reaches no arithmetic, so
@@ -8797,6 +8854,177 @@ kernel void decoded_elements(
                 );
             }
         }
+    }
+
+    /// **What a wider step is worth, which is the barrier count bought at the
+    /// occupancy** — the first of the two levers T2 priced off the instruction
+    /// mix rather than off a build.
+    ///
+    /// A step is `MMA_CODES_A_STEP` codes wide and carries two barriers, so a
+    /// reduction of 4096 is 128 steps and **256 barriers a pass**, every one of
+    /// which stops all eight simdgroups until the slowest arrives.
+    /// [`what_a_prefills_blocked_matmul_is_bound_by`]'s barrier arm — the one
+    /// that removes them and races — prices the whole term at **10%**, and a step
+    /// of two groups halves the count, so **5% is what this can return at its
+    /// ceiling.**
+    ///
+    /// **And it is bought rather than free, which is why the declaration is
+    /// printed beside the clock.** The staging is the step wide, so doubling it
+    /// doubles the threadgroup memory: 13.5 KiB to 25.5, which by `RESIDENCY`'s
+    /// sweep of what a core holds takes the block from five threadgroups a core
+    /// to three. **The two effects run opposite ways**, which is what makes this
+    /// a sweep and not a change — and what the table says is which of them is
+    /// larger.
+    ///
+    /// **And the third row is what says which of the two the table is reading.**
+    /// It is the shipped step — the same barriers, the same loop, the same bits —
+    /// declaring the wider step's threadgroup memory and never touching the extra.
+    /// That is [`RESIDENCY`]'s own trick pointed the other way: what a
+    /// threadgroup declares decides how many of them a core holds, so an arm that
+    /// declares 25.5 KiB and steps 32 codes carries the wider step's occupancy
+    /// and none of its benefit. **A row that lands where the 64-code row lands
+    /// says the whole difference is the declaration**, and one that lands at 100%
+    /// says it is not.
+    ///
+    /// Warm and swept both ways, for the reason
+    /// [`what_a_prefills_blocked_matmul_is_bound_by`] gives. Nothing asserts a
+    /// rate; what is asserted is that the shipped step was among the arms, so a
+    /// table that measured only the alternative could not read as a comparison.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_a_packed_multiply_costs_at_each_step_its_staging_brings_in() {
+        let Some(device) = device() else { return };
+
+        let mut arms: Vec<(String, usize, PackedMatmul)> = SWEPT_STEPS
+            .iter()
+            .filter_map(|&block| {
+                a_block_of(&device, block).map(|matmul| {
+                    (
+                        format!("{} codes", block.step),
+                        block.staged_bytes(),
+                        matmul,
+                    )
+                })
+            })
+            .collect();
+        let shipped = arms
+            .iter()
+            .position(|(what, ..)| *what == format!("{} codes", Block::SHIPPED.step))
+            .expect("the shipped step is one of the arms");
+
+        let widened = SWEPT_STEPS
+            .iter()
+            .map(Block::staged_bytes)
+            .max()
+            .expect("the sweep has an arm");
+        let control = PackedMatmul::blocked_from_source(
+            &device,
+            &declaring(
+                &source_blocked(Numerics::Production, Block::SHIPPED),
+                widened,
+            ),
+            Block::SHIPPED,
+        )
+        .expect("the widened declaration compiles");
+        // **A control that answered other bits would be a second change rather
+        // than a declaration**, and the whole of what this row is for is that it
+        // is the shipped kernel with one number in it.
+        assert_eq!(
+            a_tiled_call_answers(&device, &control),
+            a_tiled_call_answers(&device, &arms[shipped].2),
+            "the widened declaration answered other bits than the step it was cut from"
+        );
+        arms.push((
+            format!("{} codes, declaring the wider", Block::SHIPPED.step),
+            widened,
+            control,
+        ));
+
+        // **And a racing arm at each step, which is what says whether a barrier
+        // costs by the count or by the work between two of them.** These are
+        // [`without_the_steps_barriers`] — the same arm
+        // [`what_a_prefills_blocked_matmul_is_bound_by`] prices the whole term
+        // at — asked once per step width. **They answer nothing in particular**,
+        // because without the barriers a simdgroup reads a tile another is still
+        // filling; what they cost is the step loop with the same loads, the same
+        // decode and the same multiply-accumulates and none of the waiting. Two
+        // rows that give back the same share are a term that is the staging's
+        // imbalance rather than the barrier's count, and a step that halves the
+        // count cannot touch it.
+        for block in SWEPT_STEPS {
+            let racing = PackedMatmul::blocked_from_source(
+                &device,
+                &without_the_steps_barriers(&source_blocked(Numerics::Production, block)),
+                block,
+            )
+            .expect("the racing arm compiles");
+            arms.push((
+                format!("{} codes, racing", block.step),
+                block.staged_bytes(),
+                racing,
+            ));
+        }
+
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+
+        for tokens in BLOCKED_LENGTHS {
+            let shapes = shapes_at(tokens);
+            crate::testing::warmed(|| {
+                shapes[0].costs(&device, &arms[shipped].2, &grouping);
+            });
+            let listed: Vec<usize> = (0..arms.len()).collect();
+            let (up, down) = crate::testing::both_ways(&listed, |at| {
+                shapes
+                    .iter()
+                    .map(|shape| shape.costs(&device, &arms[at].2, &grouping))
+                    .collect::<Vec<Duration>>()
+            });
+
+            eprintln!("\n  a prefill of {tokens} tokens");
+            eprintln!(
+                "  {:<32}{:>12}{}",
+                "a step of",
+                "declares",
+                shapes
+                    .iter()
+                    .map(|shape| format!("{:>26}", shape.what))
+                    .collect::<String>()
+            );
+            for (at, (what, declared, _)) in arms.iter().enumerate() {
+                // The slower of the two passes, so a row is not whichever
+                // direction the clock happened to favour.
+                let taken = |arm: usize, column: usize| up[arm][column].max(down[arm][column]);
+                let cells: String = (0..shapes.len())
+                    .map(|column| {
+                        let (each, whole) = (taken(at, column), taken(shipped, column));
+                        format!(
+                            "{:>17}{:>9}",
+                            format!("{:.2}ms", 1e3 * each.as_secs_f64()),
+                            format!("{:.0}%", 1e2 * each.as_secs_f64() / whole.as_secs_f64()),
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "  {what:<32}{:>12}{cells}",
+                    format!("{:.1} KiB", *declared as f64 / 1024.0),
+                );
+            }
+        }
+    }
+
+    /// The shipped production source with the staged declaration widened to
+    /// `bytes` and every index into it left where it was, so what the arm changes
+    /// is how many threadgroups a core holds and nothing a thread reads.
+    ///
+    /// Written as a count of floats past the two tiles rather than as a whole new
+    /// expression, so that the arm carries the shipped declaration in it and a
+    /// change to the staging would not quietly leave this measuring a shape the
+    /// kernel no longer has.
+    fn declaring(shipped: &str, bytes: usize) -> String {
+        let staged = "threadgroup float staged[(MMA_ROWS_A_BLOCK + MMA_COLS_A_BLOCK) * \
+                      MMA_STAGED_STRIDE";
+        let spare = bytes / size_of::<f32>() - Block::SHIPPED.staged_bytes() / size_of::<f32>();
+        crate::testing::instead_of(shipped, staged, &format!("{staged} + {spare}"))
     }
 
     /// **What a table here reports has to be one dispatch of the shape it
