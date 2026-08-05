@@ -243,10 +243,18 @@ const MMA_CODES_A_STEP: usize = GROUP_SIZE;
 
 /// How the shipped block gets a fragment out of the staging.
 ///
-/// **`simdgroup_load`, and what would move it is
-/// [`what_a_packed_multiply_costs_at_each_way_it_reads_a_fragment`]**, which is
-/// the sweep this constant exists to be the subject of.
-const MMA_FRAGMENTS: Fragments = Fragments::Loaded;
+/// **The two elements each lane owns, and the sweep that chose it is
+/// [`what_a_packed_multiply_costs_at_each_way_it_reads_a_fragment`]:** 0.7 to
+/// 0.9% under `simdgroup_load` at every shape and every length, swept both ways,
+/// and a prefill's device time 0.3 to 0.4% under it with the ranges apart at
+/// seven pairs of seven.
+///
+/// **A twelfth of what it was priced at, and the arm that priced it is what says
+/// why.** The hoisting arm leaves three of every four fragments unread and reads
+/// 6%, so what it prices is three of every four *reads of threadgroup memory*;
+/// this changes only the instruction that carries the fourth, and the bytes it
+/// carries are the same bytes.
+const MMA_FRAGMENTS: Fragments = Fragments::PerLane;
 
 /// Floats of padding between two staged rows.
 ///
