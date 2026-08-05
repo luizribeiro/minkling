@@ -1339,6 +1339,15 @@ So `mma_matmul_grouped` is unchanged and `mma_matmul_planned` stands beside it,
 and the line between them is a value the entries carry rather than a module
 constant — which is what lets both be arms of one table at every length.
 
+**What the second entry costs to build is a millisecond.** A model load creates
+three production pipelines where it created two, and
+`what_each_shape_the_block_is_swept_at_costs_to_compile` reads **2992 µs and
+74.7 KiB against T4's 1955 and 56.0** — one entry more out of a source one
+`__HOLDS__` longer, paid once at load. D1 is why that is priced at all: merely
+reordering which entries are created first was worth 2.4% of a 2048-token
+prefill. **It is also the only thing that reaches a 97-token prompt**, which is
+where the one row that moved the wrong way is.
+
 **And the gate is now four rows an expert, which is the tile's own height.**
 `what_a_grouped_call_costs_through_each_entry_as_the_runs_shorten`, the block
 alone:
