@@ -1204,6 +1204,209 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## What the skew costs, which is the blocks it makes and not the tail
+
+**T6 established the skew and did not price it, and the answer is that it costs
+nothing a remedy could take.** A layer's busiest expert takes between 11.8 and
+42.7 times the mean and between 73 and 226 of its 256 experts get no rows at all
+— and two things follow from that which nobody had measured: a long tail that
+might serialise, and empty experts that might occupy the dispatch anyway.
+**Neither does.** The peak reaches this kernel as a block count and not as a
+wait, and the empty experts are worth **2.1% of one kernel at 321 tokens and no
+claim at every other length.** Nothing here was built, and the arithmetic for not
+building it is below.
+
+**No kernel, no entry, no constant and no dispatch changed.** What is added is
+the two measurements, a case holding the grid they vary to the shipped bits, and
+a test-only way to size that grid.
+
+### Whether the long tail serialises, which is the question a remedy turns on
+
+**A run's length reaches this kernel as a number of blocks, and a block is a
+threadgroup that waits on nothing.** The sort cuts a run of `L` rows into
+`ceil(L / height)` plan entries; each entry is one threadgroup of the grid, and
+there is no barrier, no pass and no ordering between them —
+[`OVER_THE_RUNS_THE_SORT_LEFT`] is the whole of what a threadgroup reads before
+it works. So "the bank waits on the longest run" describes a unit of work this
+dispatch does not have: at 8192 tokens **the longest run is not a block, it is 82
+of them**, and they are interchangeable with every other block in the grid.
+
+That is the mechanism. **The measurement is the same rows over the same experts
+with the peak taken out of them** —
+`whether_a_routings_long_tail_costs_a_grouped_call_anything`, the kernel alone,
+warm, swept both ways, the sort off each arm. The flat arm holds the row count,
+the weights, the multiply-adds and *which* experts hold rows, and flattens the
+runs to a row:
+
+    tokens     height  hottest   blocks      flat  as routed       flat  µs a block     flat
+       321    16 rows      100      194       124     3.19ms     2.45ms        16.4     19.7
+       512    16 rows      221      269       264     4.50ms     4.16ms        16.7     15.7
+       769    16 rows      626      375       384     6.37ms     6.41ms        17.0     16.7
+      1024    16 rows      702      458       429     8.05ms     7.81ms        17.6     18.2
+      2048    64 rows     1694      284       264    14.82ms    13.72ms        52.2     52.0
+      4096    64 rows     3910      479       396    27.24ms    25.51ms        56.9     64.4
+      8192    64 rows     5248      867       780    51.82ms    50.10ms        59.8     64.2
+     16384   the rows    11877     3072      3072   102.65ms   102.57ms        33.4     33.4
+
+**Read the last two columns.** A block costs 16.4 to 17.6 µs at the short height
+and 52.2 to 59.8 at the tall one, and the flat arm's blocks cost the same 15.7 to
+18.2 and 52.0 to 64.4 — **over median layers whose peak is 13 to 41 times the
+mean.** A kernel that serialised an expert's rows would put the routed arm's cost
+per block at the peak's own multiple of the flat arm's. **The ratio runs 0.83 to
+1.06 across the eight rows**, and it is under one on four of them, which is a
+kernel where the peak is not a term.
+
+**The 16384 row is the cleanest of the eight and it is a null.** That length
+takes the entry laid over the rows, where both arms are cut into the same 3072
+blocks and the same 79 experts leave the same 78 run boundaries to fall inside
+them — so the two differ in the skew and in nothing else at all, and they read
+**102.65 ms against 102.57**. The peak is worth nothing there to three figures.
+
+**Where the routed arm does cost more, it costs it in blocks.** At 321 tokens it
+is 194 blocks against the flat arm's 124 and 3.19 ms against 2.45 — 56% more
+blocks for 30% more time. **That is T6's part-empty block and not a tail**, it is
+the term the two heights were chosen to bound, and no remedy on this list
+touches it.
+
+**So all three remedies the question named are answered before they are
+built.** *Splitting a long run across threadgroups* is what the plan already does
+and is why there is no tail. *Ordering runs longest-first* reorders a queue whose
+entries are the same size and independent of each other. *Balancing blocks across
+cores rather than per run* balances a grid that is already 12096 threadgroups at
+321 tokens and 98304 at 16384, of uniform cost, on 80 cores. **All three are
+remedies for a serialisation, and the serialisation is not there.**
+
+### What the empty experts occupy, which is grid and dispatch but not plan
+
+**They take no plan slot.** A run's blocks land at a prefix sum over the runs
+before it, and an empty run adds `ceil(0 / height)` of them — so the plan is
+written compactly and an expert with nothing in it is not in it.
+`a_plan_covers_every_row_once_and_never_two_experts_in_one_block` is where that
+is held.
+
+**They occupy the grid, because the grid is a bound and the counts are on the
+device.** [`blocks_a_plan`] is `rows / height + experts + 1`: it charges a block
+per expert whether that expert has rows or not, since the worst the runs can do
+is leave every bucket a part-block short and this side cannot read which did. So
+the dispatch launches threadgroups the runs never reached, and each reads a pair
+of zeros and returns. At the median layer, at the height the call is cut at:
+
+    tokens    used  the runs   bound   null   of the grid   null threadgroups
+       321     124       194     378    184         48.7%                5888
+       512     132       269     449    180         40.1%                5760
+       769     128       375     546    171         31.3%                5472
+      1024     127       458     641    183         28.5%                5856
+      2048     132       284     449    165         36.7%                5280
+      4096     132       479     641    162         25.3%                5184
+      8192     156       867    1025    158         15.4%                5056
+     16384      79      3072    3072      0          0.0%                   0
+
+**Between a seventh and a half of every grouped dispatch below 10923 tokens is
+threadgroups with nothing in them**, and it is about 5000 to 5900 of them at
+every length because it is the empty experts and they do not move with the
+prompt. **16384 has none**, because that length takes the entry laid over the
+rows and a grid over the rows has no slack in it.
+
+**What they cost is measurable at one length and nowhere else.**
+`what_the_blocks_no_run_filled_cost_a_grouped_dispatch` runs the same plan under
+a grid stopping at the blocks the runs came to, which removes exactly those
+threadgroups and nothing else:
+
+    tokens   the bound    the runs   change
+       321      3.19ms      3.12ms    -2.1%
+       512      4.51ms      4.49ms    -0.5%
+       769      6.38ms      6.37ms    -0.3%
+      1024      8.05ms      8.06ms    +0.0%
+      2048     14.80ms     14.76ms    -0.3%
+      4096     27.25ms     27.13ms    -0.4%
+      8192     51.93ms     51.98ms    +0.1%
+
+**Removing 48.7% of the grid at 321 tokens buys 2.1% of the kernel**, and
+removing the 15 to 40% of it the other six rows carry buys −0.5 to +0.1%, which
+is this table's own noise. **A threadgroup that reads two words and returns is
+very nearly free, and the row is what says so rather than the argument.**
+
+**Two sittings, and the 321 row is the only one either of them can see.** A first
+sitting with the sort re-measured per column read −2.0, −0.3, −0.1, +0.1, −0.1,
+−0.1 and +0.1%; this one shares the sort across the columns and reads the row
+above. **The 321 row is a bound rather than a figure** — it is about two percent
+of one kernel at one length, and which side of two it lands on does not reach any
+decision here.
+
+**The shorter grid answers the shipped bits**, which is what lets that row be
+read as a cost rather than as a trade —
+`a_grid_stopping_at_the_runs_answers_what_the_bound_answers` holds it to equality
+through a real dispatch. That is also the check covering the one dispatch path
+this milestone adds, which is the inherited note about the differential gate
+answered where it applies: `encode_grouped_over` is behind `#[cfg(test)]`, is not
+reachable from the engine, and is held to the bits rather than to a name in a
+dispatch list.
+
+### What a remedy would have to be, and its ceiling
+
+**The grid cannot be tightened on this side.** `used` is the one number that
+would shrink the bound and it is written by the sort into device memory, which is
+the same reason the bound exists. The mechanism that would work is an **indirect
+dispatch** — the sort writing its block count where
+`dispatchThreadgroupsWithIndirectBuffer` reads it — and it is not the indirect
+*command buffer* D3 priced, so D3's 2.02× does not decide it.
+
+**The ceiling is 2.1% of the grouped kernel at 321 tokens and nothing at the
+other six lengths**, and end to end it is **under** that rather than equal to it,
+since the grouped banks are a share of a prefill and not the whole of one. What
+that buys has to pay for a new dispatch mechanism, a device-written count, and a
+check that the count is the one the plan was written to. **Priced and not
+built**, which is D3's shape and the same call.
+
+**The share itself is not measured here and the ceiling does not need it.** A
+figure for what the grouped banks are of a 321-token prefill today would want its
+own sitting — T5's 72% was taken when the block was refused at that length, and
+T6 moved the row 11.5%. Bounding above by the whole prefill is enough to close
+the question, and quoting a stale share would be the arithmetic this file keeps
+getting wrong in the other direction.
+
+### Say it in rows an expert, because continuous batching moves the prompt
+
+**What this found is a property of the counts and not of the prompt length**, and
+it is stated that way so it survives a step that batches several sequences: a
+grouped call costs
+
+    a · sum over experts of ceil(rows_e / height)   +   b · rows
+
+and **`max_e rows_e` does not appear in it.** The skew enters through the first
+term alone, which is the part-empty block T6 bounded with two heights; the tail
+enters nowhere. The null threadgroups are the same expression's slack,
+`ceil(rows / height) + experts + 1` less that sum, which grows with **experts
+minus used** and not with the tokens a step. **More tokens a step lengthens the
+runs**, which moves `rows_e / height` and leaves both conclusions where they are.
+
+### What did not move, which is everything
+
+- **No engine code changed.** [`PackedBank::encode_grouped`] now reads its grid
+  from a shared body it passes the bound to, which is the same bound in the same
+  layout; the second caller of that body is behind `#[cfg(test)]`.
+- **The divergence, digit for digit with T6's.** Seven prompts, 64 to 13098
+  tokens, 64 argmaxes each: **`production` agreed 448 of 448 with no prompt
+  parting**, and **`rounded` agreed 364 of 448 with two** — the code listing at
+  token 6 and the 13098-token numerals member at token 40, which are T6's two
+  partings at T6's two positions. `production` selected all four entries at a
+  prefill and none at a decode step.
+- **Every token, under every word and both backends.** The recorded continuation
+  `[656, 13, 623, 180069, 86333, 60500, 220, 23]` is unmoved under `reference`,
+  `production` and `rounded`, and off `--backend cpu`.
+- **`reference` is still the default and still bit-exact, `production` still
+  forms exact products, `rounded` is still opt-in.**
+- **Every row of T6's height table reproduces on this sitting**, at the height
+  each length is cut at — 3.18, 4.50, 6.38, 8.05, 14.81, 27.20, 51.82 and
+  102.63 ms against T6's 3.19, 4.50, 6.37, 8.04, 14.83, 27.24, 51.83 and 102.66 —
+  which is what says the two sittings are comparable and that the arms above are
+  read against a column that has not drifted.
+- **698 hermetic, 698 gated, 79 timing**, against T6's 697, 697 and 77. The one
+  new case each tier gains is the bit-equality above; the two timing cases are
+  the two tables.
+- **The whole matmul timing tier re-run green**, 30 of 30, which is where T6's
+  own tables live.
+
 ## The height a run can fill, and the runs nobody had looked at
 
 **The largest thing this milestone found is that every table this file has ever
