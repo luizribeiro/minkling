@@ -38,9 +38,9 @@ use anyhow::{Context, Result};
 use inkling_core::mtp::{CheckpointHeads, FRONTIER};
 use inkling_core::{Checkpoint, CheckpointWeights, Config, TextConfig};
 use inkling_metal::{
-    DenseMatmul, Device, ExpertGrouping, ExpertKernels, LayerKernels, ModelHeads, ModelLayers,
-    ModelTail, MoeCombine, Numerics, PackedProjection, Router, RouterWeights, StackShape, SwiGlu,
-    TailWeights,
+    DenseMatmul, Device, ExpertGrouping, ExpertKernels, LayerKernels, LayerNorm, ModelHeads,
+    ModelLayers, ModelTail, MoeCombine, Numerics, PackedProjection, Router, RouterWeights,
+    StackShape, SwiGlu, TailWeights,
 };
 
 use crate::LABEL;
@@ -119,6 +119,31 @@ impl Gpu {
         )?)
     }
 
+    /// One dispatch of one row, to submit into a gap where nothing else is
+    /// running.
+    ///
+    /// **What it is for is a question about the machine rather than about this
+    /// engine**: an Apple GPU that has been idle for a hundred milliseconds
+    /// charges the next dispatch after it about three and a half milliseconds
+    /// more than it charges the same dispatch back to back, and what nothing
+    /// here says is whether what the part is holding on to is *a dispatch* or an
+    /// occupancy. A caller that submits this into the gap and re-measures has
+    /// asked it.
+    ///
+    /// The smallest thing this crate has a kernel for, so that what it costs is
+    /// close to what a submission costs and not to what a step does: one row
+    /// through a norm is 206 microseconds of submission around a dispatch of
+    /// microseconds. The answer is thrown away — nothing reads a row of ones
+    /// normalised — and the cost is reported by whoever asked for it.
+    pub fn keep_warm(&self, width: usize) -> Result<KeepWarm<'_>> {
+        let ones = vec![1.0f32; width];
+        Ok(KeepWarm {
+            norm: LayerNorm::new(&self.device, self.kernels.norm(), &ones, 1e-6)
+                .context("wrapping a keep-warm dispatch")?,
+            row: ones,
+        })
+    }
+
     /// The six a MoE layer dispatches through, which is five of this and the
     /// packed matmul every projection in the model shares.
     fn expert_kernels(&self) -> ExpertKernels<'_> {
@@ -131,6 +156,25 @@ impl Gpu {
             weights: &self.weights,
             combine: &self.combine,
         }
+    }
+}
+
+/// A dispatch cheap enough to be worth submitting for its own sake — see
+/// [`Gpu::keep_warm`], which is where what it is for is stated.
+pub struct KeepWarm<'a> {
+    norm: LayerNorm<'a>,
+    /// The row it norms, which is the weight it norms against: what is being
+    /// submitted is a dispatch, and the numbers in it are not read by anything.
+    row: Vec<f32>,
+}
+
+impl KeepWarm<'_> {
+    /// One dispatch, submitted and waited for, as a step's own are.
+    pub fn dispatch(&self) -> Result<()> {
+        self.norm
+            .forward(&self.row)
+            .context("submitting a keep-warm dispatch")?;
+        Ok(())
     }
 }
 

@@ -95,7 +95,7 @@ const USAGE: &str = "usage:\n  \
     bench session <checkpoint> [--tokens <n>] [--reuse-tokens <n>] [--numerics <which>]\n  \
     bench batch   <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>]\n  \
     bench clock   <checkpoint> [--tokens <n>] [--context <n>] [--idle <ms>] \
-[--every <ms>] [--burst <n>] [--prefill <n>] [--batch <n>]\n  \
+[--every <ms>] [--burst <n>] [--keep-warm <ms>] [--prefill <n>] [--batch <n>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench diverge <checkpoint> [--tokens <n>] [--against <which>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
@@ -332,6 +332,7 @@ impl Job {
         let mut idle = None;
         let mut every = None;
         let mut burst = None;
+        let mut warm = None;
         let mut prefill = None;
         // A sweep runs every depth up to its own, where a cross-engine table
         // quotes one beside `k = 0` — so the default depth is what the flag
@@ -368,6 +369,12 @@ impl Job {
                     every = Some(Duration::from_millis(count(&arg, &mut args)? as u64));
                 }
                 "--burst" => burst = Some(count(&arg, &mut args)?),
+                // A keep-warm every no milliseconds is a busy loop rather than
+                // a dispatch into a gap, and the arm it would be compared
+                // against is a run with no gap at all.
+                "--keep-warm" => {
+                    warm = Some(Duration::from_millis(count(&arg, &mut args)? as u64));
+                }
                 "--prefill" => prefill = Some(count(&arg, &mut args)?),
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
                 _ => checkpoints.push(PathBuf::from(arg)),
@@ -425,7 +432,11 @@ impl Job {
         // exists to fix — so the two levers are refused to the measurements that
         // could only drop them, under the same rule as the numbers above.
         if what != What::Clock
-            && (idle.is_some() || every.is_some() || burst.is_some() || prefill.is_some())
+            && (idle.is_some()
+                || every.is_some()
+                || burst.is_some()
+                || warm.is_some()
+                || prefill.is_some())
         {
             bail!(
                 "{what:?} takes no --idle, --every, --burst or --prefill: it does not vary its \
@@ -438,6 +449,13 @@ impl Job {
         // holds the gap or follows it.
         if idle.is_some() && every.is_some() {
             bail!("--idle and --every are two answers to one question: a gap, or a rate to fit it");
+        }
+        // **A gap of nothing has nowhere to put a dispatch.** The lever exists
+        // to fill an idle device, so a run that asked for one without asking
+        // for a gap is asking for a busy loop between two units that are
+        // already back to back.
+        if warm.is_some() && every.is_none() && idle.is_none_or(|idle| idle.is_zero()) {
+            bail!("--keep-warm needs a gap to dispatch into: give --idle or --every");
         }
         // **A prefill's unit is its own prompt.** Its keys are the tokens
         // `--prefill` names and there is no step behind a context, so a number
@@ -484,6 +502,7 @@ impl Job {
                     None => Gap::After(idle.unwrap_or_default()),
                 },
                 burst: burst.unwrap_or(1),
+                warm,
             },
             prefill: prefill.unwrap_or(0),
         })
@@ -972,21 +991,47 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     None => None,
                     Some(slots) => Some(backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?),
                 };
-                let ticks = ticked(
+                // One row of the model's own width, which is the smallest
+                // dispatch this crate has a kernel for.
+                let warm = match (shape.warm, gpu.as_ref()) {
+                    (Some(_), Some(gpu)) => Some(gpu.keep_warm(text.hidden_size)?),
+                    _ => None,
+                };
+                let dispatch = warm
+                    .as_ref()
+                    .map(|warm| move || warm.dispatch().expect("a keep-warm dispatch runs"));
+                let run = ticked(
                     wrapped.as_ref().unwrap_or(&weights),
                     text,
                     &unit,
                     tokens,
                     shape,
+                    dispatch.as_ref().map(|warm| warm as &dyn Fn()),
                 );
+                let ticks = &run.ticks;
                 eprintln!(
                     "clock: {} {}, {}",
                     ticks.len(),
                     unit.over(ticks.len()),
                     shape.said(),
                 );
-                taken.extend(clocked(&ticks));
-                taken.extend(after_a_gap(&ticks, shape.burst));
+                taken.extend(clocked(ticks));
+                taken.extend(after_a_gap(ticks, shape.burst));
+                // **What the lever cost, beside what it bought.** A keep-warm
+                // is device time spent on nothing, and a run that reported only
+                // what it saved would be quoting one side of a trade.
+                if shape.warm.is_some() {
+                    eprintln!(
+                        "  kept warm: {} dispatches, {:.4?} of device between them",
+                        run.dispatched, run.kept,
+                    );
+                    taken.push(Reading::new("warm.device", millis(run.kept), "ms"));
+                    taken.push(Reading::new(
+                        "warm.dispatches",
+                        run.dispatched as f64,
+                        "count",
+                    ));
+                }
             }
             What::Prefill => {
                 // A prefill is one step and its prompt is the measurement, so
@@ -1376,15 +1421,16 @@ struct Tick {
 /// this would report as the part warming up. A generation's own first tick is
 /// the prompt's prefill, which is not a step at all; a batched run's is
 /// [`Seated`]'s settling, which it has already run and thrown away.
-fn ticked(
+fn ticked<'a>(
     weights: &CheckpointWeights<'_>,
     config: &TextConfig,
     unit: &Unit,
     count: usize,
     shape: Shape,
-) -> Vec<Tick> {
+    warm: Option<&'a dyn Fn()>,
+) -> Ticking<'a> {
     profile::take();
-    let mut ticking = Ticking::new(shape, count);
+    let mut ticking = Ticking::new(shape, warm, count);
     match unit {
         // Every step of one generation rather than a generation apiece, so that
         // the gap falls between two decode steps — which is the occupancy this
@@ -1435,7 +1481,7 @@ fn ticked(
             }
         }
     }
-    ticking.ticks
+    ticking
 }
 
 /// What a unit of work cost by where in its burst it ran.
@@ -1537,15 +1583,24 @@ impl Gap {
 struct Shape {
     gap: Gap,
     burst: usize,
+    /// How often a gap is punctuated by a dispatch that exists only to be one,
+    /// and nothing for a gap left empty — which is every figure this repo has
+    /// ever taken.
+    warm: Option<Duration>,
 }
 
 impl Shape {
-    /// How the header says it: the gap, and the units it falls between.
+    /// How the header says it: the gap, the units it falls between, and
+    /// whatever is dispatched inside it.
     fn said(&self) -> String {
-        match self.burst {
+        let mut said = match self.burst {
             1 => self.gap.said(),
             burst => format!("{}, {burst} of them a burst", self.gap.said()),
+        };
+        if let Some(every) = self.warm {
+            let _ = write!(said, ", kept warm every {every:.0?}");
         }
+        said
     }
 }
 
@@ -1554,7 +1609,7 @@ impl Shape {
 ///
 /// A type rather than a closure because both arms of [`ticked`] keep the same
 /// state and one of them reaches it from inside a sink the generator drives.
-struct Ticking {
+struct Ticking<'a> {
     /// When the unit now running began, which is what its own period is
     /// measured from.
     at: Instant,
@@ -1562,18 +1617,59 @@ struct Ticking {
     /// a request answered by four steps is one request whatever the four cost.
     opened: Instant,
     shape: Shape,
+    /// What is submitted into a gap, for the runs that fill theirs.
+    ///
+    /// A closure rather than the [`KeepWarm`] itself, so that what is being
+    /// tested here — that a gap is dispatched into and is still a gap of the
+    /// length it was asked for — can be tested without a device.
+    warm: Option<&'a dyn Fn()>,
+    /// What those submissions cost the device, kept apart from what the units
+    /// cost it: a keep-warm charged to the work it was meant to protect would
+    /// be a lever paying for itself out of its own pocket.
+    kept: Duration,
+    dispatched: usize,
     ticks: Vec<Tick>,
 }
 
-impl Ticking {
-    fn new(shape: Shape, count: usize) -> Self {
+impl<'a> Ticking<'a> {
+    fn new(shape: Shape, warm: Option<&'a dyn Fn()>, count: usize) -> Self {
         let now = Instant::now();
         Self {
             at: now,
             opened: now,
             shape,
+            warm,
+            kept: Duration::ZERO,
+            dispatched: 0,
             ticks: Vec::with_capacity(count),
         }
+    }
+
+    /// A gap of `idle`, empty or punctuated by dispatches that exist only to be
+    /// dispatches.
+    ///
+    /// The device time they cost is taken off the account here, so that the
+    /// unit after the gap is charged for itself alone — and reported, because
+    /// what the lever costs is half of what it is worth.
+    fn idled(&mut self, idle: Duration) {
+        let Some(warm) = self.warm else {
+            std::thread::sleep(idle);
+            return;
+        };
+        let Some(every) = self.shape.warm else {
+            std::thread::sleep(idle);
+            return;
+        };
+        let until = Instant::now() + idle;
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            std::thread::sleep(every.min(left));
+            if Instant::now() >= until {
+                break;
+            }
+            warm();
+            self.dispatched += 1;
+        }
+        self.kept += profile::take().gpu();
     }
 
     /// Both clocks back to zero after work nobody is timing, and a full gap
@@ -1588,8 +1684,10 @@ impl Ticking {
     fn settled(&mut self) {
         let idle = self.shape.gap.idle(Duration::ZERO);
         if !idle.is_zero() {
-            std::thread::sleep(idle);
+            self.idled(idle);
         }
+        self.kept = Duration::ZERO;
+        self.dispatched = 0;
         profile::take();
         self.at = Instant::now();
         self.opened = self.at;
@@ -1608,7 +1706,7 @@ impl Ticking {
             false => Duration::ZERO,
         };
         if !idle.is_zero() {
-            std::thread::sleep(idle);
+            self.idled(idle);
         }
         self.ticks.push(Tick {
             wall: self.at.elapsed(),
@@ -2512,6 +2610,7 @@ mod tests {
                 shape: Shape {
                     gap: Gap::After(Duration::ZERO),
                     burst: 1,
+                    warm: None,
                 },
                 prefill: 0,
             }
@@ -2530,6 +2629,7 @@ mod tests {
                 shape: Shape {
                     gap: Gap::After(Duration::ZERO),
                     burst: 1,
+                    warm: None,
                 },
                 prefill: 0,
             }
@@ -2556,6 +2656,7 @@ mod tests {
                 shape: Shape {
                     gap: Gap::After(Duration::ZERO),
                     burst: 1,
+                    warm: None,
                 },
                 prefill: 0,
             }
@@ -2588,6 +2689,7 @@ mod tests {
                 shape: Shape {
                     gap: Gap::After(Duration::ZERO),
                     burst: 1,
+                    warm: None,
                 },
                 prefill: 0,
             }
@@ -2627,6 +2729,7 @@ mod tests {
                 shape: Shape {
                     gap: Gap::After(Duration::ZERO),
                     burst: 1,
+                    warm: None,
                 },
                 prefill: 0,
             }
@@ -2693,6 +2796,7 @@ mod tests {
                 shape: Shape {
                     gap: Gap::After(Duration::from_millis(40)),
                     burst: 1,
+                    warm: None,
                 },
                 prefill: 0,
             }
@@ -2729,6 +2833,7 @@ mod tests {
                 shape: Shape {
                     gap: Gap::After(Duration::ZERO),
                     burst: 1,
+                    warm: None,
                 },
                 prefill: 2048,
             }
@@ -2806,6 +2911,102 @@ mod tests {
         }
     }
 
+    /// **A gap that is dispatched into is still a gap.** What the lever is for
+    /// is to leave the device something to do without shortening the idle it is
+    /// being asked about, so a run that came back early would be measuring a
+    /// different gap from the one the arm it is paired against left.
+    #[test]
+    fn a_gap_kept_warm_is_dispatched_into_and_is_still_the_gap_it_was_asked_for() {
+        const GAP: Duration = Duration::from_millis(100);
+        const EVERY: Duration = Duration::from_millis(20);
+        let dispatched = std::cell::Cell::new(0usize);
+        let warm = || dispatched.set(dispatched.get() + 1);
+        let mut ticking = Ticking::new(
+            Shape {
+                gap: Gap::After(GAP),
+                burst: 1,
+                warm: Some(EVERY),
+            },
+            Some(&warm),
+            2,
+        );
+
+        let started = Instant::now();
+        ticking.tick(Duration::ZERO);
+        assert!(
+            started.elapsed() >= GAP,
+            "the gap came back early: {:?}",
+            started.elapsed()
+        );
+        // At least one and no more than the gap holds, which is what a cadence
+        // is: the count itself is the host's to decide, because a sleep of 20 ms
+        // on this machine is 20 ms and however much longer it feels like.
+        assert!(
+            (1..=(GAP.as_millis() / EVERY.as_millis()) as usize).contains(&dispatched.get()),
+            "{} dispatches in a {GAP:?} gap at one every {EVERY:?}",
+            dispatched.get()
+        );
+        assert_eq!(dispatched.get(), ticking.dispatched, "counted twice");
+    }
+
+    /// **A gap of nothing has nowhere to put a dispatch**, so the lever is
+    /// refused there rather than turned into a busy loop between two units that
+    /// are already back to back — and refused, like every other one, to the
+    /// measurements that do not vary their own duty cycle.
+    #[test]
+    fn a_keep_warm_needs_a_gap_to_dispatch_into() {
+        assert!(
+            matches!(
+                Job::parse(
+                    ["clock", "models/small", "--idle", "200", "--keep-warm", "20"]
+                        .map(str::to_string)
+                )
+                .expect("parses"),
+                Job::Measure {
+                    shape: Shape { warm: Some(every), .. },
+                    ..
+                } if every == Duration::from_millis(20)
+            ),
+            "a keep-warm did not reach the run"
+        );
+        for given in [
+            ["clock", "models/small", "--keep-warm", "20"].as_slice(),
+            ["clock", "models/small", "--idle", "0", "--keep-warm", "20"].as_slice(),
+            [
+                "clock",
+                "models/small",
+                "--every",
+                "200",
+                "--keep-warm",
+                "0",
+            ]
+            .as_slice(),
+            ["decode", "models/small", "--keep-warm", "20"].as_slice(),
+        ] {
+            assert!(
+                Job::parse(given.iter().map(|word| word.to_string())).is_err(),
+                "{given:?} was taken"
+            );
+        }
+        // A rate leaves whatever the work did not spend, which is a gap to
+        // dispatch into.
+        assert!(
+            Job::parse(
+                [
+                    "clock",
+                    "models/small",
+                    "--every",
+                    "200",
+                    "--keep-warm",
+                    "20"
+                ]
+                .map(str::to_string)
+            )
+            .is_ok(),
+            "a rate had nowhere to put a keep-warm"
+        );
+    }
+
     /// **One stalled unit moves the mean and not the middle**, which is the pair
     /// of columns a reader needs to tell a run that was uniformly slower from a
     /// run that was interrupted once — and an idled run is where that matters,
@@ -2830,7 +3031,9 @@ mod tests {
             Shape {
                 gap: Gap::After(GAP),
                 burst: 3,
+                warm: None,
             },
+            None,
             6,
         );
         let started = Instant::now();
@@ -2927,7 +3130,9 @@ mod tests {
             Shape {
                 gap: Gap::After(Duration::ZERO),
                 burst: 1,
+                warm: None,
             },
+            None,
             4,
         );
         let opened = ticking.at;
@@ -3444,6 +3649,7 @@ mod tests {
                 shape: Shape {
                     gap: Gap::After(Duration::ZERO),
                     burst: 1,
+                    warm: None,
                 },
                 prefill: 0,
             }
