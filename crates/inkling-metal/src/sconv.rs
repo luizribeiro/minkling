@@ -53,7 +53,7 @@ const ENTRY: &str = "short_conv";
 const PAIRED_ENTRY: &str = "short_conv_pair";
 
 /// How many `uint`s the kernel's `Shape` struct declares.
-const FIELDS: usize = 9;
+const FIELDS: usize = 11;
 
 /// Threads one threadgroup of a dispatch holds.
 ///
@@ -94,20 +94,17 @@ impl ShortConvolution {
     }
 }
 
-/// The two windows one sequence carries through one convolution, and how much
-/// of each is filled.
+/// Where one sequence is in the two windows it carries through one convolution.
 ///
-/// **One of these per slot of a batch, and the weight is not among them.** N
-/// sequences advancing together read the same taps and carry their own
-/// timesteps, so what a slot holds is the state and what the convolution holds
-/// is the tensor — which is the whole of the bargain a batch is: one weight
-/// read, many tokens.
+/// **One of these per slot of a batch, and neither the weight nor the memory is
+/// among them.** N sequences advancing together read the same taps and carry
+/// their own timesteps, so what a slot holds is where it is and what the
+/// convolution holds is the tensor and the allocation — which is the whole of
+/// the bargain a batch is: one weight read, many tokens.
 #[derive(Debug)]
-struct Windows {
-    /// The two a call reads one of and writes the other — see the module
+struct Carrying {
+    /// Which of the two halves the next call reads — see the module
     /// documentation.
-    windows: RefCell<[Buffer<f32>; 2]>,
-    /// Which of the two the next call reads.
     reading: Cell<usize>,
     /// What each of them holds, which is the `taps - 1` the convolution reads
     /// and the timesteps behind them a rejected speculative token is taken back
@@ -133,9 +130,20 @@ pub struct LayerConv<'a> {
     /// buffer to a dispatch borrows it exclusively, and the weight belongs to
     /// the layer rather than to the call.
     weight: RefCell<Buffer<f32>>,
-    /// A sequence's windows, one entry per slot the batch has room for. A
+    /// **Every slot's two windows in one allocation**, laid `[2, slots, held,
+    /// channels]`: which of the two a slot reads is an offset into it rather
+    /// than a buffer of its own, the way a batch's spans are one allocation and
+    /// a slot of them a row offset — see
+    /// [`KeyValues`](crate::attention::LayerAttention).
+    ///
+    /// **A dispatch binds this once and not twice.** A call reads one half and
+    /// writes the other, and binding a buffer to a dispatch borrows it
+    /// exclusively — so the kernel is handed the allocation and the two offsets
+    /// rather than two pointers, and cuts them itself.
+    windows: RefCell<Buffer<f32>>,
+    /// Where each slot is in it, one entry per slot the batch has room for. A
     /// convolution serving one sequence holds one, which is slot zero.
-    slots: Vec<Windows>,
+    slots: Vec<Carrying>,
     channels: usize,
     taps: usize,
 }
@@ -203,18 +211,15 @@ impl<'a> LayerConv<'a> {
         );
 
         let held = Held::new(channels, taps, slack);
-        let window = || device.zeroed::<f32>(held.floats());
         Ok(Self {
             weight: RefCell::new(device.buffer(weight)?),
+            windows: RefCell::new(device.zeroed::<f32>(2 * slots * held.floats())?),
             slots: (0..slots)
-                .map(|_| {
-                    Ok(Windows {
-                        windows: RefCell::new([window()?, window()?]),
-                        reading: Cell::new(0),
-                        held: Cell::new(held),
-                    })
+                .map(|_| Carrying {
+                    reading: Cell::new(0),
+                    held: Cell::new(held),
                 })
-                .collect::<Result<Vec<Windows>, MetalError>>()?,
+                .collect(),
             device,
             conv,
             channels,
@@ -227,15 +232,35 @@ impl<'a> LayerConv<'a> {
         self.slots.len()
     }
 
-    /// The windows of the sequence in slot `slot`.
+    /// Where the sequence in slot `slot` is in the windows.
     ///
     /// Refused rather than wrapped round: a slot past the batch this was
     /// wrapped for is a sequence whose state is nowhere, and answering slot zero
     /// instead would be one sequence's windows serving two.
-    fn slot(&self, slot: usize) -> &Windows {
+    fn slot(&self, slot: usize) -> &Carrying {
         self.slots
             .get(slot)
             .unwrap_or_else(|| panic!("slot {slot} of a convolution carrying {}", self.slots.len()))
+    }
+
+    /// Where half `half` of slot `slot`'s windows starts in the allocation, in
+    /// floats.
+    ///
+    /// **The half is the outer axis and the slot the one under it**, so a
+    /// slot's two windows are `slots * held` floats apart and two slots reading
+    /// the same half are neighbours. Either layout works for one dispatch a
+    /// slot; this one is what lets a batched call describe the read and the
+    /// write of every slot as one stride apiece.
+    fn at(&self, half: usize, slot: usize) -> usize {
+        let floats = self.slot(slot).held.get().floats();
+        (half * self.slots.len() + slot) * floats
+    }
+
+    /// The floats of slot `slot`'s half `half`, as the run of the allocation
+    /// they are.
+    fn half(&self, half: usize, slot: usize) -> std::ops::Range<usize> {
+        let at = self.at(half, slot);
+        at..at + self.slot(slot).held.get().floats()
     }
 
     /// How many timesteps slot `slot` may still take back.
@@ -258,8 +283,9 @@ impl<'a> LayerConv<'a> {
     pub fn rewind(&self, slot: usize, rows: usize) {
         let state = self.slot(slot);
         let mut held = state.held.get();
-        let mut windows = state.windows.borrow_mut();
-        held.rewind(rows, windows[state.reading.get()].as_mut_slice());
+        let reading = self.half(state.reading.get(), slot);
+        let mut windows = self.windows.borrow_mut();
+        held.rewind(rows, &mut windows.as_mut_slice()[reading]);
         state.held.set(held);
     }
 
@@ -280,8 +306,7 @@ impl<'a> LayerConv<'a> {
     /// The weight is not on this account: it is one tensor whatever the batch
     /// is, which is what a batch is for.
     pub fn window_bytes(&self) -> u64 {
-        let floats = self.slots.iter().map(|slot| 2 * slot.held.get().floats());
-        (floats.sum::<usize>() * size_of::<f32>()) as u64
+        (self.windows.borrow().len() * size_of::<f32>()) as u64
     }
 
     /// The window a sequence starts from, which is `taps - 1` zeroed timesteps —
@@ -292,9 +317,8 @@ impl<'a> LayerConv<'a> {
     /// nobody indexes.
     pub fn restart(&self, slot: usize) {
         let state = self.slot(slot);
-        state.windows.borrow_mut()[state.reading.get()]
-            .as_mut_slice()
-            .fill(0.0);
+        let reading = self.half(state.reading.get(), slot);
+        self.windows.borrow_mut().as_mut_slice()[reading].fill(0.0);
         let mut held = state.held.get();
         held.restarted();
         state.held.set(held);
@@ -305,8 +329,9 @@ impl<'a> LayerConv<'a> {
     /// it out.
     pub fn window(&self, slot: usize) -> Vec<f32> {
         let state = self.slot(slot);
-        state.windows.borrow()[state.reading.get()].as_slice()[state.held.get().reading()..]
-            .to_vec()
+        let mut reading = self.half(state.reading.get(), slot);
+        reading.start += state.held.get().reading();
+        self.windows.borrow().as_slice()[reading].to_vec()
     }
 
     /// The rows this holds now, as something that can put them back later — the
@@ -317,11 +342,10 @@ impl<'a> LayerConv<'a> {
     /// it has to have completed.
     pub fn mark(&self, slot: usize) -> ConvMark {
         let state = self.slot(slot);
+        let reading = self.half(state.reading.get(), slot);
         ConvMark::new(
             state.held.get(),
-            state.windows.borrow()[state.reading.get()]
-                .as_slice()
-                .to_vec(),
+            self.windows.borrow().as_slice()[reading].to_vec(),
         )
     }
 
@@ -333,8 +357,9 @@ impl<'a> LayerConv<'a> {
     /// is written before it is read, so what is in it is memory nobody indexes.
     pub fn resume(&self, slot: usize, mark: &ConvMark) {
         let state = self.slot(slot);
-        let mut windows = state.windows.borrow_mut();
-        let window = windows[state.reading.get()].as_mut_slice();
+        let reading = self.half(state.reading.get(), slot);
+        let mut windows = self.windows.borrow_mut();
+        let window = &mut windows.as_mut_slice()[reading];
         assert_eq!(
             (self.channels, window.len()),
             (mark.held().channels(), mark.timesteps().len()),
@@ -464,9 +489,7 @@ impl<'a> LayerConv<'a> {
         let scaled_by = [scale];
         let mut scaling = self.device.inline(&scaled_by)?;
         let mut weight = self.weight.borrow_mut();
-        let state = self.slot(reading.slot);
-        let mut windows = state.windows.borrow_mut();
-        let (window, kept) = self.reading(reading.slot, &mut windows);
+        let mut windows = self.windows.borrow_mut();
 
         // A slot the kernel is told to ignore still has to be filled, and one
         // float in the command buffer is what filling it costs — see
@@ -484,9 +507,8 @@ impl<'a> LayerConv<'a> {
                 scaling.arg(),
                 x.arg(),
                 weight.arg(),
-                window.arg(),
+                windows.arg(),
                 landing.out.arg(),
-                kept.arg(),
                 carried,
             ],
             Grid::new(call.threads, THREADS_PER_GROUP),
@@ -534,6 +556,7 @@ impl<'a> LayerConv<'a> {
                 "a residual against what it is added to"
             );
         }
+        let reads = self.slot(slot).reading.get();
         Call {
             fields: [
                 extent(rows, "the rows of a call"),
@@ -545,6 +568,8 @@ impl<'a> LayerConv<'a> {
                 extent(landing.base, "where a call's rows start"),
                 carried.is_some() as u32,
                 extent(from, "where a call's rows are read from"),
+                extent(self.at(reads, slot), "where a call's window starts"),
+                extent(self.at(1 - reads, slot), "where a call's window is left"),
             ],
             rows,
             // A thread to each channel of each timestep, and one more timestep's
@@ -562,20 +587,6 @@ impl<'a> LayerConv<'a> {
                     + self.channels * self.taps
                     + 2 * held.floats()
                     + carried.map_or(0, |_| rows * self.channels)),
-        }
-    }
-
-    /// The window a call reads and the one it leaves behind, of the two this
-    /// convolution alternates between.
-    fn reading<'w>(
-        &self,
-        slot: usize,
-        windows: &'w mut [Buffer<f32>; 2],
-    ) -> (&'w mut Buffer<f32>, &'w mut Buffer<f32>) {
-        let [first, second] = windows;
-        match self.slot(slot).reading.get() {
-            0 => (first, second),
-            _ => (second, first),
         }
     }
 
@@ -718,10 +729,8 @@ pub fn encode_pair(
     let mut second_scaling = device.inline(&second_scaled)?;
     let mut first_weight = one.weight.borrow_mut();
     let mut second_weight = other.weight.borrow_mut();
-    let mut first_windows = one.slot(first_reading.slot).windows.borrow_mut();
-    let mut second_windows = other.slot(second_reading.slot).windows.borrow_mut();
-    let (first_window, first_kept) = one.reading(first_reading.slot, &mut first_windows);
-    let (second_window, second_kept) = other.reading(second_reading.slot, &mut second_windows);
+    let mut first_windows = one.windows.borrow_mut();
+    let mut second_windows = other.windows.borrow_mut();
 
     // One a side, for the reason `encode_over` gives — and two rather than one
     // because binding an inline value borrows it exclusively.
@@ -743,17 +752,15 @@ pub fn encode_pair(
             first_scaling.arg(),
             first_x.arg(),
             first_weight.arg(),
-            first_window.arg(),
+            first_windows.arg(),
             first_landing.out.arg(),
-            first_kept.arg(),
             first_carried,
             second_shape.arg(),
             second_scaling.arg(),
             second_x.arg(),
             second_weight.arg(),
-            second_window.arg(),
+            second_windows.arg(),
             second_landing.out.arg(),
-            second_kept.arg(),
             second_carried,
         ],
         Grid::new(first_call.threads + second_call.threads, THREADS_PER_GROUP),
@@ -780,6 +787,12 @@ struct Shape {
     uint base;
     uint carried;
     uint from;
+    /// Where in the windows allocation this call's own window starts, and where
+    /// the one it leaves behind does. **A slot is an offset rather than a
+    /// buffer**: every slot's two windows are one allocation, and a dispatch
+    /// binds it once because binding it twice would borrow it twice.
+    uint reads;
+    uint writes;
 };
 
 /// One channel of one timestep of `window ++ scale * x`, which is the padded
@@ -898,21 +911,28 @@ static void convolve(
 }
 
 /// One call of it, over the threads a call's own rows and window need.
+///
+/// **The windows are one allocation and the shape says where in it this call's
+/// two are.** A dispatch cannot bind the same buffer twice — a binding borrows
+/// it exclusively — so the halves are cut here, out of the one pointer, at the
+/// offsets the slot decided.
 kernel void short_conv(
     constant Shape &shape [[buffer(0)]],
     constant float &scale [[buffer(1)]],
     device const float *x [[buffer(2)]],
     device const float *weight [[buffer(3)]],
-    device const float *window [[buffer(4)]],
+    device float *windows [[buffer(4)]],
     device float *out [[buffer(5)]],
-    device float *kept [[buffer(6)]],
-    device const float *carried [[buffer(7)]],
+    device const float *carried [[buffer(6)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= (shape.rows + shape.held) * shape.channels) {
         return;
     }
-    convolve(shape, scale, x, weight, window, out, kept, carried, id);
+    convolve(
+        shape, scale, x, weight, windows + shape.reads,
+        out, windows + shape.writes, carried, id
+    );
 }
 
 /// Two convolutions as one dispatch: a grid of both calls' threads, the first
@@ -934,30 +954,28 @@ kernel void short_conv_pair(
     constant float &first_scale [[buffer(1)]],
     device const float *first_x [[buffer(2)]],
     device const float *first_weight [[buffer(3)]],
-    device const float *first_window [[buffer(4)]],
+    device float *first_windows [[buffer(4)]],
     device float *first_out [[buffer(5)]],
-    device float *first_kept [[buffer(6)]],
-    device const float *first_carried [[buffer(7)]],
-    constant Shape &second [[buffer(8)]],
-    constant float &second_scale [[buffer(9)]],
-    device const float *second_x [[buffer(10)]],
-    device const float *second_weight [[buffer(11)]],
-    device const float *second_window [[buffer(12)]],
-    device float *second_out [[buffer(13)]],
-    device float *second_kept [[buffer(14)]],
-    device const float *second_carried [[buffer(15)]],
+    device const float *first_carried [[buffer(6)]],
+    constant Shape &second [[buffer(7)]],
+    constant float &second_scale [[buffer(8)]],
+    device const float *second_x [[buffer(9)]],
+    device const float *second_weight [[buffer(10)]],
+    device float *second_windows [[buffer(11)]],
+    device float *second_out [[buffer(12)]],
+    device const float *second_carried [[buffer(13)]],
     uint id [[thread_position_in_grid]]
 ) {
     const uint firsts = (first.rows + first.held) * first.channels;
     if (id < firsts) {
         convolve(
-            first, first_scale, first_x, first_weight, first_window,
-            first_out, first_kept, first_carried, id
+            first, first_scale, first_x, first_weight, first_windows + first.reads,
+            first_out, first_windows + first.writes, first_carried, id
         );
     } else if (id - firsts < (second.rows + second.held) * second.channels) {
         convolve(
-            second, second_scale, second_x, second_weight, second_window,
-            second_out, second_kept, second_carried, id - firsts
+            second, second_scale, second_x, second_weight, second_windows + second.reads,
+            second_out, second_windows + second.writes, second_carried, id - firsts
         );
     }
 }
