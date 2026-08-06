@@ -365,8 +365,94 @@ impl<'a> Generator<'a> {
     ) -> Vec<Picked> {
         let counts: Vec<usize> = batch.iter().map(|sequence| sequence.ids.len()).collect();
         let rows: usize = counts.iter().sum();
+        let picks = self.asked_of(batch, rows, weights);
+
+        let mut from = 0;
+        counts
+            .into_iter()
+            .map(|queries| {
+                let picked = Picked {
+                    first: from,
+                    picks: picks[from..from + queries].to_vec(),
+                };
+                from += queries;
+                picked
+            })
+            .collect()
+    }
+
+    /// The same step over a batch whose **leading seats are feeding a prompt
+    /// and whose trailing `decoding` seats are decoding a row apiece**, and the
+    /// id each of those decoders produced.
+    ///
+    /// **This is what a slot filling while its neighbours decode looks like from
+    /// here**, and it is one call rather than two: a request joining a running
+    /// batch feeds its prompt in the same forward pass the sequences already in
+    /// flight take their next token out of, so the weights that pass reads are
+    /// read once for the joiner and the decoders together. That is the seat path
+    /// `B3` built and nothing reached — a seat is a *stride* of the grid rather
+    /// than a run of it precisely so that one call can carry rows of unequal
+    /// counts.
+    ///
+    /// **The order of the seats is the interface and it is asserted.** A tail is
+    /// asked for the last `block` rows of a call — see [`Tail::block`] — so the
+    /// rows that are questions have to be the last of them. A joining prompt's
+    /// rows are not questions: every position but its last would be a pass over
+    /// 200058 rows of the head to answer what nothing asks. So the fillers go in
+    /// front, the decoders behind, and the block is exactly the decoders.
+    ///
+    /// **Which is why a prompt is filled to its last token and no further.**
+    /// The token that follows a prompt is decided by the prompt's last row, and
+    /// that row is a question — so a joining sequence feeds `prompt[..n-1]`
+    /// here and then feeds `prompt[n-1]` as its first decode row, which is the
+    /// split `prefilling_then_decoding_matches_one_prefill_over_the_whole_sequence`
+    /// says produces the same logits as one pass over all of it.
+    pub fn step_admitting(
+        &self,
+        batch: &mut [Batched<'_>],
+        decoding: usize,
+        weights: &impl ModelWeights,
+    ) -> Vec<usize> {
+        assert!(
+            decoding <= batch.len(),
+            "{decoding} decoding seats in a batch of {}",
+            batch.len()
+        );
+        let filling = batch.len() - decoding;
+        assert!(
+            batch[..filling].iter().all(|seat| !seat.ids.is_empty()),
+            "a seat of the batch feeding no rows"
+        );
+        assert!(
+            batch[filling..].iter().all(|seat| seat.ids.len() == 1),
+            "a decoding seat feeding more than the token it owes"
+        );
+
+        // **A step with nothing to ask still asks for one row**, which is a
+        // batch every seat of which is filling: a backend that carried the last
+        // layer's rows has a run still open and the tail is what closes it, so
+        // the smallest tail there is is the one [`Generator::prefill`] takes and
+        // for the same reason. The id it names is a mid-prompt position's and is
+        // dropped here.
+        let picks = self.asked_of(batch, decoding.max(1), weights);
+        picks[picks.len() - decoding..].to_vec()
+    }
+
+    /// The stack and the tail over a batch, and the ids of the **last `block`
+    /// rows** of the call.
+    ///
+    /// The one place the two batched steps share, because what differs between
+    /// them is which rows are questions and nothing else: a batch every row of
+    /// which is a speculative block's asks for all of them, and a batch that is
+    /// admitting a sequence asks for the decoders behind the prompt being fed.
+    fn asked_of(
+        &self,
+        batch: &mut [Batched<'_>],
+        block: usize,
+        weights: &impl ModelWeights,
+    ) -> Vec<usize> {
         let want = Tail {
-            block: rows,
+            block,
             chained: false,
             logits: false,
         };
@@ -376,20 +462,8 @@ impl<'a> Generator<'a> {
                 .expect("a stack that carried its last layer's rows holds the tail behind them"),
             Passed::Rows(h) => self.on_this_side(&h, want),
         };
-        assert_eq!(tailed.picks.len(), rows, "an id per row of the batch");
-
-        let mut from = 0;
-        counts
-            .into_iter()
-            .map(|queries| {
-                let picked = Picked {
-                    first: from,
-                    picks: tailed.picks[from..from + queries].to_vec(),
-                };
-                from += queries;
-                picked
-            })
-            .collect()
+        assert_eq!(tailed.picks.len(), block, "an id per row of the block");
+        tailed.picks
     }
 
     /// `ids` into `cache`, with no token taken back out of it.
