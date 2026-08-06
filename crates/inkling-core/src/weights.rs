@@ -58,7 +58,7 @@ use crate::generate::Generator;
 use crate::head::{LmHead, Tail, Tailed};
 use crate::layer::{
     DecoderCache, DecoderDevice, DecoderLayer, DecoderWeights, Experts, Hidden, LayerMlp,
-    NoExperts, Passed,
+    NoExperts, Passed, Seat,
 };
 use crate::model::{CacheMark, Mark, Model, ModelCache, ModelWeights};
 use crate::moe::{ExpertBank, Gate, GateWeights, Gathered, MoeConfig, SparseMoe};
@@ -1193,6 +1193,11 @@ impl ModelWeights for CheckpointWeights<'_> {
     }
 
     fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: Hidden<'_>) -> Passed {
+        let queries = x.tokens(self.config.hidden_size);
+        self.run_layer_batch(index, &mut [Seat { queries, cache }], x)
+    }
+
+    fn run_layer_batch(&self, index: usize, seats: &mut [Seat<'_>], x: Hidden<'_>) -> Passed {
         let mut buffer = self.layer_scratch.borrow_mut();
         let mut scratch = Scratch::new(&mut buffer);
         let widened = &self.layers[index];
@@ -1212,8 +1217,8 @@ impl ModelWeights for CheckpointWeights<'_> {
         let config = AttentionConfig::for_layer(self.config, index);
         let layer = DecoderLayer::new(config, weights, mlp.view());
         match experts {
-            Some(experts) => layer.forward(index, cache, x, experts, device),
-            None => layer.forward(index, cache, x, &mlp, device),
+            Some(experts) => layer.forward_batch(index, seats, x, experts, device),
+            None => layer.forward_batch(index, seats, x, &mlp, device),
         }
     }
 

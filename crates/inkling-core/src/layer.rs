@@ -570,7 +570,79 @@ impl<'a> DecoderLayer<'a> {
         experts: &(impl Experts + ?Sized),
         device: Option<&dyn DecoderDevice>,
     ) -> Passed {
-        self.run(layer, cache, x, experts, device, Residual::PreNorm)
+        self.forward_batch(
+            layer,
+            &mut [Seat {
+                queries: x.tokens(self.hidden),
+                cache,
+            }],
+            x,
+            experts,
+            device,
+        )
+    }
+
+    /// The same layer over several sequences advancing together, which is what
+    /// [`DecoderLayer::forward`] is one of.
+    ///
+    /// **A batch of one is this call and not a simpler one beside it.** What a
+    /// batch buys is that the layer's weights are read once for every sequence
+    /// in it, and the shape-keyed tuning that decides how they are read is the
+    /// same tuning at every N — so a single request that took another path
+    /// would be a second copy of it to keep in step.
+    ///
+    /// `x` is the `[rows, hidden]` of the whole call, each sequence's rows
+    /// following the last's in the order the seats name them.
+    ///
+    /// **A backend that holds the layer whole is what makes a batch of more
+    /// than one worth anything**, and what a backend that does not is left with
+    /// is this side's own arithmetic — which has no batch: every weight it
+    /// touches it decodes into a scratch a row at a time, so N sequences here
+    /// are N calls, each against its own cache, which is the answer a batch has
+    /// to agree with rather than a way of reaching it faster.
+    pub fn forward_batch(
+        &self,
+        layer: usize,
+        seats: &mut [Seat<'_>],
+        x: Hidden<'_>,
+        experts: &(impl Experts + ?Sized),
+        device: Option<&dyn DecoderDevice>,
+    ) -> Passed {
+        if let Some(device) = device
+            && let Some(passed) = self.advancing(seats, |batch| device.run(layer, batch, x))
+        {
+            return passed;
+        }
+        self.severally(layer, seats, x, experts)
+    }
+
+    /// Each sequence's rows through the layer against its own cache, which is
+    /// what a batch means and what nothing but a backend can do in one pass.
+    fn severally(
+        &self,
+        layer: usize,
+        seats: &mut [Seat<'_>],
+        x: Hidden<'_>,
+        experts: &(impl Experts + ?Sized),
+    ) -> Passed {
+        let rows = x.rows();
+        let mut out = Vec::with_capacity(rows.len());
+        let mut from = 0;
+        for seat in seats.iter_mut() {
+            let take = seat.queries * self.hidden;
+            let own = Hidden::Rows(&rows[from..from + take]);
+            out.extend(
+                self.run(layer, seat.cache, own, experts, None, Residual::PreNorm)
+                    .rows(),
+            );
+            from += take;
+        }
+        assert_eq!(
+            from,
+            rows.len(),
+            "a sequence's rows for every row of the call"
+        );
+        Passed::Rows(out)
     }
 
     /// [`DecoderLayer::forward`], with the two ways of wiring a residual named

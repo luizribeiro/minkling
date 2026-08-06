@@ -79,7 +79,7 @@ use crate::attention::AttentionConfig;
 use crate::config::TextConfig;
 use crate::embed::Embed;
 use crate::head::{Tail, Tailed};
-use crate::layer::{DecoderCache, Hidden, LayerMark, Passed};
+use crate::layer::{DecoderCache, Hidden, LayerMark, Passed, Seat};
 use crate::ops::rms_norm;
 
 /// The model's weights, reached through an index rather than held as slices.
@@ -143,6 +143,34 @@ pub trait ModelWeights {
     /// the next layer, so the only thing it needs of a hidden state it never
     /// sees is that the last layer's is a value again.
     fn run_layer(&self, index: usize, cache: &mut DecoderCache, x: Hidden<'_>) -> Passed;
+
+    /// The same layer over several sequences advancing together, `x` being the
+    /// `[rows, hidden]` of the whole call with each sequence's rows following
+    /// the last's.
+    ///
+    /// **Defaulted to a call a sequence, because that is what a batch means.**
+    /// Sequence `s`'s rows through layer `index` against sequence `s`'s cache
+    /// is the answer a batch has to produce, whatever it does to produce it —
+    /// so the default is the definition, and an implementation that has
+    /// somewhere to run the layer where the weights are read once overrides it
+    /// with something faster and not with something else. See
+    /// [`DecoderLayer::forward_batch`](crate::layer::DecoderLayer::forward_batch).
+    fn run_layer_batch(&self, index: usize, seats: &mut [Seat<'_>], x: Hidden<'_>) -> Passed {
+        let rows = x.rows();
+        let hidden = match seats.iter().map(|seat| seat.queries).sum::<usize>() {
+            0 => panic!("a forward pass over no tokens"),
+            total => rows.len() / total,
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        let mut from = 0;
+        for seat in seats.iter_mut() {
+            let take = seat.queries * hidden;
+            let own = Hidden::Rows(&rows[from..from + take]);
+            out.extend(self.run_layer(index, seat.cache, own).rows());
+            from += take;
+        }
+        Passed::Rows(out)
+    }
 
     /// The final norm, the muP divide and `lm_head` behind the `rows` the last
     /// layer left where they lie, and `None` from a backend that answered that
@@ -286,6 +314,17 @@ impl ModelCache {
     }
 }
 
+/// One sequence of a batch, as the stack sees it: the state that is its own and
+/// the ids it is feeding this call.
+///
+/// The cache carries which of a backend's slots holds the rest of that
+/// sequence's state — see [`ModelCache::in_slot`] — so a batch is built by
+/// naming caches and nothing else has to be kept in step.
+pub struct Batched<'a> {
+    pub cache: &'a mut ModelCache,
+    pub ids: &'a [usize],
+}
+
 /// Where a run of layers was, one [`LayerMark`] apiece.
 ///
 /// A list rather than a map from layer index, because both ends of it walk the
@@ -396,15 +435,47 @@ impl<'a> Model<'a> {
         ids: &[usize],
         weights: &impl ModelWeights,
     ) -> Passed {
-        assert_eq!(
-            cache.layers.len(),
-            self.layers,
-            "a cache per layer of the model"
-        );
+        self.forward_batch(&mut [Batched { cache, ids }], weights)
+    }
 
-        let mut h = Passed::Rows(self.embeddings(ids, weights));
-        for (index, cache) in cache.layers.iter_mut().enumerate() {
-            h = weights.run_layer(index, cache, h.handed());
+    /// The same stack over several sequences advancing together: every
+    /// sequence's ids embedded into one call, forty-two layers over all of
+    /// them, and the rows they produced in the order the batch names them.
+    ///
+    /// **A batch of one is this call and not a simpler one beside it**, for the
+    /// reason [`DecoderLayer::forward_batch`](crate::layer::DecoderLayer::forward_batch)
+    /// gives: what a batch buys is that a layer's weights are read once for
+    /// every sequence in it, and a single request that took another path would
+    /// be a second copy of every shape-keyed decision to keep in step.
+    ///
+    /// The rows are laid out sequence by sequence, which is what makes each
+    /// sequence's run of them contiguous — the thing every dispatch that reads
+    /// one sequence's rows out of the call indexes by.
+    pub fn forward_batch(&self, batch: &mut [Batched<'_>], weights: &impl ModelWeights) -> Passed {
+        assert!(!batch.is_empty(), "a forward pass over no sequences");
+        let mut ids = Vec::new();
+        for sequence in batch.iter() {
+            assert_eq!(
+                sequence.cache.layers.len(),
+                self.layers,
+                "a cache per layer of the model"
+            );
+            assert!(!sequence.ids.is_empty(), "a forward pass over no tokens");
+            ids.extend_from_slice(sequence.ids);
+        }
+
+        let mut h = Passed::Rows(self.embeddings(&ids, weights));
+        for index in 0..self.layers {
+            let mut seats: Vec<Seat<'_>> = batch
+                .iter_mut()
+                .map(|sequence| Seat {
+                    queries: sequence.ids.len(),
+                    cache: sequence.cache.layer(index),
+                })
+                .collect();
+            let handed = h.handed();
+            let next = weights.run_layer_batch(index, &mut seats, handed);
+            h = next;
         }
         h
     }
@@ -725,6 +796,78 @@ mod tests {
                 wrong.len()
             );
         }
+    }
+
+    /// **The same sequence, run alone and run inside a batch, produces
+    /// identical rows** — stated on the stack, where the rows are all there is
+    /// to compare.
+    ///
+    /// On this side a batch is a call a sequence and so cannot fail; what this
+    /// pins is everything around those calls, which a backend that runs them in
+    /// one pass inherits: that the ids are laid out sequence by sequence, that
+    /// each sequence's rows come back where its own are, and that a sequence is
+    /// answered the same wherever in the batch it sits. The kernels' own case
+    /// is `a_sequence_in_a_batch_produces_what_it_produces_alone`.
+    ///
+    /// Exact equality, because both arms multiply the same numbers in the same
+    /// order — the only thing a batch changes is which row of the call each of
+    /// them is at.
+    #[test]
+    fn a_sequence_in_a_batch_produces_what_it_produces_alone() {
+        let stack = Stack::load();
+        let model = stack.model();
+        let sequence = stack.sequence();
+        // Two prompts of different lengths, so that a neighbour's length is one
+        // of the things a batch has to be right about.
+        let prompts: [&[usize]; 3] = [&sequence[..3], &sequence[3..], &sequence[..1]];
+
+        let alone: Vec<Vec<f32>> = prompts
+            .iter()
+            .map(|ids| {
+                model
+                    .forward(&mut ModelCache::new(&stack.config), ids, &stack)
+                    .rows()
+            })
+            .collect();
+        assert_ne!(alone[0], alone[2], "two sequences to tell apart");
+
+        for order in [vec![0, 1, 2], vec![2, 1, 0], vec![1, 2], vec![2, 1]] {
+            let mut caches: Vec<ModelCache> = order
+                .iter()
+                .enumerate()
+                .map(|(slot, _)| ModelCache::in_slot(&stack.config, 0, slot))
+                .collect();
+            let mut batch: Vec<Batched<'_>> = caches
+                .iter_mut()
+                .zip(&order)
+                .map(|(cache, at)| Batched {
+                    cache,
+                    ids: prompts[*at],
+                })
+                .collect();
+            let rows = model.forward_batch(&mut batch, &stack).rows();
+
+            let mut from = 0;
+            for at in &order {
+                let take = prompts[*at].len() * model.hidden();
+                assert_eq!(
+                    rows[from..from + take],
+                    alone[*at][..],
+                    "sequence {at} of {order:?}"
+                );
+                from += take;
+            }
+            assert_eq!(from, rows.len(), "a sequence's rows for every row");
+        }
+    }
+
+    /// A batch of no sequences is a forward pass with nothing to answer, for the
+    /// reason a pass over no tokens is.
+    #[test]
+    #[should_panic(expected = "a forward pass over no sequences")]
+    fn a_forward_pass_over_no_sequences_is_refused() {
+        let stack = Stack::load();
+        stack.model().forward_batch(&mut [], &stack);
     }
 
     /// A mark says where a sequence *was*. Asking to be put somewhere it has not
