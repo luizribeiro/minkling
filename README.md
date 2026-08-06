@@ -1226,21 +1226,30 @@ appeared to gain between 2048 and 8192. **It then set a height against it.**
 `moe_tap`, per MoE layer, at each length the block's tables are read at. What a
 router gives is nothing like the construction:
 
-    tokens   rows   experts used   hottest / mean   part empty at 32 rows
-      321    1926        116           27x               58 - 186%
-      512    3072        122           27x               35 - 119%
-     1024    6144        130           27x               17 -  62%
-     2048   12288        136           28x                9 -  31%
-     4096   24576        139           29x                5 -  16%
-     8192   49152        141           30x                2 -   8%
-    16384   98304         79           36x                1 -   3%
+**The first three columns are the mean over the forty MoE layers and the last two
+are the range across them**, which the table now says because it did not: two
+statistics in five columns, with the prose under it reading the means as though
+they were the spread.
 
-**Between 115 and 177 of the 256 experts get no rows at all**, at every length,
-and the busiest gets 27 to 36 times the mean. The spread between the flattest
-layer and the peakiest is a factor of three, which is why the table below is read
-over the median layer by a rule rather than over one picked by hand.
+    tokens   rows   experts used   hottest / mean   empty, least - most   part empty at 32 rows
+      321    1926      116  mean      27x  mean         108 - 207              58 - 186%
+      512    3072      122            27x               102 - 206              35 - 119%
+     1024    6144      130            27x                88 - 207              17 -  62%
+     2048   12288      136            28x                80 - 207               9 -  31%
+     4096   24576      139            29x                76 - 207               5 -  16%
+     8192   49152      141            29x                73 - 207               2 -   8%
+    16384   98304       80            36x               137 - 226               1 -   3%
 
-**The fixture is 246 KiB and committed**, and
+**A layer leaves between 73 and 226 of its 256 experts with no rows at all**, and
+its busiest gets between 11.8 and 42.7 times the mean. **Averaged over the forty
+layers those read 115 to 176 empty and 27 to 36 times**, which is what this table
+said before it said which it was — a layer-average is not a bound, and the two
+differ here by a factor of two at both ends. The spread between the flattest layer
+and the peakiest is why the table below is read over the median layer by a rule
+rather than over one picked by hand.
+
+**The fixture is 320.6 KiB and committed** — 328,330 bytes, which is the eight
+lengths' 40 × 256 counts and a header — and
 `the_recorded_routing_is_a_routers_and_not_an_even_layout` fails if it is ever
 regenerated from a construction — the failure this file has no other guard for is
 a fixture that silently goes back to being a layout with a file in front of it
@@ -1383,10 +1392,15 @@ So the numerals carry two lengths where they carried one — 4298 tokens and 130
 three present it selects all four entries.
 
 **What that check cannot see is the two heights**, because both are the same
-`mma_matmul_planned` and a dispatch list is a list of names. What holds them is
-`a_block_cut_to_another_shape_answers_what_the_shipped_one_answers`, which now
-carries both shipped heights and holds each to the shipped block's **own bits**
-through a real dispatch — a stronger statement than reaching them would make.
+`mma_matmul_planned` and a dispatch list is a list of names.
+`a_block_cut_to_another_shape_answers_what_the_shipped_one_answers` carries both
+shipped heights and holds each to the shipped block's **own bits** through a real
+dispatch, **and it takes the tiled entry to do it** — that walk takes its rows
+where they lie, so what it holds at 16 rows is the block body rather than the
+run-cut entry that reads a plan. T7 carried a second length into
+`a_grouped_block_answers_the_grouped_tile_through_both_permutations`, which is
+where the short block is held reading a plan; before that the height every prompt
+under about 1366 tokens dispatches had been measured and never checked.
 
 ### The divergence, which decides it
 
