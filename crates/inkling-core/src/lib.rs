@@ -13,6 +13,7 @@ pub mod mtp;
 pub mod ops;
 pub mod profile;
 pub mod quant;
+pub mod schedule;
 pub mod sconv;
 pub mod tokenizer;
 pub mod weights;
@@ -47,6 +48,7 @@ pub use ops::{
 };
 pub use profile::{Op, Profile};
 pub use quant::{Dequantized, QuantError, Scratch};
+pub use schedule::{Answered, Continuous, Request, Stepped};
 pub use sconv::{ConvMark, ConvState, Held, ShortConv};
 pub use tokenizer::{Detokenizer, Tokenizer, TokenizerError};
 pub use weights::{
