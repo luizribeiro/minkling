@@ -1210,6 +1210,330 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## The workload below the knee, which is a toll a wake and not a slower clock
+
+**C1 left one sentence for this milestone to check: a server holding a batch
+open and answering a request every few hundred milliseconds runs below the knee,
+and its steps will cost up to 23% more device time than any figure here
+predicts.** The 23% is real and it reproduces — a batch of one woken every 200 ms
+reads **15.483 ms of device against 19.372, +25.1%, seven pairs of seven and the
+ranges apart**, at 76.4% duty against 9.3%.
+
+**What is wrong with the sentence is "its steps".** The cost is not a lower clock
+held across a low-occupancy period. It is a fixed toll of about three and a half
+milliseconds charged to *the first dispatch after a gap* and to nothing behind
+it. A run that takes one step per wake pays it on every step, which is what the
+23% is a measurement of; a server that answers a request with eight steps pays it
+once in eight, and one that answers with a hundred pays it once in a hundred.
+
+**And the knee is not a duty cycle.** At **61.1% occupancy with 20 ms gaps the
+toll is zero, and at 61.9% occupancy with 100 ms gaps it is 3.31 ms** — the same
+duty cycle, two different gaps, and the gap decides. C1's sweep moved the gap and
+the occupancy together, because it left its gap after every single step, so it
+could not have told them apart. The lever that tells them apart is a burst.
+
+### The three levers a server's shape needed
+
+`bench clock` repeated one unit and left a gap after it. A server's shape is
+three things that arrangement could not say, and each is a lever:
+
+- **`--batch <n>`** — the unit is a step of `n` sequences. The same gap after a
+  step of one and after a step of thirty-two is two occupancies at one gap
+  length, which is the pair that separates them.
+- **`--burst <n>`** — the gap falls behind `n` units rather than after each. A
+  request is answered by however many steps it needs, back to back, and then the
+  device is idle; and the position table this prints is where the whole finding
+  is, because a mean cannot tell a ramp paid once from a clock held low
+  throughout.
+- **`--every <ms>`** — an arrival interval rather than a gap: what is left idle
+  is the interval less whatever the work spent. A batch of thirty-two answering
+  every 200 ms has no idle at all, which is a sentence `--idle` cannot write.
+
+`clock.median` is beside `clock.device` for the reason the cross-engine table
+quotes both: an idled run has one dear unit a burst by construction, so its mean
+sits above every unit it is a mean of, and only the pair of columns says whether
+that is the shape or a stall.
+
+### What a step costs at each arrival interval
+
+One step per request, both directions of the list, with the duty cycle each
+produced. `--idle 0` is the same steps back to back, which is the arm every
+figure in this file is taken at.
+
+**What a row holds constant is everything but the interval**: one binary, one
+width, sixty steps, and therefore the same keys — 37 at the first timed step and
+96 at the last. That last one is the trap C1 fell into and named: a decode run's
+keys grow one a step and this repo has measured that at +1.33% per 200 keys, so
+two rows of different lengths are not comparable and every row here is the same
+length.
+
+    width  back to back   every 50 ms   every 200 ms    every 1 s     every 2 s
+      1   15.419 77.9%   16.675 27.9%   19.106  9.2%   18.947 1.9%  21.651  1.1%
+      8   63.969 95.5%   64.095 95.5%   67.588 32.7%   68.525 6.8%  76.860  3.8%
+     32  223.029 90.7%  223.045 91.0%  223.024 90.5%  226.884 22.5% 238.733 11.9%
+
+**Read the rows as milliseconds and not as percentages.** The excess over each
+width's own back-to-back figure is +3.69, +3.62 and −0.01 ms at a 200 ms
+interval, and +3.53, +4.56 and +3.86 at a one-second one — **the same three and a
+half to four and a half milliseconds whatever the step costs**, which is what a
+fixed toll looks like and is not what a slower clock looks like. The one-second
+toll as a percentage is 22.9%, 7.1% and 1.7% of those three steps: the same
+number of milliseconds, and the percentage is the thing that moves.
+
+**A wide batch is not answering these requests at all.** At 50 and 200 ms the
+batch of thirty-two never idles — a step is 223 ms, the interval is spent before
+it ends, and the duty cycle says so at 90%. The rate a batch cannot keep up with
+is a queue growing, which is a scheduler's problem and not a clock's.
+
+**Idle until asked costs more than idle for a moment.** Two seconds between
+requests costs +6.23, +12.89 and +15.70 ms against those widths' own figures —
+between twice and four times what a wake after 200 ms or a second costs the same
+width. **The three widths differ because a longer step absorbs more of a longer
+recovery**, which the recovery table below shows directly: after two seconds the
+part takes about fifty milliseconds of work to come back, and a 15 ms step ends
+long before that where a 223 ms step holds all of it.
+
+### The toll is one dispatch's, and the seven behind it pay nothing
+
+The same 200 ms gap, with the steps behind it in bursts. 128 steps a row, both
+directions, and the device time by position within the burst. **A row holds the
+gap, the width and the count still and moves only how many steps share a gap;
+the positions inside a row hold everything, including the keys, to the eight
+that separate the first step of a burst from the last:**
+
+    burst   mean device   duty     position 1   2       3       4      ... 8
+      1      19.340 ms    8.1%     19.34
+      2      17.551      13.5%     19.43   15.67
+      4      16.416      22.3%     19.19   15.61   15.44   15.42
+      8      15.896      35.1%     19.18   15.44   15.36   15.41  ...  15.48
+     16      15.637      49.3%     18.59   15.44   15.48   15.48  ...  15.41
+     32      15.632      62.0%     20.07   16.41   15.57   15.45  ...  15.45
+
+**Every position but the first is the back-to-back figure**, 15.4 ms, including
+at a burst of eight where the duty cycle is 35% — twenty points below where C1's
+sweep said the clock steps down. The mean falls as the burst grows because the
+toll is being divided by more units, and for no other reason. The second
+position at a burst of thirty-two is the one reading above 15.7, and that row is
+four bursts of thirty-two where the others are sixteen bursts and more.
+
+### What decides whether the toll is paid is the gap, not the occupancy
+
+The gap swept behind bursts of one, four and sixteen — 128 steps a row, both
+directions, toll being the first position against the mean of the rest. **A
+column holds the burst and moves the gap; a row holds the gap and moves the
+burst; every cell is the same binary, the same width, and 128 steps over the
+same keys.**
+The gap named is what was asked for, and this host's `sleep` overshoots it —
+by a few milliseconds at 8 ms and by tens at 200 — so the duty cycle beside it,
+which is measured rather than asked for, is the figure to read:
+
+    gap      burst 1              burst 4                 burst 16
+             duty   toll          duty   toll             duty   toll
+       0    85.0%   —            84.4%  -0.00 ms         84.3%  -0.02 ms
+       8    52.5%   +0.50        72.4%  +0.01            81.0%  +0.10
+      12    44.6%   +0.94        68.6%  -0.04            80.9%  +0.10
+      20    35.1%   +1.40        61.1%  -0.05            77.1%  +0.03
+      50    20.5%   +1.32        47.6%  +0.00            71.0%  +0.05
+     100    13.8%   +3.42        35.4%  +3.61            61.9%  +3.31
+     200     8.1%   +3.83        22.6%  +4.51            49.3%  +3.47
+
+(The burst-1 column has one position, so its toll is the run's mean against the
+same run's `--idle 0`.)
+
+**Two readings across that table settle the question the milestone was set:**
+
+- **Hold the duty cycle and move the gap.** Burst 4 at a 20 ms gap runs at 61.1%
+  and pays nothing; burst 16 at a 100 ms gap runs at 61.9% and pays 3.31 ms. The
+  occupancy is the same to a point of a percent and the toll is the whole of it.
+- **Hold the gap and move the duty cycle.** A 20 ms gap costs 1.40 ms behind one
+  step, −0.05 behind four and +0.03 behind sixteen; a 100 ms gap costs 3.42, 3.61
+  and 3.31 behind the same three.
+
+So **above about 100 ms of idle the toll is paid in full whatever the
+occupancy**, and **below about 50 ms it is paid only where the work between gaps
+is a single step**. Duty cycle is not the variable; it was C1's proxy for a gap
+length it could not vary independently.
+
+**The two accounts are read off the same figures.** C1's own sweep is this
+table's burst-1 column taken over 200 steps a row instead of 128, and the rows
+agree where either of them is resolved: 12 ms reads 16.461 there against 16.422
+here, 200 ms reads 19.34 against 19.32. The one row that disagrees is 8 ms —
+15.489 there against 15.99 here — and it is this milestone's row that is
+unresolved, its two directions reading 15.71 and 16.27, three and a half percent
+apart on a host whose null pair is 0.3%. The knee's near edge is somewhere in
+8 to 12 ms of gap at a burst of one, and neither sitting has pinned it closer.
+
+### How long the recovery takes, which is longer after a deeper sleep
+
+Bursts of eight at two idle depths and two widths, 64 steps a row, both
+directions:
+
+    arm                    position 1     2        3        4        5-8
+    batch 1, 200 ms gap      19.30      15.35    15.57    15.59    15.4-15.5
+    batch 8, 200 ms gap      67.19      64.01    64.13    64.06    64.1-64.2
+    batch 1, 2 s gap         21.08      19.50    16.71    15.63    16.0-16.4
+    batch 8, 2 s gap         80.72      64.77    64.09    64.11    64.2
+
+**After 200 ms of idle one step pays it off.** After two seconds it takes about
+fifty milliseconds of work: three steps at batch 1, less than two at batch 8.
+
+**The two experiments agree on the size of the deep toll to the extent either
+resolves it.** A batch of thirty-two woken every two seconds pays +15.70 ms on a
+step long enough to hold the whole recovery; a batch of one pays +6.23 on a step
+that ends before the recovery does, and the burst table above shows where the
+rest of it goes — +4.1 ms on the second step, +1.3 on the third, and a tail of
++0.6 to +1.0 that four bursts of eight cannot separate from this host's noise.
+Summed, that is 12 to 15 ms against the wide batch's 15.7, which is agreement in
+size and not a closed account.
+
+**What the sizes say about the clock, which is the one piece of physics here.**
+A step at 1380 MHz is 15.45 ms. A toll of 3.83 ms is what running 6.5 ms of that
+step at the 565 MHz idle clock would cost; a toll of 15.7 ms is what running 27
+ms of it there would cost. Sampled beside these runs, `macmon` reads the part at
+**1380 MHz and 76 W back to back at batch 1, 1202 MHz mean with a floor of 1012
+at a 20 ms gap, 901 MHz with a floor of 564 at 200 ms, and 394 MHz with a floor
+of 0 at two seconds** — the floor falling with the gap, which is the same
+ordering the toll has. The sampler corroborates and is not the evidence; the
+evidence is the timing.
+
+### What recovers it: two things do, and the cheap one does not
+
+**A burst recovers it, because there is only one toll to divide.** Eight steps
+behind one 200 ms gap: `--idle 0` against `--idle 200`, seven pairs, everything
+else held —
+
+    reading         no gap   200 ms gap   change  ranges  pairs   claim
+    clock.device  15.515 ms   15.905       +2.5%   apart   7 of 7  the same way
+    clock.median  15.496      15.439       -0.4%   apart   7 of 7  the same way
+    at1.device    15.559      19.188      +23.3%   apart   7 of 7  the same way
+    at2.device    15.490      15.480       -0.1%   across  2 of 7  no claim
+    at3.device    15.485      15.400       -0.5%   across  6 of 7  no claim
+    at8.device    15.711      15.450       -1.7%   across  7 of 7  no claim
+    clock.duty    84.797 %    35.574      -58.0%   apart   7 of 7  the same way
+
+**Width recovers it too, by making the step long enough for the toll to
+disappear into.** A batch of thirty-two across a 200 ms gap reads **223.985 ms
+against 227.027 — 1.4%, ranges across, six of seven — no claim**, where the same
+gap at batch 1 is +25.1% with the ranges apart. The toll did not shrink; the step
+grew fourteenfold around it.
+
+**A cheap dispatch in the gap does not recover it, and this milestone built the
+lever to find out.** `--keep-warm <ms>` submits one row through a norm into the
+gap — the smallest dispatch this crate has a kernel for, 30 µs of device apiece —
+as often as it is told to. 60 steps a row behind a 200 ms gap, both directions:
+
+    kept warm      device     duty     period    dispatches   what they cost
+    never         19.151 ms   8.0%   240.03 ms         0        —
+    every 100 ms  19.304      8.1%   238.25           60        2.05 ms
+    every 50      19.117      8.0%   238.64          180        5.05
+    every 20      19.749      8.4%   235.18          413       11.09
+    every 10      20.128      8.6%   234.15          832       23.80
+
+**Nothing is bought and something is spent.** Paired seven times, the gap left
+empty against the same gap kept warm every 20 ms reads **19.063 ms of device
+against 19.697 — 3.3% the wrong way for the lever, ranges apart, seven pairs of
+seven** — beside 415 dispatches costing 11.4 ms of device that bought nothing.
+
+**The period column carries the one confound in that pair.** A gap subdivided
+into 20 ms sleeps comes back closer to its deadline than one 200 ms sleep does,
+because this host's `sleep` overshoots what it was asked for and the chunks
+behind it absorb the overshoot — so the kept-warm arm idles about five
+milliseconds *less* than the arm it is paired against, 235 ms of period against
+240. That is the direction that flatters the lever, and it
+lost anyway. `macmon` beside those two arms reads 950 MHz mean against 917 and a
+floor of 672 against 476 — the dispatches lift the floor a little and do not
+reach the clock the work needs.
+
+**Which is the arithmetic the candidate is refused on.** What the part gives its
+top clock to is work, not dispatches: about six milliseconds of continuous work
+is what a 200 ms sleep costs to undo, and 30 microseconds every 10 ms is three
+parts in a thousand of that. A keep-warm that *did* hold the clock would have to
+be work, and the gap table says how much of it: **one step every 137 ms — 14%
+duty — does not do it, and four steps every 100 ms — 61% duty — does.** `macmon`
+reads this part at 76 W with the device full and 3.05 W over the period of a
+batch of one woken every 200 ms, so **holding 61% occupancy of invented work
+costs about forty watts of added draw to save three and a half milliseconds a
+wake**. There is no cheap version of this lever: the hardware ramp is a thing to
+schedule around rather than to defeat.
+
+### What this says to a scheduler
+
+- **Price a wake, not a step.** The toll is 3.5 ms after a tenth of a second of
+  idle and 13 to 16 ms after seconds of it, once, on whatever runs next.
+- **It is charged per gap.** A request answered with 100 tokens amortises it to
+  0.035 ms a token, which is 0.2%. A server whose batch never drains never pays
+  it at all.
+- **The shape that pays 23% is one step per wake**, and it is a real shape — a
+  server holding a batch open for one client that types a message every few
+  hundred milliseconds — but it pays 3.5 ms of a 200 ms period, which is 1.8% of
+  what that client waits.
+- **A gap under about 50 ms is free** as long as the burst before it was more
+  than one step, so a scheduler that batches arrivals into short bursts pays
+  nothing at all.
+- **Nothing about this is the batching curve.** Every figure in this file is
+  taken back to back, where the largest gap is the three to five milliseconds of
+  host time between two steps of a batch of one, and 4 to 8 ms of deliberate gap
+  costs nothing at any burst above one.
+
+### B3's 0.7% is not this
+
+B3 left a regression nobody has explained — a batch-1 step at 15.345 ms against
+15.450 with the seat table added, seven pairs of seven, which C1's item zero then
+failed to remove by removing the binding it was blamed on. **The server shape
+does not explain it either, and the arithmetic is the table above.** Both of
+B3's arms were run back to back in one sitting at the occupancy this milestone
+measures at 74 to 78%, where the only gap is the three to five milliseconds of
+host time between two steps — and a deliberate gap of 4 or 8 ms costs 0.01 ms
+behind a burst of four and 0.10 behind sixteen, against the 0.105 ms the
+regression is. There is no gap in that arrangement large enough to charge a toll
+to, and a toll charged to one arm and not the other would need the two arms to
+leave different gaps, which two decode runs of the same shape do not.
+
+### What did not move
+
+**Every guarantee in the batch's list is where it was, and this milestone
+changed no kernel** — what it added is a measurement's levers, in `bench.rs` and
+one wrapper in `backend.rs`. `just test-full` is green — **747 gated and 81
+timing**, which is the 735 the batch left plus the
+twelve cases this milestone's levers brought — the recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what the engine generates,
+`--backend cpu` is unmoved, `bench diverge` re-run here agrees **448 of 448**
+under `production` against `reference` with no prompt parting, and `rounded` is
+still opt-in. Contamination passes at every scale, the ragged-seat
+cases still drive both halves of a merged pair, barriers derived == encoded, the
+duplicate-slot refusal still refuses, memory is linear at 30.8 MiB a slot and
+`what_an_empty_seat_costs` still bounds an idle seat. **The mutations those cases
+exist to fail were not re-run**, and the reason they were not is the sentence
+above: nothing here touches a kernel, a seat or a slot.
+
+**One timing case failed once, and what it failed on is this section.**
+`a_blocks_table_reports_one_dispatch_of_the_shape_it_names` holds a block
+table's cost against the same dispatch submitted on its own, and requires the
+ratio to sit in 0.75 to 1.35. On one pass of the tier it read **0.72 — the table
+at 282.51 µs against 394.38 µs for the lone dispatch** — and passed on the
+re-run, alone and inside a full green tier. **Its two arms are the two
+occupancies this section is about**: the table is `testing::warmed`'s back-to-
+back sweep at essentially 100% duty, and the arm it is divided by is one
+dispatch a submission with host time either side of it. A bound between those
+two is a bound on the machine's power state as much as on the kernel, which is
+worth knowing before it is read as a regression. Nothing in this milestone
+touches that kernel or that table.
+
+**And the batch's own figures are where they were, re-measured here as the
+back-to-back arm of every table above**: 15.412 ms, 64.059 and 223.155 of device
+at batches 1, 8 and 32, against the 15.45, 64.08 and 223.33 this file records —
+0.2%, 0.03% and 0.08%, which is the drift between two sittings that C1 measured
+at 0.16% the other way on a binary it had not changed.
+
+**What this milestone added to the tier** is the batched clock unit, the burst
+and its position table, the arrival interval, the median and the keep-warm —
+eleven cases in the binary's own tests, and one gated case beside the two clock
+cases already there.
+
+**The one number that moved is a name.** `bench clock` now prints
+`clock.median` between `clock.device` and `clock.wall`, so a milestone quoting
+the harness's report will see one more row than C1's did.
+
 ## What clock every figure here was taken at
 
 **The GPU's clock moves by a factor of two and a half, nothing in this file had
