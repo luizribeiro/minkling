@@ -249,6 +249,40 @@ fn a_clock_run_reports_every_part_and_the_period_the_gap_is_inside() {
     );
 }
 
+/// **The third unit is a step of a batch**, which is what puts a gap of a fixed
+/// length beside two very different amounts of work — the arrangement that says
+/// whether a slower clock is a function of the gap or of the occupancy the gap
+/// produced.
+///
+/// Two sequences and two steps, because what this asserts is that the arm runs,
+/// reports under the same names, and says the width it repeated.
+#[test]
+fn a_clock_run_over_a_batch_reports_the_width_it_repeated() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ran = bench(&[
+        "clock",
+        "--batch",
+        "2",
+        "--tokens",
+        "2",
+        &dir.display().to_string(),
+    ]);
+
+    assert_eq!(
+        named(stdout(&ran)),
+        [
+            "part1.device",
+            "part2.device",
+            "clock.device",
+            "clock.wall",
+            "clock.duty",
+            "clock.drift"
+        ]
+    );
+    let said = String::from_utf8_lossy(&ran.stderr).to_string();
+    assert!(said.contains("2-wide decode steps"), "{said}");
+}
+
 /// **The other unit is a whole prefill**, which is the arm whose repetitions are
 /// the same work every time and so the arm a drift means anything under — and
 /// nothing else in this file runs it.

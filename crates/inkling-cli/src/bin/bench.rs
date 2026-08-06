@@ -95,7 +95,7 @@ const USAGE: &str = "usage:\n  \
     bench session <checkpoint> [--tokens <n>] [--reuse-tokens <n>] [--numerics <which>]\n  \
     bench batch   <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>]\n  \
     bench clock   <checkpoint> [--tokens <n>] [--context <n>] [--idle <ms>] \
-[--prefill <n>]\n  \
+[--prefill <n>] [--batch <n>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench diverge <checkpoint> [--tokens <n>] [--against <which>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
@@ -241,9 +241,14 @@ enum Job {
         /// Positions a session keeps between its turns, and zero for the arm
         /// that keeps nothing — which is the server as it was.
         reuse: usize,
-        /// The widest batch the batch sweep runs, which every other measurement
-        /// ignores.
-        widest: usize,
+        /// How many sequences a unit of work decodes through, and nothing at all
+        /// for the measurements that decode one.
+        ///
+        /// **Two measurements mean two things by it and both of them are a
+        /// width.** The sweep runs every width doubling up to this one; the
+        /// clock measurement runs *this* width and repeats it, which is what
+        /// lets a gap be held constant while the work either side of it grows.
+        widest: Option<usize>,
         /// Host time left between one unit of work and the next, which only the
         /// clock measurement has anywhere to put.
         idle: Duration,
@@ -418,12 +423,17 @@ impl Job {
         if prefill.is_some() && context.is_some() {
             bail!("a clock run over prefills takes no --context: its keys are its own prompt");
         }
-        // **Only the batch sweep has a width to be swept.** Every other
-        // measurement here decodes one sequence, so a widest batch handed to one
-        // of them could only be dropped — the same rule the numbers above are
-        // refused under.
-        if what != What::Batch && widest.is_some() {
+        // **Only the two measurements that have a width take one.** Every other
+        // one here decodes a single sequence, so a width handed to it could only
+        // be dropped — the same rule the numbers above are refused under.
+        if !matches!(what, What::Batch | What::Clock) && widest.is_some() {
             bail!("{what:?} takes no --batch: it decodes one sequence");
+        }
+        // **A prefill already fills the machine**, which is why the batching
+        // milestone batched the other regime — so a width given to the arm whose
+        // unit is a prompt would be a width nothing could do anything with.
+        if prefill.is_some() && widest.is_some() {
+            bail!("a clock run over prefills takes no --batch: a prefill fills the machine alone");
         }
         // **Only a session has a between-requests to keep anything across.**
         // Every other measurement here is one call or a series of them against
@@ -445,7 +455,7 @@ impl Job {
             depth,
             numerics: numerics.unwrap_or_default(),
             reuse: reuse.unwrap_or(DEFAULT_BOUND),
-            widest: widest.unwrap_or(WIDEST),
+            widest,
             idle: idle.unwrap_or_default(),
             prefill: prefill.unwrap_or(0),
         })
@@ -741,8 +751,9 @@ struct Asked {
     depth: usize,
     numerics: Numerics,
     reuse: usize,
-    /// The widest batch the batch sweep runs, ignored by everything else.
-    widest: usize,
+    /// How many sequences a unit of work decodes through: the widest of the
+    /// sweep's doubling, or the one width the clock measurement repeats.
+    widest: Option<usize>,
     /// Host time the clock measurement leaves between its units, ignored by
     /// everything else.
     idle: Duration,
@@ -876,7 +887,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
             // layer, and a stack wrapped for sixteen holds sixteen of them
             // whether or not sixteen sequences are in flight.
             What::Batch => {
-                for slots in widths(widest) {
+                for slots in widths(widest.unwrap_or(WIDEST)) {
                     let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?;
                     let ids = behind_a_step(&prompt, context);
                     let run = batched(&weights, text, &ids, slots, tokens);
@@ -920,11 +931,26 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
             // true of, because the drift column means different things under
             // them.
             What::Clock => {
-                let unit = match prefill {
-                    0 => Unit::Step(behind_a_step(&prompt, context)),
-                    length => Unit::Prefill(tiled(&prompt, length)),
+                let unit = match (prefill, widest) {
+                    (0, None) => Unit::Step(behind_a_step(&prompt, context)),
+                    (0, Some(slots)) => Unit::Batch(behind_a_step(&prompt, context), slots),
+                    (length, _) => Unit::Prefill(tiled(&prompt, length)),
                 };
-                let ticks = ticked(&weights, text, &unit, tokens, idle);
+                // Wrapped for the width being repeated, for the reason the sweep
+                // wraps per width: a slot is a span and four convolution windows
+                // in every layer, allocated when the stack is wrapped rather
+                // than when a sequence sits in one.
+                let wrapped = match widest {
+                    None => None,
+                    Some(slots) => Some(backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?),
+                };
+                let ticks = ticked(
+                    wrapped.as_ref().unwrap_or(&weights),
+                    text,
+                    &unit,
+                    tokens,
+                    idle,
+                );
                 eprintln!(
                     "clock: {} {}, {} idle between them",
                     ticks.len(),
@@ -1263,8 +1289,17 @@ fn batched(
 /// **What the step arm is for is the pair rather than the drift**: two runs of
 /// it over the same keys, one with `--idle` and one without, have the same slope
 /// under both arms and differ only in occupancy.
+///
+/// **The batched unit is the same step over more sequences**, and it is what
+/// separates a gap from the occupancy it produces. A step of one sequence is
+/// 15 ms of work and a step of thirty-two is 223, so the same gap left after
+/// each of them is two very different duty cycles at the same gap — which is
+/// the one arrangement that says which of the two a slower clock is a function
+/// of. Its keys grow exactly as the single-sequence arm's do, one a step in
+/// every slot.
 enum Unit {
     Step(Vec<usize>),
+    Batch(Vec<usize>, usize),
     Prefill(Vec<usize>),
 }
 
@@ -1281,6 +1316,11 @@ impl Unit {
                 "decode steps over {} to {} keys",
                 ids.len() + 1,
                 ids.len() + units
+            ),
+            Self::Batch(ids, slots) => format!(
+                "{slots}-wide decode steps over {} to {} keys a sequence",
+                ids.len() + 1 + SETTLED,
+                ids.len() + SETTLED + units
             ),
             Self::Prefill(ids) => format!("prefills of {} tokens", ids.len()),
         }
@@ -1303,11 +1343,13 @@ struct Tick {
 /// `count` repetitions of `unit`, back to back, with `idle` of host time
 /// deliberately left between them.
 ///
-/// **One repetition is discarded before the ones that are timed**, for the
-/// reason the prefill measurement takes the second of two: the first unit of a
-/// length is the one that faults in the pages the rest of them read, and a page
-/// fault charged to the first unit is a drift this would report as the part
-/// warming up.
+/// **What each arm discards before the ones that are timed is its own**, and
+/// every arm discards something for the reason the prefill measurement takes the
+/// second of two: the first unit of a shape is the one that faults in the pages
+/// the rest of them read, and a page fault charged to the first unit is a drift
+/// this would report as the part warming up. A generation's own first tick is
+/// the prompt's prefill, which is not a step at all; a batched run's is
+/// [`Seated`]'s settling, which it has already run and thrown away.
 fn ticked(
     weights: &CheckpointWeights<'_>,
     config: &TextConfig,
@@ -1317,7 +1359,7 @@ fn ticked(
 ) -> Vec<Tick> {
     profile::take();
     let mut ticking = Ticking::new(idle, count + 1);
-    match unit {
+    let warmed = match unit {
         // Every step of one generation rather than a generation apiece, so that
         // the gap `--idle` leaves falls between two decode steps — which is the
         // occupancy this arm exists to move. What it costs is the growing key
@@ -1334,18 +1376,35 @@ fn ticked(
                 ControlFlow::Continue(())
             };
             generator.stream(cache, ids, ending, weights, &mut sink);
+            1
+        }
+        // The gap falls between two steps of one batch, as it does between two
+        // steps of one generation: what moves is how much work the period holds
+        // either side of it.
+        Unit::Batch(ids, slots) => {
+            let mut seated = Seated::new(weights, config, ids, *slots);
+            // The prefills and the settling steps off both accounts before the
+            // first timed one, which is what the single-sequence arm's
+            // discarded first tick does for it. Unsettled, the first period is
+            // the seating — 1.30 s of wall around 24 ms of device, which is a
+            // duty cycle of 1.9% this measurement would report as the machine's.
+            ticking.settled();
+            for _ in 0..count {
+                seated.step(weights);
+                ticking.tick(profile::take().gpu());
+            }
+            0
         }
         Unit::Prefill(ids) => {
             for _ in 0..count + 1 {
                 let run = generate(weights, None, config, ids, 1, 0);
                 ticking.tick(run.gpu);
             }
+            1
         }
-    }
+    };
     let mut ticks = ticking.ticks;
-    // For a generation, the prompt's own prefill; for a run of prefills, the
-    // repetition that faulted the pages in.
-    ticks.drain(..1.min(ticks.len()));
+    ticks.drain(..warmed.min(ticks.len()));
     ticks
 }
 
@@ -1368,6 +1427,14 @@ impl Ticking {
             idle,
             ticks: Vec::with_capacity(count),
         }
+    }
+
+    /// Both clocks back to zero after work nobody is timing, which is what the
+    /// arms that discard a first unit get by discarding it: the first period
+    /// opens where the first timed unit does and not where the run did.
+    fn settled(&mut self) {
+        profile::take();
+        self.at = Instant::now();
     }
 
     /// One unit finished for `gpu` of device time, the gap it is followed by,
@@ -2259,7 +2326,7 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
-                widest: WIDEST,
+                widest: None,
                 idle: Duration::ZERO,
                 prefill: 0,
             }
@@ -2274,7 +2341,7 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
-                widest: WIDEST,
+                widest: None,
                 idle: Duration::ZERO,
                 prefill: 0,
             }
@@ -2297,7 +2364,7 @@ mod tests {
                 depth: BEST,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
-                widest: WIDEST,
+                widest: None,
                 idle: Duration::ZERO,
                 prefill: 0,
             }
@@ -2326,7 +2393,7 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: 0,
-                widest: WIDEST,
+                widest: None,
                 idle: Duration::ZERO,
                 prefill: 0,
             }
@@ -2340,16 +2407,15 @@ mod tests {
         }
     }
 
-    /// **Only the batch sweep has a width to be swept**, so it is the only
-    /// measurement here the number means anything to — and every other one
-    /// refuses it rather than dropping it, which is the rule the numbers above
-    /// are refused under.
+    /// **Only the two measurements that decode more than one sequence take a
+    /// width**, and every other one refuses it rather than dropping it — which
+    /// is the rule the numbers above are refused under.
     ///
-    /// It takes a context for the reason a decode step does: a batch is decode
+    /// Both take a context for the reason a decode step does: a batch is decode
     /// steps, and a step is the one measurement here with a context to be taken
     /// at.
     #[test]
-    fn only_the_batch_sweep_takes_a_width() {
+    fn only_the_measurements_that_decode_a_batch_take_a_width() {
         assert_eq!(
             Job::parse(
                 ["batch", "models/small", "--batch", "8", "--context", "8192"].map(str::to_string)
@@ -2363,10 +2429,22 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
-                widest: 8,
+                widest: Some(8),
                 idle: Duration::ZERO,
                 prefill: 0,
             }
+        );
+        assert!(
+            matches!(
+                Job::parse(["clock", "models/small", "--batch", "32"].map(str::to_string))
+                    .expect("parses"),
+                Job::Measure {
+                    what: What::Clock,
+                    widest: Some(32),
+                    ..
+                }
+            ),
+            "a clock run took no width to repeat"
         );
         for what in ["decode", "prefill", "sweep", "engines", "session"] {
             assert!(
@@ -2374,6 +2452,16 @@ mod tests {
                 "{what} took a width to sweep"
             );
         }
+        // **A prefill fills the machine on its own**, so the arm whose unit is a
+        // prompt has nowhere to put a width — refused rather than dropped, like
+        // the context that arm is already refused.
+        assert!(
+            Job::parse(
+                ["clock", "models/small", "--prefill", "2048", "--batch", "8"].map(str::to_string)
+            )
+            .is_err(),
+            "a clock run over prefills took a width"
+        );
     }
 
     /// The widths a sweep runs double from one, and the widest is run whether or
@@ -2404,7 +2492,7 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
-                widest: WIDEST,
+                widest: None,
                 idle: Duration::from_millis(40),
                 prefill: 0,
             }
@@ -2437,7 +2525,7 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
-                widest: WIDEST,
+                widest: None,
                 idle: Duration::ZERO,
                 prefill: 2048,
             }
@@ -2476,6 +2564,48 @@ mod tests {
         assert!(
             matches!(job, Job::Measure { idle, .. } if idle.is_zero()),
             "{job:?}"
+        );
+    }
+
+    /// **The key range is what tells a reader which figure they are holding**,
+    /// and the two decode arms open it at different keys: a generation's first
+    /// timed step is the one after the prompt's own prefill, and a batched one's
+    /// is the one after [`Seated`]'s settling steps as well.
+    #[test]
+    fn a_decode_run_says_which_keys_its_steps_walked() {
+        let ids = vec![0; 34];
+        assert_eq!(
+            Unit::Step(ids.clone()).over(200),
+            "decode steps over 35 to 234 keys"
+        );
+        assert_eq!(
+            Unit::Batch(ids, 32).over(200),
+            format!(
+                "32-wide decode steps over {} to {} keys a sequence",
+                35 + SETTLED,
+                234 + SETTLED
+            )
+        );
+        assert_eq!(
+            Unit::Prefill(vec![0; 2048]).over(20),
+            "prefills of 2048 tokens"
+        );
+    }
+
+    /// **A period opens where the timed work does.** The batched arm seats its
+    /// sequences after the run's clock has started — prefills and settling
+    /// steps, over a second of them — and a period that held those would report
+    /// the seating as a duty cycle the machine never ran at.
+    #[test]
+    fn the_first_period_opens_after_the_work_nobody_timed() {
+        let mut ticking = Ticking::new(Duration::ZERO, 4);
+        let opened = ticking.at;
+        let seating = Duration::from_millis(2);
+        std::thread::sleep(seating);
+        ticking.settled();
+        assert!(
+            ticking.at.duration_since(opened) >= seating,
+            "the seating is inside the first period"
         );
     }
 
@@ -2978,7 +3108,7 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
-                widest: WIDEST,
+                widest: None,
                 idle: Duration::ZERO,
                 prefill: 0,
             }
