@@ -5753,71 +5753,102 @@ kernel void decoded_elements(
     /// fragment, and the rows of a scattered call are not at one. So this is the
     /// case that would catch a block writing its answer where the *grouping* put
     /// the row rather than where the router did.
+    ///
+    /// **At both of the heights the run-cut entry is compiled to**, which is two
+    /// lengths here rather than two shapes: the height is chosen by rows an
+    /// expert, so 64 rows over three experts take the short block and 128 take
+    /// the tall one. Bit-equality across the two heights is held elsewhere, but
+    /// only through the *tiled* entry — that walk takes its rows where they lie
+    /// and this one takes them where the plan says, so a short block reading a
+    /// plan is a kernel neither case reached until this one carried a second
+    /// length.
     #[test]
     fn a_grouped_block_answers_the_grouped_tile_through_both_permutations() {
         let Some(device) = device() else { return };
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
         const EXPERTS: usize = 3;
-        const TOKENS: usize = 64;
         const SLOTS: usize = 2;
-        const ROWS: usize = TOKENS * SLOTS;
+        /// Tokens whose rows take the shorter of the two shipped heights, and
+        /// the tall one's — named for the block they select, since that is the
+        /// only thing either length is here for.
+        const TAKES_THE_SHORT_BLOCK: usize = 32;
+        const TAKES_THE_TALL_BLOCK: usize = 64;
         // A call under the line stays on the reference tile and would prove
-        // nothing here, so the shape is held above it where it is written.
-        const _: () = assert!(ROWS >= EXPERTS * RUNS_A_BLOCKED_CALL);
-        const _: () = assert!(ROWS >= MMA_BLOCKS_A_CALL * MMA_ROWS_A_BLOCK);
+        // nothing here, so the shorter shape is held above it where it is
+        // written — the taller one is twice it.
+        const _: () = assert!(TAKES_THE_SHORT_BLOCK * SLOTS >= EXPERTS * RUNS_A_BLOCKED_CALL);
+        const _: () =
+            assert!(TAKES_THE_SHORT_BLOCK * SLOTS >= MMA_BLOCKS_A_CALL * MMA_ROWS_A_BLOCK);
 
-        let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, ROWS);
-        let chosen: Vec<u32> = (0..TOKENS)
-            .flat_map(|token| (0..SLOTS).map(move |slot| ((token + slot * 2) % EXPERTS) as u32))
-            .collect();
-        assert!(
-            !tiles(&chosen, ROWS_A_TILE),
-            "a routing a tile could already reach would prove nothing"
-        );
-
-        let through = |matmul: &PackedMatmul, through: Through| {
-            let bank = PackedBank::upload(
-                &device,
-                matmul,
-                EXPERTS,
-                IN_DIM,
-                OUT_DIM,
-                &case.packed(),
-                &case.scales,
-            )
-            .expect("the bank's shapes pair");
-            let mut selection = device.buffer(&chosen).expect("the selection uploads");
-            let mut x = device
-                .buffer(&case.x[..TOKENS * IN_DIM])
-                .expect("the rows upload");
-            let mut batch = device.batch().expect("a command buffer opens");
-            let mut sorted = grouping
-                .encode(
-                    &mut batch,
-                    &mut selection,
-                    EXPERTS,
-                    bank.rows_a_block(chosen.len()),
-                )
-                .expect("the grouping encodes");
-            let pending = bank
-                .encode_grouped(&mut batch, &mut sorted, &mut x, SLOTS, through)
-                .expect("the dispatch encodes");
-            batch.wait().expect("the dispatch completes");
-            pending.take()
-        };
-
+        // Both compiled once for both lengths: a Metal pipeline costs about a
+        // second to build and neither arm's kernels depend on the shape.
+        let reference = matmul(&device);
         let production = PackedMatmul::under(&device, Numerics::Production).expect("compiles");
-        for end in [Through::Gathered, Through::Scattered] {
-            let was = through(&matmul(&device), end);
-            let is = through(&production, end);
-            let deviation = deviation(&is, &was);
-            eprintln!("a grouped block, {end:?}: deviation {deviation:e}");
-            assert!(deviation > 0.0, "{end:?}: an exact match is not two orders");
+        let mut heights = BTreeSet::new();
+        for tokens in [TAKES_THE_SHORT_BLOCK, TAKES_THE_TALL_BLOCK] {
+            let rows = tokens * SLOTS;
+            let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, rows);
+            let chosen: Vec<u32> = (0..tokens)
+                .flat_map(|token| (0..SLOTS).map(move |slot| ((token + slot * 2) % EXPERTS) as u32))
+                .collect();
             assert!(
-                deviation <= MMA_TOLERANCE,
-                "{end:?}: deviation {deviation:e}"
+                !tiles(&chosen, ROWS_A_TILE),
+                "a routing a tile could already reach would prove nothing"
             );
+            heights.insert(production.rows_a_block(rows, EXPERTS));
+
+            let through = |matmul: &PackedMatmul, through: Through| {
+                let bank = PackedBank::upload(
+                    &device,
+                    matmul,
+                    EXPERTS,
+                    IN_DIM,
+                    OUT_DIM,
+                    &case.packed(),
+                    &case.scales,
+                )
+                .expect("the bank's shapes pair");
+                let mut selection = device.buffer(&chosen).expect("the selection uploads");
+                let mut x = device
+                    .buffer(&case.x[..tokens * IN_DIM])
+                    .expect("the rows upload");
+                let mut batch = device.batch().expect("a command buffer opens");
+                let mut sorted = grouping
+                    .encode(
+                        &mut batch,
+                        &mut selection,
+                        EXPERTS,
+                        bank.rows_a_block(chosen.len()),
+                    )
+                    .expect("the grouping encodes");
+                let pending = bank
+                    .encode_grouped(&mut batch, &mut sorted, &mut x, SLOTS, through)
+                    .expect("the dispatch encodes");
+                batch.wait().expect("the dispatch completes");
+                pending.take()
+            };
+
+            for end in [Through::Gathered, Through::Scattered] {
+                let was = through(&reference, end);
+                let is = through(&production, end);
+                let deviation = deviation(&is, &was);
+                eprintln!("a grouped block of {rows} rows, {end:?}: deviation {deviation:e}");
+                assert!(deviation > 0.0, "{end:?}: an exact match is not two orders");
+                assert!(
+                    deviation <= MMA_TOLERANCE,
+                    "{rows} rows, {end:?}: deviation {deviation:e}"
+                );
+            }
         }
+
+        // **That the two lengths were two heights**, which is the whole of why
+        // there are two: a line moved without moving these would leave both
+        // reaching one entry and this case comparing it against itself.
+        assert_eq!(
+            heights.len(),
+            2,
+            "both lengths took the same block height, so the shorter entry is unchecked: {heights:?}"
+        );
     }
 
     /// **A block is the simdgroups this device gives a threadgroup**, and the
