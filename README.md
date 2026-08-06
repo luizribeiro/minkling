@@ -1251,10 +1251,22 @@ commit before it, seven pairs, alternating:
     decode    16.272 -> 16.291 ms   +0.1%   ranges across, 4 of 7   no claim
     device    15.195 -> 15.206 ms   +0.1%   ranges across, 6 of 7   no claim
 
-**No token moved under any word.** `just test-full` is green, the recorded
-continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what the engine
-generates, `--backend cpu` is unmoved, and `production` is still 448 of 448
-against `reference`.
+**No token moved under any word.** `just test-full` is green — 715 gated and 79
+timing — the recorded continuation `[656, 13, 623, 180069, 86333, 60500, 220,
+23]` is what the engine generates, `--backend cpu` is unmoved, and `production`
+is still 448 of 448 against `reference`.
+
+**And speculation is unmoved, digit for digit.** Three pairs on the packed heads,
+`k = 3` still the best depth at 1.105 against `k = 2`'s 1.092, and acceptance
+identical on both arms:
+
+    84.85 / 86.96-78.26 / 85-65-55 / 82.35-64.71-52.94-47.06
+
+with 1.829, 2.560, 2.909 and 3.368 tokens a round. Every device row reads no
+claim but one: `k = 4`'s is 15.551 → 15.570 ms, +0.12%, the same way in three of
+three pairs — a tenth of a percent on the one arm that is already 0.92× and is
+not shipped, and a twelfth of the 1.7% this host has drifted inside a single
+sitting.
 
 ### The test this milestone lives or dies by
 
