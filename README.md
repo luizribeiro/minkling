@@ -1370,9 +1370,9 @@ directions:
 
     arm                    position 1     2        3        4        5-8
     batch 1, 200 ms gap      19.30      15.35    15.57    15.59    15.4-15.5
-    batch 8, 200 ms gap      67.19      64.01    64.13    64.06    64.1-64.2
-    batch 1, 2 s gap         21.08      19.50    16.71    15.63    16.0-16.4
-    batch 8, 2 s gap         80.72      64.77    64.09    64.11    64.2
+    batch 8, 200 ms gap      67.19      64.01    64.13    64.06    64.2-64.3
+    batch 1, 2 s gap         21.08      19.50    16.71    15.63    16.0-16.5
+    batch 8, 2 s gap         80.72      64.77    64.09    64.11    64.2-64.3
 
 **After 200 ms of idle one step pays it off.** After two seconds it takes about
 fifty milliseconds of work: three steps at batch 1, less than two at batch 8.
@@ -1493,9 +1493,9 @@ leave different gaps, which two decode runs of the same shape do not.
 
 **Every guarantee in the batch's list is where it was, and this milestone
 changed no kernel** — what it added is a measurement's levers, in `bench.rs` and
-one wrapper in `backend.rs`. `just test-full` is green — **747 gated and 81
-timing**, which is the 735 the batch left plus the
-twelve cases this milestone's levers brought — the recorded continuation
+one wrapper in `backend.rs`. `just test-full` is green — **748 gated and 81
+timing**, which is the 735 the batch left plus the thirteen cases this
+milestone's levers brought — the recorded continuation
 `[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what the engine generates,
 `--backend cpu` is unmoved, `bench diverge` re-run here agrees **448 of 448**
 under `production` against `reference` with no prompt parting, and `rounded` is
@@ -1527,7 +1527,7 @@ at 0.16% the other way on a binary it had not changed.
 
 **What this milestone added to the tier** is the batched clock unit, the burst
 and its position table, the arrival interval, the median and the keep-warm —
-eleven cases in the binary's own tests, and one gated case beside the two clock
+twelve cases in the binary's own tests, and one gated case beside the two clock
 cases already there.
 
 **The one number that moved is a name.** `bench clock` now prints

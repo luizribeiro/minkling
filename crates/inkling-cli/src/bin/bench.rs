@@ -2982,6 +2982,40 @@ mod tests {
         );
     }
 
+    /// **The three things at once**: a burst, a count that does not divide it,
+    /// and fewer bursts than there are parts. Every part still holds whole
+    /// bursts, so no part is a different shape from its neighbours and the tail
+    /// that belongs to no burst is in none of them.
+    #[test]
+    fn a_run_of_a_few_uneven_bursts_still_cuts_its_parts_on_them() {
+        // Three bursts of four and a tail of two, dear in every first position.
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(19_000);
+            held.extend([15_500; 3]);
+        }
+        held.extend([15_500; 2]);
+        let readings = clocked(&ticks(&held, &[20_000; 14]), 4);
+
+        let parts: Vec<&str> = names(&readings)
+            .into_iter()
+            .filter(|name| name.starts_with("part"))
+            .collect();
+        assert_eq!(parts.len(), 3, "three bursts cut into {parts:?}");
+        for part in 1..=3 {
+            reads(
+                &readings,
+                &format!("part{part}.device"),
+                (19.0 + 3.0 * 15.5) / 4.0,
+            );
+        }
+        // The two units of the unfinished burst are in no part and in no mean:
+        // a whole-run figure that held them would carry three tolls where the
+        // shape it reports carries three in twelve.
+        reads(&readings, "clock.device", (19.0 + 3.0 * 15.5) / 4.0);
+        reads(&readings, "clock.drift", 0.0);
+    }
+
     /// **A gap that is dispatched into is still a gap.** What the lever is for
     /// is to leave the device something to do without shortening the idle it is
     /// being asked about, so a run that came back early would be measuring a
