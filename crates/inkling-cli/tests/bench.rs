@@ -224,6 +224,7 @@ fn a_clock_run_reports_every_part_and_the_period_the_gap_is_inside() {
             "part3.device",
             "part4.device",
             "clock.device",
+            "clock.median",
             "clock.wall",
             "clock.duty",
             "clock.drift",
@@ -274,6 +275,7 @@ fn a_clock_run_over_a_batch_reports_the_width_it_repeated() {
             "part1.device",
             "part2.device",
             "clock.device",
+            "clock.median",
             "clock.wall",
             "clock.duty",
             "clock.drift"
@@ -307,6 +309,7 @@ fn a_clock_run_over_prefills_reports_the_same_readings() {
             "part1.device",
             "part2.device",
             "clock.device",
+            "clock.median",
             "clock.wall",
             "clock.duty",
             "clock.drift"

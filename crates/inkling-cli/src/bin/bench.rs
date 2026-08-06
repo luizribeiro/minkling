@@ -1668,20 +1668,36 @@ fn clocked(ticks: &[Tick]) -> Vec<Reading> {
     let drift = parts
         .last()
         .map_or(0.0, |(last, _)| against(*last, parts[0].0));
+    let median = middle(ticks);
     eprintln!(
-        "  whole: device {:.4?}, wall {:.4?}, duty {:.1}%, drift {:+.2}%",
+        "  whole: device {:.4?}, median {:.4?}, wall {:.4?}, duty {:.1}%, drift {:+.2}%",
         whole_gpu,
+        median,
         whole_wall,
         duty(whole_gpu, whole_wall),
         drift,
     );
     readings.extend([
         Reading::new("clock.device", millis(whole_gpu), "ms"),
+        Reading::new("clock.median", millis(median), "ms"),
         Reading::new("clock.wall", millis(whole_wall), "ms"),
         Reading::new("clock.duty", duty(whole_gpu, whole_wall), "%"),
         Reading::new("clock.drift", drift, "%"),
     ]);
     readings
+}
+
+/// The middle unit's device time.
+///
+/// **A mean that is not near its median is a reading of something else**, which
+/// is the rule [`Generated::median`] states and the one an idled run needs most:
+/// a run whose gap costs it one dear unit a burst has a mean above every unit it
+/// is a mean of, and a single stalled unit does the same to a run with no gap at
+/// all. The two are told apart by the pair of columns and by nothing else here.
+fn middle(ticks: &[Tick]) -> Duration {
+    let mut held: Vec<Duration> = ticks.iter().map(|tick| tick.gpu).collect();
+    held.sort_unstable();
+    held.get(held.len() / 2).copied().unwrap_or_default()
 }
 
 /// How much of the wall around a unit of work the device was busy for, which is
@@ -2790,6 +2806,20 @@ mod tests {
         }
     }
 
+    /// **One stalled unit moves the mean and not the middle**, which is the pair
+    /// of columns a reader needs to tell a run that was uniformly slower from a
+    /// run that was interrupted once — and an idled run is where that matters,
+    /// because the gap makes one unit a burst dear by design.
+    #[test]
+    fn a_stalled_unit_moves_the_mean_and_not_the_middle() {
+        let mut held = vec![15_000; 9];
+        held.push(150_000);
+        let stalled = ticks(&held, &[20_000; 10]);
+        let readings = clocked(&stalled);
+        reads(&readings, "clock.median", 15.0);
+        reads(&readings, "clock.device", 28.5);
+    }
+
     /// **A burst is units back to back and one gap behind them**, which is the
     /// shape a request has and a metronome does not. A run that slept after
     /// every unit of a burst would be reporting a gap the server never left.
@@ -2971,6 +3001,7 @@ mod tests {
                 "part4.device",
                 "part5.device",
                 "clock.device",
+                "clock.median",
                 "clock.wall",
                 "clock.duty",
                 "clock.drift",
