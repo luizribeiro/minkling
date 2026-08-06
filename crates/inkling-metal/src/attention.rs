@@ -1089,6 +1089,13 @@ pub struct LayerAttention<'a> {
     /// it and nothing inside it does but
     /// `what_the_split_over_the_key_span_is_worth`.
     pinned: Cell<Option<usize>>,
+    /// The rows of the call in flight, refilled rather than allocated — see
+    /// [`Walking`].
+    ///
+    /// Behind a cell for the reason the projection is: it belongs to the layer
+    /// rather than to the call, and only one call of a layer is being encoded
+    /// at a time.
+    walking: RefCell<Walking>,
     /// The query rows a call brings before it is given a block, where a caller
     /// has pinned it rather than left it to
     /// [`FusedAttention::SHORTEST_BLOCKED_CALL`].
@@ -1171,6 +1178,7 @@ impl<'a> LayerAttention<'a> {
                 slots,
             )?),
             rel_extent,
+            walking: RefCell::new(Walking::default()),
             pinned: Cell::new(None),
             floor: Cell::new(None),
             device,
@@ -1237,6 +1245,20 @@ impl<'a> LayerAttention<'a> {
         let mut out = self
             .device
             .zeroed::<f32>(rows * self.config.heads * self.config.head_dim)?;
+        // One sequence over a span handed over whole: its keys start at row zero
+        // of the binding and it is the whole of the call.
+        let mut walking = self.walking.borrow_mut();
+        walking.refill(
+            &[Attending {
+                slot: 0,
+                first: 0,
+                queries: rows,
+                q_offset: step.q_offset,
+                taus: step.taus,
+            }],
+            |_| (0, keys),
+            rows,
+        );
         self.encoding(
             batch,
             Encoding {
@@ -1245,22 +1267,11 @@ impl<'a> LayerAttention<'a> {
                 v: &mut v,
                 rel: &mut rel,
                 key_stride: keys,
-                // One sequence over a span handed over whole: its keys start at
-                // row zero of the binding and it is the whole of the call.
-                walking: &walking(
-                    &[Attending {
-                        slot: 0,
-                        first: 0,
-                        queries: rows,
-                        q_offset: step.q_offset,
-                        taus: step.taus,
-                    }],
-                    |_| (0, keys),
-                    rows,
-                ),
+                walking: &walking,
             },
             &mut out,
         )?;
+        drop(walking);
         Ok(out)
     }
 
@@ -1326,7 +1337,8 @@ impl<'a> LayerAttention<'a> {
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
         let key_stride = spans.stride();
-        let walking = walking(attending, |slot| (spans.base(slot), spans.held(slot)), rows);
+        let mut walking = self.walking.borrow_mut();
+        walking.refill(attending, |slot| (spans.base(slot), spans.held(slot)), rows);
         self.encoding(
             batch,
             Encoding {
@@ -1650,7 +1662,13 @@ pub(crate) struct Attending<'a> {
 /// sequences over N spans are one dispatch: `span` is where that sequence's
 /// keys start in the binding, `keys` is how many it has, and `position` is
 /// where the row sits among them.
-#[derive(Debug)]
+///
+/// **Held by the layer and refilled rather than built a call.** A decode step
+/// runs 42 of these and a speculative round runs them over four rows apiece, so
+/// a table allocated per call is two allocations a layer a step for a few dozen
+/// bytes — which is encode time, which is the half of a decode step's wall the
+/// device does not see.
+#[derive(Debug, Default)]
 struct Walking {
     /// `[queries, 3]` — `span`, `keys` and `position` for each query row.
     rows: Vec<u32>,
@@ -1675,61 +1693,62 @@ impl Walking {
         let row = &self.rows[i * WALKED..][..WALKED];
         (row[0] as usize, row[1] as usize, row[2] as usize)
     }
-}
 
-/// The rows and scales of a call, from the sequences it carries and where each
-/// of their spans is.
-///
-/// `span` answers a slot with the row of a KV head its keys start at and how
-/// many it holds, which is [`KeyValues`] for a layer keeping them and `(0,
-/// keys)` for a caller that handed the span over whole.
-fn walking(
-    attending: &[Attending<'_>],
-    span: impl Fn(usize) -> (usize, usize),
-    rows: usize,
-) -> Walking {
-    let mut walking = Walking {
-        rows: vec![0; rows * WALKED],
-        taus: vec![1.0; rows],
-        sequences: attending.len(),
-    };
-    let mut filled = 0;
-    for seat in attending {
-        assert_eq!(
-            seat.first, filled,
-            "a sequence's rows follow the last one's"
-        );
-        assert!(
-            seat.first + seat.queries <= rows,
-            "{} queries at {} of a call holding {rows}",
-            seat.queries,
-            seat.first
-        );
-        let (base, keys) = span(seat.slot);
-        // **Every query's own key is one of the keys**, which the module
-        // documentation states: a query sitting past the last key would attend
-        // over the tail of the span or over nothing at all, and a row of zeroes
-        // is wrong quietly. Refused here, where the shape is known.
-        assert!(
-            seat.q_offset + seat.queries <= keys,
-            "{} queries from {} sit past the {keys} keys of the sequence",
-            seat.queries,
-            seat.q_offset
-        );
-        if let Some(taus) = seat.taus {
-            assert_eq!(taus.len(), seat.queries, "a tau a query");
-            walking.taus[seat.first..][..seat.queries].copy_from_slice(taus);
+    /// The rows and scales of a call, from the sequences it carries and where
+    /// each of their spans is.
+    ///
+    /// `span` answers a slot with the row of a KV head its keys start at and
+    /// how many it holds, which is [`KeyValues`] for a layer keeping them and
+    /// `(0, keys)` for a caller that handed the span over whole.
+    fn refill(
+        &mut self,
+        attending: &[Attending<'_>],
+        span: impl Fn(usize) -> (usize, usize),
+        rows: usize,
+    ) {
+        self.rows.clear();
+        self.rows.resize(rows * WALKED, 0);
+        self.taus.clear();
+        self.taus.resize(rows, 1.0);
+        self.sequences = attending.len();
+        let mut filled = 0;
+        for seat in attending {
+            assert_eq!(
+                seat.first, filled,
+                "a sequence's rows follow the last one's"
+            );
+            assert!(
+                seat.first + seat.queries <= rows,
+                "{} queries at {} of a call holding {rows}",
+                seat.queries,
+                seat.first
+            );
+            let (base, keys) = span(seat.slot);
+            // **Every query's own key is one of the keys**, which the module
+            // documentation states: a query sitting past the last key would
+            // attend over the tail of the span or over nothing at all, and a
+            // row of zeroes is wrong quietly. Refused here, where the shape is
+            // known.
+            assert!(
+                seat.q_offset + seat.queries <= keys,
+                "{} queries from {} sit past the {keys} keys of the sequence",
+                seat.queries,
+                seat.q_offset
+            );
+            if let Some(taus) = seat.taus {
+                assert_eq!(taus.len(), seat.queries, "a tau a query");
+                self.taus[seat.first..][..seat.queries].copy_from_slice(taus);
+            }
+            for j in 0..seat.queries {
+                let row = &mut self.rows[(seat.first + j) * WALKED..][..WALKED];
+                row[0] = extent(base, "where a slot's keys start");
+                row[1] = extent(keys, "the keys of a sequence");
+                row[2] = extent(seat.q_offset + j, "the position of a query");
+            }
+            filled += seat.queries;
         }
-        for j in 0..seat.queries {
-            let row = &mut walking.rows[(seat.first + j) * WALKED..][..WALKED];
-            row[0] = extent(base, "where a slot's keys start");
-            row[1] = extent(keys, "the keys of a sequence");
-            row[2] = extent(seat.q_offset + j, "the position of a query");
-        }
-        filled += seat.queries;
+        assert_eq!(filled, rows, "a sequence's rows for every row of the call");
     }
-    assert_eq!(filled, rows, "a sequence's rows for every row of the call");
-    walking
 }
 
 /// The checkpoint's `[d_rel, rel_extent]` projection as `[rel_extent, d_rel]`,
@@ -3109,7 +3128,8 @@ mod tests {
     /// The rows of a call one sequence brings, which is what the accounting is
     /// read against and what a batch of one hands the kernel.
     fn alone(queries: usize, q_offset: usize, keys: usize) -> Walking {
-        walking(
+        let mut walking = Walking::default();
+        walking.refill(
             &[Attending {
                 slot: 0,
                 first: 0,
@@ -3119,7 +3139,8 @@ mod tests {
             }],
             |_| (0, keys),
             queries,
-        )
+        );
+        walking
     }
 
     /// **The claim the whole kernel rests on.** Every entry of the additive mask
