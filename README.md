@@ -1210,6 +1210,248 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## The dispatches a slot had left, and the column that priced them
+
+**B2 left four dispatches a layer to each slot and said it had not sized them.
+This is the table that sizes them, and then it takes all four.** What is left
+after it is a batch that dispatches what a single sequence dispatches — 876
+either way at any width — and a step **7.4% faster on the device at 32 sequences
+than the one B2 shipped**, at 1.08× the floor where B2 reached 1.16×.
+
+### The table B2 did not take, and the column that decides
+
+A per-kernel table has ranked by device share since M9 and by achieved bandwidth
+since M12. Neither of those columns can say what B2 found the hard way: 1302
+dispatches came out of a batch-32 step and were 5.4 ms of the 37.9 it saved,
+while the other 32.5 was **32 dispatches of 32 threadgroups becoming one of
+1024**. So the table gains the column that would have predicted it — the mean
+grid a dispatch of that kernel is given, against the 2048 `WANTED_GROUPS` that
+`splits_for` already cuts a key span to reach.
+
+Taken at a batch of 32 on B2's own code — the three kernels those four
+dispatches a layer are, with the step B2 batched underneath them as the control:
+
+    kernel              calls      device   share    groups  of want   achieved
+    short_conv           2688     25.89ms    9.9%        64       3%    22 GB/s
+    rms_norm_pair        1344     10.00ms    3.8%        40       2%     6 GB/s
+    short_conv_pair      1344      9.76ms    3.7%        32       2%    14 GB/s
+    windowed attention     35      1.70ms    0.7%      1024      50%   325 GB/s
+
+**The attention step is the one B2 batched and it is the control.** Same
+arithmetic per row, same walk, and its row reads 45% of the machine's bandwidth
+where the three per-slot kernels read 1 to 3% of it. Nothing about that
+separates them except the grid: 32 or 64 threadgroups against 2048 wanted, times
+however many slots there are.
+
+Those three are **45.65 ms of the 261.87 ms the passes account for** — 17.4% of a
+batch-32 step's sampled device time, and 5376 of its 6124 dispatches. At batch 1
+they are 1.42 ms of 17.30, which is the same three kernels at the same grids and
+is what says the cost is the batch's rather than the kernels'.
+
+**The count would have ordered these three correctly and priced them against the
+step wrongly**, which is exactly B1's error read the other way round: 168
+dispatches a slot against the step's 42 says the four are four times the prize,
+where the grids say the step was already at half the machine's wanted
+threadgroups before B2 touched it and these are at a fortieth. The bandwidth
+column ranks them last and says nothing about why — a kernel at 3% of peak is
+either short of work or short of the machine, and only the grid tells the two
+apart.
+
+### What was taken, which is all four
+
+A slot's dispatches were per slot because a slot's *memory* was: the two windows
+each convolution carries were an allocation apiece, and a kernel binds what it
+reads. That is the same sentence B2 wrote about the spans, one layer down — so
+the remedy is the same one, and B2's own note about why it would be harder holds
+up: a call reads one window and writes the other, and a binding borrows a buffer
+exclusively.
+
+- **A convolution's windows are one allocation**, laid `[2, slots, held,
+  channels]`. Which half a slot reads is an offset in its shape rather than a
+  buffer of its own, and the dispatch binds the allocation **once** — the kernel
+  is handed the two offsets and cuts the halves itself.
+- **A call takes a seat per sequence.** A seat is the rows of the call that are
+  that sequence's, where in the windows its own two are, and where its rows land;
+  everything else — the taps, the channels, the buffers — is the call's. The
+  shape splits along exactly that line into a `Call` every seat shares and a
+  `Seat` each has of its own.
+- **A seat is a stride of the grid rather than a run of it.** Each is given what
+  the widest of them needs, so a thread finds its sequence by a divide the way it
+  already found its timestep inside one, and a batch of equal-length sequences
+  wastes nothing. B2 expected the thread-to-row map to stop being a divide; it
+  does not, because the ragged case is paid for in idle threads rather than in a
+  search.
+- **The head norms go the same way**, and they never had state at all: what made
+  them per sequence was that the query's rows land where that sequence's rows are
+  and the key's where its span has reached. Both are a base, so both are a seat's
+  — and log scaling's `tau` is one value a row of one sequence, so the scales are
+  a seat's too.
+
+The same table at 32, after:
+
+    kernel              calls      device   share    groups  of want   achieved
+    short_conv             84      2.17ms    1.0%      2048     100%   185 GB/s
+    short_conv_pair        42    704.02µs    0.3%      1024      50%   127 GB/s
+    rms_norm_pair          42    484.13µs    0.2%      1280      62%   114 GB/s
+    windowed attention     35      1.72ms    0.8%      1024      50%   321 GB/s
+
+**45.65 ms to 3.36 ms, and the control did not move.** The arithmetic is
+unchanged and every row is the same rows through the same taps; what changed is
+that the machine is offered all of them at once. `short_conv` reaches exactly the
+2048 threadgroups `WANTED_GROUPS` names and 26% of the memory it can then use,
+where it had 3% of one and 3% of the other.
+
+### What it is worth, on the device and on the wall
+
+`just bench 8764ebc . batch --batch 32`, seven alternating pairs, warm, order
+flipped each pair:
+
+    N     B2's device    this   change    seven pairs, alternating
+    1      15.345 ms   15.450   +0.7%    ranges across, 7 of 7    no claim
+    2      24.857      24.257   -2.4%    ranges apart,  7 of 7
+    4      37.109      35.351   -4.7%    ranges apart,  7 of 7
+    8      68.189      64.082   -6.0%    ranges apart,  7 of 7
+   16     124.937     116.029   -7.1%    ranges apart,  7 of 7
+   32     241.287     223.325   -7.4%    ranges apart,  7 of 7
+
+    N     step      a token   device   a token   tokens/s   against N=1
+                                        (device)              (device)
+    1    19.90 ms   19.90 ms  15.45 ms  15.45 ms     50.3      1.00x
+    2    25.56      12.78     24.26     12.13        78.2      1.27x
+    4    37.13       9.28     35.35      8.84       107.7      1.75x
+    8    67.17       8.40     64.08      8.01       119.1      1.93x
+   16    124.89      7.81    116.03      7.25       128.1      2.13x
+   32    244.50      7.64    223.33      6.98       130.9      2.21x
+
+**2.03× → 2.21× on the device and 126.0 → 130.9 tokens a second on the wall**,
+both against B2 in one sitting. The ratio is the device column's for the reason
+B2 gave and this sitting repeats: B2's own binary reads batch 1 at 20.02 ms of
+wall here against the 19.65 its section quotes — 1.9% on the wall — while its
+device row reads 15.345 against 15.278, which is 0.4%.
+
+### How close to the ceiling this got
+
+The ceiling is B1's, re-measured in this sitting with both binaries — a prefill of
+N rows is N rows through *one* sequence, so it pays what N rows cost the model and
+none of what N *sequences* cost the scheduler:
+
+    rows    N rows, one sequence    N rows, N sequences    batched / alone
+                                                            B1     B2    this
+      1          14.34 ms                15.45 ms          1.10x  1.10x  1.08x
+      2          22.49                   24.26             1.18   1.11   1.08
+      4          33.27                   35.35             1.23   1.11   1.06
+      8          60.02                   64.08             1.28   1.14   1.07
+     16         108.17                  116.03             1.33   1.15   1.07
+     32         207.70                  223.33             1.34   1.16   1.08
+
+**1.16× to 1.08× at the widest, which is 53% of what B2 left.** At 32 sequences
+the batch was 71.4 ms over the floor at B1, 33.5 at B2 and is **15.6 now**; at 16
+it was 35.2, then 16.5, and is 7.9. Both widths closed the same 53% again, which
+is the second milestone running to remove half of what was left rather than a
+share that depended on which kernels it took.
+
+Fitted through the device column at N = 1 and N = 32, a step is **8.74 ms read
+once between the sequences and 6.71 ms a sequence**, against B2's 7.99 and 7.29.
+It predicts 35.57 ms at N = 4 against 35.35 measured and 116.03 at N = 16 against
+116.03. Of that 6.71, **6.49 ms is what a row costs the model** — 207.70 over 32
+rows through one sequence, unmoved from B2's own 6.49 — so what is left to the
+scheduler is **0.215 ms a sequence, where B2 left 0.80 and B1 left 2.01.**
+
+**At batch 32 that is 6.9 ms of a 223 ms step**, and there is no dispatch left to
+take it out of: a batch of two encodes 876 dispatches in 617 barriers, which is
+what a batch of *one* encodes, and a batch of four adds 40 — one to each routed
+layer's grouped matmul, which is the block reading a taller call and is the batch
+working rather than costing.
+
+### What a slot nobody is decoding through costs, which is nothing
+
+**Every batched figure in this file feeds every slot it wrapped**, so all of them
+say what N sequences cost together and none of them says what *one* sequence
+costs in a wrap with room for 32. That is the question a server asks — a batch
+held open between requests has idle slots — and if an empty seat were not free
+the width would have to follow the load rather than be configured once.
+
+    in a wrap        step      device    dispatches   against 1
+      1 of 4     15.81ms     14.81ms           876        0.7%
+      1 of 1     15.70ms     14.71ms           876
+      1 of 8     15.78ms     14.81ms           876        0.1%
+      1 of 1     15.78ms     14.80ms           876
+     1 of 32     15.74ms     14.78ms           876        0.1%
+      1 of 1     15.73ms     14.76ms           876
+
+**An empty seat costs nothing on the device and nothing on the wall.** Each width
+is A B B A in one process, so a host drifting through the sitting moves both arms
+the same way; the 0.7% is the first arm of the sitting and the two widths after
+it read 0.1%.
+
+**The mechanism is asserted rather than read off the source**, which is what makes
+this a measurement and not a claim about the code: **a call's seats are the
+sequences it was handed and not the slots the wrap holds**, so one sequence in a
+wrap of 32 encodes the same 876 dispatches over the same grids — `short_conv` at
+64 threadgroups, the attention step at 32, `rms_norm_pair` at 40 — and
+`what_an_empty_seat_costs` fails if either the count or any kernel's grid ever
+comes to be sized by the wrap instead.
+
+**This is the opposite of the empty-expert result and for a reason worth
+naming.** T7 found 15 to 49% of a grouped matmul's threadgroups reading two zero
+words and returning, because *that* grid is sized by the bank the router chose
+from rather than by the rows it routed. A seat's grid is sized by the call, so
+there is no equivalent to remove. What an idle slot does hold is memory — 30.8
+MiB a slot of spans and windows, allocated at wrap time and read by nothing —
+which `a_slot_costs_a_span_and_four_windows_in_every_layer` bounds and which is
+the whole price of leaving a batch configured on.
+
+### What batch 1 pays for it, which is 0.7% and is not nothing
+
+**A one-row call now carries a seat table it does not need.** Every one of the
+168 seated dispatches a step encodes — four a layer — gains one `setBytes` of a
+few dozen bytes and one indirection per thread, and at batch 1 there is no
+per-slot dispatch to remove in exchange.
+It reads +0.7% on the device — 15.345 to 15.450 ms — with the ranges across but
+every one of seven pairs moving the same way, and the same shape appears on a
+prefill of one row at +2.2% and on a prefill of 32 rows at +0.1%, which is what
+a fixed cost per dispatch looks like against a growing one.
+
+**It is a cost per dispatch and not per row**, so it is worth naming where it
+would matter: a decode step of one sequence pays it 168 times, and a prefill of
+any length pays it 168 times over grids hundreds of times larger. The lever that
+would remove it is one binding rather than two — the shared fields and the seats
+in a single `setBytes`, cut by the kernel — and it is not taken here because it
+trades a pointer cast in the constant address space for 0.1 ms at the one width
+this milestone is not about. It is written down rather than done.
+
+### What did not move
+
+**No token moved under any word.** `just test-full` is green — 719 gated and 79
+timing — the recorded continuation `[656, 13, 623, 180069, 86333, 60500, 220,
+23]` is what the engine generates, `--backend cpu` is unmoved, and `production`
+is still 448 of 448 against `reference`.
+
+**Every contamination case still holds, and there is a new one for each kernel
+this changed.** `a_generation_in_a_batch_produces_what_it_produces_alone_on_the
+_device` passes at all four B1 scales; the layer mutation that pins a residual
+convolution to slot 0 still fails it; B2's two — a row's span base pinned, and
+position laid by place-in-call — still fail both the attention- and layer-level
+cases. Added: **two sequences in one convolution dispatch are the two sequences
+alone**, which fails when a seat reads seat zero's rows or lands where seat zero
+lands; and **two sequences in one norm dispatch are the two sequences alone**,
+which fails on those two and on a seat carrying seat zero's scale. Pinning a
+slot's window base to slot zero fails
+`two_sequences_in_two_slots_are_the_two_sequences_alone`.
+
+**Barriers derived == encoded at every width**, which is what makes a missing one
+a test failure rather than a paragraph: 617, 617 and 614 at batch 1, 2 and 4,
+over 876, 876 and 916 dispatches. The counts fell from B2's 617/739/985 over
+876/1044/1420 because the dispatches they order did.
+
+**Memory is still 30.8 MiB a sequence, exactly linear in the slots.** The windows
+are one allocation where they were two a slot, and it is the same floats:
+`a_slot_costs_a_span_and_four_windows_in_every_layer` still holds the device's own
+count against the shapes the checkpoint gives it.
+
+**And the duplicate-slot refusal is unmoved**, which is the invariant a seat rests
+on: two sequences in one slot would be two seats reading one window.
+
 ## The dispatches a slot kept, and which of them was the gap
 
 **A slot kept five dispatches a layer to itself, and one of the five was the

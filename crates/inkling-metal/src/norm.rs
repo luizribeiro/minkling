@@ -1229,6 +1229,113 @@ mod tests {
         }
     }
 
+    /// **Seats of different lengths in one dispatch each answer for their own
+    /// rows and write nobody else's**, which is the case a grid strided by the
+    /// widest seat exists for.
+    ///
+    /// A batch's sequences need not feed the same number of rows, so a call is
+    /// one row of one sequence beside two of another and the short seat has
+    /// threadgroups with no row to normalise. What they must do is return: a
+    /// threadgroup that ran would write `base + row` for a row its seat does not
+    /// have, which is the landing of whatever sits after it.
+    ///
+    /// **The two seats land with a row between them**, and that row is the
+    /// assertion: a spare threadgroup writing the row after its own would land
+    /// exactly there, where a landing packed end to end would hide it under the
+    /// value the next seat writes anyway.
+    #[test]
+    fn seats_of_different_lengths_in_one_dispatch_are_each_the_sequence_alone() {
+        let Some(device) = device() else { return };
+        const WIDTH: usize = 128;
+        const ROWS: usize = 4;
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let weight: Vec<f32> = (0..WIDTH).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+        let layer = LayerNorm::new(&device, &norm, &weight, 1e-6).expect("the weight uploads");
+        let rows: Vec<f32> = (0..ROWS * WIDTH)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) * (1 + i / WIDTH) as f32)
+            .collect();
+        let seats = [
+            Seating {
+                from: 0,
+                rows: 1,
+                base: 0,
+                scale: Some(&[1.5]),
+            },
+            Seating {
+                from: 1,
+                rows: 2,
+                base: 2,
+                scale: Some(&[3.0, 0.5]),
+            },
+        ];
+
+        let alone: Vec<Vec<f32>> = seats
+            .iter()
+            .map(|seat| {
+                let own = &rows[seat.from * WIDTH..][..seat.rows * WIDTH];
+                let mut x = device.buffer(own).expect("the rows upload");
+                let mut out = device
+                    .zeroed::<f32>(own.len())
+                    .expect("the landing allocates");
+                let mut batch = device.batch().expect("a command buffer opens");
+                layer
+                    .encode_seats(
+                        &mut batch,
+                        &mut x,
+                        &[Seating {
+                            from: 0,
+                            base: 0,
+                            ..*seat
+                        }],
+                        Landing {
+                            out: &mut out,
+                            groups: 1,
+                            stride: seat.rows,
+                            base: 0,
+                        },
+                    )
+                    .expect("the dispatch encodes");
+                batch.wait().expect("the dispatch completes");
+                out.to_vec()
+            })
+            .collect();
+
+        let mut x = device.buffer(&rows).expect("the rows upload");
+        let mut out = device
+            .zeroed::<f32>(ROWS * WIDTH)
+            .expect("the landing allocates");
+        let mut batch = device.batch().expect("a command buffer opens");
+        layer
+            .encode_seats(
+                &mut batch,
+                &mut x,
+                &seats,
+                Landing {
+                    out: &mut out,
+                    groups: 1,
+                    stride: ROWS,
+                    base: 0,
+                },
+            )
+            .expect("the dispatch encodes");
+        batch.wait().expect("the dispatch completes");
+
+        let together = out.to_vec();
+        for (seat, apart) in seats.iter().zip(&alone) {
+            let at = seat.base * WIDTH;
+            assert_eq!(
+                together[at..at + apart.len()],
+                apart[..],
+                "the sequence at row {}",
+                seat.from
+            );
+        }
+        assert!(
+            together[WIDTH..2 * WIDTH].iter().all(|value| *value == 0.0),
+            "the row between the seats was written by a threadgroup with no row of its own"
+        );
+    }
+
     /// What the bandwidth column divides by, against what the kernel reads: the
     /// rows in, the same rows out, the one weight every row of every call
     /// reduces against, and a scale a row.
@@ -1701,6 +1808,106 @@ mod tests {
 
         assert_eq!(together.0, normed_alone(&device, &one, &x, None, 1, 2));
         assert_eq!(together.1, normed_alone(&device, &other, &y, None, 1, 2));
+    }
+
+    /// **The fallback carries the seats too**, which is the arm of
+    /// [`encode_pair`] nothing else drives with more than one sequence in it.
+    ///
+    /// A pair whose halves cannot share a threadgroup is two dispatches, and
+    /// each of them is still a call over every sequence its half was given — so
+    /// a fallback that dropped the seats, or handed both halves the first
+    /// half's, would answer one sequence of each pair and leave the other where
+    /// it was. The seats are ragged on both sides so that the span arithmetic is
+    /// exercised in the fallback as well.
+    #[test]
+    fn a_pair_dispatched_apart_still_seats_every_sequence() {
+        let Some(device) = device() else { return };
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let (narrow, wide) = (32, 1024);
+        let one = LayerNorm::new(&device, &norm, &weight_of(narrow, 3), 1e-6)
+            .expect("the weight uploads");
+        let other =
+            LayerNorm::new(&device, &norm, &weight_of(wide, 5), 1e-6).expect("the weight uploads");
+        assert_ne!(one.threads, other.threads, "the two widths part company");
+        let seats = [
+            Seating {
+                from: 0,
+                rows: 1,
+                base: 0,
+                scale: None,
+            },
+            Seating {
+                from: 1,
+                rows: 2,
+                base: 1,
+                scale: None,
+            },
+        ];
+
+        let (x, y) = (values(3 * narrow, 7), values(3 * wide, 9));
+        let seated = |norm: &LayerNorm<'_>, values: &[f32], seats: &[Seating<'_>]| {
+            let mut input = device.buffer(values).expect("the rows upload");
+            let mut out = device
+                .zeroed::<f32>(values.len())
+                .expect("the landing allocates");
+            let mut batch = device.batch().expect("a command buffer opens");
+            norm.encode_seats(
+                &mut batch,
+                &mut input,
+                seats,
+                Landing {
+                    out: &mut out,
+                    groups: 1,
+                    stride: 3,
+                    base: 0,
+                },
+            )
+            .expect("the dispatch encodes");
+            batch.wait().expect("the batch completes");
+            out.to_vec()
+        };
+
+        let mut first_x = device.buffer(&x).expect("the rows upload");
+        let mut second_x = device.buffer(&y).expect("the rows upload");
+        let mut first_out = device
+            .zeroed::<f32>(x.len())
+            .expect("the landing allocates");
+        let mut second_out = device
+            .zeroed::<f32>(y.len())
+            .expect("the landing allocates");
+        let dispatches = device.dispatches();
+        let mut batch = device.batch().expect("a command buffer opens");
+        super::encode_pair(
+            &mut batch,
+            Normalising {
+                norm: &one,
+                x: &mut first_x,
+                seats: &seats,
+                landing: Landing {
+                    out: &mut first_out,
+                    groups: 1,
+                    stride: 3,
+                    base: 0,
+                },
+            },
+            Normalising {
+                norm: &other,
+                x: &mut second_x,
+                seats: &seats,
+                landing: Landing {
+                    out: &mut second_out,
+                    groups: 1,
+                    stride: 3,
+                    base: 0,
+                },
+            },
+        )
+        .expect("the pair encodes");
+        batch.wait().expect("the batch completes");
+        assert_eq!(device.dispatches() - dispatches, 2, "two dispatches");
+
+        assert_eq!(first_out.to_vec(), seated(&one, &x, &seats));
+        assert_eq!(second_out.to_vec(), seated(&other, &y, &seats));
     }
 
     /// A weight that is not all one value, so a norm that dropped it or read it

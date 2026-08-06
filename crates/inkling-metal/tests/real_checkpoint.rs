@@ -1822,6 +1822,16 @@ const ATTENTION_ROWS: [&str; 2] = ["windowed attention", "global attention"];
 /// measured that. **What decides whether they are worth a kernel change is the
 /// `groups` column against `WANTED_GROUPS`, not the `calls` one.**
 ///
+/// **What it said, and what came of it.** At a batch of 32 the three were 45.65
+/// ms of the 261.87 the passes accounted for, at 2 to 3% of the threadgroups the
+/// machine wants and 1 to 3% of its bandwidth, against the batched attention
+/// step's 50% and 45% — the same arithmetic per row, ranked apart by the grid
+/// alone. All three are now one dispatch a layer over a seat per sequence, and
+/// the same rows read 3.36 ms at 100%, 62% and 50% of the wanted grid. The table
+/// stays because it is what would notice the next kernel that goes narrow, and
+/// because a batch of one is where it says what a seat costs a call that has
+/// only one.
+///
 /// **Both arms at every width**, for the reason the context table gives: a
 /// sampled step is a pass a dispatch and the per-slot kernels are the numerous
 /// ones, so the cost of asking grows with the batch and a table that did not

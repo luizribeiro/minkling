@@ -1572,6 +1572,206 @@ mod tests {
         assert_eq!(batched[1], alone[1], "the sequence in seat 1");
     }
 
+    /// **Seats of different lengths in one dispatch are each the sequence
+    /// alone**, which is the case a grid strided by the widest seat exists for
+    /// and the one a grid summed over the seats would not need.
+    ///
+    /// A batch's sequences need not feed the same number of rows — nothing in
+    /// [`Batched`](inkling_core::model::Batched) says they do — so a call is two
+    /// rows of one sequence beside one of another, and the seat that is short
+    /// has threads with no timestep to run. What they must do is *return*: a
+    /// short seat whose spare threads ran would write past its own rows, into
+    /// the window of the seat beside it or the landing of the row after it.
+    ///
+    /// The long seat is second so that a call which ignored the stride and laid
+    /// the seats end to end would answer this one at the wrong offset rather
+    /// than by luck.
+    #[test]
+    fn seats_of_different_lengths_in_one_dispatch_are_each_the_sequence_alone() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let fx = Synthetic::load();
+        let sequences = [
+            fx.sequence(&fx.input, 0),
+            fx.sequence(&fx.input, 1 % fx.batch),
+        ];
+        assert_ne!(sequences[0], sequences[1], "two sequences to tell apart");
+        // One row for the first seat and two for the second, which is the
+        // ragged call: 1 + 2 rows of one buffer, and a span of the wider.
+        let taking = [1, 2];
+        let rows: usize = taking.iter().sum();
+
+        let alone: Vec<Vec<f32>> = sequences
+            .iter()
+            .zip(taking)
+            .map(|(sequence, taken)| {
+                let one = fx.wrapped(&device, &conv, &fx.weight);
+                one.restart(0);
+                one.forward(&sequence[..taken * fx.channels])
+                    .expect("the dispatch completes")
+            })
+            .collect();
+
+        let shared = LayerConv::holding(&device, &conv, fx.channels, &fx.weight, 0, 2)
+            .expect("the kernel uploads");
+        let mut at = 0;
+        let mut seats = Vec::new();
+        let mut call = Vec::new();
+        for (slot, taken) in taking.into_iter().enumerate() {
+            shared.restart(slot);
+            seats.push(Seating::over(slot, at, taken));
+            call.extend_from_slice(&sequences[slot][..taken * fx.channels]);
+            at += taken;
+        }
+
+        let mut x = device.buffer(&call).expect("the rows upload");
+        let mut out = device
+            .zeroed::<f32>(rows * fx.channels)
+            .expect("the landing allocates");
+        let mut batch = device.batch().expect("a command buffer opens");
+        shared
+            .encode_seats(
+                &mut batch,
+                &seats,
+                &mut x,
+                None,
+                1.0,
+                Landing {
+                    out: &mut out,
+                    groups: 1,
+                    stride: rows,
+                    base: 0,
+                },
+            )
+            .expect("the dispatch encodes");
+        batch.wait().expect("the batch completes");
+
+        let answered = out.to_vec();
+        for (seat, apart) in seats.iter().zip(&alone) {
+            let at = seat.base * fx.channels;
+            assert_eq!(
+                answered[at..at + apart.len()],
+                apart[..],
+                "the sequence in slot {}",
+                seat.slot
+            );
+            // And its window, because a short seat that ran its spare threads
+            // would have written the timesteps of a call it does not have.
+            assert_eq!(
+                shared.window(seat.slot),
+                {
+                    let one = fx.wrapped(&device, &conv, &fx.weight);
+                    one.restart(0);
+                    one.forward(&sequences[seat.slot][..seat.rows * fx.channels])
+                        .expect("the dispatch completes");
+                    one.window(0)
+                },
+                "the window slot {} was left with",
+                seat.slot
+            );
+        }
+    }
+
+    /// **A batched call leaves a slot it was given no seat for exactly as it
+    /// was**, which is what a server holding a batch open between requests
+    /// needs and is where the *bound* on a seat's threads is checked rather than
+    /// the map into them.
+    ///
+    /// A seat shorter than the widest has threads with no timestep of its own,
+    /// and the windows of every slot are one allocation — so a spare thread that
+    /// ran would write one row past its own window, which is the first row of
+    /// the next slot's. The case above cannot see that: both its slots write
+    /// their own windows in the same dispatch, so whichever write lands second
+    /// covers it.
+    ///
+    /// Here the neighbour is a slot the call does not name, and it is left
+    /// reading the half the overflow would land in — so what it answers on its
+    /// next call is what says whether anything reached it.
+    #[test]
+    fn a_slot_no_seat_names_is_left_as_it_was() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let fx = Synthetic::load();
+        let sequence = fx.sequence(&fx.input, 0);
+        let other = fx.sequence(&fx.input, 1 % fx.batch);
+        let channels = fx.channels;
+        let row = move |sequence: &[f32], at: usize| sequence[at * channels..][..channels].to_vec();
+
+        // Three slots, and the middle one is the one nobody seats. Its first
+        // call is what leaves it reading the half a short seat of slot 0 would
+        // overflow into — `at(1, 1)` is one window past `at(1, 0)`.
+        let shared = LayerConv::holding(&device, &conv, fx.channels, &fx.weight, 0, 3)
+            .expect("the kernel uploads");
+        for slot in 0..3 {
+            shared.restart(slot);
+        }
+        let feed = |slot: usize, values: &[f32]| {
+            let mut x = device.buffer(values).expect("the row uploads");
+            let mut out = device
+                .zeroed::<f32>(values.len())
+                .expect("the landing allocates");
+            let mut batch = device.batch().expect("a command buffer opens");
+            shared
+                .encode_seats(
+                    &mut batch,
+                    &[Seating::over(slot, 0, values.len() / fx.channels)],
+                    &mut x,
+                    None,
+                    1.0,
+                    Landing {
+                        out: &mut out,
+                        groups: 1,
+                        stride: values.len() / fx.channels,
+                        base: 0,
+                    },
+                )
+                .expect("the dispatch encodes");
+            batch.wait().expect("the batch completes");
+            out.to_vec()
+        };
+        feed(1, &row(other, 0));
+
+        // The ragged call over its neighbours: one row for slot 0, two for slot
+        // 2, so slot 0's seat has a row's worth of threads with nothing to do.
+        let call: Vec<f32> = [&row(sequence, 0), &sequence[..2 * fx.channels]].concat();
+        let mut x = device.buffer(&call).expect("the rows upload");
+        let mut out = device
+            .zeroed::<f32>(call.len())
+            .expect("the landing allocates");
+        let mut batch = device.batch().expect("a command buffer opens");
+        shared
+            .encode_seats(
+                &mut batch,
+                &[Seating::over(0, 0, 1), Seating::over(2, 1, 2)],
+                &mut x,
+                None,
+                1.0,
+                Landing {
+                    out: &mut out,
+                    groups: 1,
+                    stride: 3,
+                    base: 0,
+                },
+            )
+            .expect("the dispatch encodes");
+        batch.wait().expect("the batch completes");
+
+        // What the untouched slot answers next, against the same two rows
+        // through a convolution nothing else ever touched.
+        let alone = fx.wrapped(&device, &conv, &fx.weight);
+        alone.restart(0);
+        alone
+            .forward(&row(other, 0))
+            .expect("the dispatch completes");
+        assert_eq!(
+            feed(1, &row(other, 1)),
+            alone
+                .forward(&row(other, 1))
+                .expect("the dispatch completes"),
+            "a call that seated slots 0 and 2 reached slot 1"
+        );
+    }
+
     /// A slot past the batch a convolution was wrapped for is a sequence whose
     /// windows are nowhere. Answering slot zero instead would be one sequence's
     /// state serving two, which is the whole of what a batch must not do.

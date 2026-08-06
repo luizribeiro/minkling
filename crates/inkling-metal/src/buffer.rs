@@ -336,21 +336,19 @@ pub struct Landing<'a> {
 
 impl Landing<'_> {
     /// That `rows` rows of `groups` groups of `width` fit where this says they
-    /// go.
+    /// go, starting at `base`.
     ///
     /// Checked here rather than by each kernel that writes one, because what
     /// these three numbers have to agree with is the buffer they index — and a
     /// GPU write past a buffer's end is memory somebody else owns rather than a
     /// fault. `width` is the caller's because only it knows what a row of its
     /// own is.
-    pub fn fits(&self, rows: usize, width: usize) {
-        self.fits_at(self.base, rows, width);
-    }
-
-    /// The same, for `rows` starting at `base` rather than at this landing's own
-    /// — which is what a dispatch writing several sequences' rows into one
-    /// landing has: the buffer, the groups and the stride are the call's and the
-    /// base is each sequence's.
+    ///
+    /// **The base is an argument rather than this landing's own**, which is what
+    /// a dispatch writing several sequences' rows into one landing has: the
+    /// buffer, the groups and the stride are the call's and the base is each
+    /// sequence's. A caller with one sequence passes [`Landing::base`], which is
+    /// what it always checked.
     pub fn fits_at(&self, base: usize, rows: usize, width: usize) {
         assert!(self.groups > 0, "a row has groups");
         assert!(
