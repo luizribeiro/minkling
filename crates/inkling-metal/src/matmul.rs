@@ -2517,6 +2517,49 @@ impl<'a> PackedBank<'a> {
         per_source: usize,
         through: Through,
     ) -> Result<Pending, MatmulError> {
+        let blocks = blocks_a_plan(grouped.order.len(), self.experts, grouped.rows_a_block);
+        self.grouped_over(batch, grouped, x, per_source, through, blocks)
+    }
+
+    /// The same over a grid the caller sized rather than the bound the plan was
+    /// allocated at, which is how the blocks no run filled are priced.
+    ///
+    /// **A count under the bound drops threadgroups off the end and nothing
+    /// else.** The plan is written compactly — a run's blocks land at a prefix
+    /// sum over the runs before it, so the entries a dispatch reads are
+    /// `0..blocks` and everything past them is the zeros the buffer was
+    /// allocated with. A grid stopping at the count the runs came to therefore
+    /// answers the same bits as one covering the bound, and
+    /// [`what_the_blocks_no_run_filled_cost_a_grouped_dispatch`] holds it to
+    /// them. A count *over* the bound would read past the plan, which is why
+    /// this is not public.
+    #[cfg(test)]
+    pub(crate) fn encode_grouped_over(
+        &self,
+        batch: &mut Batch<'_>,
+        grouped: &mut Grouped,
+        x: &mut Buffer<f32>,
+        per_source: usize,
+        through: Through,
+        blocks: usize,
+    ) -> Result<Pending, MatmulError> {
+        assert!(
+            blocks <= blocks_a_plan(grouped.order.len(), self.experts, grouped.rows_a_block),
+            "a grid of {blocks} blocks reads past the plan it was allocated for"
+        );
+        self.grouped_over(batch, grouped, x, per_source, through, blocks)
+    }
+
+    /// Both of the above, which differ in the grid and in nothing else.
+    fn grouped_over(
+        &self,
+        batch: &mut Batch<'_>,
+        grouped: &mut Grouped,
+        x: &mut Buffer<f32>,
+        per_source: usize,
+        through: Through,
+        blocks: usize,
+    ) -> Result<Pending, MatmulError> {
         let _timed = profile::scope(Op::Encode);
         let rows = grouped.order.len();
         self.rows_a_source(rows, per_source, x.len());
@@ -2529,7 +2572,7 @@ impl<'a> PackedBank<'a> {
         let layout = Layout::Grouped {
             order: grouped.order.arg(),
             plan: grouped.plan.arg(),
-            blocks: blocks_a_plan(rows, self.experts, grouped.rows_a_block),
+            blocks,
             through,
         };
         self.dispatch(batch, rows, per_source, grouped.experts.arg(), x, layout)
@@ -10583,6 +10626,76 @@ kernel void mma_lane_probe___T__(
                 );
             }
         }
+    }
+
+    /// **A synthetic bank rather than the routed one**, for the reason
+    /// `the_two_grouped_entries_answer_one_call_the_same_bits` uses one: what
+    /// this is about is the grid, which is the same grid at seven experts as at
+    /// 256, and the routed bank's codes are 1.07 GB to generate for a case that
+    /// runs beside every other. **The routing's own runs are what the tables
+    /// above read**; what is borrowed here is the one property that puts slack in
+    /// the bound at all, which is experts holding no rows.
+    #[test]
+    fn a_grid_stopping_at_the_runs_answers_what_the_bound_answers() {
+        let Some(device) = device() else { return };
+        let matmul = PackedMatmul::under(&device, Numerics::Production).expect("compiles");
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        const EXPERTS: usize = 7;
+
+        // Four of the seven hold nothing and the three that do are as far from
+        // each other as the bank allows, which is the recorded routing's two
+        // properties at a shape a case can afford.
+        let counts = [61usize, 0, 0, 29, 0, 11, 0];
+        let chosen = named_by(&counts);
+        let rows = chosen.len();
+        let case = Case::noisy(IN_DIM, EXPERTS * OUT_DIM, rows);
+        let bank = PackedBank::upload(
+            &device,
+            &matmul,
+            EXPERTS,
+            IN_DIM,
+            OUT_DIM,
+            &case.packed(),
+            &case.scales,
+        )
+        .expect("the bank's shapes pair");
+
+        let height = bank.rows_a_block(rows);
+        let came = blocks_a_run_is_cut_into(&chosen, height);
+        assert!(
+            height > 0 && came < blocks_a_plan(rows, EXPERTS, height),
+            "this call's runs filled the bound, so the two grids are one grid"
+        );
+
+        let answers = |blocks: Option<usize>| {
+            let mut batch = device.batch().expect("a command buffer opens");
+            let mut picked = device.buffer(&chosen).expect("the selection uploads");
+            let mut x = device.buffer(&case.x).expect("the rows upload");
+            let mut sorted = grouping
+                .encode(&mut batch, &mut picked, EXPERTS, height)
+                .expect("the grouping encodes");
+            let pending = match blocks {
+                None => bank.encode_grouped(&mut batch, &mut sorted, &mut x, 1, Through::Gathered),
+                Some(blocks) => bank.encode_grouped_over(
+                    &mut batch,
+                    &mut sorted,
+                    &mut x,
+                    1,
+                    Through::Gathered,
+                    blocks,
+                ),
+            }
+            .expect("the dispatch encodes");
+            batch.wait().expect("the dispatches complete");
+            pending.take()
+        };
+
+        assert_eq!(
+            answers(None),
+            answers(Some(came)),
+            "a grid of the {came} blocks the runs came to answered other bits than one covering \
+             the bound, so the blocks past the last run are not the empty blocks they read as"
+        );
     }
 
     /// The three ways `rows` can be spread over `experts` at one mean run
