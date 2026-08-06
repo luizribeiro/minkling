@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **713 of the 792 tests, no
+`just test` is the one to run while iterating: **715 of the 794 tests, no
 checkpoint, thirteen seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,9 +32,9 @@ a crate's tests in one process: opening a Metal device costs a second, so the 25
 kernel tests are 13.6 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 792 against a
-real checkpoint, twenty minutes and the measurements after it.** The 713 the
-gated tier runs and the 79 the timing tier does. The 57 gated tests — the 41
+`just test-full` is what has to pass at the ends of a series: **all 794 against a
+real checkpoint, twenty minutes and forty more for the measurements after it.**
+The 715 the gated tier runs and the 79 the timing tier does. The 57 gated tests — the 41
 above and sixteen of the measurements below, which need weights as well as a
 clock — are what
 only weights can settle — that the packed tensors decode to what the reference

@@ -3111,6 +3111,64 @@ mod tests {
         }
     }
 
+    /// Two sequences of one batch in one slot is one sequence's span and windows
+    /// serving both, which is the whole of what a batch must not do.
+    ///
+    /// Refused where it is asked for rather than where it would break: what it
+    /// breaks is the second borrow of the same span, which reports a cell rather
+    /// than a mistake.
+    #[test]
+    #[should_panic(expected = "two sequences of a batch are in slot 0")]
+    fn two_sequences_of_a_batch_in_one_slot_are_refused() {
+        let Some(device) = device() else {
+            panic!("two sequences of a batch are in slot 0")
+        };
+        let kernels = LayerKernels::compile(&device).expect("the kernels compile");
+        let swiglu = SwiGlu::new(&device).expect("the kernel compiles");
+        let weights = NarrowWeights::new();
+        let narrow = Narrow {
+            device: &device,
+            kernels: &kernels,
+            swiglu: &swiglu,
+            slack: 0,
+            slots: 2,
+        };
+        let stack = stack(&device, vec![narrow.layer(&weights, 0)], RETAINED_BUDGET);
+        let held = stack.layer(0).expect("the layer is here");
+        let layer = DecoderLayer::new(
+            NARROW,
+            weights.decoder(&held.attention),
+            LayerMlp::Dense(DenseMlp::backend(
+                NARROW.hidden,
+                NARROW_FFN,
+                held.mlp.as_ref().and_then(dense).expect("a dense layer"),
+                GLOBAL_SCALE,
+            )),
+        );
+
+        // Both in slot zero, which is what a scheduler that forgot to hand a
+        // joining request a free slot would build.
+        let mut caches = [
+            DecoderCache::new(NARROW, NARROW.hidden, KERNEL_SIZE),
+            DecoderCache::new(NARROW, NARROW.hidden, KERNEL_SIZE),
+        ];
+        let (first, second) = caches.split_at_mut(1);
+        let mut seats = [
+            Seat {
+                cache: &mut first[0],
+                queries: 1,
+            },
+            Seat {
+                cache: &mut second[0],
+                queries: 1,
+            },
+        ];
+        let x = vec![0.5f32; 2 * NARROW.hidden];
+        layer.advancing(&mut seats, |batch| {
+            (&stack as &dyn DecoderDevice).run(0, batch, Hidden::Rows(&x))
+        });
+    }
+
     /// A stack of layers this backend holds whole, which is what a merged run is
     /// asked of — see [`ModelLayers::run`].
     /// **A rejected speculative token leaves nothing behind in a stack that ran
