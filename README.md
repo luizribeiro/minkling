@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **716 of the 795 tests, no
+`just test` is the one to run while iterating: **723 of the 804 tests, no
 checkpoint, thirteen seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,9 +32,9 @@ a crate's tests in one process: opening a Metal device costs a second, so the 25
 kernel tests are 13.6 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 795 against a
+`just test-full` is what has to pass at the ends of a series: **all 804 against a
 real checkpoint, twenty minutes and forty more for the measurements after it.**
-The 716 the gated tier runs and the 79 the timing tier does. The 57 gated tests — the 41
+The 723 the gated tier runs and the 81 the timing tier does. The 57 gated tests — the 41
 above and sixteen of the measurements below, which need weights as well as a
 clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -45,7 +45,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the seventy-nine tests whose result *is* a number — a duration
+`just test-timing` is the eighty-one tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -1214,9 +1214,11 @@ pair rather than what a prefill costs today — the prefill section above is.
 
 **B2 left four dispatches a layer to each slot and said it had not sized them.
 This is the table that sizes them, and then it takes all four.** What is left
-after it is a batch that dispatches what a single sequence dispatches — 876
-either way at any width — and a step **7.4% faster on the device at 32 sequences
-than the one B2 shipped**, at 1.08× the floor where B2 reached 1.16×.
+after it is a batch that dispatches what a single sequence dispatches — 876 at
+any width, plus the 40 a routed layer's grouped matmul adds from four rows up,
+which are the rows' own and not the slots' — and a step **7.4% faster on the
+device at 32 sequences than the one B2 shipped**, at 1.08× the floor where B2
+reached 1.16×.
 
 ### The table B2 did not take, and the column that decides
 
@@ -1422,7 +1424,7 @@ this milestone is not about. It is written down rather than done.
 
 ### What did not move
 
-**No token moved under any word.** `just test-full` is green — 719 gated and 79
+**No token moved under any word.** `just test-full` is green — 723 gated and 81
 timing — the recorded continuation `[656, 13, 623, 180069, 86333, 60500, 220,
 23]` is what the engine generates, `--backend cpu` is unmoved, and `production`
 is still 448 of 448 against `reference`.
@@ -1451,6 +1453,67 @@ count against the shapes the checkpoint gives it.
 
 **And the duplicate-slot refusal is unmoved**, which is the invariant a seat rests
 on: two sequences in one slot would be two seats reading one window.
+
+### The tests, and the one the review found missing again
+
+**Three milestones running, the code-reviewer has named a shipped kernel with an
+arm no test drove.** This time it is the one a seat exists for, and the review
+and this milestone reached it together — which is worth recording either way,
+because the gap was the same gap. Every batched case in this tree feeds exactly
+one row to each sequence — `generate_batch` sends
+`[id]` per slot and prefill is not batched at all — so nothing anywhere
+exercised **seats of unequal length in one dispatch**, which is the whole reason
+a seat is a *stride* of the grid rather than a run of it. The plumbing claimed to
+support it, the arithmetic was written for it, and `step_batch` reaches it the
+moment a batch speculates.
+
+Three cases now drive it, each against a mutation of its own:
+
+- **Seats of different lengths answer what each sequence answers alone**, in the
+  convolution and in the norm. A grid that laid the seats end to end rather than
+  striding them fails the first.
+- **A slot the call gives no seat is left as it was.** This is where a short
+  seat's *bound* is checked rather than its map: a spare thread that ran would
+  write one row past its own window, which is the first row of the next slot's —
+  and the ragged case above cannot see it, because both its seats write their own
+  windows in the same dispatch and whichever lands second covers it. An unseated
+  neighbour keeps the evidence. Removing the bound fails it.
+- **A pair whose halves cannot share a threadgroup is two dispatches, and each
+  still carries every seat its half was given** — the fallback in
+  `norm::encode_pair`, which nothing else drives with more than one sequence in
+  it.
+
+The review's other finding was dead code this milestone left: `Landing::fits`
+had no caller once `fits_at` took the last one, and two spellings of one bounds
+check are two that can drift.
+
+### What this leaves
+
+**Static still, and prefill still one sequence at a time**, for the reasons B1
+gave and B2 repeated: what continuous scheduling would be worth is bounded above
+by the same curve, and a prompt of any length already fills the machine. What is
+new is that **an idle slot is now measured rather than assumed** — a wrap of 32
+carrying one sequence costs what a wrap of one does — so a scheduler that keeps a
+batch open pays only the memory.
+
+**The MTP chain is still not batched**, and the note B1 and B2 both left is
+sharper now: a `k = 3` verify at batch 8 is 32 rows, exactly the matmul's MMA
+floor, and **the ragged seats such a round needs are built and tested here
+without anything driving them**. `ModelHeads::wrap` still takes a slot count that
+nothing asks for more than one of. That is the shape of the next milestone rather
+than a gap in this one.
+
+**And the lever this milestone declines is the one batch 1 pays for**: the shared
+fields and the seats in a single `setBytes`, cut by the kernel out of one binding
+instead of two. It is 0.1 ms a step at the width this is not about, and it trades
+a pointer cast in the constant address space for it.
+
+**What is left to the scheduler is 0.215 ms a sequence and there is no dispatch
+left to take it out of.** The remaining 6.49 ms a sequence is what a *row* costs
+the model, measured through one sequence, and B1's arithmetic for why it barely
+amortises is unchanged: three quarters of the 5.9 GB a step reads is routed
+experts, and 32 tokens draw about 130 distinct ones of 256. The next thing to
+move is not the shape of a dispatch.
 
 ## The dispatches a slot kept, and which of them was the gap
 
