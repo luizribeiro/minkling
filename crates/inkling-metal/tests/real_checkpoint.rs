@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use inkling_core::fixture::{self, ACTIVATIONS, deviation, indices};
-use inkling_core::generate::{Proposer, Round};
+use inkling_core::generate::{Picked, Proposer, Round};
+use inkling_core::model::Batched;
 use inkling_core::moe::{Gate, GateWeights, MoeConfig, SparseMoe};
 use inkling_core::mtp::{CheckpointHeads, MtpProposer};
 use inkling_core::ops::linear;
@@ -3373,6 +3374,97 @@ fn a_generation_in_a_batch_produces_what_it_produces_alone_on_the_device() {
                 "sequence {seq} at position {at} of {order:?}"
             );
         }
+    }
+}
+
+/// **The derived and the encoded barrier counts still agree at batch > 1**, which
+/// is what makes contamination through a missing barrier a test failure rather
+/// than a paragraph.
+///
+/// D4's claim is that the barriers a step encodes are the ones its dependency
+/// graph needs and no others, and the graph is derived from each kernel's Metal
+/// source at compile time. A batch adds edges that graph never saw: a
+/// convolution reads the run of the projections' rows that is its own and writes
+/// into a span the step after it binds, and there are N of each — so a division
+/// that was right for one sequence is not thereby right for sixteen.
+///
+/// **A missing barrier is a race that is correct most of the time**, which is
+/// the same reason the single-sequence case exists: what it would otherwise cost
+/// is a wrong token months later, in the one place this milestone cannot afford
+/// one.
+///
+/// Two steps at each width, because the sequence is the same commands every step
+/// and a division that differed between two of them would be an ordering that
+/// depends on something other than the shape.
+#[test]
+fn the_barriers_a_batched_step_encodes_are_the_ones_its_dependencies_need() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let config = fixture::config(&dir).text_config;
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+    let recorded = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+
+    for slots in [1, 2, 4] {
+        let weights = gpu.wrap_batch(&ckpt, &config, slots);
+        let generator = weights.generator();
+        let mut caches: Vec<ModelCache> = (0..slots)
+            .map(|slot| ModelCache::in_slot(&config, 0, slot))
+            .collect();
+        let want = Tail {
+            block: 1,
+            chained: false,
+            logits: false,
+        };
+        let mut pending: Vec<usize> = caches
+            .iter_mut()
+            .enumerate()
+            .map(|(slot, cache)| {
+                let mut prompt = recorded.clone();
+                let by = slot % prompt.len();
+                prompt.rotate_left(by);
+                generator.tailed(cache, &prompt, want, &weights).picks[0]
+            })
+            .collect();
+
+        trace::record(true);
+        let mut divisions = Vec::new();
+        for _ in 0..2 {
+            let before = device.barriers();
+            let feeding: Vec<[usize; 1]> = pending.iter().map(|id| [*id]).collect();
+            let mut batch: Vec<Batched<'_>> = caches
+                .iter_mut()
+                .zip(&feeding)
+                .map(|(cache, ids)| Batched { cache, ids })
+                .collect();
+            pending = generator
+                .step_batch(&mut batch, &weights)
+                .iter()
+                .map(Picked::last)
+                .collect();
+            let encoded = device.barriers() - before;
+            // The boundaries first: taking the trace clears both.
+            let boundaries = trace::submissions();
+            let groups = Groups::over(&trace::take(), &boundaries);
+            assert_eq!(
+                encoded,
+                groups.barriers() as u64,
+                "a batch of {slots} encoded {encoded} barriers where its division needs {}",
+                groups.barriers()
+            );
+            eprintln!(
+                "batch {slots}: {} dispatches in {} groups, {} barriers",
+                groups.dispatches(),
+                groups.groups(),
+                groups.barriers()
+            );
+            divisions.push(groups);
+        }
+        trace::record(false);
+        assert_eq!(
+            divisions[0], divisions[1],
+            "a batch of {slots} divides two steps differently"
+        );
     }
 }
 

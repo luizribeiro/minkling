@@ -59,6 +59,9 @@ use inkling_metal::{FusedAttention, Numerics, PackedMatmul};
 /// lengths this repo quotes.
 const PREFILLED: usize = 385;
 
+/// Steps a width runs and discards before the ones it is timed over.
+const SETTLED: usize = 2;
+
 /// The widest batch the batch sweep runs, when nobody says.
 ///
 /// Doubling from one, so that the curve is read on a log axis and the row that
@@ -1067,6 +1070,26 @@ fn batched(
         .zip(&prompts)
         .map(|(cache, prompt)| generator.tailed(cache, prompt, want, weights).picks[0])
         .collect();
+
+    // **Thrown away, for the reason the warm generation above the sweep is.**
+    // A width is a fresh wrap — a slot is buffers this device has not allocated
+    // before — so the first steps of a width pay for allocating its spans and
+    // its windows, which belongs to the wrap rather than to the step. The
+    // device's own clock does not see it and the wall does: unsettled, the batch
+    // of one read 25.9 ms against its own 16.4.
+    for _ in 0..SETTLED {
+        let feeding: Vec<[usize; 1]> = pending.iter().map(|id| [*id]).collect();
+        let mut batch: Vec<Batching<'_>> = caches
+            .iter_mut()
+            .zip(&feeding)
+            .map(|(cache, ids)| Batching { cache, ids })
+            .collect();
+        pending = generator
+            .step_batch(&mut batch, weights)
+            .iter()
+            .map(Picked::last)
+            .collect();
+    }
 
     profile::take();
     let started = Instant::now();
