@@ -169,6 +169,11 @@ pub trait ModelWeights {
             out.extend(self.run_layer(index, seat.cache, own).rows());
             from += take;
         }
+        assert_eq!(
+            from,
+            rows.len(),
+            "a sequence's rows for every row of the call"
+        );
         Passed::Rows(out)
     }
 

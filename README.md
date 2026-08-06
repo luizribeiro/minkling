@@ -1346,7 +1346,10 @@ Two things follow, and they point in different directions.
 **The batch is within a third of the best any batching could do here**, and the
 gap is the dispatches a slot keeps to itself: five a layer — the convolution
 pair, the head-norm pair and the attention step — which is 210 more dispatches a
-slot, measured. The remedy is a step and a convolution that take a slot index per
+slot, asserted rather than described. (What a slot adds is exactly that; what the
+*rows* add beside it is one dispatch to each of the 40 routed layers from four
+rows up, which is the grouped block reading its own shape off a taller call and
+is the batch working rather than costing.) The remedy is a step and a convolution that take a slot index per
 *row* rather than a call per slot, so that N sequences are one dispatch reading N
 spans. That is priced here and not built: it is a kernel change to the three
 entries whose bit-exactness every numerics claim in this file rests on, and the

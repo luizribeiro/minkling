@@ -44,7 +44,7 @@ use inkling_cli::kept::{DEFAULT_BOUND, Kept};
 use inkling_cli::{backend, config, session};
 use inkling_core::generate::{Picked, Proposer, Round};
 use inkling_core::head::Tail;
-use inkling_core::model::Batched as Batching;
+use inkling_core::model::Batched;
 use inkling_core::mtp::{CheckpointHeads, MtpProposer};
 use inkling_core::workload::{
     BEST, CORPUS, DECODED, DIFFERENTIAL, REALISTIC, STRUCTURED_PROMPT, SWEPT, Session, tiled,
@@ -991,7 +991,6 @@ impl<P: Proposer> Proposer for Held<P> {
     }
 }
 
-/// One generation of `budget` tokens, timed a step at a time.
 /// The widths a batch sweep runs, doubling from one up to `widest`.
 ///
 /// Doubling rather than every width, because what the curve says is where
@@ -1010,7 +1009,7 @@ fn widths(widest: usize) -> Vec<usize> {
 
 /// What one batched decode step costs, over `slots` copies of `ids` decoded
 /// together.
-struct Batched {
+struct Amortised {
     /// The wall one step of the whole batch takes, meaned over the steps.
     step: Duration,
     /// The device time inside it, on the same account every other row here
@@ -1037,7 +1036,7 @@ fn batched(
     ids: &[usize],
     slots: usize,
     budget: usize,
-) -> Batched {
+) -> Amortised {
     let generator = weights.generator();
     let prompts: Vec<Vec<usize>> = (0..slots)
         .map(|slot| {
@@ -1061,49 +1060,44 @@ fn batched(
         .map(|(cache, prompt)| generator.tailed(cache, prompt, want, weights).picks[0])
         .collect();
 
-    // **Thrown away, for the reason the warm generation above the sweep is.**
-    // A width is a fresh wrap — a slot is buffers this device has not allocated
+    let step = |pending: &[usize], caches: &mut Vec<ModelCache>| -> Vec<usize> {
+        let feeding: Vec<[usize; 1]> = pending.iter().map(|id| [*id]).collect();
+        let mut batch: Vec<Batched<'_>> = caches
+            .iter_mut()
+            .zip(&feeding)
+            .map(|(cache, ids)| Batched { cache, ids })
+            .collect();
+        generator
+            .step_batch(&mut batch, weights)
+            .iter()
+            .map(Picked::last)
+            .collect()
+    };
+
+    // **Thrown away, for the reason the warm generation above the sweep is.** A
+    // width is a fresh wrap — a slot is buffers this device has not allocated
     // before — so the first steps of a width pay for allocating its spans and
     // its windows, which belongs to the wrap rather than to the step. The
     // device's own clock does not see it and the wall does: unsettled, the batch
     // of one read 25.9 ms against its own 16.4.
     for _ in 0..SETTLED {
-        let feeding: Vec<[usize; 1]> = pending.iter().map(|id| [*id]).collect();
-        let mut batch: Vec<Batching<'_>> = caches
-            .iter_mut()
-            .zip(&feeding)
-            .map(|(cache, ids)| Batching { cache, ids })
-            .collect();
-        pending = generator
-            .step_batch(&mut batch, weights)
-            .iter()
-            .map(Picked::last)
-            .collect();
+        pending = step(&pending, &mut caches);
     }
 
     profile::take();
     let started = Instant::now();
     for _ in 0..budget {
-        let feeding: Vec<[usize; 1]> = pending.iter().map(|id| [*id]).collect();
-        let mut batch: Vec<Batching<'_>> = caches
-            .iter_mut()
-            .zip(&feeding)
-            .map(|(cache, ids)| Batching { cache, ids })
-            .collect();
-        pending = generator
-            .step_batch(&mut batch, weights)
-            .iter()
-            .map(Picked::last)
-            .collect();
+        pending = step(&pending, &mut caches);
     }
     let wall = started.elapsed();
     let charged = u32::try_from(budget.max(1)).unwrap_or(1);
-    Batched {
+    Amortised {
         step: wall / charged,
         gpu: profile::take().per_step(charged).gpu(),
     }
 }
 
+/// One generation of `budget` tokens, timed a step at a time.
 fn generate(
     weights: &CheckpointWeights<'_>,
     heads: Option<&CheckpointHeads<'_>>,

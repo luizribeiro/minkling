@@ -1981,7 +1981,7 @@ kernel void fused_attention(
     // no tokens rather than a row to divide by it.
     if (shape.splits == 1u) {
         device float *result =
-            out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
+        out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
         const float norm = total > 0.0f ? 1.0f / total : 0.0f;
         for (uint d = local; d < shape.head_dim; d += threads) {
             result[d] = weighted[d] * norm;
@@ -2034,7 +2034,7 @@ kernel void attention_combine(
     const uint stride = shape.head_dim + 2u;
     device const float *base = partials + (ulong)pair * shape.splits * stride;
     device float *result =
-            out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
+        out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
 
     // Every thread reduces the same handful of entries rather than one reducing
     // and broadcasting, which is what the tile loop above does with its scores
@@ -2365,7 +2365,7 @@ kernel void mma_attention(
         return;
     }
     device float *result =
-            out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
+        out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
     for (uint dd = 0; dd < MMA_FRAGS_A_ROW; ++dd) {
         const uint d = dd * MMA_FRAGMENT + fn;
         if (d < shape.head_dim) {

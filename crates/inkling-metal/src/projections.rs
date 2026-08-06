@@ -555,7 +555,6 @@ impl<'a> LayerProjections<'a> {
                     landing: values,
                 },
             )?;
-            let mut convolved = convolved;
 
             // One dispatch rather than two: the two norms read different rows
             // against different weights into different landings, and neither
@@ -1712,8 +1711,19 @@ impl LayerDevice<'_> {
             .expect("a batch of at least one sequence")
             .step;
         let mut rows = 0;
+        let mut taken: Vec<usize> = Vec::with_capacity(advancing.len());
         for seat in advancing.iter_mut() {
             assert_eq!(seat.first, rows, "a sequence's rows follow the last one's");
+            // **Two sequences in one slot is one sequence's state serving both**,
+            // which is the whole of what a batch must not do — and which would
+            // otherwise be found by the second borrow of the same span rather
+            // than by anything that names the mistake.
+            assert!(
+                !taken.contains(&seat.slot()),
+                "two sequences of a batch are in slot {}",
+                seat.slot()
+            );
+            taken.push(seat.slot());
             rows += seat.queries();
             let step = seat.step;
             attention.beginning(seat.cache.attention(), step.attention, step.queries);

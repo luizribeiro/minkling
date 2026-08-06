@@ -3479,6 +3479,7 @@ fn the_barriers_a_batched_step_encodes_are_the_ones_its_dependencies_need() {
     let gpu = Kernels::compile(&device);
     let recorded = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
 
+    let mut dispatched = Vec::new();
     for slots in [1, 2, 4] {
         let weights = gpu.wrap_batch(&ckpt, &config, slots);
         let generator = weights.generator();
@@ -3539,6 +3540,43 @@ fn the_barriers_a_batched_step_encodes_are_the_ones_its_dependencies_need() {
             divisions[0], divisions[1],
             "a batch of {slots} divides two steps differently"
         );
+        dispatched.push((slots, divisions[0].dispatches()));
+    }
+
+    // **What a slot costs in dispatches, which is the other half of what it
+    // costs.** The five weights every sequence reads are one dispatch each
+    // whatever the batch is; what stays one a sequence is what touches that
+    // sequence's own span and its own windows — the convolution pair, the head
+    // norm pair and the step. So a slot adds five a layer and nothing else, and
+    // a dispatch that quietly became per sequence would show up here before it
+    // showed up in a timing.
+    // **What a slot costs in dispatches, which is the other half of what it
+    // costs.** The five weights every sequence reads are one dispatch each
+    // whatever the batch is; what stays one a sequence is what touches that
+    // sequence's own span and its own windows — the convolution pair, the head
+    // norm pair and the step. So a slot adds five a layer, and a dispatch that
+    // quietly became per sequence would show up here before it showed up in a
+    // timing.
+    //
+    // **The upper bound is the rows and not the slots**, and it is why this is a
+    // range rather than an equality: a routed layer's grouped dispatch decides
+    // its own shape from the rows it is given, and at four rows it takes one
+    // dispatch more than at one — 40 of them, which is one a MoE layer, at every
+    // width from four up. That is the batch feeding the block more rows, which
+    // is what a batch is for.
+    let routed = (0..config.num_hidden_layers)
+        .filter(|layer| !config.layer_is_dense(*layer))
+        .count();
+    let (_, alone) = dispatched[0];
+    for (slots, dispatches) in &dispatched[1..] {
+        let added = dispatches - alone;
+        let slotted = 5 * config.num_hidden_layers * (slots - 1);
+        assert!(
+            (slotted..=slotted + routed).contains(&added),
+            "a batch of {slots} adds {added} dispatches where its slots need {slotted} \
+             and its rows may add one to each of {routed} routed layers"
+        );
+        eprintln!("slots {slots}: {dispatches} dispatches, {added} over one");
     }
 }
 
