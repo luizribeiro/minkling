@@ -306,6 +306,13 @@ const MMA_ROUNDED_PADDING: usize = 12;
 /// again at compile time for a swept one, out of [`Block::holds`]'s one reading.
 const _: () = Block::SHIPPED.holds();
 const _: () = Block::ROUNDED.holds();
+// The two heights the run-cut entry is compiled at, under both words that
+// compile it — four shapes a model load dispatches, checked where they are
+// derived rather than where they are compiled.
+const _: () = Block::SHIPPED.shorter().holds();
+const _: () = Block::SHIPPED.taller().holds();
+const _: () = Block::ROUNDED.shorter().holds();
+const _: () = Block::ROUNDED.taller().holds();
 
 /// The shape one threadgroup of the production entries covers, and the threads
 /// that cover it.
@@ -415,6 +422,36 @@ impl Block {
         padding: MMA_ROUNDED_PADDING,
         ..Self::SHIPPED
     };
+
+    /// The same block at half the height, which is what a grouped call whose
+    /// runs are shorter than [`RUNS_A_SHORT_BLOCK`] is cut into.
+    ///
+    /// The simdgroups do not move: half the rows over the same 64 columns is one
+    /// fragment down apiece where the shipped block holds two, and the
+    /// threadgroup stays 256.
+    const fn shorter(&self) -> Self {
+        Self {
+            rows: self.rows / 2,
+            ..*self
+        }
+    }
+
+    /// The same at twice the height, which is what it is cut into above that
+    /// line.
+    ///
+    /// **The simdgroups turn with it.** Twice the rows over the same columns
+    /// would give a simdgroup four fragments down and two across where it held
+    /// two of each, so the threadgroup is re-laid four simdgroups down and two
+    /// across — which keeps it at 256 threads and each of them at the same two
+    /// by two.
+    const fn taller(&self) -> Self {
+        Self {
+            rows: 2 * self.rows,
+            simds_down: 2 * self.simds_down,
+            simds_across: self.simds_across / 2,
+            ..*self
+        }
+    }
 
     /// Which word of the flag compiles this block, which is
     /// [`Block::under`] read the other way — and the reason a sweep needs it is
@@ -746,6 +783,45 @@ const RUNS_A_BLOCKED_CALL: usize = 4;
 /// there.
 const BLOCKS_A_RUN_PLANS: usize = 4;
 
+/// Rows an expert under which a grouped call's run-cut entry is dispatched at
+/// the short height rather than the tall one.
+///
+/// **The height is not a constant of the kernel and this milestone is what says
+/// so.** Cut at the run boundaries there are no straddles left at any height, so
+/// what a height trades against is the other term the cut created: the
+/// part-empty block each run ends in, which a taller block makes bigger per
+/// expert and rarer per row. Which way that falls is decided by how long the
+/// runs are, and a routed bank's runs span 7.5 rows an expert at 321 tokens and
+/// 384 at 16384 — a factor of fifty inside the range this kernel is asked over.
+///
+/// `what_a_block_of_each_height_costs_where_the_runs_do_not_divide_it`, against
+/// the model's own routing, the kernel alone:
+///
+/// ```text
+/// tokens   an expert   16 rows    32 rows    64 rows
+///    321    7.5        3.19ms     3.86ms     4.78ms
+///    512   12.0        4.50ms     5.06ms     5.88ms
+///    769   18.0        6.37ms     6.76ms     7.50ms
+///   1024   24.0        8.04ms     8.29ms     8.78ms
+///   2048   48.0       15.39ms    15.04ms    14.83ms
+///   4096   96.0       30.57ms    28.09ms    27.24ms
+///   8192  192.0       59.79ms    54.89ms    51.83ms
+///  16384  384.0      115.44ms   102.66ms   101.65ms
+/// ```
+///
+/// **The sign turns between 24 rows an expert and 48**, and the shipped 32 wins
+/// at neither end — it is 17.4% behind the short block at 321 tokens and 5.6%
+/// behind the tall one at 8192. So the line goes inside the gap the measurement
+/// leaves, and **32 is the taller block's own half and the shorter one's
+/// double**, which is the one value in that gap that is not arbitrary.
+///
+/// **What this is not is [`RUNS_A_BLOCKED_CALL`] or [`BLOCKS_A_RUN_PLANS`].**
+/// Those decide whether a call is blocked at all and whether its blocks are cut
+/// at the boundaries; this decides how tall the blocks are once they are. All
+/// three are counts of rows an expert and all three are drawn from a different
+/// measurement, which is why they are three constants rather than one.
+const RUNS_A_SHORT_BLOCK: usize = 32;
+
 /// Threads one threadgroup of a dispatch holds.
 ///
 /// A multiple of every simdgroup width Metal reports, which is what lets the
@@ -1048,7 +1124,24 @@ impl PackedMatmul {
     /// operand word reaching the engine and the operand word reaching a sweep
     /// are the same block rather than two spellings of one.
     pub fn under(device: &Device, numerics: Numerics) -> Result<Self, MetalError> {
-        Self::blocked(device, numerics, Block::under(numerics))
+        let block = Block::under(numerics);
+        // **The engine's own pair of heights, and the one place they are
+        // named.** [`PackedMatmul::blocked`] below is a sweep's constructor and
+        // stays one height, because an arm that compiled both would be two
+        // kernels measured as one.
+        Self::compiled(
+            device,
+            &source_blocked(numerics, block),
+            ROWS_A_TILE,
+            COLS_A_TILE,
+            numerics,
+            block,
+            BLOCKS_A_RUN_PLANS,
+            &[
+                (block.shorter(), RUNS_A_SHORT_BLOCK),
+                (block.taller(), usize::MAX),
+            ],
+        )
     }
 
     /// The same, where the production entries are cut to a block of another
@@ -1061,6 +1154,9 @@ impl PackedMatmul {
     /// other would leave output no threadgroup reached — a wrong answer rather
     /// than a slow one, and the reason the height and the width were unsweepable
     /// while these were module constants.
+    // A sweep's own constructor since the shipped pair stopped going through it:
+    // an arm is one block, and [`PackedMatmul::under`] names two.
+    #[cfg(test)]
     pub(crate) fn blocked(
         device: &Device,
         numerics: Numerics,
@@ -1073,6 +1169,7 @@ impl PackedMatmul {
     /// [`PackedMatmul::plans`] can be an arm: the line decides which of two
     /// entries a grouped call reaches, so two lines are two matmuls and not two
     /// builds.
+    #[cfg(test)]
     pub(crate) fn planning_under(
         device: &Device,
         numerics: Numerics,
@@ -1087,6 +1184,7 @@ impl PackedMatmul {
             numerics,
             block,
             plans_under,
+            &[(block, usize::MAX)],
         )
     }
 
@@ -1117,6 +1215,7 @@ impl PackedMatmul {
             Numerics::Production,
             block,
             BLOCKS_A_RUN_PLANS,
+            &[(block, usize::MAX)],
         )
     }
 
@@ -1153,11 +1252,17 @@ impl PackedMatmul {
             Numerics::default(),
             Block::SHIPPED,
             BLOCKS_A_RUN_PLANS,
+            &[(Block::SHIPPED, usize::MAX)],
         )
     }
 
     /// The whole of it, which is [`PackedMatmul::tiling`] and the two things
     /// that are not properties of the source string.
+    // The three that describe the block — the shipped shape, the line the walk
+    // over the runs is taken under, and the heights it is cut at — travel
+    // together for the reason [`Block`] gives, and splitting them into a struct
+    // would put the grid's shape and the kernel's prelude behind two names.
+    #[allow(clippy::too_many_arguments)]
     fn compiled(
         device: &Device,
         source: &str,
@@ -1166,6 +1271,7 @@ impl PackedMatmul {
         numerics: Numerics,
         block: Block,
         plans_under: usize,
+        heights: &[(Block, usize)],
     ) -> Result<Self, MetalError> {
         let mut declared = vec![
             format!("constant uint ROWS_A_TILE = {rows_a_tile};"),
@@ -1208,13 +1314,30 @@ impl PackedMatmul {
         // entries below are not in it to compile.
         let mma = match numerics.compiles_the_entries() {
             false => None,
-            true => Some(Mma::of(
-                device.compile(source, MMA_TILED_ENTRY)?,
-                device.compile(source, MMA_GROUPED_ENTRY)?,
-                device.compile(source, MMA_PLANNED_ENTRY)?,
-                block,
-                plans_under,
-            )?),
+            true => {
+                let tiled = device.compile(source, MMA_TILED_ENTRY)?;
+                let grouped = device.compile(source, MMA_GROUPED_ENTRY)?;
+                // **The run-cut entry is compiled once per height and the other
+                // two are not.** A block's shape is in the prelude, so a second
+                // height is a second source — and only this entry has two,
+                // because only this entry's cost turns on how much of a block a
+                // run fills. The tiled entry's rows are one run by construction
+                // and the walk laid over the rows never leaves a block part
+                // empty, so both stay at the shipped shape and neither is built
+                // twice.
+                let planned = heights
+                    .iter()
+                    .map(|&(at, under)| {
+                        Ok(Planned {
+                            kernel: device
+                                .compile(&source_blocked(numerics, at), MMA_PLANNED_ENTRY)?,
+                            block: at,
+                            under,
+                        })
+                    })
+                    .collect::<Result<Vec<Planned>, MetalError>>()?;
+                Some(Mma::of(tiled, grouped, planned, block, plans_under)?)
+            }
         };
         // **The two tiled entries are compiled before the untiled one, and the
         // order is worth 2.4% of a prefill.** Nothing about the three kernels
@@ -1388,9 +1511,9 @@ impl PackedMatmul {
         // grid is sized by the bound the plan was allocated at, since what the
         // runs actually came to is on the device. The threadgroups past the last
         // run read a block of no rows and return.
-        let blocks = |mma: &Mma, down: usize| {
-            let over = down * out_dim.div_ceil(mma.block.cols);
-            Grid::new(over * mma.block.threads, mma.block.threads)
+        let blocks = |block: &Block, down: usize| {
+            let over = down * out_dim.div_ceil(block.cols);
+            Grid::new(over * block.threads, block.threads)
         };
         let tiles = rows.div_ceil(self.rows_a_tile) * out_dim.div_ceil(self.cols_a_tile);
         // **The plan is bound by whichever entry this returns and by nothing
@@ -1416,7 +1539,7 @@ impl PackedMatmul {
             ),
             (Some(mma), Layout::Tiled) => (
                 &mma.tiled,
-                blocks(mma, rows.div_ceil(mma.block.rows)),
+                blocks(&mma.block, rows.div_ceil(mma.block.rows)),
                 false,
             ),
             (
@@ -1425,10 +1548,17 @@ impl PackedMatmul {
                     blocks: planned, ..
                 },
             ) => match self.plans(rows, experts) {
-                true => (&mma.planned, blocks(mma, *planned), true),
+                // **The grid is the plan's height and not the module's**, which
+                // is the whole of what makes a second height dispatchable: the
+                // plan was cut at this entry's rows and the threadgroups have to
+                // cover the blocks it made.
+                true => {
+                    let at = mma.plan(rows, experts);
+                    (&at.kernel, blocks(&at.block, *planned), true)
+                }
                 false => (
                     &mma.grouped,
-                    blocks(mma, rows.div_ceil(mma.block.rows)),
+                    blocks(&mma.block, rows.div_ceil(mma.block.rows)),
                     false,
                 ),
             },
@@ -1558,8 +1688,10 @@ impl PackedMatmul {
     /// a value the entries carry rather than a constant of this module, so the
     /// only side that can answer it is the matmul that compiled them — and a
     /// plan cut at some other height would leave rows no block reaches.
-    pub(crate) fn rows_a_block(&self) -> usize {
-        self.mma.as_ref().map_or(0, |mma| mma.block.rows)
+    pub(crate) fn rows_a_block(&self, rows: usize, experts: usize) -> usize {
+        self.mma
+            .as_ref()
+            .map_or(0, |mma| mma.plan(rows, experts).block.rows)
     }
 
     /// The rows one dispatch of this shape reads a weight once for, which is the
@@ -1571,7 +1703,14 @@ impl PackedMatmul {
     /// shares it.
     fn rows_a_read(&self, layout: &Layout<'_>, rows: usize, experts: usize) -> usize {
         match self.blocks(layout, rows, experts) {
-            Some(mma) => mma.block.rows,
+            // **A run-cut call reads a weight per block of the height it was
+            // cut at**, which is not the shipped block's once there are two of
+            // them — and a bandwidth column taken off the wrong one would
+            // describe a dispatch other than the one that ran.
+            Some(mma) => match (layout, self.plans(rows, experts)) {
+                (Layout::Grouped { .. }, true) => mma.plan(rows, experts).block.rows,
+                _ => mma.block.rows,
+            },
             None => self.rows_a_tile,
         }
     }
@@ -1608,7 +1747,14 @@ impl PackedMatmul {
         };
         match self.blocks(&grouped, rows, experts) {
             None => false,
-            Some(mma) => rows < experts.saturating_mul(mma.plans_under * mma.block.rows),
+            // **In the height that would run and not in the shipped one.** The
+            // line is a count of blocks a run, so it is measured in the rows of
+            // whichever block this call's runs would be cut into — and a taller
+            // one is still worth cutting at lengths a shorter one has already
+            // left for the walk laid over the rows.
+            Some(mma) => {
+                rows < experts.saturating_mul(mma.plans_under * mma.plan(rows, experts).block.rows)
+            }
         }
     }
 
@@ -1631,13 +1777,37 @@ impl PackedMatmul {
 /// The three entries behind [`Numerics::Production`], held together because a
 /// dispatch reaches one of them by the same predicate and none is any use
 /// without the others.
+/// One height the run-cut entry is compiled at, and the run length under which
+/// it is the one a call reaches.
+///
+/// **The height is a value the entry carries and this is where it is carried.**
+/// A block decodes its expert's columns once whatever it holds, so a run
+/// shorter than the block leaves the rest of it computing nothing — and how much
+/// of a call that is depends on the routing rather than on the prompt. Cut at
+/// the boundaries, the model's own runs leave a 32-row block computing 2.4 times
+/// the rows it has at 321 tokens and 1.1 at 8192, which is the whole of why one
+/// height cannot serve both ends.
+#[derive(Debug)]
+struct Planned {
+    kernel: Kernel,
+    block: Block,
+    /// Rows an expert under which this is the height dispatched, and
+    /// [`usize::MAX`] on the last — the tallest is what a call falls back to
+    /// rather than a range it has to be inside.
+    under: usize,
+}
+
 #[derive(Debug)]
 struct Mma {
     tiled: Kernel,
     grouped: Kernel,
     /// The grouped walk over the sort's runs rather than over the rows — see
-    /// [`MMA_PLANNED_ENTRY`] and [`PackedMatmul::plans`].
-    planned: Kernel,
+    /// [`MMA_PLANNED_ENTRY`] and [`PackedMatmul::plans`] — at each height a call
+    /// reaches it at, shortest first.
+    ///
+    /// **Two, and the line between them is measured rather than derived.** See
+    /// [`RUNS_A_SHORT_BLOCK`].
+    planned: Vec<Planned>,
     /// The shape these were cut to, which is what the grid covering a call and
     /// the weight the accounting charges are both taken from — see [`Block`].
     block: Block,
@@ -1680,11 +1850,34 @@ impl Mma {
     fn of(
         tiled: Kernel,
         grouped: Kernel,
-        planned: Kernel,
+        planned: Vec<Planned>,
         block: Block,
         plans_under: usize,
     ) -> Result<Self, MetalError> {
-        for kernel in [&tiled, &grouped, &planned] {
+        // **The heights are ordered and the tallest is unbounded**, because
+        // [`Mma::plan`] takes the first whose line a call is under and a list
+        // that ended in a bound would leave the longest runs reaching no entry
+        // at all. Held here rather than at the call sites that build one.
+        assert!(
+            !planned.is_empty(),
+            "a grouped call needs some height to be cut at"
+        );
+        assert!(
+            planned.windows(2).all(|two| two[0].under < two[1].under),
+            "the heights a run-cut call reaches are tried shortest first, so their lines have to \
+             rise: {:?}",
+            planned.iter().map(|at| at.under).collect::<Vec<usize>>()
+        );
+        assert_eq!(
+            planned.last().map(|at| at.under),
+            Some(usize::MAX),
+            "the tallest height is what a call falls back to and cannot be a range it has to be \
+             inside"
+        );
+        for (kernel, wants) in [(&tiled, block), (&grouped, block)]
+            .into_iter()
+            .chain(planned.iter().map(|at| (&at.kernel, at.block)))
+        {
             if kernel.simd_width() != NARROWEST_SIMD {
                 return Err(MetalError::UnexpectedSimdWidth {
                     entry: kernel.entry().to_string(),
@@ -1693,11 +1886,11 @@ impl Mma {
                 });
             }
             assert!(
-                kernel.max_threads_per_group() >= block.threads,
+                kernel.max_threads_per_group() >= wants.threads,
                 "{} takes at most {} threads a threadgroup, where the block wants {}",
                 kernel.entry(),
                 kernel.max_threads_per_group(),
-                block.threads
+                wants.threads
             );
         }
         Ok(Self {
@@ -1707,6 +1900,19 @@ impl Mma {
             block,
             plans_under,
         })
+    }
+
+    /// The run-cut entry a call of `rows` over `experts` reaches, and the height
+    /// it is cut at.
+    ///
+    /// **The first whose line the call's runs are under**, which is why the
+    /// heights are ordered shortest first and the tallest is unbounded — see
+    /// [`Mma::of`], where both are held.
+    fn plan(&self, rows: usize, experts: usize) -> &Planned {
+        self.planned
+            .iter()
+            .find(|at| rows < experts.saturating_mul(at.under))
+            .unwrap_or_else(|| self.planned.last().expect("some height is compiled"))
     }
 }
 
@@ -2134,7 +2340,7 @@ impl<'a> PackedBank<'a> {
     /// to agreeing.
     pub(crate) fn rows_a_block(&self, rows: usize) -> usize {
         match self.matmul.plans(rows, self.experts) {
-            true => self.matmul.rows_a_block(),
+            true => self.matmul.rows_a_block(rows, self.experts),
             false => 0,
         }
     }
@@ -5380,10 +5586,17 @@ kernel void decoded_elements(
             &PackedMatmul::under(&device, Numerics::Production).expect("the block compiles"),
         );
 
+        // **The heights are here because the engine now ships two of them.**
+        // Every other list on this chain is a sweep's arms — shapes measured and
+        // not dispatched — where [`SWEPT_HEIGHTS`] holds the two a model load
+        // compiles the run-cut entry at. A height that answered other bits would
+        // be a wrong answer at one prompt length and not at another, which is
+        // the one failure this file has no other case for.
         let swept: Vec<Block> = SWEPT_BLOCKS
             .into_iter()
             .chain(SWEPT_STEPS)
             .chain(SWEPT_FRAGMENTS)
+            .chain(SWEPT_HEIGHTS)
             .collect();
         let mut ran = 0;
         for block in swept.iter().copied() {
@@ -10263,6 +10476,84 @@ kernel void mma_lane_probe___T__(
             .collect()
     }
 
+    /// **The routed bank's runs at `tokens`, as the model's own router made
+    /// them** — which is what every table on this kernel invented until there
+    /// was a fixture for it.
+    ///
+    /// [`fixture::ROUTING`] is where they come from and why. What is worth
+    /// repeating here is how far they are from the runs the constructor above
+    /// lays out: the model gives its busiest expert 27 to 36 times the mean and
+    /// leaves 115 to 177 of its 256 experts with no rows at all, where
+    /// `row * experts / rows` gives all 256 the same run and lands every
+    /// boundary on a block edge at any length that divides.
+    ///
+    /// **The layer is the median of the forty and not one somebody picked.**
+    /// The flattest layer and the peakiest are a factor of three apart in how
+    /// much of a block-cut call they leave part empty, so a row taken over one
+    /// chosen by hand is a row whose reader cannot tell which — the median is a
+    /// rule, and it moves with the fixture rather than with this file.
+    fn as_the_model_routes(tokens: usize) -> Vec<u32> {
+        let bundle = fixture::open(fixture::ROUTING);
+        let mut layers = fixture::routing(&bundle, tokens);
+        // Ranked by what this table is about: the row-slots a call cut at the
+        // run boundaries computes against the rows it actually holds, at the
+        // shipped height. Scaled rather than floating so the key is orderable.
+        let slack = |counts: &Vec<usize>| {
+            let rows: usize = counts.iter().sum();
+            let blocks: usize = counts
+                .iter()
+                .filter(|&&count| count > 0)
+                .map(|&count| count.div_ceil(Block::SHIPPED.rows))
+                .sum();
+            blocks * Block::SHIPPED.rows * 1000 / rows.max(1)
+        };
+        layers.sort_by_key(slack);
+        named_by(&layers[layers.len() / 2])
+    }
+
+    /// **That the recorded routing is a router's and not an even layout**,
+    /// which is the one thing the table reading it cannot say for itself.
+    ///
+    /// A fixture regenerated from a construction rather than from the model
+    /// would leave every table above it reading the way they read before there
+    /// was a fixture — the same failure, with a file in front of it saying it
+    /// had been fixed. So what is asserted is the two properties that separate a
+    /// routing from a layout: some expert far above the mean, and some expert
+    /// with nothing. Both are decades clear of where they are asserted.
+    #[test]
+    fn the_recorded_routing_is_a_routers_and_not_an_even_layout() {
+        let bundle = fixture::open(fixture::ROUTING);
+        let (_, a_token, .., experts, _) = BOUND_SHAPES[1];
+        for tokens in SWEPT_HEIGHT_LENGTHS {
+            let layers = fixture::routing(&bundle, tokens);
+            assert!(
+                layers.len() > 1,
+                "a routing recorded for one layer cannot have a median"
+            );
+            for (layer, counts) in layers.iter().enumerate() {
+                let rows: usize = counts.iter().sum();
+                assert_eq!(
+                    (counts.len(), rows),
+                    (experts, tokens * a_token),
+                    "layer {layer} at {tokens} tokens is not the shape this bank is dispatched at"
+                );
+                let mean = rows as f64 / experts as f64;
+                let hottest = *counts.iter().max().expect("a layer routes somewhere") as f64;
+                assert!(
+                    hottest > 4.0 * mean,
+                    "layer {layer} at {tokens} tokens gives its busiest expert {hottest:.0} rows \
+                     against a mean of {mean:.1}, which is flat enough to be a layout rather than \
+                     a routing"
+                );
+                assert!(
+                    counts.contains(&0),
+                    "layer {layer} at {tokens} tokens reaches all {experts} experts, where the \
+                     model leaves 115 to 177 of them with no rows"
+                );
+            }
+        }
+    }
+
     /// The three ways `rows` can be spread over `experts` at one mean run
     /// length, which differ in where the run boundaries land against a block of
     /// `rows_a_block` and in nothing else.
@@ -10610,19 +10901,35 @@ kernel void mma_lane_probe___T__(
     /// Sixteen is `gather_qmm_rhs`'s own `BM` and is why it is here. Both arms
     /// keep the 256-thread threadgroup and the 64-column width, so what moves
     /// between them is the rows and the fragments a simdgroup holds down them.
+    ///
+    /// **A hundred and twenty-eight is not here and the layout is what refuses
+    /// it**, at this width rather than in general. The answer is written over
+    /// the two staged tiles — see [`Block::holds`] — so a block needs
+    /// `rows * (cols + 4)` floats to fit in `(rows + cols) * (step + padding)`,
+    /// which at 64 columns and a 32-code step is `128 * 68 = 8704` against
+    /// `192 * 36 = 6912`. Narrowing the block to 32 columns would admit it and
+    /// would be a sweep of two axes at once, which is not this table.
+    /// **The two outer arms are the shipped pair itself** — [`Block::shorter`]
+    /// and [`Block::taller`], the same two [`PackedMatmul::under`] compiles the
+    /// run-cut entry at — so this table prices what the engine dispatches rather
+    /// than two neighbours of it, and a height moved in one place moves in both.
+    /// The middle arm is the shipped block, which is what both are read against
+    /// and is what the engine no longer cuts a grouped call at.
     const SWEPT_HEIGHTS: [Block; 3] = [
-        Block {
-            rows: MMA_ROWS_A_BLOCK / 2,
-            ..Block::SHIPPED
-        },
+        Block::SHIPPED.shorter(),
         Block::SHIPPED,
-        Block {
-            rows: 2 * MMA_ROWS_A_BLOCK,
-            simds_down: 4,
-            simds_across: 2,
-            ..Block::SHIPPED
-        },
+        Block::SHIPPED.taller(),
     ];
+
+    /// The lengths the height is swept at: [`CEILING_LENGTHS`]'s six, and the
+    /// two between 512 and 2048 that the sign turns in.
+    ///
+    /// **The two extra are not decoration.** The six say a shorter block wins
+    /// under a thousand tokens and a taller one wins above two, which locates
+    /// the crossing inside a gap of four times — and a height chosen by shape
+    /// needs a line, so the line's own neighbourhood has to be measured rather
+    /// than interpolated.
+    const SWEPT_HEIGHT_LENGTHS: [usize; 8] = [321, 512, 769, 1024, 2048, 4096, 8192, 16384];
 
     /// **What a block of each height costs where the runs divide it and where
     /// they do not**, which is the lever the diagnosis above implies and the
@@ -10635,14 +10942,40 @@ kernel void mma_lane_probe___T__(
     /// gives up is the arithmetic intensity the height was taken for**, and this
     /// is the two of them on one clock rather than either alone.
     ///
-    /// **Taken before the plan was, and kept as the reading that made the plan
-    /// the answer rather than the height.** A shorter block halves what a
-    /// straddle costs and gives back a tenth of the rate on runs that straddle
-    /// nothing, so it wins at the short end and loses at the long one — a trade
-    /// rather than a lever, which is what sent this milestone at the layout
-    /// instead. `where_a_grouped_calls_run_boundaries_land_against_a_block` is
-    /// where the term itself is, and the plan is what removes it at every
-    /// height.
+    /// **Taken before the plan was, and re-taken against the model's own
+    /// routing once the plan made the height a lever rather than a trade.**
+    /// Before the cut, a shorter block halved what a straddle costs and gave
+    /// back a tenth of the rate on runs that straddle nothing, so it won at the
+    /// short end and lost at the long one. With the boundaries cut there are no
+    /// straddles left at any height, and what the height trades against is the
+    /// other term the cut created: the part-empty block each run ends in.
+    ///
+    /// **That term is a fact about the routing, and the routing was invented
+    /// until [`fixture::ROUTING`] existed.** Over runs laid out as
+    /// `row * experts / rows` a taller block wastes almost nothing — every run
+    /// is the same length and long — and T5 read a 64-row block 4 to 7% ahead
+    /// on exactly that layout. A router's runs are not that, and the column
+    /// this table now leads with is what a height costs against them: the
+    /// row-slots a cut call computes against the rows it holds are 1.2x at the
+    /// shipped height and 1.5x at twice it at 2048 tokens, and 2.4x against
+    /// 4.2x at 321.
+    ///
+    /// The even-run arm is kept beside it rather than dropped, because it is
+    /// what every earlier table on this kernel was measuring and the gap between
+    /// the two columns is the size of that error.
+    ///
+    /// **Six lengths and not three**, for [`CEILING_LENGTHS`]'s reason: the
+    /// remainder a height pays is a count of experts and the rows are a count of
+    /// tokens, so the trade is the whole of what moves between 321 tokens and
+    /// 16384 and a table over the long end alone cannot see it. The two inside
+    /// them are where the sign turns and are here for that alone.
+    ///
+    /// **A row is what shipping that height would do and not the height in
+    /// isolation**, which the entry column is what says. [`PackedMatmul::plans`]
+    /// draws its line in blocks a run, so it is measured in the arm's own rows —
+    /// a 64-row block is still cutting at the boundaries at 8192 tokens where a
+    /// 32-row one has moved to the walk laid over them. Holding the entry fixed
+    /// instead would price a height nothing would dispatch.
     ///
     /// Warm and swept both ways, and the sort is taken off every column.
     #[test]
@@ -10657,22 +10990,23 @@ kernel void mma_lane_probe___T__(
             .collect();
         let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
 
-        for tokens in BLOCKED_LENGTHS {
+        for tokens in SWEPT_HEIGHT_LENGTHS {
             let whole = Blocked::at(tokens, BOUND_SHAPES[1]);
-            // **The layouts are held at the shipped block's height and not at
-            // each arm's**, because the run boundaries are the bank's own. A
-            // ragged layout cut against every height in turn would be three
-            // different callers rather than three blocks under one.
-            let ways = each_way_runs_can_land(whole.rows, whole.experts, Block::SHIPPED.rows);
-            let shapes: Vec<(&str, Blocked)> = ways
-                .iter()
-                .map(|(what, chosen)| {
-                    (
-                        *what,
-                        Blocked::at(tokens, BOUND_SHAPES[1]).named(chosen.clone()),
-                    )
-                })
-                .collect();
+            let routed = as_the_model_routes(tokens);
+            assert_eq!(
+                routed.len(),
+                whole.rows,
+                "the recorded routing at {tokens} tokens is not this call's rows, so the fixture \
+                 and the shape have parted company"
+            );
+            // The even runs the constructor lays out are the second column and
+            // not the first: they are the control this table is read against
+            // rather than a layout anything produces. `whole` is that layout
+            // already, so the column borrows it — a third fixture at 16384
+            // tokens is 2.7 GB of codes and rows to say what this one says.
+            let routed = Blocked::at(tokens, BOUND_SHAPES[1]).named(routed);
+            let shapes: [(&str, &Blocked); 2] =
+                [("as the model routes", &routed), ("even runs", &whole)];
 
             let banks: Vec<PackedBank<'_>> = arms
                 .iter()
@@ -10691,12 +11025,14 @@ kernel void mma_lane_probe___T__(
 
             eprintln!("\n  a routed bank at {tokens} tokens");
             eprintln!(
-                "  {:<22}{:>10}{}",
+                "  {:<14}{:>9}{:>8}{:>10}{}",
                 "a block of",
                 "blocks",
+                "slots",
+                "it picks",
                 shapes
                     .iter()
-                    .map(|(what, _)| format!("{:>32}", *what))
+                    .map(|(what, _)| format!("{:>30}", *what))
                     .collect::<String>()
             );
             for (at, (block, _)) in arms.iter().enumerate() {
@@ -10705,18 +11041,32 @@ kernel void mma_lane_probe___T__(
                         let taken = up[at][column].max(down[at][column]).as_secs_f64();
                         let (_, shape) = &shapes[column];
                         format!(
-                            "{:>17}{:>15}",
+                            "{:>15}{:>15}",
                             format!("{:.2}ms", 1e3 * taken),
                             format!("{:.1} TFLOP/s", 1e-12 * shape.flops() / taken),
                         )
                     })
                     .collect();
+                // The blocks the routed column is cut into at this height, and
+                // the row-slots they compute against the rows there are — which
+                // is the term the height is bought at, stated beside its price.
+                let blocks = blocks_a_run_is_cut_into(&shapes[0].1.chosen, block.rows);
                 eprintln!(
-                    "  {:<22}{:>10}{cells}",
+                    "  {:<14}{blocks:>9}{:>8}{:>10}{cells}",
                     format!("{} rows", block.rows),
-                    // The blocks the call is cut into at this height, which is
-                    // what the straddles are counted against.
-                    whole.rows.div_ceil(block.rows),
+                    format!("{:.1}x", (blocks * block.rows) as f64 / whole.rows as f64),
+                    // **Which entry the height itself selects**, which is not a
+                    // constant down a column: [`PackedMatmul::plans`] is a line
+                    // in blocks a run and so is measured in this block's own
+                    // rows, and a taller block reaches the run-cut entry at
+                    // lengths a shorter one has already left it for the walk
+                    // laid over the rows. That is what shipping this height
+                    // would do, so it is what the row measures — and a reader
+                    // comparing two cells has to be able to see it.
+                    match arms[at].1.plans(whole.rows, whole.experts) {
+                        true => "the runs",
+                        false => "the rows",
+                    },
                 );
             }
         }
@@ -10766,6 +11116,46 @@ kernel void mma_lane_probe___T__(
         // it is the one arm anything ships, so what it costs to compile is a
         // price the engine pays at every load under that word rather than a
         // price a sweep pays once.
+        // **The load price first, which is the row the engine actually pays.**
+        // Every row under it is one height, because a sweep arm is one block;
+        // this is the pair a model load builds and the only row here whose
+        // figure anything ships.
+        for numerics in [Numerics::Production, Numerics::Rounded] {
+            let taken = Instant::now();
+            let matmul = PackedMatmul::under(&device, numerics).expect("the shipped pair compiles");
+            let whole = taken.elapsed();
+            let mma = matmul
+                .mma
+                .as_ref()
+                .expect("the production entries compiled");
+            let entries = MMA_UNTIMED_ENTRIES + mma.planned.len();
+            assert_eq!(
+                entries, MMA_SHIPPED_ENTRIES,
+                "a model load under {numerics:?} built {entries} production pipelines where it \
+                 builds {MMA_SHIPPED_ENTRIES}"
+            );
+            let source: usize = mma
+                .planned
+                .iter()
+                .map(|at| source_blocked(numerics, at.block).len())
+                .sum::<usize>()
+                + source_blocked(numerics, mma.block).len();
+            eprintln!(
+                "  {:<44}{entries:>12}{:>12}{:>12}",
+                format!(
+                    "a model load under {}, {} and {} rows",
+                    match numerics {
+                        Numerics::Rounded => "rounded",
+                        _ => "production",
+                    },
+                    mma.planned[0].block.rows,
+                    mma.planned[1].block.rows,
+                ),
+                format!("{:.0} us", 1e6 * whole.as_secs_f64()),
+                format!("{:.1} KiB", source as f64 / 1024.0),
+            );
+        }
+
         let mut swept: Vec<Block> = Vec::new();
         for block in SWEPT_STEPS
             .into_iter()
@@ -10788,15 +11178,15 @@ kernel void mma_lane_probe___T__(
                 .mma
                 .as_ref()
                 .expect("the production entries compiled");
-            let named = [mma.tiled.entry(), mma.grouped.entry(), mma.planned.entry()];
-            let entries = named
-                .iter()
-                .enumerate()
-                .filter(|(at, entry)| !named[..*at].contains(entry))
-                .count();
+            // **Pipelines and not distinct entry names.** The run-cut entry is
+            // compiled once per height and every one of them is the same
+            // `__HOLDS__` name, so a count of names would read three however
+            // many heights a load builds — which is exactly the thing this
+            // column exists to catch.
+            let entries = MMA_UNTIMED_ENTRIES + mma.planned.len();
             assert_eq!(
                 entries, MMA_ENTRIES,
-                "a block of {block:?} compiled {entries} production entries where a model load \
+                "a block of {block:?} compiled {entries} production pipelines where a sweep arm \
                  builds {MMA_ENTRIES}"
             );
             eprintln!(
@@ -10817,11 +11207,23 @@ kernel void mma_lane_probe___T__(
         }
     }
 
-    /// Production entries a model load builds, which are the three
-    /// [`PackedMatmul::compiled`] creates and no arm of any sweep changes: the
-    /// tiled walk, the grouped walk laid over the rows, and the grouped walk
-    /// laid over the runs the sort left.
-    const MMA_ENTRIES: usize = 3;
+    /// Production pipelines that are not the run-cut entry: the tiled walk and
+    /// the grouped walk laid over the rows, both at the shipped block.
+    const MMA_UNTIMED_ENTRIES: usize = 2;
+
+    /// Production pipelines a *sweep arm* builds, which is those two and the one
+    /// height the arm is cut at.
+    const MMA_ENTRIES: usize = MMA_UNTIMED_ENTRIES + 1;
+
+    /// Production pipelines a *model load* builds, which is those two and the
+    /// run-cut entry at each of [`RUNS_A_SHORT_BLOCK`]'s two heights.
+    ///
+    /// **Four where T5 left three, and the fourth is what this milestone
+    /// bought.** D1 measured merely reordering which entries are created first
+    /// at 2.4% of a 2048-token prefill, so a pipeline more owes a figure — and
+    /// it is the only thing here a prompt too short to be blocked at all
+    /// reaches.
+    const MMA_SHIPPED_ENTRIES: usize = MMA_UNTIMED_ENTRIES + 2;
 
     /// **What a table here reports has to be one dispatch of the shape it
     /// names**, and the way it stops being one is silent.
