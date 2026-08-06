@@ -1210,6 +1210,211 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## What clock every figure here was taken at
+
+**The GPU's clock moves by a factor of two and a half, nothing in this file had
+ever accounted for it, and it turns out to reach none of these figures.** The
+part runs at 1380 MHz working and 565 MHz idle; a decode step is 16 ms of device
+work with a host gap after it and a prefill is a minute of continuous work, so
+the two ends of this file's own batching curve are taken at two occupancies. If
+the part held a low state through a bursty decode loop and ramped under sustained
+batched load, part of that curve would be the machine waking up rather than the
+weight reads amortising.
+
+**It does not, and the margin is twenty points of duty cycle.** The clock is flat
+above about 58% occupancy and falls off a cliff below 50%; every figure in this
+file is taken at 67% or above.
+
+### The instrument, which is timing and not a sampler
+
+`bench clock` repeats **one identical unit of work** and reports what each of
+them cost the *device*, in five parts, with the duty cycle beside it. Where the
+work is fixed the device column is the clock read backwards: the same dispatches
+over the same shapes cost more device time only on a slower part. `--idle` is the
+lever — the same steps with host time deliberately left between them, which is a
+lower occupancy at identical work.
+
+**`macmon` corroborates and is not the evidence.** It needs no sudo and reads
+`gpu_usage` as `[MHz, utilisation]`; sampled beside this milestone's own runs it
+gave 1378–1380 MHz at 49–90 W under load and 563–577 MHz at 0.04 W idle. That
+says the states exist. What they do to a kernel is the timing's to answer, and a
+sampler frequent enough to answer it would be the contamination D5 hit.
+
+### The experiment that would have lied, and why it is written down
+
+**The first shape of the decode arm had a confound larger than the signal it was
+looking for.** A run of N decode steps is one generation, so the keys grow by one
+a step — and a step at 8192 keys is 1.45× its 97-key figure. Over 200 steps from
+34 keys the run reports a drift of **+1.352%**, seven pairs of seven the same
+way, which read as a clock falling under sustained load is exactly the answer
+this milestone was looking for.
+
+It is the keys. Measured directly, a step at 34 keys against one at 234, twice
+each:
+
+    context      device, twice        mean
+      34      15.3489  15.2735     15.3112 ms
+     234      15.5172  15.5125     15.5149 ms
+
+**+1.33% predicted against +1.352% observed, and nothing is left over.** The
+review that caught this caught it in a doc comment — the type claimed "the
+dispatches and the shapes are identical unit to unit", which is true of the
+prefill unit and false of the decode one — and the code now says which arm a
+drift means anything under. **An experiment whose own structural growth exceeds
+the signal it hunts produces a confident wrong answer**, and the only reason this
+one did not is that the growth was named before the number was read.
+
+What the decode arm is good for is the *pair*: two runs over the same keys, one
+with a gap and one without, share the slope exactly and differ only in occupancy.
+
+### Sustained load does nothing at all
+
+Identical work, back to back, `bench clock --prefill`:
+
+    units                       parts, device                      whole    duty   drift
+    20 x 2048 tokens   9.3258 9.3259 9.3253 9.3269 9.3247 s      9.3257 s   81.9%  -0.01%
+    10 x 16384 tokens  105.16 105.15 105.18 105.15 105.14  s     105.16 s   92.3%  -0.02%
+
+**The tenth 16384-token prefill is 0.02% off the first, over nineteen minutes of
+the heaviest continuous load this engine produces**, and the whole run spans
+0.046%. The 2048 row is 3.8 minutes and spans 0.024%. There is no sustained
+downclocking, and the brief's hint — three consecutive runs rising 0.10% — is
+inside what a single one of these runs varies by.
+
+### A gap does something, and it takes a very large gap
+
+Seven alternating pairs, `--idle 0` against `--idle 200`, 200 decode steps each:
+
+    arm            duty       device      seven pairs
+    no gap        93.63%     15.475 ms
+    200 ms gap     8.13%     19.049 ms    +23.1%, ranges apart, 7 of 7
+
+**+23.1% on the device for the same dispatches over the same shapes**, which is
+the clock and can be nothing else. So the effect is real. The question is where
+it starts, and the sweep answers it — 200 steps a row, up the list and down it:
+
+    gap      duty        up          down
+      0 ms  93.5%    15.4745 ms   15.4791 ms
+      1     87.4%    15.4851      15.4885
+      2     81.6%    15.4905      15.4770
+      3     75.0%    15.5277      15.5513
+      5     67.1%    15.5149      15.5283
+      8     57.7%    15.4890      15.4959
+     12     50.3%    16.4613      16.3228
+     20     38.8%    16.5553      16.5794
+     50     22.5%    17.1218      17.5249
+    100     13.9%    18.2042      18.0572
+    200      8.3%    19.3423      19.4213
+
+**The knee is between 8 ms of gap and 12 ms, which is between 58% and 50% duty**,
+and it is a step rather than a slope — 15.49 to 16.46, six percent, across one
+row. Above it the eleven readings either side of the turn span 0.5% and are not
+monotone, which is this host's noise. Both directions agree on where the step is,
+so it is the occupancy and not the order.
+
+### What that does to the batching curve, which is nothing
+
+The curve's two ends, with the duty cycle each was taken at — the batch harness's
+own step and device columns, this sitting:
+
+    N     device      step      duty     against the knee
+     1    15.457 ms  20.007 ms  77.3%    +19 points
+     8    64.152     67.081     95.6%    +38
+    32   223.371    246.255     90.7%    +33
+
+**Batch 1 idles 23% of its period and batch 32 idles 9%, and both are twenty
+points or more clear of where the clock moves.** Between 75% and 93.5% duty the
+sweep reads 15.5277 and 15.4745 — 0.34%, in the direction that would *flatter*
+batch 32, and inside the spread of the rows around it. So the 2.21× the device
+column reports across the curve is amortisation, and none of it is the part being
+more awake.
+
+### The denominators, which were already taken at the right clock
+
+`725 GB/s` and `25.3 TFLOP/s` are measured on this part, and if they had been
+taken at a different occupancy than the kernels they judge, every percent-of-peak
+figure here would be off. Both go through `testing::warmed`, which busies the
+device for two seconds before the pass that counts and then takes the best of
+several back-to-back command buffers — **that is a duty cycle of essentially
+100%**, above the knee by forty points, and the helper's own paragraph says why
+it was written: a clock that ramps over a sweep manufactures a monotone row, and
+an external pass reproducing this crate's threadgroup-memory experiment got a
+1.7× phantom win that vanished under thirty warm-up dispatches.
+
+So the denominators are sound, and so is the settled-host discipline: five
+`bench decode` runs to a sub-1% spread certifies a state the machine holds,
+because the machine holds it at every occupancy a real workload reaches.
+
+### Which figures are affected, and by how much
+
+**None, and the arithmetic is above.** Every measurement in this file runs at 67%
+duty or higher — the decode step at 77 to 94%, the batch sweep at 77 to 96%, a
+long prefill at 82 to 92%, the ceiling tests at ~100% — and the clock is flat
+across that whole band to 0.5%, which is under this host's own noise. Absolutes
+quoted across sittings remain exposed to the thing that was already known to move
+them, which is the wall rather than the clock: this milestone's own sitting reads
+B3's binary at 15.474 ms of device against the 15.450 its section quotes, 0.16%,
+where the wall moves percent.
+
+**What is exposed is a workload this engine does not have yet.** A server holding
+a batch open and answering one request every few hundred milliseconds runs at a
+duty cycle below the knee, and its steps will cost up to 23% more device time
+than any figure here predicts. That is a scheduler's problem rather than a
+kernel's, and it is the first thing the continuous-batching milestone should
+measure.
+
+### What a stated duty cycle looks like
+
+`bench clock` prints `clock.duty` beside `clock.device`, so the discipline this
+milestone leaves is one line: **an absolute quoted from a new measurement says
+what occupancy it was taken at**, and a figure taken below 60% says so loudly.
+Ratios taken paired and alternating in one sitting need none of it, because both
+arms run at the same occupancy — which is what the seven-pair arrangement was
+already buying and nobody had named.
+
+## The binding B3 wrote down, taken — and worth nothing
+
+**B3 left one known regression and the remedy for it written down rather than
+done. It is done now, and it does not move the number it was written for.**
+
+A seated dispatch bound the fields its seats share and the fields each seat has
+of its own as two arguments, and a decode step of one sequence encodes 168 of
+them — four to each of forty-two layers. B3 measured that at **+0.7% on the
+device at batch 1**, ranges across but seven pairs of seven the same way, and
+named the second binding as the cost. The two now travel in one `setBytes`, the
+`Call` at the head of a `uint` run and a `Seat` for each sequence behind it, cut
+apart in the kernel by a pointer cast in the constant address space at its own
+`sizeof(Call)`.
+
+`just bench c10076d . batch --batch 32`, seven alternating pairs, warm:
+
+    N     B3's device    this    change   ranges   pairs      claim
+     1     15.474 ms   15.457    -0.1%    across   4 of 7     no claim
+     2     24.263      24.230    -0.1%    across   7 of 7     no claim
+     4     35.327      35.327     0.0%    across   3 of 7     no claim
+     8     64.057      64.152    +0.1%    across   4 of 7     no claim
+    16    116.026     116.045     0.0%    across   4 of 7     no claim
+    32    223.353     223.371     0.0%    across   3 of 7     no claim
+
+**No claim at any width, and four of seven pairs at the width it was written
+for.** The binding is gone and the 0.7% is not. So B3's account of that
+regression was at most half right: it named "one `setBytes` of a few dozen bytes
+and one indirection per thread", and removing the `setBytes` buys nothing
+measurable — whatever the cost is, it is the indirection, or it was never the
+seat table at all.
+
+**It is kept because it is the cheaper shape and because the measurement is the
+finding.** One binding a dispatch instead of two is less to encode, and a lever
+that reads zero at 15.457 ms against 15.474 is a lever priced rather than a lever
+untried. What it also did was expose an arm nothing drove: the merged `_pair`
+entries of both kernels had only ever been given **one seat per half**, so a
+kernel that read seat zero of each and no other passed every case in the tree.
+`a_paired_convolution_seats_every_sequence_of_both_halves` and
+`a_merged_pair_seats_every_sequence_of_both_halves` drive them ragged and the
+other way round from each other; each fails when a half indexes seat zero and
+when a half reads the other half's binding. That is the fourth milestone running
+in which the review named a shipped kernel with an arm no test exercised.
+
 ## The dispatches a slot had left, and the column that priced them
 
 **B2 left four dispatches a layer to each slot and said it had not sized them.
