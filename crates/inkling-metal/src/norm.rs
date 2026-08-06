@@ -52,7 +52,6 @@
 //! tree is checked against, and a kernel that reproduced MLX's extra rounding
 //! would be the one operation in the model whose backend changed the answer.
 
-use std::borrow::Cow;
 use std::cell::RefCell;
 
 use inkling_core::profile::{self, Op};
@@ -66,8 +65,13 @@ const ENTRY: &str = "rms_norm";
 /// The entry that runs two of those calls as one dispatch — see [`encode_pair`].
 const PAIRED_ENTRY: &str = "rms_norm_pair";
 
-/// How many `uint`s the kernel's `Shape` struct declares.
-const FIELDS: usize = 7;
+/// How many `uint`s the kernel's `Seat` struct declares, which one sequence of
+/// a call has of its own.
+const FIELDS: usize = 4;
+
+/// How many its `Call` struct declares, which every sequence of one dispatch
+/// shares.
+const SHARED: usize = 6;
 
 /// The widest threadgroup a dispatch here uses, and — unlike [`crate::matmul`]'s
 /// — all of it works on one group of one row.
@@ -256,8 +260,12 @@ impl<'a> LayerNorm<'a> {
         self.encoding(
             batch,
             x,
-            Reading { from, rows },
-            None,
+            &[Seating {
+                from,
+                rows,
+                base: 0,
+                scale: None,
+            }],
             Landing {
                 out: &mut out,
                 groups: 1,
@@ -289,27 +297,34 @@ impl<'a> LayerNorm<'a> {
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
         let rows = self.rows(x.len() / landing.groups.max(1));
-        self.encoding(batch, x, Reading { from: 0, rows }, scale, landing)
+        let seat = Seating {
+            from: 0,
+            rows,
+            base: landing.base,
+            scale,
+        };
+        self.encoding(batch, x, &[seat], landing)
     }
 
-    /// The same, over a run of the rows a dispatch left rather than all of them.
+    /// The same norm over every sequence of a batch, in one dispatch.
     ///
-    /// **A run because a batch's rows are one buffer.** The projections of a
-    /// batched step produce every sequence's rows together, and a head norm
-    /// writes into the span of the sequence whose rows it is norming — so what
-    /// a call reads is the run that is its own. A sequence advancing alone
-    /// reads the whole call, which is [`Reading::whole`] and is what
-    /// [`LayerNorm::encode_over`] passes.
-    pub fn encode_rows(
+    /// **A seat rather than a call**, for the reason a convolution's
+    /// [`Seating`](crate::sconv::Seating) is one: the rows a sequence norms are
+    /// a run of the call's, and where they land is that sequence's own — the
+    /// span it is keeping, for the key norm — while the weight, the width and
+    /// the groups are the call's. What a seat costs the grid is a stride: each
+    /// is given the threadgroups the widest of them needs, so a threadgroup
+    /// finds its sequence by a divide and a short seat's spare threadgroups
+    /// return whole. A batch of one is one seat over the whole grid.
+    pub fn encode_seats(
         &self,
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
-        reading: Reading,
-        scale: Option<&[f32]>,
+        seats: &[Seating<'_>],
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
-        self.encoding(batch, x, reading, scale, landing)
+        self.encoding(batch, x, seats, landing)
     }
 
     /// Threads the threadgroup over one group holds: whole simdgroups enough to
@@ -355,19 +370,20 @@ impl<'a> LayerNorm<'a> {
         &self,
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
-        reading: Reading,
-        scale: Option<&[f32]>,
+        seats: &[Seating<'_>],
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
-        let (call, scale) = self.described(x.len(), reading, scale, &landing);
-        let mut shape = self.device.inline(&call.fields)?;
+        let call = self.described(x.len(), seats, &landing);
+        let mut shared = self.device.inline(&call.shared)?;
+        let mut seated = self.device.inline(&call.seats)?;
         let mut weight = self.weight.borrow_mut();
-        let mut scales = self.device.inline(&scale)?;
+        let mut scales = self.device.inline(&call.scales)?;
 
         batch.add(
             &self.norm.kernel,
             &[
-                shape.arg(),
+                shared.arg(),
+                seated.arg(),
                 x.arg(),
                 weight.arg(),
                 scales.arg(),
@@ -377,26 +393,20 @@ impl<'a> LayerNorm<'a> {
             // pair the threadgroup's own position and so what makes the barriers
             // inside uniform: a threadgroup either runs a group or returns from
             // one, and never splits over the question.
-            Grid::new(call.slots * self.threads, self.threads),
+            Grid::new(call.slots() * self.threads, self.threads),
             call.moves,
         )
     }
 
     /// Everything about a call that does not depend on whether it has a
-    /// dispatch to itself: the seven fields the kernel reads, the threadgroups
-    /// it needs, and the bytes it moves.
+    /// dispatch to itself: the fields every seat shares, the fields each seat
+    /// has of its own, the scales they read and the bytes the call moves.
     ///
     /// Here rather than inside [`LayerNorm::encoding`] because a paired dispatch
-    /// asks the same three questions of each half, and a second spelling of the
-    /// shape struct is one that could drift from the kernel's own.
-    fn described<'s>(
-        &self,
-        values: usize,
-        reading: Reading,
-        scale: Option<&'s [f32]>,
-        landing: &Landing<'_>,
-    ) -> (Call, Cow<'s, [f32]>) {
-        let Reading { from, rows } = reading;
+    /// asks the same questions of each half, and a second spelling of the shape
+    /// struct is one that could drift from the kernel's own.
+    fn described(&self, values: usize, seats: &[Seating<'_>], landing: &Landing<'_>) -> Call {
+        assert!(!seats.is_empty(), "a norm over no sequence at all");
         assert!(landing.groups > 0, "a row has groups");
         assert_eq!(
             values % landing.groups,
@@ -404,69 +414,97 @@ impl<'a> LayerNorm<'a> {
             "{values} values are not {} groups",
             landing.groups
         );
-        assert!(
-            from + rows <= self.rows(values / landing.groups),
-            "{rows} rows at {from} of a call holding {}",
-            self.rows(values / landing.groups)
-        );
-        let scale = match scale {
-            Some(scale) => {
-                assert_eq!(scale.len(), rows, "a scale a row");
-                Cow::Borrowed(scale)
-            }
-            None => Cow::Owned(vec![1.0; rows]),
-        };
-        landing.fits(rows, self.width);
 
-        let call = Call {
-            fields: [
-                extent(rows, "rows of a call"),
-                extent(landing.groups, "the groups of a row"),
-                extent(self.width, "the width of a norm"),
-                extent(landing.stride, "the rows a group has room for"),
-                extent(landing.base, "where a call's rows start"),
-                extent(from, "where a call's rows are read from"),
-                self.eps.to_bits(),
-            ],
-            slots: rows * landing.groups,
-            // The rows in, the same rows out, the one weight every row of every
-            // call reads, and a scale for each row. A call over a suffix reads
-            // and writes its own rows and not the ones in front of them.
-            moves: size_of::<f32>() * (2 * rows * landing.groups * self.width + self.width + rows),
+        let mut call = Call {
+            shared: [0; SHARED],
+            seats: Vec::with_capacity(seats.len() * FIELDS),
+            scales: Vec::new(),
+            span: 0,
+            // The one weight every row of every seat reads, which is read once
+            // whatever the batch is.
+            moves: size_of::<f32>() * self.width,
         };
-        (call, scale)
+        for seat in seats {
+            let &Seating {
+                from, rows, base, ..
+            } = seat;
+            assert!(
+                from + rows <= self.rows(values / landing.groups),
+                "{rows} rows at {from} of a call holding {}",
+                self.rows(values / landing.groups)
+            );
+            landing.fits_at(base, rows, self.width);
+            call.seats.extend([
+                extent(rows, "rows of a seat"),
+                extent(from, "where a seat's rows are read from"),
+                extent(base, "where a seat's rows land"),
+                extent(call.scales.len(), "where a seat's scales start"),
+            ]);
+            match seat.scale {
+                Some(scale) => {
+                    assert_eq!(scale.len(), rows, "a scale a row");
+                    call.scales.extend_from_slice(scale);
+                }
+                None => call.scales.resize(call.scales.len() + rows, 1.0),
+            }
+            call.span = call.span.max(rows * landing.groups);
+            // The rows in, the same rows out, and a scale for each row. A seat
+            // over a run reads and writes its own rows and not the ones in front
+            // of them.
+            call.moves += size_of::<f32>() * (2 * rows * landing.groups * self.width + rows);
+        }
+        call.shared = [
+            extent(landing.groups, "the groups of a row"),
+            extent(self.width, "the width of a norm"),
+            extent(landing.stride, "the rows a group has room for"),
+            self.eps.to_bits(),
+            extent(seats.len(), "the sequences of a call"),
+            extent(call.span, "the threadgroups a seat is given"),
+        ];
+        call
     }
 }
 
-/// Which rows of what a dispatch left on the device a norm reads.
+/// One sequence's place in a norm's call: which rows of it are that sequence's,
+/// where they land, and the scale each of those rows carries.
 ///
-/// **A run rather than a buffer because a batch's rows are one buffer**, for
-/// the reason a convolution's [`Reading`](crate::sconv::Reading) is one. The
-/// two are separate types because the two kernels index a row differently —
-/// this one by group and that one by channel — and one type over both would be
-/// a field each of them has to be told to ignore.
+/// **A run rather than a buffer because a batch's rows are one buffer**, the way
+/// a convolution's [`Seating`](crate::sconv::Seating) is — and the scale is per
+/// seat for the same reason the rows are: log scaling's `tau` is a sequence's
+/// own, one value a row of its own.
 #[derive(Debug, Clone, Copy)]
-pub struct Reading {
-    /// The row of `x` this call's first row is.
+pub struct Seating<'a> {
+    /// The row of `x` this seat's first row is.
     pub from: usize,
     /// How many rows it takes from there.
     pub rows: usize,
+    /// The row of the landing this seat's first row goes to.
+    pub base: usize,
+    /// Log scaling's `tau`, one value per row of this seat. `None` is ones.
+    pub scale: Option<&'a [f32]>,
 }
 
-impl Reading {
-    /// Every row of what the call was handed, which is what a sequence
-    /// advancing alone reads.
-    pub fn whole(rows: usize) -> Self {
-        Self { from: 0, rows }
-    }
-}
-
-/// One norm's call as a paired dispatch describes it.
+/// One norm's call as the dispatch that runs it describes it.
 struct Call {
-    fields: [u32; FIELDS],
-    /// Threadgroups it wants, which is a group of a row each.
-    slots: usize,
+    shared: [u32; SHARED],
+    /// [`FIELDS`] `uint`s for each seat, in the order the seats were given —
+    /// which is the order the kernel indexes them in.
+    seats: Vec<u32>,
+    /// Every seat's per-row scales, one run after another, which is what each
+    /// seat's own offset into indexes.
+    scales: Vec<f32>,
+    /// Threadgroups each seat is given, which is a group of a row for the widest
+    /// of them.
+    span: usize,
     moves: usize,
+}
+
+impl Call {
+    /// The threadgroups the dispatch takes: every seat's span, whether or not it
+    /// has the rows to fill one.
+    fn slots(&self) -> usize {
+        self.span * (self.seats.len() / FIELDS)
+    }
 }
 
 /// One half of a paired normalisation: the rows it reads, what multiplies them,
@@ -478,10 +516,9 @@ struct Call {
 pub struct Normalising<'a> {
     pub norm: &'a LayerNorm<'a>,
     pub x: &'a mut Buffer<f32>,
-    /// Which rows of `x` this half reads — see [`LayerNorm::encode_rows`].
-    pub reading: Reading,
-    /// Log scaling's `tau`, one value per row. `None` is a row of ones.
-    pub scale: Option<&'a [f32]>,
+    /// Which rows of `x` each sequence of this half reads, and what each of them
+    /// scales by — see [`LayerNorm::encode_seats`].
+    pub seats: &'a [Seating<'a>],
     pub landing: Landing<'a>,
 }
 
@@ -513,61 +550,51 @@ pub fn encode_pair(
     let Normalising {
         norm: one,
         x: first_x,
-        reading: first_reading,
-        scale: first_scale,
+        seats: first_seats,
         landing: first_landing,
     } = first;
     let Normalising {
         norm: other,
         x: second_x,
-        reading: second_reading,
-        scale: second_scale,
+        seats: second_seats,
         landing: second_landing,
     } = second;
 
     if one.threads != other.threads {
-        one.encoding(batch, first_x, first_reading, first_scale, first_landing)?;
-        return other.encoding(
-            batch,
-            second_x,
-            second_reading,
-            second_scale,
-            second_landing,
-        );
+        one.encoding(batch, first_x, first_seats, first_landing)?;
+        return other.encoding(batch, second_x, second_seats, second_landing);
     }
 
-    let (first_call, first_scale) =
-        one.described(first_x.len(), first_reading, first_scale, &first_landing);
-    let (second_call, second_scale) = other.described(
-        second_x.len(),
-        second_reading,
-        second_scale,
-        &second_landing,
-    );
+    let first_call = one.described(first_x.len(), first_seats, &first_landing);
+    let second_call = other.described(second_x.len(), second_seats, &second_landing);
     let device = one.device;
-    let mut first_shape = device.inline(&first_call.fields)?;
-    let mut second_shape = device.inline(&second_call.fields)?;
-    let mut first_scales = device.inline(&first_scale)?;
-    let mut second_scales = device.inline(&second_scale)?;
+    let mut first_shared = device.inline(&first_call.shared)?;
+    let mut second_shared = device.inline(&second_call.shared)?;
+    let mut first_seated = device.inline(&first_call.seats)?;
+    let mut second_seated = device.inline(&second_call.seats)?;
+    let mut first_scales = device.inline(&first_call.scales)?;
+    let mut second_scales = device.inline(&second_call.scales)?;
     let mut first_weight = one.weight.borrow_mut();
     let mut second_weight = other.weight.borrow_mut();
 
     batch.add(
         &one.norm.paired,
         &[
-            first_shape.arg(),
+            first_shared.arg(),
+            first_seated.arg(),
             first_x.arg(),
             first_weight.arg(),
             first_scales.arg(),
             first_landing.out.arg(),
-            second_shape.arg(),
+            second_shared.arg(),
+            second_seated.arg(),
             second_x.arg(),
             second_weight.arg(),
             second_scales.arg(),
             second_landing.out.arg(),
         ],
         Grid::new(
-            (first_call.slots + second_call.slots) * one.threads,
+            (first_call.slots() + second_call.slots()) * one.threads,
             one.threads,
         ),
         first_call.moves + second_call.moves,
@@ -594,14 +621,28 @@ const BODY: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-struct Shape {
-    uint rows;
+/// What every sequence of a call shares, which is everything that is not a
+/// sequence's own rows or place.
+struct Call {
     uint groups;
     uint width;
     uint stride;
-    uint base;
-    uint source;
     uint eps_bits;
+    /// How many sequences this dispatch is norming.
+    uint seats;
+    /// Threadgroups each of them is given, which is what the widest of them
+    /// needs — so a threadgroup's own sequence is `slot / span` and its group of
+    /// its own row is `slot % span`.
+    uint span;
+};
+
+/// One sequence's place in that call.
+struct Seat {
+    uint rows;
+    uint source;
+    uint base;
+    /// Where this sequence's own per-row scales start in the call's.
+    uint scales;
 };
 
 /// What a lane contributes to each of the two reductions, and how it is brought
@@ -672,7 +713,7 @@ static inline float4 scaled_by(float4 values, int exponent) {
 /// alignment. A norm over a ragged width takes the same body a float at a time.
 template <typename Lane>
 static void normalise(
-    constant Shape &shape,
+    constant Call &call,
     device const Lane *values,
     device const Lane *weight,
     device Lane *result,
@@ -723,9 +764,9 @@ static void normalise(
     // what lets the row's own factor cancel below rather than be multiplied
     // back in. `precise` because the default is a hardware approximation, and
     // this is the one reciprocal square root the whole answer rests on.
-    const float eps = as_type<float>(shape.eps_bits);
+    const float eps = as_type<float>(call.eps_bits);
     const float inverse = precise::rsqrt(
-        sum / (float)shape.width + ldexp(eps, -2 * exponent)
+        sum / (float)call.width + ldexp(eps, -2 * exponent)
     );
 
     for (uint i = local; i < lanes; i += threads) {
@@ -741,7 +782,8 @@ static void normalise(
 /// changes is which of two shapes a threadgroup reads and nothing else, which is
 /// what makes the pair bit-safe by construction rather than within a tolerance.
 static void normalise_slot(
-    constant Shape &shape,
+    constant Call &call,
+    constant Seat &seat,
     device const float *x,
     device const float *weight,
     device const float *scale,
@@ -755,29 +797,29 @@ static void normalise_slot(
     uint simd,
     uint simds
 ) {
-    const uint row = slot / shape.groups;
-    const uint group = slot % shape.groups;
+    const uint row = slot / call.groups;
+    const uint group = slot % call.groups;
 
     device const float *values =
-        x + ((ulong)shape.source * shape.groups + slot) * shape.width;
+        x + ((ulong)seat.source * call.groups + slot) * call.width;
     device float *result =
-        out + ((ulong)group * shape.stride + shape.base + row) * shape.width;
-    const float row_scale = scale[row];
+        out + ((ulong)group * call.stride + seat.base + row) * call.width;
+    const float row_scale = scale[seat.scales + row];
 
     // The width is a shape and not a thread's own, so both barriers inside stay
     // uniform however this branches.
-    if (shape.width % LANE == 0) {
+    if (call.width % LANE == 0) {
         normalise(
-            shape,
+            call,
             (device const float4 *)values,
             (device const float4 *)weight,
             (device float4 *)result,
-            shape.width / LANE,
+            call.width / LANE,
             row_scale, peaks, sums, local, threads, lane, simd, simds
         );
     } else {
         normalise(
-            shape, values, weight, result, shape.width,
+            call, values, weight, result, call.width,
             row_scale, peaks, sums, local, threads, lane, simd, simds
         );
     }
@@ -802,11 +844,12 @@ static void normalise_slot(
 /// scaling's `tau` is the only thing that ever sets it and everywhere else it is
 /// a row of ones, which multiplies exactly.
 kernel void rms_norm(
-    constant Shape &shape [[buffer(0)]],
-    device const float *x [[buffer(1)]],
-    device const float *weight [[buffer(2)]],
-    device const float *scale [[buffer(3)]],
-    device float *out [[buffer(4)]],
+    constant Call &call [[buffer(0)]],
+    constant Seat *seats [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device const float *weight [[buffer(3)]],
+    device const float *scale [[buffer(4)]],
+    device float *out [[buffer(5)]],
     uint slot [[threadgroup_position_in_grid]],
     uint local [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -817,17 +860,24 @@ kernel void rms_norm(
     threadgroup float peaks[MOST_SIMDGROUPS];
     threadgroup float sums[MOST_SIMDGROUPS];
 
-    // Unreachable under the grid this is dispatched over, which gives exactly
-    // one threadgroup to each group of each row. It is here for what it would
-    // have to be if that ever stopped being true: the pair is the threadgroup's
-    // own position, so this turns away a whole group and never splits one — and
-    // a bounds check on `local` instead would leave some threads at the barriers
-    // below and others past them, which is undefined rather than slow.
-    if (slot >= shape.rows * shape.groups) {
+    // **A sequence is a stride of the grid rather than a dispatch**: each is
+    // given what the widest of them needs, so a threadgroup finds its own
+    // sequence by a divide and the ones a shorter seat does not need return.
+    //
+    // Both refusals are of a whole threadgroup and never of part of one — the
+    // pair is the threadgroup's own position — where a bounds check on `local`
+    // would leave some threads at the barriers below and others past them,
+    // which is undefined rather than slow.
+    const uint seat = slot / call.span;
+    if (seat >= call.seats) {
+        return;
+    }
+    const uint own = slot % call.span;
+    if (own >= seats[seat].rows * call.groups) {
         return;
     }
     normalise_slot(
-        shape, x, weight, scale, out, slot,
+        call, seats[seat], x, weight, scale, out, own,
         peaks, sums, local, threads, lane, simd, simds
     );
 }
@@ -849,16 +899,18 @@ kernel void rms_norm(
 /// The two halves share one threadgroup width, which is why a pair is only
 /// formed where both call for the same one — see `norm::encode_pair`.
 kernel void rms_norm_pair(
-    constant Shape &first [[buffer(0)]],
-    device const float *first_x [[buffer(1)]],
-    device const float *first_weight [[buffer(2)]],
-    device const float *first_scale [[buffer(3)]],
-    device float *first_out [[buffer(4)]],
-    constant Shape &second [[buffer(5)]],
-    device const float *second_x [[buffer(6)]],
-    device const float *second_weight [[buffer(7)]],
-    device const float *second_scale [[buffer(8)]],
-    device float *second_out [[buffer(9)]],
+    constant Call &first [[buffer(0)]],
+    constant Seat *first_seats [[buffer(1)]],
+    device const float *first_x [[buffer(2)]],
+    device const float *first_weight [[buffer(3)]],
+    device const float *first_scale [[buffer(4)]],
+    device float *first_out [[buffer(5)]],
+    constant Call &second [[buffer(6)]],
+    constant Seat *second_seats [[buffer(7)]],
+    device const float *second_x [[buffer(8)]],
+    device const float *second_weight [[buffer(9)]],
+    device const float *second_scale [[buffer(10)]],
+    device float *second_out [[buffer(11)]],
     uint slot [[threadgroup_position_in_grid]],
     uint local [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -869,18 +921,28 @@ kernel void rms_norm_pair(
     threadgroup float peaks[MOST_SIMDGROUPS];
     threadgroup float sums[MOST_SIMDGROUPS];
 
-    const uint firsts = first.rows * first.groups;
+    const uint firsts = first.seats * first.span;
     if (slot < firsts) {
-        normalise_slot(
-            first, first_x, first_weight, first_scale, first_out, slot,
-            peaks, sums, local, threads, lane, simd, simds
-        );
-    } else if (slot < firsts + second.rows * second.groups) {
-        normalise_slot(
-            second, second_x, second_weight, second_scale, second_out,
-            slot - firsts,
-            peaks, sums, local, threads, lane, simd, simds
-        );
+        const uint seat = slot / first.span;
+        const uint own = slot % first.span;
+        if (own < first_seats[seat].rows * first.groups) {
+            normalise_slot(
+                first, first_seats[seat], first_x, first_weight, first_scale,
+                first_out, own,
+                peaks, sums, local, threads, lane, simd, simds
+            );
+        }
+    } else if (slot < firsts + second.seats * second.span) {
+        const uint over = slot - firsts;
+        const uint seat = over / second.span;
+        const uint own = over % second.span;
+        if (own < second_seats[seat].rows * second.groups) {
+            normalise_slot(
+                second, second_seats[seat], second_x, second_weight, second_scale,
+                second_out, own,
+                peaks, sums, local, threads, lane, simd, simds
+            );
+        }
     }
 }
 "#;
@@ -1024,11 +1086,15 @@ mod tests {
                     .expect("the landing allocates");
                 let mut batch = device.batch().expect("a command buffer opens");
                 layer
-                    .encode_rows(
+                    .encode_seats(
                         &mut batch,
                         &mut x,
-                        Reading { from, rows: taken },
-                        None,
+                        &[Seating {
+                            from,
+                            rows: taken,
+                            base: from,
+                            scale: None,
+                        }],
                         Landing {
                             out: &mut out,
                             groups: 1,
@@ -1052,6 +1118,110 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// **The sequences of one dispatch are those sequences alone**, which is
+    /// what a seat has to buy and the three things batching a norm can get
+    /// wrong: a seat that reads another's rows, one that lands where another
+    /// lands, and one that carries another's scale.
+    ///
+    /// The three are made to disagree deliberately — the seats read different
+    /// runs, land at different bases, and scale by different values — so that
+    /// each confusion moves a number rather than landing on a coincidence.
+    #[test]
+    fn two_sequences_in_one_dispatch_are_the_two_sequences_alone() {
+        let Some(device) = device() else { return };
+        const WIDTH: usize = 128;
+        const ROWS: usize = 4;
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let weight: Vec<f32> = (0..WIDTH).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+        let layer = LayerNorm::new(&device, &norm, &weight, 1e-6).expect("the weight uploads");
+        let rows: Vec<f32> = (0..ROWS * WIDTH)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) * (1 + i / WIDTH) as f32)
+            .collect();
+        // A seat apiece over two rows, landing in the other's half of the
+        // landing so that a base taken from the wrong seat is visible.
+        let seats = [
+            Seating {
+                from: 0,
+                rows: 2,
+                base: 2,
+                scale: Some(&[1.5, 0.25]),
+            },
+            Seating {
+                from: 2,
+                rows: 2,
+                base: 0,
+                scale: Some(&[3.0, 0.5]),
+            },
+        ];
+
+        // **Each sequence alone is its own rows in their own buffer**, at row
+        // zero of their own landing — so a seat that read row zero, landed at
+        // row zero or took the first scale would agree with this arm rather than
+        // differ from it. A reference arm that also carried the offsets would be
+        // the mutation's own answer twice.
+        let alone: Vec<Vec<f32>> = seats
+            .iter()
+            .map(|seat| {
+                let own = &rows[seat.from * WIDTH..][..seat.rows * WIDTH];
+                let mut x = device.buffer(own).expect("the rows upload");
+                let mut out = device
+                    .zeroed::<f32>(seat.rows * WIDTH)
+                    .expect("the landing allocates");
+                let mut batch = device.batch().expect("a command buffer opens");
+                layer
+                    .encode_seats(
+                        &mut batch,
+                        &mut x,
+                        &[Seating {
+                            from: 0,
+                            base: 0,
+                            ..*seat
+                        }],
+                        Landing {
+                            out: &mut out,
+                            groups: 1,
+                            stride: seat.rows,
+                            base: 0,
+                        },
+                    )
+                    .expect("the dispatch encodes");
+                batch.wait().expect("the dispatch completes");
+                out.to_vec()
+            })
+            .collect();
+
+        let mut x = device.buffer(&rows).expect("the rows upload");
+        let mut out = device
+            .zeroed::<f32>(ROWS * WIDTH)
+            .expect("the landing allocates");
+        let mut batch = device.batch().expect("a command buffer opens");
+        layer
+            .encode_seats(
+                &mut batch,
+                &mut x,
+                &seats,
+                Landing {
+                    out: &mut out,
+                    groups: 1,
+                    stride: ROWS,
+                    base: 0,
+                },
+            )
+            .expect("the dispatch encodes");
+        batch.wait().expect("the dispatch completes");
+
+        let together = out.to_vec();
+        for (seat, apart) in seats.iter().zip(&alone) {
+            let at = seat.base * WIDTH;
+            assert_eq!(
+                together[at..at + apart.len()],
+                apart[..],
+                "the sequence at row {}",
+                seat.from
+            );
         }
     }
 
@@ -1165,7 +1335,7 @@ mod tests {
     #[test]
     fn the_vectorised_lane_and_the_ragged_one_reduce_alike() {
         let Some(device) = device() else { return };
-        let scalar = source().replace("shape.width % LANE == 0", "false");
+        let scalar = source().replace("call.width % LANE == 0", "false");
         assert_ne!(scalar, source(), "the mutation changed nothing");
         let (rows, width) = (3, 256);
         let weight: Vec<f32> = (0..width).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
@@ -1607,8 +1777,12 @@ mod tests {
             Normalising {
                 norm: one,
                 x: &mut first_x,
-                reading: Reading::whole(x.len() / (groups * one.width())),
-                scale,
+                seats: &[Seating {
+                    from: 0,
+                    rows: x.len() / (groups * one.width()),
+                    base: 0,
+                    scale,
+                }],
                 landing: Landing {
                     out: &mut first_out,
                     groups,
@@ -1619,8 +1793,12 @@ mod tests {
             Normalising {
                 norm: other,
                 x: &mut second_x,
-                reading: Reading::whole(y.len() / (other_groups * other.width())),
-                scale: other_scale,
+                seats: &[Seating {
+                    from: 0,
+                    rows: y.len() / (other_groups * other.width()),
+                    base: 0,
+                    scale: other_scale,
+                }],
                 landing: Landing {
                     out: &mut second_out,
                     groups: other_groups,

@@ -951,34 +951,19 @@ impl KeyValues {
         2 * (self.kv_heads * self.stride() * self.head_dim) as u64 * size_of::<f32>() as u64
     }
 
-    /// Where a dispatch writing slot `slot`'s keys should put them, and where
-    /// one writing its values should.
-    ///
-    /// Both at once because a call writes both and they are separate buffers, so
-    /// the borrow of one has to be able to outlive the other's dispatch.
+    /// The row of a KV head that slot `slot`'s next keys go to, which is where
+    /// its span starts plus what it already holds.
     ///
     /// **The slot is in the base and the layout is in the stride**, which is the
     /// same three numbers a landing always carries: a KV head's rows are every
     /// slot's, so what separates two heads is `slots * capacity` and what places
-    /// a sequence inside one is where its own span starts.
+    /// a sequence inside one is where its own span starts. A dispatch writing
+    /// every sequence's keys at once carries one landing and a base per
+    /// sequence, which is why the base is asked for apart from the landing that
+    /// would otherwise borrow the buffer for one slot.
     ///
-    /// Neither advances `held`: the rows are not there until the batch has run,
-    /// and [`KeyValues::appended`] is what says they are.
-    pub(crate) fn landings(&mut self, slot: usize) -> (Landing<'_>, Landing<'_>) {
-        let base = self.writing(slot);
-        let (mut keys, mut values) = self.spanning();
-        keys.base = base;
-        values.base = base;
-        (keys, values)
-    }
-
-    /// The row of a KV head that slot `slot`'s next keys go to, which is where
-    /// its span starts plus what it already holds.
-    ///
-    /// Apart from [`KeyValues::landings`] for the dispatch that writes every
-    /// sequence's keys at once: what such a call carries is one landing and a
-    /// base per sequence, so the base has to be askable without the landing
-    /// that would borrow the buffer for one slot.
+    /// It does not advance `held`: the rows are not there until the batch has
+    /// run, and [`KeyValues::appended`] is what says they are.
     pub(crate) fn writing(&self, slot: usize) -> usize {
         self.base(slot) + self.held(slot)
     }

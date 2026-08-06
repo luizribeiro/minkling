@@ -574,52 +574,67 @@ impl<'a> LayerProjections<'a> {
             },
         )?;
 
-        for seat in attending {
-            let (slot, first, queries) = (seat.slot, seat.first, seat.queries);
-            let step = seat.step;
-            let (keys, _) = spans.landings(slot);
-            // One dispatch rather than two: the two norms read different rows
-            // against different weights into different landings, and neither
-            // reads what the other writes — so what separated them was that they
-            // are two tensors. See `norm::encode_pair`, which is where they part
-            // company again if a checkpoint ever gives them different widths.
-            norm::encode_pair(
-                batch,
-                Normalising {
-                    norm: &self.q_norm,
-                    x: &mut q,
-                    reading: norm::Reading {
-                        from: first,
-                        rows: queries,
-                    },
-                    scale: step.q_taus,
-                    landing: Landing {
-                        out: &mut headed,
-                        groups: heads,
-                        stride: rows,
-                        base: first,
-                    },
+        // **The head norms of the whole batch as one dispatch too**, and for the
+        // same reason: what a sequence norms is a run of the projections' rows
+        // and where its keys land is a run of the span. The query's rows land
+        // where they already are and the key's go where that sequence's span has
+        // reached, which is the one thing that differs between the two halves'
+        // seats — and log scaling's `tau` is a sequence's own, so it is a seat's
+        // rather than the call's.
+        let queried: Vec<norm::Seating<'_>> = attending
+            .iter()
+            .map(|seat| norm::Seating {
+                from: seat.first,
+                rows: seat.queries,
+                base: seat.first,
+                scale: seat.step.q_taus,
+            })
+            .collect();
+        let keying: Vec<norm::Seating<'_>> = attending
+            .iter()
+            .map(|seat| norm::Seating {
+                from: seat.first,
+                rows: seat.queries,
+                base: spans.writing(seat.slot),
+                scale: None,
+            })
+            .collect();
+        let (keys, _) = spans.spanning();
+        // One dispatch rather than two: the two norms read different rows
+        // against different weights into different landings, and neither
+        // reads what the other writes — so what separated them was that they
+        // are two tensors. See `norm::encode_pair`, which is where they part
+        // company again if a checkpoint ever gives them different widths.
+        norm::encode_pair(
+            batch,
+            Normalising {
+                norm: &self.q_norm,
+                x: &mut q,
+                seats: &queried,
+                landing: Landing {
+                    out: &mut headed,
+                    groups: heads,
+                    stride: rows,
+                    base: 0,
                 },
-                Normalising {
-                    norm: &self.k_norm,
-                    x: &mut convolved,
-                    reading: norm::Reading {
-                        from: first,
-                        rows: queries,
-                    },
-                    scale: None,
-                    landing: keys,
-                },
-            )?;
+            },
+            Normalising {
+                norm: &self.k_norm,
+                x: &mut convolved,
+                seats: &keying,
+                landing: keys,
+            },
+        )?;
 
-            // **The span grows here rather than when the batch completes**,
-            // because the step below is what has to see this call's keys and it
-            // is in the same command buffer as the two dispatches that wrote
-            // them. The step binds the spans those two write, so the batch puts
-            // a barrier between them and those writes are done before it reads
-            // them — and a span that grew after the wait would attend over the
-            // previous step's keys and leave this token out of its own row.
-            spans.appended(slot, queries);
+        // **The spans grow here rather than when the batch completes**, because
+        // the step below is what has to see this call's keys and it is in the
+        // same command buffer as the two dispatches that wrote them. The step
+        // binds the spans those two write, so the batch puts a barrier between
+        // them and those writes are done before it reads them — and a span that
+        // grew after the wait would attend over the previous step's keys and
+        // leave this token out of its own row.
+        for seat in attending {
+            spans.appended(seat.slot, seat.queries);
         }
 
         let walking: Vec<attention::Attending<'_>> = attending
