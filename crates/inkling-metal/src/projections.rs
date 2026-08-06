@@ -3023,35 +3023,219 @@ mod tests {
     /// on the step that wrote it and wrong on the one after.
     #[test]
     fn a_sequence_in_a_batch_produces_what_it_produces_alone() {
-        let Some(device) = device() else { return };
-        let kernels = LayerKernels::compile(&device).expect("the kernels compile");
-        let swiglu = SwiGlu::new(&device).expect("the kernel compiles");
-        let weights = NarrowWeights::new();
+        let Some(batching) = Batching::open() else {
+            return;
+        };
+        let alone = batching.alone();
 
-        // Three sequences that differ in every way a neighbour can: how many
-        // rows they feed a step, how many steps they take, and the values in
-        // them. The third stops after one step, which is the early finisher.
-        let feeding = [vec![1, 1, 1, 1], vec![3, 2, 1, 1], vec![2]];
-        let rows_of = |seq: usize, step: usize, rows: usize| -> Vec<f32> {
+        // Every ordering of the three, so that a sequence is checked at the
+        // front of a batch, in the middle of one and at the back of one.
+        for order in [
+            vec![0, 1, 2],
+            vec![2, 1, 0],
+            vec![1, 0, 2],
+            vec![1, 2, 0],
+            vec![0, 1],
+            vec![1, 0],
+        ] {
+            let stays: Vec<Stay> = order
+                .iter()
+                .enumerate()
+                .map(|(slot, seq)| Stay {
+                    seq: *seq,
+                    slot,
+                    from: 0,
+                })
+                .collect();
+            let batched = batching.run(order.len(), &stays);
+            for (at, seq) in order.iter().enumerate() {
+                assert_eq!(
+                    batched[at], alone[*seq],
+                    "sequence {seq} at position {at} of {order:?}"
+                );
+            }
+        }
+    }
+
+    /// **The contamination case for a slot that fills and empties while the
+    /// batch around it goes on running.**
+    ///
+    /// The case above holds the batch's membership still: every sequence starts
+    /// at step zero and a slot a sequence leaves stays empty. That is the shape
+    /// `generate_batch` has and it is the only shape anything here had ever
+    /// driven. A continuous engine has two more, and each is a way for one
+    /// sequence's state to reach another's answer:
+    ///
+    /// - **A stay that begins after step zero** is a request admitted into a
+    ///   batch already decoding. Its first call feeds several rows where its
+    ///   neighbours feed one, into windows and a span that have to be its own
+    ///   from a step nothing else in the run started at.
+    /// - **A second stay in a slot the first has left** is that slot handed on.
+    ///   The span and the four convolution windows belong to the *slot*, so a
+    ///   sequence given one that still counts the previous sequence's keys
+    ///   attends over them — and answers a row of the right shape, out of a
+    ///   plausible softmax, which `o_proj` projects and the next layer refines.
+    ///
+    /// Exact equality against each sequence run alone, for the reason the case
+    /// above is exact: the arms walk the same taps over the same window and the
+    /// same keys in the same tiles, and the only thing a batch changes is which
+    /// row of a buffer each of them is at.
+    ///
+    /// **Two mutations, one for each half.** Not restarting a slot's caches
+    /// where a stay begins — the line in [`Batching::run`] that builds them
+    /// fresh — fails the handover; laying a step's rows in stay order rather
+    /// than in slot order fails the join, which is the mistake a scheduler that
+    /// admitted into the first free slot rather than the next one would make.
+    #[test]
+    fn a_slot_that_fills_and_empties_carries_what_each_sequence_carries_alone() {
+        let Some(batching) = Batching::open() else {
+            return;
+        };
+        let alone = batching.alone();
+
+        // Slot 0 carries sequence 0 throughout. Slot 1 carries sequence 2 for
+        // its one step, then sequence 1 from step 2 — which is a handover *and*
+        // a join, into a batch whose other slot has been decoding since step
+        // zero and feeding three rows where that slot feeds one.
+        let handover = [
+            Stay {
+                seq: 0,
+                slot: 0,
+                from: 0,
+            },
+            Stay {
+                seq: 2,
+                slot: 1,
+                from: 0,
+            },
+            Stay {
+                seq: 1,
+                slot: 1,
+                from: 2,
+            },
+        ];
+        // And the same three the other way round in their slots, so that the
+        // handover is checked in the slot the long-lived sequence is not in.
+        let swapped = [
+            Stay {
+                seq: 0,
+                slot: 1,
+                from: 0,
+            },
+            Stay {
+                seq: 2,
+                slot: 0,
+                from: 0,
+            },
+            Stay {
+                seq: 1,
+                slot: 0,
+                from: 2,
+            },
+        ];
+
+        for stays in [handover, swapped] {
+            let ran = batching.run(2, &stays);
+            for (at, stay) in stays.iter().enumerate() {
+                assert_eq!(
+                    ran[at], alone[stay.seq],
+                    "sequence {} in slot {} from step {}",
+                    stay.seq, stay.slot, stay.from
+                );
+            }
+        }
+    }
+
+    /// One sequence's turn in one slot: which of [`Batching::FEEDING`]'s
+    /// sequences it is, the slot it sits in, and the step it is admitted at.
+    ///
+    /// **A slot may hold more than one of these over a run**, which is the whole
+    /// of what evicting and admitting are at this scale.
+    #[derive(Debug, Clone, Copy)]
+    struct Stay {
+        seq: usize,
+        slot: usize,
+        from: usize,
+    }
+
+    /// Two narrow decoder layers over a fixed set of slots, driven a step at a
+    /// time.
+    ///
+    /// Two layers, because a leak a single layer hid would be carried in the
+    /// rows the second one is handed; and several steps in a row, because a
+    /// window written into a neighbour's slot is a state machine that is right
+    /// on the step that wrote it and wrong on the one after.
+    struct Batching {
+        device: Device,
+        kernels: LayerKernels,
+        swiglu: SwiGlu,
+        weights: NarrowWeights,
+    }
+
+    impl Batching {
+        /// How many rows each sequence feeds at each of its steps.
+        ///
+        /// Three that differ in every way a neighbour can: the rows a step, the
+        /// steps taken, and — through [`Batching::rows_of`]'s salt — the values
+        /// in them. The third stops after one step, which is the early finisher.
+        const FEEDING: [&'static [usize]; 3] = [&[1, 1, 1, 1], &[3, 2, 1, 1], &[2]];
+
+        fn open() -> Option<Self> {
+            let device = device()?;
+            let kernels = LayerKernels::compile(&device).expect("the kernels compile");
+            let swiglu = SwiGlu::new(&device).expect("the kernel compiles");
+            Some(Self {
+                device,
+                kernels,
+                swiglu,
+                weights: NarrowWeights::new(),
+            })
+        }
+
+        fn rows_of(seq: usize, step: usize, rows: usize) -> Vec<f32> {
             (0..rows * NARROW.hidden)
                 .map(|i| {
                     let salt = (seq * 7 + step * 3) as f32;
                     ((i % 23) as f32 - 11.0 + salt) / 16.0
                 })
                 .collect()
-        };
+        }
 
-        let run = |slots: usize, of: &[usize]| -> Vec<Vec<Vec<f32>>> {
+        /// Each sequence alone, which is the batch of one and is the oracle
+        /// every batched arm is held against.
+        fn alone(&self) -> Vec<Vec<Vec<f32>>> {
+            let alone: Vec<Vec<Vec<f32>>> = (0..Self::FEEDING.len())
+                .map(|seq| {
+                    self.run(
+                        1,
+                        &[Stay {
+                            seq,
+                            slot: 0,
+                            from: 0,
+                        }],
+                    )
+                    .remove(0)
+                })
+                .collect();
+            assert_ne!(alone[0], alone[1], "two sequences to tell apart");
+            alone
+        }
+
+        /// Every stay's rows, in the order the stays were given.
+        fn run(&self, slots: usize, stays: &[Stay]) -> Vec<Vec<Vec<f32>>> {
             let narrow = Narrow {
-                device: &device,
-                kernels: &kernels,
-                swiglu: &swiglu,
+                device: &self.device,
+                kernels: &self.kernels,
+                swiglu: &self.swiglu,
                 slack: 0,
                 slots,
             };
             let stack = stack(
-                &device,
-                vec![narrow.layer(&weights, 0), narrow.layer(&weights, 0x99)],
+                &self.device,
+                vec![
+                    narrow.layer(&self.weights, 0),
+                    narrow.layer(&self.weights, 0x99),
+                ],
                 RETAINED_BUDGET,
             );
             let layers: Vec<DecoderLayer<'_>> = (0..2)
@@ -3059,7 +3243,7 @@ mod tests {
                     let held = stack.layer(at).expect("the layer is here");
                     DecoderLayer::new(
                         NARROW,
-                        weights.decoder(&held.attention),
+                        self.weights.decoder(&held.attention),
                         LayerMlp::Dense(DenseMlp::backend(
                             NARROW.hidden,
                             NARROW_FFN,
@@ -3070,32 +3254,59 @@ mod tests {
                 })
                 .collect();
 
-            let mut caches: Vec<[DecoderCache; 2]> = (0..of.len())
-                .map(|slot| {
-                    [0, 1].map(|_| {
-                        DecoderCache::new(NARROW, NARROW.hidden, KERNEL_SIZE).in_slot(slot)
-                    })
-                })
-                .collect();
+            let fresh = |slot: usize| {
+                [0, 1].map(|_| DecoderCache::new(NARROW, NARROW.hidden, KERNEL_SIZE).in_slot(slot))
+            };
+            let mut caches: Vec<[DecoderCache; 2]> = (0..slots).map(fresh).collect();
 
-            let steps = of
+            let steps = stays
                 .iter()
-                .map(|seq| feeding[*seq].len())
+                .map(|stay| stay.from + Self::FEEDING[stay.seq].len())
                 .max()
-                .expect("a sequence");
-            let mut produced: Vec<Vec<Vec<f32>>> = of.iter().map(|_| Vec::new()).collect();
+                .expect("a stay");
+            let mut produced: Vec<Vec<Vec<f32>>> = stays.iter().map(|_| Vec::new()).collect();
             for step in 0..steps {
-                let live: Vec<usize> = (0..of.len())
-                    .filter(|at| step < feeding[of[*at]].len())
+                // **The slot a stay begins in starts from nothing.** The span
+                // and the four windows are the slot's rather than the
+                // sequence's, and a cache carried over from the sequence before
+                // would have this one attend over its keys.
+                for stay in stays.iter().filter(|stay| stay.from == step) {
+                    caches[stay.slot] = fresh(stay.slot);
+                }
+                // **In slot order**, which is the order the call's rows are laid
+                // in: a seat is placed by the slot its cache names, so a step
+                // whose rows were laid in any other order would hand a
+                // sequence's rows to its neighbour's seat.
+                let mut live: Vec<usize> = (0..stays.len())
+                    .filter(|at| {
+                        let stay = stays[*at];
+                        (stay.from..stay.from + Self::FEEDING[stay.seq].len()).contains(&step)
+                    })
                     .collect();
+                live.sort_by_key(|at| stays[*at].slot);
+                let seated: Vec<usize> = live.iter().map(|at| stays[*at].slot).collect();
+                assert_eq!(
+                    seated.len(),
+                    seated
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len(),
+                    "two stays in one slot at step {step}"
+                );
                 if live.is_empty() {
                     continue;
                 }
-                let queries: Vec<usize> = live.iter().map(|at| feeding[of[*at]][step]).collect();
+
+                let queries: Vec<usize> = live
+                    .iter()
+                    .map(|at| Self::FEEDING[stays[*at].seq][step - stays[*at].from])
+                    .collect();
                 let x: Vec<f32> = live
                     .iter()
                     .zip(&queries)
-                    .flat_map(|(at, rows)| rows_of(of[*at], step, *rows))
+                    .flat_map(|(at, rows)| {
+                        Self::rows_of(stays[*at].seq, step - stays[*at].from, *rows)
+                    })
                     .collect();
 
                 let mut h = Passed::Rows(x);
@@ -3103,7 +3314,7 @@ mod tests {
                     let mut held: Vec<&mut DecoderCache> = caches
                         .iter_mut()
                         .enumerate()
-                        .filter(|(slot, _)| live.contains(slot))
+                        .filter(|(slot, _)| seated.contains(slot))
                         .map(|(_, pair)| &mut pair[at])
                         .collect();
                     let mut seats: Vec<Seat<'_>> = held
@@ -3132,31 +3343,6 @@ mod tests {
                 }
             }
             produced
-        };
-
-        // Each sequence alone, which is the batch of one and is the oracle.
-        let alone: Vec<Vec<Vec<f32>>> = (0..feeding.len())
-            .map(|seq| run(1, &[seq]).remove(0))
-            .collect();
-        assert_ne!(alone[0], alone[1], "two sequences to tell apart");
-
-        // Every ordering of the three, so that a sequence is checked at the
-        // front of a batch, in the middle of one and at the back of one.
-        for order in [
-            vec![0, 1, 2],
-            vec![2, 1, 0],
-            vec![1, 0, 2],
-            vec![1, 2, 0],
-            vec![0, 1],
-            vec![1, 0],
-        ] {
-            let batched = run(order.len(), &order);
-            for (at, seq) in order.iter().enumerate() {
-                assert_eq!(
-                    batched[at], alone[*seq],
-                    "sequence {seq} at position {at} of {order:?}"
-                );
-            }
         }
     }
 
