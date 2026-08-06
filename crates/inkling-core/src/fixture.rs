@@ -59,6 +59,25 @@ pub const LONG_ACTIVATIONS: &str = "long_activations.safetensors";
 /// without decoding it whole.
 pub const MXFP4: &str = "mxfp4_dequant.safetensors";
 
+/// The run lengths `just dump-routing-fixture` recorded: how many rows each
+/// expert was given, per MoE layer, at each length the block's tables are read
+/// at.
+///
+/// **The one fixture here that is a distribution rather than an answer**, and
+/// the reason it exists is that every table on the grouped matmul used to invent
+/// one. Laying 256 experts over the rows as `row * experts / rows` gives every
+/// expert the same run and puts every boundary on a block edge at any length
+/// that divides it — T5 found that layout was the whole of the flat 79% column
+/// `qmm_probe` read off mlx's gather and of the thirteen points this engine's
+/// own block appeared to gain between 2048 and 8192 tokens. A block's height is
+/// priced in exactly that term, so a height swept against those runs is a height
+/// chosen for a kernel nobody runs.
+///
+/// A router's runs are not that: the model gives its busiest expert 27 to 36
+/// times the mean and leaves 115 to 177 of its 256 with no rows at all, at every
+/// length.
+pub const ROUTING: &str = "routing.safetensors";
+
 /// mlx-vlm's answers to synthetic inputs for the two ops a dense layer is built
 /// from, from `just dump-op-fixture`.
 ///
@@ -194,6 +213,33 @@ pub fn indices(view: &TensorView<'_>) -> Vec<usize> {
     view.data()
         .chunks_exact(size_of::<i32>())
         .map(|b| i32::from_le_bytes(b.try_into().expect("chunked into ints")) as usize)
+        .collect()
+}
+
+/// The routing [`ROUTING`] recorded at one prompt length, a run length per
+/// expert per MoE layer.
+///
+/// **Every layer and not one**, because the routing is a property of the layer
+/// as much as of the text — the recorded spread between the flattest layer and
+/// the peakiest is a factor of three at every length — so a caller that wants
+/// one layer's runs picks it by a rule it states rather than by an index
+/// somebody chose.
+pub fn routing(ckpt: &Checkpoint, tokens: usize) -> Vec<Vec<usize>> {
+    let view = tensor(ckpt, &format!("routing_{tokens}"));
+    let [layers, experts] = view.shape() else {
+        panic!(
+            "a recorded routing is [layers, experts], not {:?}",
+            view.shape()
+        );
+    };
+    let counts = f32s(&view);
+    (0..*layers)
+        .map(|layer| {
+            counts[layer * experts..(layer + 1) * experts]
+                .iter()
+                .map(|&count| count as usize)
+                .collect()
+        })
         .collect()
 }
 

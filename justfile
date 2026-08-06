@@ -388,6 +388,23 @@ dump-stack-fixture:
 dump-moe-fixture model="models/Inkling-Small-mxfp4":
     reference/.venv/bin/python reference/scripts/dump_moe_fixture.py {{ model }}
 
+# Regenerate the committed run lengths the block's height sweep is read against.
+#
+# **The one fixture here whose subject is a distribution rather than an answer.**
+# Every table on the grouped matmul used to lay its experts over the rows as
+# `row * experts / rows`, which gives every expert the same run and puts every
+# boundary on a block edge at any length that divides — and T5 found that layout
+# was the whole of `gather_qmm`'s flat 79% column and of the thirteen points this
+# engine's own block appeared to gain between 2048 and 8192. A height is priced
+# in exactly that term, so a height swept against those runs is a height chosen
+# for a kernel nobody runs.
+#
+# What this records is `topk_idx` out of the reference's own `moe_tap`, per MoE
+# layer, at each length the block's tables are read at: about twenty minutes, and
+# most of it the 16384-token prefill.
+dump-routing-fixture model="models/Inkling-Small-mxfp4":
+    reference/.venv/bin/python reference/scripts/dump_routing.py {{ model }}
+
 # Regenerate the committed synthetic tensors the Rust CPU ops are tested against
 dump-op-fixture:
     reference/.venv/bin/python reference/scripts/dump_op_fixture.py
