@@ -1800,6 +1800,247 @@ fn which_kernels_own_a_decode_step_at_each_context() {
     }
 }
 
+/// The widths the batched table is taken at, which are B2's own sweep's without
+/// the two it can say nothing new about: 1 is the case that must not move, and
+/// 32 is where the curve it is read against ends.
+const BATCHED_WIDTHS: [usize; 5] = [1, 4, 8, 16, 32];
+
+/// What the profile files a layer's attention step under — two rows for one
+/// entry, because the 35 windowed layers and the 7 global ones are a number
+/// about neither summed.
+const ATTENTION_ROWS: [&str; 2] = ["windowed attention", "global attention"];
+
+/// **The batched per-kernel table B2 named and did not take**, at five widths
+/// and with the column that would have predicted its own win.
+///
+/// B2 shared the attention step between a batch's sequences and left four
+/// dispatches a layer that are still a slot's own — the key and value
+/// convolutions as one pair, the two head norms as one, and the two residual
+/// convolutions. Their count is 168 a slot against the step's 42, which on B1's
+/// reading makes them four times the prize; on the reading B2 established they
+/// are worth what their grids are short of the machine by, and nothing had
+/// measured that. **What decides whether they are worth a kernel change is the
+/// `groups` column against `WANTED_GROUPS`, not the `calls` one.**
+///
+/// **Both arms at every width**, for the reason the context table gives: a
+/// sampled step is a pass a dispatch and the per-slot kernels are the numerous
+/// ones, so the cost of asking grows with the batch and a table that did not
+/// print the unsampled step beside it could not say by how much.
+///
+/// Nothing here asserts a share or a grid ratio between kernels — that is the
+/// reading, and the reading is the report's. What is asserted is what the two
+/// tables above assert, plus the one thing the new column can be wrong about:
+/// **a batched attention dispatch's grid is the batch's rows and not a slot's.**
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn which_kernels_own_a_batched_step() {
+    let Some((dir, device)) = sampling_device() else {
+        return;
+    };
+    let config = fixture::config(&dir).text_config;
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+    let recorded = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+
+    let mut alone = 0.0;
+    for slots in BATCHED_WIDTHS {
+        let unsampled = batched_steps(&device, &gpu, &ckpt, &config, &recorded, slots, false);
+        let run = batched_steps(&device, &gpu, &ckpt, &config, &recorded, slots, true);
+        eprintln!("{}", step_table(&run.measured()));
+        eprintln!(
+            "  against a {:.2?} unsampled step of {:.2?} device time, so the rows carry \
+             {:+.1}% of asking",
+            unsampled.step,
+            unsampled.profile.gpu(),
+            100.0
+                * (run.profile.dispatched().as_secs_f64() / unsampled.profile.gpu().as_secs_f64()
+                    - 1.0)
+        );
+
+        let (timed, moved) = what_was_sampled(&run.profile);
+        let moved = moved as f64;
+        // **What a batch reads is between one step's bytes and N of them**, and
+        // both ends are the claim rather than one: the projections and both
+        // shared experts are read once between the sequences, and the routed
+        // banks are not — sixteen tokens draw about 80 distinct experts of 256
+        // where one draws six, so the bytes grow with the batch and grow slower
+        // than it. A batch of one is held to the checkpoint's own 5.9 GB, which
+        // is the figure the other four are read against.
+        if slots == 1 {
+            alone = moved;
+            assert!(
+                (5e9..7e9).contains(&moved),
+                "a batch of one moved {:.2} GB, where the checkpoint's active weights are 5.9",
+                moved / 1e9
+            );
+        } else {
+            assert!(
+                (alone..slots as f64 * alone).contains(&moved),
+                "a batch of {slots} moved {:.2} GB against {:.2} for one sequence, which is \
+                 outside the {:.2} to {:.2} a shared read has to land in",
+                moved / 1e9,
+                alone / 1e9,
+                alone / 1e9,
+                slots as f64 * alone / 1e9
+            );
+        }
+        let (dispatches, ..) = run.counters;
+        assert_eq!(
+            timed, dispatches,
+            "a batch of {slots} did not have all its dispatches timed"
+        );
+        assert!(
+            run.profile.dispatched() <= run.profile.gpu(),
+            "at a batch of {slots} the passes claim {:.2?} of command buffers the device clocked \
+             at {:.2?}",
+            run.profile.dispatched(),
+            run.profile.gpu()
+        );
+
+        // **A threadgroup to each query row of each head, over the whole
+        // batch.** The recorded prompt is short enough that no span has the
+        // tiles to be cut, so every attention dispatch is exactly one grid of
+        // `heads * slots` — which is the arithmetic B2's 32 dispatches of 32
+        // becoming one of 1024 is, and the one thing the column above can be
+        // wrong about. A row that read a slot's grid here would leave the table
+        // saying the step is as short of the machine at 32 as at 1.
+        let rows = run.profile.kernels();
+        for name in ATTENTION_ROWS {
+            let Some((_, attention)) = rows.iter().find(|(kernel, _)| *kernel == name) else {
+                panic!("a batch of {slots} ran no {name}");
+            };
+            assert_eq!(
+                attention.groups_a_dispatch(),
+                (config.num_attention_heads * slots) as f64,
+                "a batch of {slots} dispatched {name} over {} threadgroups",
+                attention.groups_a_dispatch()
+            );
+        }
+    }
+}
+
+/// `slots` sequences prefilled apart and then decoded together, timed over the
+/// steps after them.
+///
+/// **The prompts are rotated rather than copied**, for the reason `bench batch`
+/// gives: the routing is the prompt's, and a batch of identical sequences sends
+/// every row of every step to the same six experts — the one distribution a
+/// grouped dispatch is least like the real one at.
+///
+/// **The prefills and the first [`SETTLED`] steps are outside the clock.** A
+/// width is a fresh wrap, and a slot is buffers this device has not allocated
+/// before, so what the first steps of a width pay for belongs to the wrap: the
+/// batch of one read 25.9 ms against its own 16.4 unsettled.
+fn batched_steps(
+    device: &Device,
+    gpu: &Kernels<'_>,
+    ckpt: &Checkpoint,
+    config: &inkling_core::TextConfig,
+    ids: &[usize],
+    slots: usize,
+    sampling: bool,
+) -> BatchedSteps {
+    device
+        .time_each_dispatch(sampling)
+        .expect("the device times a dispatch");
+    let weights = gpu.wrap_batch(ckpt, config, slots);
+    let generator = weights.generator();
+    let mut caches: Vec<ModelCache> = (0..slots)
+        .map(|slot| ModelCache::in_slot(config, 0, slot))
+        .collect();
+    let want = Tail {
+        block: 1,
+        chained: false,
+        logits: false,
+    };
+    let mut pending: Vec<usize> = caches
+        .iter_mut()
+        .enumerate()
+        .map(|(slot, cache)| {
+            let mut prompt = ids.to_vec();
+            prompt.rotate_left(slot % ids.len());
+            generator.tailed(cache, &prompt, want, &weights).picks[0]
+        })
+        .collect();
+
+    let step = |pending: &[usize], caches: &mut [ModelCache]| -> Vec<usize> {
+        let feeding: Vec<[usize; 1]> = pending.iter().map(|id| [*id]).collect();
+        let mut batch: Vec<Batched<'_>> = caches
+            .iter_mut()
+            .zip(&feeding)
+            .map(|(cache, ids)| Batched { cache, ids })
+            .collect();
+        generator
+            .step_batch(&mut batch, &weights)
+            .iter()
+            .map(Picked::last)
+            .collect()
+    };
+
+    for _ in 0..SETTLED {
+        pending = step(&pending, &mut caches);
+    }
+
+    profile::take();
+    device.record_round_trips(true);
+    device.round_trips();
+    let before = counters(device);
+    let started = Instant::now();
+    for _ in 0..CHARGED {
+        pending = step(&pending, &mut caches);
+    }
+    let elapsed = started.elapsed();
+    let charged = CHARGED as u32;
+    let (dispatches, submissions, allocations, bytes) = since(before, counters(device));
+    let each = |total: u64| total / u64::from(charged);
+    let steps = BatchedSteps {
+        slots,
+        prompt: ids.len(),
+        step: elapsed / charged,
+        counters: (
+            each(dispatches),
+            each(submissions),
+            each(allocations),
+            each(bytes),
+        ),
+        profile: profile::take().per_step(charged),
+        round_trips: device.round_trips(),
+    };
+    device.record_round_trips(false);
+    steps
+}
+
+/// One batched decode step, priced the way a single sequence's is.
+struct BatchedSteps {
+    slots: usize,
+    prompt: usize,
+    step: Duration,
+    counters: (u64, u64, u64, u64),
+    profile: Profile,
+    round_trips: Vec<RoundTrip>,
+}
+
+impl BatchedSteps {
+    /// The batch as the tables read a regime, which is where it is put beside a
+    /// decode step, a prefill and a chain of heads.
+    fn measured(&self) -> Measured<'_> {
+        let first = self.prompt + SETTLED;
+        Measured {
+            regime: format!(
+                "step over a batch of {}, {}-token prompts and {first} to {} keys",
+                self.slots,
+                self.prompt,
+                first + CHARGED - 1
+            ),
+            step: self.step,
+            steps: CHARGED as u32,
+            counters: self.counters,
+            profile: &self.profile,
+            round_trips: &self.round_trips,
+        }
+    }
+}
+
 /// **What the step after a prefill is paying for**, which every decode figure in
 /// this file takes out and none of them has ever priced.
 ///
@@ -3650,10 +3891,14 @@ struct Kernels<'d> {
 }
 
 impl<'d> Kernels<'d> {
+    /// Under [`numerics`], the way [`OnTheDevice::running`] compiles its own —
+    /// so that the batched table is reachable on both sides of the flag, which
+    /// is what a table that is anyone's arbiter has to be. Unset is the
+    /// reference, which is what every gated case here is written against.
     fn compile(device: &'d Device) -> Self {
         Self {
             device,
-            layers: LayerKernels::compile(device).expect("the layer kernels compile"),
+            layers: LayerKernels::compiling(device, numerics()).expect("the layer kernels compile"),
             dense: DenseMatmul::new(device).expect("the dense matmul compiles"),
             swiglu: SwiGlu::new(device).expect("the swiglu compiles"),
             router: Router::new(device).expect("the router compiles"),
