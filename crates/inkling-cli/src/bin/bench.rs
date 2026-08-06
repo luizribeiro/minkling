@@ -95,7 +95,7 @@ const USAGE: &str = "usage:\n  \
     bench session <checkpoint> [--tokens <n>] [--reuse-tokens <n>] [--numerics <which>]\n  \
     bench batch   <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>]\n  \
     bench clock   <checkpoint> [--tokens <n>] [--context <n>] [--idle <ms>] \
-[--every <ms>] [--prefill <n>] [--batch <n>]\n  \
+[--every <ms>] [--burst <n>] [--prefill <n>] [--batch <n>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench diverge <checkpoint> [--tokens <n>] [--against <which>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
@@ -249,9 +249,9 @@ enum Job {
         /// clock measurement runs *this* width and repeats it, which is what
         /// lets a gap be held constant while the work either side of it grows.
         widest: Option<usize>,
-        /// What is left between one unit of work and the next, which only the
-        /// clock measurement has anywhere to put.
-        gap: Gap,
+        /// What is left between two bursts of work and how many units are in
+        /// one, which only the clock measurement has anywhere to put.
+        shape: Shape,
         /// The prompt each of the clock measurement's units prefills, and zero
         /// for the decode step it charges otherwise.
         prefill: usize,
@@ -331,6 +331,7 @@ impl Job {
         // cycle this means something by, and so is a prompt of no tokens.
         let mut idle = None;
         let mut every = None;
+        let mut burst = None;
         let mut prefill = None;
         // A sweep runs every depth up to its own, where a cross-engine table
         // quotes one beside `k = 0` — so the default depth is what the flag
@@ -366,6 +367,7 @@ impl Job {
                 "--every" => {
                     every = Some(Duration::from_millis(count(&arg, &mut args)? as u64));
                 }
+                "--burst" => burst = Some(count(&arg, &mut args)?),
                 "--prefill" => prefill = Some(count(&arg, &mut args)?),
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
                 _ => checkpoints.push(PathBuf::from(arg)),
@@ -422,10 +424,12 @@ impl Job {
         // and says so nowhere, which is the whole of what this measurement
         // exists to fix — so the two levers are refused to the measurements that
         // could only drop them, under the same rule as the numbers above.
-        if what != What::Clock && (idle.is_some() || every.is_some() || prefill.is_some()) {
+        if what != What::Clock
+            && (idle.is_some() || every.is_some() || burst.is_some() || prefill.is_some())
+        {
             bail!(
-                "{what:?} takes no --idle, --every or --prefill: it does not vary its own duty \
-                 cycle"
+                "{what:?} takes no --idle, --every, --burst or --prefill: it does not vary its \
+                 own duty cycle"
             );
         }
         // **A gap and an interval are two answers to one question**, and the
@@ -474,9 +478,12 @@ impl Job {
             numerics: numerics.unwrap_or_default(),
             reuse: reuse.unwrap_or(DEFAULT_BOUND),
             widest,
-            gap: match every {
-                Some(period) => Gap::Every(period),
-                None => Gap::After(idle.unwrap_or_default()),
+            shape: Shape {
+                gap: match every {
+                    Some(period) => Gap::Every(period),
+                    None => Gap::After(idle.unwrap_or_default()),
+                },
+                burst: burst.unwrap_or(1),
             },
             prefill: prefill.unwrap_or(0),
         })
@@ -565,7 +572,7 @@ impl Job {
                 numerics,
                 reuse,
                 widest,
-                gap,
+                shape,
                 prefill,
             } => {
                 let asked = Asked {
@@ -575,7 +582,7 @@ impl Job {
                     numerics: *numerics,
                     reuse: *reuse,
                     widest: *widest,
-                    gap: *gap,
+                    shape: *shape,
                     prefill: *prefill,
                 };
                 for reading in measure(*what, checkpoint, asked)? {
@@ -775,9 +782,9 @@ struct Asked {
     /// How many sequences a unit of work decodes through: the widest of the
     /// sweep's doubling, or the one width the clock measurement repeats.
     widest: Option<usize>,
-    /// What the clock measurement leaves between its units, ignored by
-    /// everything else.
-    gap: Gap,
+    /// The shape the clock measurement puts its units in, ignored by everything
+    /// else.
+    shape: Shape,
     /// The prompt each of the clock measurement's units prefills, and zero for
     /// the decode step it charges otherwise.
     prefill: usize,
@@ -791,7 +798,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
         numerics,
         reuse,
         widest,
-        gap,
+        shape,
         prefill,
     } = asked;
     let config = config::of_checkpoint(dir)?;
@@ -970,15 +977,16 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     text,
                     &unit,
                     tokens,
-                    gap,
+                    shape,
                 );
                 eprintln!(
                     "clock: {} {}, {}",
                     ticks.len(),
                     unit.over(ticks.len()),
-                    gap.said(),
+                    shape.said(),
                 );
                 taken.extend(clocked(&ticks));
+                taken.extend(after_a_gap(&ticks, shape.burst));
             }
             What::Prefill => {
                 // A prefill is one step and its prompt is the measurement, so
@@ -1373,15 +1381,15 @@ fn ticked(
     config: &TextConfig,
     unit: &Unit,
     count: usize,
-    gap: Gap,
+    shape: Shape,
 ) -> Vec<Tick> {
     profile::take();
-    let mut ticking = Ticking::new(gap, count + 1);
-    let warmed = match unit {
+    let mut ticking = Ticking::new(shape, count);
+    match unit {
         // Every step of one generation rather than a generation apiece, so that
-        // the gap `--idle` leaves falls between two decode steps — which is the
-        // occupancy this arm exists to move. What it costs is the growing key
-        // count [`Unit`] describes.
+        // the gap falls between two decode steps — which is the occupancy this
+        // arm exists to move. What it costs is the growing key count [`Unit`]
+        // describes.
         Unit::Step(ids) => {
             let generator = weights.generator();
             let cache = &mut ModelCache::speculating(config, 0);
@@ -1389,41 +1397,92 @@ fn ticked(
                 budget: count + 1,
                 eos: None,
             };
+            // The prompt's own prefill, which is not a decode step: it opens the
+            // run rather than being timed inside it.
+            let mut opened = false;
             let mut sink = |_| {
-                ticking.tick(profile::take().gpu());
+                let gpu = profile::take().gpu();
+                match opened {
+                    true => ticking.tick(gpu),
+                    false => {
+                        opened = true;
+                        ticking.settled();
+                    }
+                }
                 ControlFlow::Continue(())
             };
             generator.stream(cache, ids, ending, weights, &mut sink);
-            1
         }
         // The gap falls between two steps of one batch, as it does between two
         // steps of one generation: what moves is how much work the period holds
         // either side of it.
         Unit::Batch(ids, slots) => {
             let mut seated = Seated::new(weights, config, ids, *slots);
-            // The prefills and the settling steps off both accounts before the
-            // first timed one, which is what the single-sequence arm's
-            // discarded first tick does for it. Unsettled, the first period is
-            // the seating — 1.30 s of wall around 24 ms of device, which is a
-            // duty cycle of 1.9% this measurement would report as the machine's.
             ticking.settled();
             for _ in 0..count {
                 seated.step(weights);
                 ticking.tick(profile::take().gpu());
             }
-            0
         }
         Unit::Prefill(ids) => {
-            for _ in 0..count + 1 {
+            // The repetition that faults the pages in, which every later one
+            // reads without paying for.
+            generate(weights, None, config, ids, 1, 0);
+            ticking.settled();
+            for _ in 0..count {
                 let run = generate(weights, None, config, ids, 1, 0);
                 ticking.tick(run.gpu);
             }
-            1
         }
+    }
+    ticking.ticks
+}
+
+/// What a unit of work cost by where in its burst it ran.
+///
+/// **This is what separates a clock that follows the occupancy from one that
+/// ramps after a gap**, and a mean cannot tell them apart. A part that pays a
+/// fixed ramp for having been idle pays it once a burst: the unit after the gap
+/// is dear and the ones behind it are not. A part running a lower clock because
+/// the period is mostly idle pays the same on every unit of the burst, however
+/// long ago the gap was.
+///
+/// Whole bursts only. A run whose count does not divide would otherwise report
+/// its early positions over one more burst than its late ones, which is a
+/// difference between the columns that is nothing but where the run stopped.
+fn after_a_gap(ticks: &[Tick], burst: usize) -> Vec<Reading> {
+    let whole = ticks.len() / burst.max(1) * burst.max(1);
+    if burst < 2 || whole == 0 {
+        return Vec::new();
+    }
+    let at = |position: usize| {
+        let held: Vec<Duration> = ticks[..whole]
+            .iter()
+            .skip(position)
+            .step_by(burst)
+            .map(|tick| tick.gpu)
+            .collect();
+        held.iter().sum::<Duration>() / held.len() as u32
     };
-    let mut ticks = ticking.ticks;
-    ticks.drain(..warmed.min(ticks.len()));
-    ticks
+    let positions: Vec<Duration> = (0..burst).map(at).collect();
+    let furthest = *positions.last().expect("a burst of at least two positions");
+
+    eprintln!("  in burst     device    against the {burst}th, which is furthest from the gap");
+    let mut readings = Vec::new();
+    for (position, held) in positions.iter().enumerate() {
+        eprintln!(
+            "  {:>8}  {:>9.4?}    {:+.2}%",
+            position + 1,
+            held,
+            against(*held, furthest)
+        );
+        readings.push(Reading::new(
+            format!("at{}.device", position + 1),
+            millis(*held),
+            "ms",
+        ));
+    }
+    readings
 }
 
 /// What a run leaves between one unit of work and the next.
@@ -1465,43 +1524,89 @@ impl Gap {
     }
 }
 
-/// The clock a run of units is timed on, and the gap it leaves after each of
+/// The shape a run puts its work in: what it leaves between two gaps, and how
+/// many units it answers between them.
+///
+/// **A burst is what makes the gap a server's rather than a metronome's.** A
+/// request arriving every 200 ms is not one step every 200 ms — it is however
+/// many steps that request needs, back to back, and then an idle device until
+/// the next one. The two are the same duty cycle at different gap lengths,
+/// which is the pair that says which of the two a slower clock is a function
+/// of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Shape {
+    gap: Gap,
+    burst: usize,
+}
+
+impl Shape {
+    /// How the header says it: the gap, and the units it falls between.
+    fn said(&self) -> String {
+        match self.burst {
+            1 => self.gap.said(),
+            burst => format!("{}, {burst} of them a burst", self.gap.said()),
+        }
+    }
+}
+
+/// The clock a run of units is timed on, and the gap it leaves between bursts of
 /// them.
 ///
 /// A type rather than a closure because both arms of [`ticked`] keep the same
-/// two pieces of state and one of them reaches it from inside a sink the
-/// generator drives.
+/// state and one of them reaches it from inside a sink the generator drives.
 struct Ticking {
+    /// When the unit now running began, which is what its own period is
+    /// measured from.
     at: Instant,
-    gap: Gap,
+    /// When the burst now running began, which is what a rate is measured from:
+    /// a request answered by four steps is one request whatever the four cost.
+    opened: Instant,
+    shape: Shape,
     ticks: Vec<Tick>,
 }
 
 impl Ticking {
-    fn new(gap: Gap, count: usize) -> Self {
+    fn new(shape: Shape, count: usize) -> Self {
+        let now = Instant::now();
         Self {
-            at: Instant::now(),
-            gap,
+            at: now,
+            opened: now,
+            shape,
             ticks: Vec::with_capacity(count),
         }
     }
 
-    /// Both clocks back to zero after work nobody is timing, which is what the
-    /// arms that discard a first unit get by discarding it: the first period
-    /// opens where the first timed unit does and not where the run did.
+    /// Both clocks back to zero after work nobody is timing, and a full gap
+    /// before the first unit that is.
+    ///
+    /// **The gap is left here for the same reason it is left between two units**:
+    /// every timed unit is preceded by one, so the first is too. A run that
+    /// opened straight out of its own prefills would have its first unit — and
+    /// with a burst, its whole first position — measured off a device that had
+    /// been busy right up to it, which is the one thing this measurement is
+    /// about.
     fn settled(&mut self) {
+        let idle = self.shape.gap.idle(Duration::ZERO);
+        if !idle.is_zero() {
+            std::thread::sleep(idle);
+        }
         profile::take();
         self.at = Instant::now();
+        self.opened = self.at;
     }
 
-    /// One unit finished for `gpu` of device time, the gap it is followed by,
-    /// and the period the two of them are.
+    /// One unit finished for `gpu` of device time, whatever gap follows it, and
+    /// the period the two of them are.
     ///
     /// The sleep is behind a test so that a run asking for no gap makes no
     /// syscall a run of any other measurement here would not: what this is
     /// timing is a decode step, and a decode step's own host side is 8% of it.
     fn tick(&mut self, gpu: Duration) {
-        let idle = self.gap.idle(self.at.elapsed());
+        let ending = (self.ticks.len() + 1) % self.shape.burst == 0;
+        let idle = match ending {
+            true => self.shape.gap.idle(self.opened.elapsed()),
+            false => Duration::ZERO,
+        };
         if !idle.is_zero() {
             std::thread::sleep(idle);
         }
@@ -1510,6 +1615,9 @@ impl Ticking {
             gpu,
         });
         self.at = Instant::now();
+        if ending {
+            self.opened = self.at;
+        }
     }
 }
 
@@ -2385,7 +2493,10 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                gap: Gap::After(Duration::ZERO),
+                shape: Shape {
+                    gap: Gap::After(Duration::ZERO),
+                    burst: 1,
+                },
                 prefill: 0,
             }
         );
@@ -2400,7 +2511,10 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                gap: Gap::After(Duration::ZERO),
+                shape: Shape {
+                    gap: Gap::After(Duration::ZERO),
+                    burst: 1,
+                },
                 prefill: 0,
             }
         );
@@ -2423,7 +2537,10 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                gap: Gap::After(Duration::ZERO),
+                shape: Shape {
+                    gap: Gap::After(Duration::ZERO),
+                    burst: 1,
+                },
                 prefill: 0,
             }
         );
@@ -2452,7 +2569,10 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: 0,
                 widest: None,
-                gap: Gap::After(Duration::ZERO),
+                shape: Shape {
+                    gap: Gap::After(Duration::ZERO),
+                    burst: 1,
+                },
                 prefill: 0,
             }
         );
@@ -2488,7 +2608,10 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: Some(8),
-                gap: Gap::After(Duration::ZERO),
+                shape: Shape {
+                    gap: Gap::After(Duration::ZERO),
+                    burst: 1,
+                },
                 prefill: 0,
             }
         );
@@ -2551,12 +2674,15 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                gap: Gap::After(Duration::from_millis(40)),
+                shape: Shape {
+                    gap: Gap::After(Duration::from_millis(40)),
+                    burst: 1,
+                },
                 prefill: 0,
             }
         );
         for what in ["decode", "prefill", "sweep", "engines", "session", "batch"] {
-            for lever in [["--idle", "40"], ["--prefill", "2048"]] {
+            for lever in [["--idle", "40"], ["--prefill", "2048"], ["--burst", "4"]] {
                 let given = [what, "models/small"].map(str::to_string);
                 assert!(
                     Job::parse(given.into_iter().chain(lever.map(str::to_string))).is_err(),
@@ -2584,7 +2710,10 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                gap: Gap::After(Duration::ZERO),
+                shape: Shape {
+                    gap: Gap::After(Duration::ZERO),
+                    burst: 1,
+                },
                 prefill: 2048,
             }
         );
@@ -2643,7 +2772,7 @@ mod tests {
                 Job::parse(["clock", "models/small", "--every", "200"].map(str::to_string))
                     .expect("parses"),
                 Job::Measure {
-                    gap: Gap::Every(period),
+                    shape: Shape { gap: Gap::Every(period), .. },
                     ..
                 } if period == Duration::from_millis(200)
             ),
@@ -2661,6 +2790,64 @@ mod tests {
         }
     }
 
+    /// **A burst is units back to back and one gap behind them**, which is the
+    /// shape a request has and a metronome does not. A run that slept after
+    /// every unit of a burst would be reporting a gap the server never left.
+    #[test]
+    fn a_gap_falls_behind_a_burst_and_not_inside_one() {
+        const GAP: Duration = Duration::from_millis(40);
+        let mut ticking = Ticking::new(
+            Shape {
+                gap: Gap::After(GAP),
+                burst: 3,
+            },
+            6,
+        );
+        let started = Instant::now();
+        for _ in 0..6 {
+            ticking.tick(Duration::from_micros(100));
+        }
+        let whole = started.elapsed();
+
+        for ending in [2, 5] {
+            assert!(
+                ticking.ticks[ending].wall >= GAP,
+                "the period closing burst {} holds no gap: {:?}",
+                ending / 3 + 1,
+                ticking.ticks[ending].wall
+            );
+        }
+        // Two gaps for six units, which is what separates a burst from a
+        // metronome: one after each of six would be 240 ms.
+        assert!(
+            whole < 4 * GAP,
+            "six units left more than two gaps: {whole:?}"
+        );
+    }
+
+    /// **What a unit cost by where in its burst it ran is what a mean cannot
+    /// say**: a part that ramps once after a gap and a part running slower for
+    /// the whole period report the same mean and a different table.
+    #[test]
+    fn a_burst_says_what_each_of_its_positions_cost() {
+        // Four bursts of three, each dear in its first position and flat behind
+        // it — a ramp paid once a gap.
+        let ramped = ticks(&[20_000, 15_000, 15_000].repeat(4), &[20_000; 12]);
+        let readings = after_a_gap(&ramped, 3);
+        assert_eq!(names(&readings), ["at1.device", "at2.device", "at3.device"]);
+        reads(&readings, "at1.device", 20.0);
+        reads(&readings, "at3.device", 15.0);
+        // Whole bursts only: a thirteenth unit belongs to a burst that did not
+        // finish, and counting it would put one more reading in the first
+        // position than in the last.
+        let mut uneven = ramped.clone();
+        uneven.push(ticks(&[90_000], &[90_000])[0]);
+        reads(&after_a_gap(&uneven, 3), "at1.device", 20.0);
+        // And a run of one unit a gap has one position, which is the mean it
+        // already reports.
+        assert!(after_a_gap(&ramped, 1).is_empty());
+    }
+
     /// **A gap of nothing is a gap this measurement means something by** — it is
     /// the arm every other measurement here runs at and the one the idled arm is
     /// compared against — so `--idle 0` is a run rather than a refusal, unlike
@@ -2670,7 +2857,7 @@ mod tests {
         let job = Job::parse(["clock", "models/small", "--idle", "0"].map(str::to_string))
             .expect("a gap of nothing parses");
         assert!(
-            matches!(job, Job::Measure { gap, .. } if gap == Gap::After(Duration::ZERO)),
+            matches!(job, Job::Measure { shape, .. } if shape.gap == Gap::After(Duration::ZERO)),
             "{job:?}"
         );
     }
@@ -2706,7 +2893,13 @@ mod tests {
     /// the seating as a duty cycle the machine never ran at.
     #[test]
     fn the_first_period_opens_after_the_work_nobody_timed() {
-        let mut ticking = Ticking::new(Gap::After(Duration::ZERO), 4);
+        let mut ticking = Ticking::new(
+            Shape {
+                gap: Gap::After(Duration::ZERO),
+                burst: 1,
+            },
+            4,
+        );
         let opened = ticking.at;
         let seating = Duration::from_millis(2);
         std::thread::sleep(seating);
@@ -3217,7 +3410,10 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                gap: Gap::After(Duration::ZERO),
+                shape: Shape {
+                    gap: Gap::After(Duration::ZERO),
+                    burst: 1,
+                },
                 prefill: 0,
             }
         );
