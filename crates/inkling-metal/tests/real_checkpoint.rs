@@ -3300,6 +3300,90 @@ fn which_kernels_own_a_chain_of_heads() {
     );
 }
 
+/// **The test this milestone lives or dies by, on the real checkpoint.**
+///
+/// The same prompt, generated alone and generated inside a batch, produces
+/// identical tokens: at every position of the batch, beside neighbours whose
+/// prompts are different lengths, and beside a neighbour that finishes early.
+///
+/// **Every existing check here is blind to what a batch breaks.** If sequence
+/// A's span, convolution window or rows leak into B, both continuations are
+/// still fluent text and the recorded eight-token continuation still passes —
+/// the sequence that carries it is one of the batch's, and it is checked
+/// against the oracle here as well, but agreeing with the oracle is not the
+/// claim. The claim is that the *other* sequences are unmoved too, and only a
+/// token-for-token comparison against each of them run alone says so.
+///
+/// One of the prompts is the oracle's own, so this is the recorded
+/// continuation asserted from inside a batch as well as beside one.
+#[test]
+fn a_generation_in_a_batch_produces_what_it_produces_alone_on_the_device() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let config = fixture::config(&dir).text_config;
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+
+    let recorded = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+    let oracle = indices(&fixture::tensor(
+        &fixture::open(ACTIVATIONS),
+        "greedy_continuation",
+    ));
+    // Three prompts of three different lengths, the first of them the oracle's.
+    let prompts: Vec<Vec<usize>> = vec![
+        recorded.clone(),
+        recorded[..recorded.len() / 2].to_vec(),
+        recorded[recorded.len() - 3..].to_vec(),
+    ];
+    // The third stops two tokens early, which is a neighbour leaving the batch
+    // while the others go on.
+    let counts = [BATCHED, BATCHED, BATCHED - 2];
+
+    let alone: Vec<Vec<usize>> = {
+        let weights = gpu.wrap(&ckpt, &config, 0);
+        let generator = weights.generator();
+        prompts
+            .iter()
+            .zip(&counts)
+            .map(|(prompt, count)| {
+                generator.generate(&mut ModelCache::new(&config), prompt, *count, &weights)
+            })
+            .collect()
+    };
+    assert_eq!(
+        alone[0],
+        oracle[..BATCHED],
+        "the recorded continuation, generated alone"
+    );
+    assert_ne!(alone[0], alone[1], "two generations to tell apart");
+
+    for order in [vec![0, 1, 2], vec![2, 1, 0], vec![1, 0], vec![0, 2]] {
+        let weights = gpu.wrap_batch(&ckpt, &config, order.len());
+        let generator = weights.generator();
+        let mut caches: Vec<ModelCache> = (0..order.len())
+            .map(|slot| ModelCache::in_slot(&config, 0, slot))
+            .collect();
+        let ids: Vec<&[usize]> = order.iter().map(|at| prompts[*at].as_slice()).collect();
+        let budgets: Vec<usize> = order.iter().map(|at| counts[*at]).collect();
+        let batched = generator.generate_batch(&mut caches, &ids, &budgets, &weights);
+
+        for (at, seq) in order.iter().enumerate() {
+            assert_eq!(
+                batched[at], alone[*seq],
+                "sequence {seq} at position {at} of {order:?}"
+            );
+        }
+    }
+}
+
+/// How many tokens each sequence of the batched case generates.
+///
+/// Short, because the case runs every ordering of three sequences and each
+/// token is a decode step of the whole stack — and long enough that a step
+/// reads what more than one step before it left, a convolution's window being
+/// three inputs deep.
+const BATCHED: usize = 4;
+
 /// The kernels a speculative run compiles, held so that the weights wrapped
 /// against them can be built once per depth.
 struct Kernels<'d> {
@@ -3338,7 +3422,21 @@ impl<'d> Kernels<'d> {
     where
         'd: 'a,
     {
-        self.wrapping(ckpt, config, slack, true)
+        self.wrapping(ckpt, config, slack, true, 1)
+    }
+
+    /// The same, holding `slots` sequences at once — see
+    /// [`StackShape::slots`](inkling_metal::StackShape).
+    fn wrap_batch<'a>(
+        &'a self,
+        ckpt: &'a Checkpoint,
+        config: &'a inkling_core::TextConfig,
+        slots: usize,
+    ) -> CheckpointWeights<'a>
+    where
+        'd: 'a,
+    {
+        self.wrapping(ckpt, config, 0, true, slots)
     }
 
     /// The same, with the final norm and the muP divide left on the CPU and
@@ -3352,7 +3450,7 @@ impl<'d> Kernels<'d> {
     where
         'd: 'a,
     {
-        self.wrapping(ckpt, config, 0, false)
+        self.wrapping(ckpt, config, 0, false, 1)
     }
 
     fn wrapping<'a>(
@@ -3361,6 +3459,7 @@ impl<'d> Kernels<'d> {
         config: &'a inkling_core::TextConfig,
         slack: usize,
         tail: bool,
+        slots: usize,
     ) -> CheckpointWeights<'a>
     where
         'd: 'a,
@@ -3395,7 +3494,7 @@ impl<'d> Kernels<'d> {
                 layers: config.num_hidden_layers,
                 dim: config.hidden_size,
                 slack,
-                slots: 1,
+                slots,
             },
         )
         .expect("the layers wrap");
