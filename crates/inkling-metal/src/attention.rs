@@ -45,7 +45,6 @@
 //! not have to — the tensor of scores is as quadratic as the mask, and neither
 //! is formed.
 
-use std::borrow::Cow;
 use std::cell::{Cell, RefCell, RefMut};
 
 use inkling_core::attention::AttentionConfig;
@@ -566,15 +565,24 @@ impl FusedAttention {
     /// line the two above cannot draw: a call of a handful of rows reaches
     /// neither of them and would still have a block walk the whole span for
     /// rows it throws away.
+    ///
+    /// **A call carrying more than one sequence is refused, and that is a
+    /// correctness line rather than a rate.** A block stages one tile of keys
+    /// for the [`MMA_ROWS_A_BLOCK`] query rows that share it, so rows attending
+    /// over different spans cannot be in one — where the entry above walks a
+    /// span per query row and can. A batched decode step of 32 sequences is 32
+    /// query rows and would otherwise clear the floor.
     fn blocked(
         &self,
         sliding: usize,
         queries: usize,
         head_dim: usize,
         splits: usize,
+        sequences: usize,
         floor: usize,
     ) -> Option<&Kernel> {
         let worth = splits == 1
+            && sequences == 1
             && queries >= floor
             && head_dim <= MMA_MOST_CHANNELS
             && head_dim % MMA_FRAGMENT == 0;
@@ -625,15 +633,12 @@ fn keys_walked(position: usize, keys: usize, sliding: usize, tile: usize) -> usi
 ///
 /// Summed rather than closed-form, because the bound above is the kernel's and a
 /// second expression for it is a second thing that can drift from the source.
-fn keys_a_call_walks(
-    queries: usize,
-    q_offset: usize,
-    keys: usize,
-    sliding: usize,
-    tile: usize,
-) -> usize {
-    (0..queries)
-        .map(|i| keys_walked(q_offset + i, keys, sliding, tile))
+fn keys_a_call_walks(walking: &Walking, sliding: usize, tile: usize) -> usize {
+    (0..walking.queries())
+        .map(|i| {
+            let (_, keys, position) = walking.at(i);
+            keys_walked(position, keys, sliding, tile)
+        })
         .sum()
 }
 
@@ -645,13 +650,15 @@ fn keys_a_call_walks(
 /// the union of its rows' spans — the first row's `reach` to the last live row's
 /// `last` — which is what the kernel's own bound takes and is what the rows
 /// inside it then mask themselves out of.
-fn keys_the_blocks_walk(queries: usize, q_offset: usize, keys: usize, sliding: usize) -> usize {
+fn keys_the_blocks_walk(walking: &Walking, sliding: usize) -> usize {
+    let queries = walking.queries();
     (0..queries.div_ceil(MMA_ROWS_A_BLOCK))
         .map(|block| {
             let first = block * MMA_ROWS_A_BLOCK;
             let lastrow = (first + MMA_ROWS_A_BLOCK).min(queries) - 1;
-            let to = keys.min(lastrow + q_offset + 1);
-            let opening = first + q_offset;
+            let (_, keys, last) = walking.at(lastrow);
+            let to = keys.min(last + 1);
+            let opening = walking.at(first).2;
             let from = match sliding {
                 0 => 0,
                 window if opening >= window => {
@@ -1225,13 +1232,20 @@ impl<'a> LayerAttention<'a> {
                 k: &mut k,
                 v: &mut v,
                 rel: &mut rel,
-                keys,
                 key_stride: keys,
-                span: 0,
-                taus: step.taus,
-                q_offset: step.q_offset,
-                first: 0,
-                rows,
+                // One sequence over a span handed over whole: its keys start at
+                // row zero of the binding and it is the whole of the call.
+                walking: &walking(
+                    &[Attending {
+                        slot: 0,
+                        first: 0,
+                        queries: rows,
+                        q_offset: step.q_offset,
+                        taus: step.taus,
+                    }],
+                    |_| (0, keys),
+                    rows,
+                ),
             },
             &mut out,
         )?;
@@ -1268,38 +1282,39 @@ impl<'a> LayerAttention<'a> {
         let mut out = self
             .device
             .zeroed::<f32>(rows * self.config.heads * self.config.head_dim)?;
-        self.encode_into(
-            batch,
-            spans,
+        let alone = [Attending {
             slot,
-            q,
-            rel,
-            taus,
+            first: 0,
+            queries: rows,
             q_offset,
-            Placed::alone(rows),
-            &mut out,
-        )?;
+            taus,
+        }];
+        self.encode_into(batch, spans, q, rel, &alone, rows, &mut out)?;
         Ok(out)
     }
 
-    /// The same step, writing its rows into an answer the caller owns rather
-    /// than one of its own — which is what a batch needs of it: N sequences
-    /// attend over N spans and one `o_proj` reads what they all produced.
+    /// **The step for every sequence of a batch at once**, writing their rows
+    /// into an answer the caller owns rather than into one apiece.
+    ///
+    /// One dispatch and not one a slot, which is what a per-row slot index buys:
+    /// the spans are runs of one allocation and the queries are rows of one
+    /// buffer, so what tells a thread which sequence it is working for is the
+    /// row it was given rather than the dispatch it is in. A sequence advancing
+    /// alone is a batch of one and encodes what it always encoded.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_into(
         &self,
         batch: &mut Batch<'_>,
         spans: &mut KeyValues,
-        slot: usize,
         q: &mut Buffer<f32>,
         rel: &mut Buffer<f32>,
-        taus: Option<&[f32]>,
-        q_offset: usize,
-        placed: Placed,
+        attending: &[Attending<'_>],
+        rows: usize,
         out: &mut Buffer<f32>,
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
-        let (keys, key_stride, span) = (spans.held(slot), spans.stride(), spans.base(slot));
+        let key_stride = spans.stride();
+        let walking = walking(attending, |slot| (spans.base(slot), spans.held(slot)), rows);
         self.encoding(
             batch,
             Encoding {
@@ -1307,13 +1322,8 @@ impl<'a> LayerAttention<'a> {
                 k: &mut spans.keys,
                 v: &mut spans.values,
                 rel,
-                keys,
                 key_stride,
-                span,
-                taus,
-                q_offset,
-                first: placed.first,
-                rows: placed.rows,
+                walking: &walking,
             },
             out,
         )
@@ -1325,11 +1335,12 @@ impl<'a> LayerAttention<'a> {
     }
 
     /// The dispatch itself, which is the same whichever of the two put the
-    /// buffers where they are.
+    /// buffers where they are and whatever the batch is.
     ///
-    /// `out` is written at [`Encoding::first`], which for a sequence advancing
-    /// alone is row zero of a buffer of its own — and for a sequence of a batch
-    /// is its own run of the rows `o_proj` will read for all of them.
+    /// **One dispatch over every row of the call**, each row saying which
+    /// sequence's span it attends over — see [`Walking`]. What used to be a
+    /// dispatch a slot with the slot in its shape is a dispatch whose shape
+    /// names no slot at all.
     fn encoding(
         &self,
         batch: &mut Batch<'_>,
@@ -1339,76 +1350,54 @@ impl<'a> LayerAttention<'a> {
         let (heads, kv_heads) = (self.config.heads, self.config.kv_heads);
         let head_dim = self.config.head_dim;
 
-        let stride = heads * head_dim;
+        let queries = step.walking.queries();
         assert_eq!(
-            step.q.len() % stride,
-            0,
-            "{} query values are not whole calls of {stride}",
+            step.q.len(),
+            queries * heads * head_dim,
+            "{} query values are not {queries} rows of {heads} heads",
             step.q.len()
         );
-        let queries = step.q.len() / stride;
-        let taus = match step.taus {
-            Some(taus) => {
-                assert_eq!(taus.len(), queries, "a tau a query");
-                Cow::Borrowed(taus)
-            }
-            None => Cow::Owned(vec![1.0; queries]),
-        };
         assert_eq!(
             step.rel.len(),
-            step.rows * heads * self.config.d_rel,
-            "{} relative features are not {} rows of {heads} heads",
-            step.rel.len(),
-            step.rows
-        );
-        assert!(
-            step.first + queries <= step.rows,
-            "{queries} queries at {} of a call holding {}",
-            step.first,
-            step.rows
+            queries * heads * self.config.d_rel,
+            "{} relative features are not {queries} rows of {heads} heads",
+            step.rel.len()
         );
         assert_eq!(
             out.len(),
-            step.rows * heads * head_dim,
-            "the answer against the rows the call is one of"
-        );
-        // **Every query's own key is one of the keys**, which the module
-        // documentation states and which nothing checked while the kernel scored
-        // the whole span: a query sitting past the last key used to attend over
-        // all of them, which is wrong quietly. The kernel bounds its loop by that
-        // position now, so the same call would attend over the tail of the span
-        // or over nothing at all — and a row of zeroes is wrong more quietly
-        // still. Refused here, where the shape is known.
-        assert!(
-            step.q_offset + queries <= step.keys,
-            "{queries} queries from {} sit past the {} keys of the call",
-            step.q_offset,
-            step.keys
+            queries * heads * head_dim,
+            "the answer against the rows of the call"
         );
 
         let pairs = heads * queries;
+        // The longest span in the call, because a split is a grid extent and a
+        // grid extent is one number: each row cuts its own `[0, keys)` into this
+        // many, and a row with fewer tiles than splits leaves the tail of them
+        // empty — which the fold rescales by an exact zero, the way it does a
+        // split with no live key in it.
+        let reaching = (0..queries)
+            .map(|i| step.walking.at(i).1)
+            .max()
+            .unwrap_or(0);
         let splits = self
             .pinned
             .get()
-            .unwrap_or_else(|| splits_for(pairs, step.keys, head_dim));
+            .unwrap_or_else(|| splits_for(pairs, reaching, head_dim));
         let fields = [
             extent(heads, "the heads of a layer"),
             extent(kv_heads, "the KV heads of a layer"),
             extent(head_dim, "the channels of a head"),
             extent(queries, "the queries of a call"),
-            extent(step.keys, "the keys of a call"),
             extent(step.key_stride, "the keys a span has room for"),
-            extent(step.span, "where a slot's keys start"),
-            extent(step.q_offset, "the offset of a call"),
             extent(self.config.d_rel, "the relative features of a layer"),
             extent(self.rel_extent, "the band of a layer"),
             extent(self.config.sliding, "the window of a layer"),
             extent(splits, "the splits of a call"),
             (1.0 / head_dim as f32).to_bits(),
-            extent(step.first, "where a call's rows start"),
         ];
         let mut shape = self.device.inline(&fields)?;
-        let mut scaled = self.device.inline(&taus)?;
+        let mut scaled = self.device.inline(&step.walking.taus)?;
+        let mut walked = self.device.inline(&step.walking.rows)?;
         let mut proj = self.proj.borrow_mut();
         // What each split leaves for the fold: its weighted sum, its peak and
         // its total. An unsplit call writes its row straight out and this is the
@@ -1435,6 +1424,7 @@ impl<'a> LayerAttention<'a> {
             queries,
             head_dim,
             splits,
+            step.walking.sequences,
             self.floor
                 .get()
                 .unwrap_or(FusedAttention::SHORTEST_BLOCKED_CALL),
@@ -1465,23 +1455,18 @@ impl<'a> LayerAttention<'a> {
         // partition `[0, keys)`, so between them they hold each live key once.
         let row = queries * heads * head_dim;
         let staged = pairs * splits * partial;
-        let walked = match blocked {
-            None => keys_a_call_walks(
-                queries,
-                step.q_offset,
-                step.keys,
-                self.config.sliding,
-                tile_keys(head_dim),
-            ),
-            Some(_) => keys_the_blocks_walk(queries, step.q_offset, step.keys, self.config.sliding),
+        let reads = match blocked {
+            None => keys_a_call_walks(step.walking, self.config.sliding, tile_keys(head_dim)),
+            Some(_) => keys_the_blocks_walk(step.walking, self.config.sliding),
         };
         let moves = size_of::<f32>()
             * (step.q.len()
                 + if splits == 1 { row } else { staged }
-                + 2 * heads * walked * head_dim
+                + 2 * heads * reads * head_dim
                 + queries * heads * self.config.d_rel
-                + step.keys.min(self.rel_extent) * self.config.d_rel
-                + queries);
+                + reaching.min(self.rel_extent) * self.config.d_rel
+                + queries)
+            + size_of::<u32>() * step.walking.rows.len();
         batch.add(
             blocked.unwrap_or_else(|| self.attention.on(self.config.sliding, splits)),
             &[
@@ -1494,6 +1479,7 @@ impl<'a> LayerAttention<'a> {
                 scaled.arg(),
                 out.arg(),
                 partials.arg(),
+                walked.arg(),
             ],
             grid,
             moves,
@@ -1621,46 +1607,123 @@ struct Encoding<'a> {
     k: &'a mut Buffer<f32>,
     v: &'a mut Buffer<f32>,
     rel: &'a mut Buffer<f32>,
-    /// Keys the sequence has, which is the kernel's loop bound.
-    keys: usize,
     /// Rows a KV head has room for, which is the stride between two heads —
-    /// every slot's, where the layer is holding the span.
+    /// every slot's, where the layer is holding the spans.
     key_stride: usize,
-    /// The row of a KV head this sequence's own keys start at, which is what
-    /// places a slot inside a head. Zero for a call handed the span whole.
-    span: usize,
-    taus: Option<&'a [f32]>,
-    q_offset: usize,
-    /// The row of the relative features and of the answer that this call's
-    /// first query is.
-    ///
-    /// **The query is not indexed by it and the other two are**, which is what
-    /// a batched step's shapes come to: the query rows a step reads were normed
-    /// into a buffer of this sequence's own, while the relative features one
-    /// dispatch produced for every sequence and the answer one `o_proj` will
-    /// read for every sequence are shared. Zero for a sequence advancing alone.
-    first: usize,
-    /// How many rows those two buffers hold, which for a sequence advancing
-    /// alone is its own queries.
-    rows: usize,
+    /// One entry a query row of the call, and the scale beside it.
+    walking: &'a Walking,
 }
 
-/// Where one sequence's query rows sit in the two buffers a batched step
-/// shares: the relative features one dispatch produced for every sequence, and
-/// the answer one `o_proj` will read for every sequence.
+/// One sequence of a batched step: which slot's span it attends over, where its
+/// rows sit in the call's buffers, and where those rows sit in the sequence.
+///
+/// **The rows of a call are one buffer and the spans are one allocation**, so
+/// this is what a batch's sequences differ by and the whole of it. A sequence
+/// advancing alone is one of these at row zero.
 #[derive(Debug, Clone, Copy)]
-pub struct Placed {
-    /// The row of those two that this call's first query is.
+pub(crate) struct Attending<'a> {
+    /// Which of the layer's slots carries this sequence's span.
+    pub slot: usize,
+    /// The row of the call's queries, relative features and answer that this
+    /// sequence's first query is.
     pub first: usize,
-    /// How many rows they hold.
-    pub rows: usize,
+    /// How many rows it takes from there.
+    pub queries: usize,
+    /// Where the first of them sits in the sequence: query `j` of this sequence
+    /// is at absolute position `j + q_offset`.
+    pub q_offset: usize,
+    /// One `tau` per query of this sequence, or `None` on a layer with no log
+    /// scaling — a row of ones by the time the kernel reads it.
+    pub taus: Option<&'a [f32]>,
 }
 
-impl Placed {
-    /// A sequence advancing alone, whose rows are the whole of both buffers.
-    pub fn alone(rows: usize) -> Self {
-        Self { first: 0, rows }
+/// A call's query rows as the kernel indexes them, and the scale beside each.
+///
+/// **Three numbers a row is what replaces a dispatch a slot.** A thread reads
+/// the row it was given rather than the shape of the call it is in, so N
+/// sequences over N spans are one dispatch: `span` is where that sequence's
+/// keys start in the binding, `keys` is how many it has, and `position` is
+/// where the row sits among them.
+#[derive(Debug)]
+struct Walking {
+    /// `[queries, 3]` — `span`, `keys` and `position` for each query row.
+    rows: Vec<u32>,
+    taus: Vec<f32>,
+    /// How many sequences the rows are drawn from, which is what decides
+    /// whether a block may carry them — see [`FusedAttention::blocked`].
+    sequences: usize,
+}
+
+/// What one row of [`Walking::rows`] holds, which is what the kernel's own
+/// stride over it has to agree with.
+const WALKED: usize = 3;
+
+impl Walking {
+    fn queries(&self) -> usize {
+        self.rows.len() / WALKED
     }
+
+    /// Where the sequence at query row `i` starts its keys, how many it has,
+    /// and where the row sits among them.
+    fn at(&self, i: usize) -> (usize, usize, usize) {
+        let row = &self.rows[i * WALKED..][..WALKED];
+        (row[0] as usize, row[1] as usize, row[2] as usize)
+    }
+}
+
+/// The rows and scales of a call, from the sequences it carries and where each
+/// of their spans is.
+///
+/// `span` answers a slot with the row of a KV head its keys start at and how
+/// many it holds, which is [`KeyValues`] for a layer keeping them and `(0,
+/// keys)` for a caller that handed the span over whole.
+fn walking(
+    attending: &[Attending<'_>],
+    span: impl Fn(usize) -> (usize, usize),
+    rows: usize,
+) -> Walking {
+    let mut walking = Walking {
+        rows: vec![0; rows * WALKED],
+        taus: vec![1.0; rows],
+        sequences: attending.len(),
+    };
+    let mut filled = 0;
+    for seat in attending {
+        assert_eq!(
+            seat.first, filled,
+            "a sequence's rows follow the last one's"
+        );
+        assert!(
+            seat.first + seat.queries <= rows,
+            "{} queries at {} of a call holding {rows}",
+            seat.queries,
+            seat.first
+        );
+        let (base, keys) = span(seat.slot);
+        // **Every query's own key is one of the keys**, which the module
+        // documentation states: a query sitting past the last key would attend
+        // over the tail of the span or over nothing at all, and a row of zeroes
+        // is wrong quietly. Refused here, where the shape is known.
+        assert!(
+            seat.q_offset + seat.queries <= keys,
+            "{} queries from {} sit past the {keys} keys of the sequence",
+            seat.queries,
+            seat.q_offset
+        );
+        if let Some(taus) = seat.taus {
+            assert_eq!(taus.len(), seat.queries, "a tau a query");
+            walking.taus[seat.first..][..seat.queries].copy_from_slice(taus);
+        }
+        for j in 0..seat.queries {
+            let row = &mut walking.rows[(seat.first + j) * WALKED..][..WALKED];
+            row[0] = extent(base, "where a slot's keys start");
+            row[1] = extent(keys, "the keys of a sequence");
+            row[2] = extent(seat.q_offset + j, "the position of a query");
+        }
+        filled += seat.queries;
+    }
+    assert_eq!(filled, rows, "a sequence's rows for every row of the call");
+    walking
 }
 
 /// The checkpoint's `[d_rel, rel_extent]` projection as `[rel_extent, d_rel]`,
@@ -1728,17 +1791,22 @@ struct Shape {
     uint kv_heads;
     uint head_dim;
     uint queries;
-    uint keys;
     uint key_stride;
-    uint span;
-    uint q_offset;
     uint d_rel;
     uint rel_extent;
     uint sliding;
     uint splits;
     uint scale_bits;
-    uint first;
 };
+
+/// What a query row of the call says about itself, which is what a batch's
+/// sequences differ by: `walked[WALKED * i]` is the row of a KV head where that
+/// sequence's own keys start, `+ 1` is how many it has, and `+ 2` is where the
+/// query sits among them.
+///
+/// **This is what replaces a dispatch a slot.** Nothing in the shape above names
+/// a sequence, so the same dispatch serves one of them or thirty-two.
+constant uint WALKED = 3u;
 
 /// One query-key pair's entry of the banded relative-position mask, from the
 /// backward distance alone.
@@ -1826,6 +1894,7 @@ kernel void fused_attention(
     device const float *taus [[buffer(6)]],
     device float *out [[buffer(7)]],
     device float *partials [[buffer(8)]],
+    device const uint *walked [[buffer(9)]],
     uint slot [[threadgroup_position_in_grid]],
     uint local [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -1880,12 +1949,19 @@ kernel void fused_attention(
     // filled — every sequence's, since a KV head's rows carry the whole batch.
     // `span` is where this sequence's own start inside them, and a call handed
     // the span whole passes `keys` for the stride and zero for the start.
+    // This query's own sequence: where its keys start, how many it has, and
+    // where the query sits among them. A batch's rows differ in these three and
+    // in nothing else.
+    const uint span = walked[WALKED * i];
+    const uint keys = walked[WALKED * i + 1u];
+    const int position = (int)walked[WALKED * i + 2u];
+
     device const float *q_row = q + (ulong)pair * shape.head_dim;
-    const ulong own = (ulong)kv * shape.key_stride + shape.span;
+    const ulong own = (ulong)kv * shape.key_stride + span;
     device const float *keys_of = k + own * shape.head_dim;
     device const float *values_of = v + own * shape.head_dim;
     device const float *rel_row =
-        rel + ((ulong)(shape.first + i) * shape.heads + head) * shape.d_rel;
+        rel + ((ulong)i * shape.heads + head) * shape.d_rel;
 
     // The residency is read for the zero it was filled with, and by the thread
     // that filled it, so nothing here needs a barrier. **What says the array
@@ -1907,7 +1983,6 @@ kernel void fused_attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const int position = (int)(i + shape.q_offset);
     // **The tile does not move between the entries.** TILED_VALUES bounds it in
     // both, so the two walk the same keys in the same tiles and differ in where
     // a value is read from and in nothing else.
@@ -1937,7 +2012,7 @@ kernel void fused_attention(
     //
     // The branches stay, and the tests that pin them drive the loop unbounded —
     // which this is measured against, so they pin what it is measured against.
-    const uint last = min(shape.keys, (uint)position + 1u);
+    const uint last = min(keys, (uint)position + 1u);
     const uint reach = shape.sliding > 0 && (uint)position >= shape.sliding
         ? ((uint)position - (shape.sliding - 1u)) / tile * tile
         : 0u;
@@ -1956,10 +2031,10 @@ kernel void fused_attention(
     //
     // A split is at least one tile, so `per_split * tile` never cuts a tile in
     // half and `from` stays on the alignment `reach` already has.
-    const uint spans = (shape.keys + tile - 1u) / tile;
+    const uint spans = (keys + tile - 1u) / tile;
     const uint per_split = (spans + shape.splits - 1u) / shape.splits;
     const uint from = max(reach, split * per_split * tile);
-    const uint to = min(last, min(shape.keys, (split + 1u) * per_split * tile));
+    const uint to = min(last, min(keys, (split + 1u) * per_split * tile));
 
     for (uint first = from; first < to; first += tile) {
         const uint held = min(tile, to - first);
@@ -2058,7 +2133,7 @@ kernel void fused_attention(
     // no tokens rather than a row to divide by it.
     if (shape.splits == 1u) {
         device float *result =
-        out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
+        out + ((ulong)i * shape.heads + head) * shape.head_dim;
         const float norm = total > 0.0f ? 1.0f / total : 0.0f;
         for (uint d = local; d < shape.head_dim; d += threads) {
             result[d] = weighted[d] * norm;
@@ -2111,7 +2186,7 @@ kernel void attention_combine(
     const uint stride = shape.head_dim + 2u;
     device const float *base = partials + (ulong)pair * shape.splits * stride;
     device float *result =
-        out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
+        out + ((ulong)i * shape.heads + head) * shape.head_dim;
 
     // Every thread reduces the same handful of entries rather than one reducing
     // and broadcasting, which is what the tile loop above does with its scores
@@ -2239,6 +2314,7 @@ kernel void mma_attention(
     device const float *taus [[buffer(6)]],
     device float *out [[buffer(7)]],
     device float *partials [[buffer(8)]],
+    device const uint *walked [[buffer(9)]],
     uint block [[threadgroup_position_in_grid]],
     uint local [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -2273,7 +2349,11 @@ kernel void mma_attention(
     const bool live = first + row < shape.queries;
     const uint i = min(first + row, shape.queries - 1u);
     const uint kv = head / (shape.heads / shape.kv_heads);
-    const int position = (int)(i + shape.q_offset);
+    // **Every row of this call is one sequence's**, which the host refuses to
+    // dispatch a block for otherwise — see `FusedAttention::blocked`. So the
+    // three numbers a row carries are the same three for every row of the block
+    // but the position, and one tile of keys serves all of them.
+    const int position = (int)walked[WALKED * i + 2u];
     // `M_LOG2E_F` folded into both, so that every exponential below is one
     // hardware instruction and the learned bias is in the units of the scores
     // it is added to.
@@ -2281,11 +2361,11 @@ kernel void mma_attention(
     const float tau = taus[i] * M_LOG2E_F;
 
     device const float *q_row = q + ((ulong)head * shape.queries + i) * shape.head_dim;
-    const ulong own = (ulong)kv * shape.key_stride + shape.span;
+    const ulong own = (ulong)kv * shape.key_stride + walked[WALKED * i];
     device const float *keys_of = k + own * shape.head_dim;
     device const float *values_of = v + own * shape.head_dim;
     device const float *features =
-        rel + ((ulong)(shape.first + i) * shape.heads + head) * shape.d_rel;
+        rel + ((ulong)i * shape.heads + head) * shape.d_rel;
 
     // The row's own channels, held as the fragments the first multiply wants:
     // element `jj` of fragment `dd` is channel `dd * MMA_FRAGMENT + fn + jj`,
@@ -2316,8 +2396,8 @@ kernel void mma_attention(
     // `last` cover every row between them — and what a row inside the block may
     // not attend to is masked per score, exactly as it is above.
     const uint lastrow = min(first + MMA_ROWS_A_BLOCK, shape.queries) - 1u;
-    const uint to = min(shape.keys, (uint)(lastrow + shape.q_offset) + 1u);
-    const uint opening = first + shape.q_offset;
+    const uint to = min(walked[WALKED * lastrow + 1u], walked[WALKED * lastrow + 2u] + 1u);
+    const uint opening = walked[WALKED * first + 2u];
     const uint from = shape.sliding > 0u && opening >= shape.sliding
         ? (opening - (shape.sliding - 1u)) / MMA_KEYS_A_BLOCK * MMA_KEYS_A_BLOCK
         : 0u;
@@ -2443,7 +2523,7 @@ kernel void mma_attention(
         return;
     }
     device float *result =
-        out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
+        out + ((ulong)i * shape.heads + head) * shape.head_dim;
     for (uint dd = 0; dd < MMA_FRAGS_A_ROW; ++dd) {
         const uint d = dd * MMA_FRAGMENT + fn;
         if (d < shape.head_dim) {
@@ -2509,7 +2589,7 @@ mod tests {
             .split_once("\n    // SPLIT:")
             .expect("the bound ends where the split begins");
         let whole = format!(
-            "{head}    const uint last = shape.keys;\n    const uint reach = 0u;\n\n    // SPLIT:{tail}"
+            "{head}    const uint last = keys;\n    const uint reach = 0u;\n\n    // SPLIT:{tail}"
         );
         // What is asserted is that the bound is *gone*, not merely that the
         // string moved: cutting between two markers is only as good as the
@@ -2520,8 +2600,7 @@ mod tests {
             "the bound survived the cut"
         );
         assert!(
-            whole.contains("const uint reach = 0u;")
-                && whole.contains("const uint last = shape.keys;"),
+            whole.contains("const uint reach = 0u;") && whole.contains("const uint last = keys;"),
             "the loop was not put back over the whole span"
         );
         whole
@@ -2791,6 +2870,11 @@ mod tests {
                     + self.keys.min(rel_extent) * self.config.d_rel
                     + self.queries
                     + folded)
+                // And the three numbers each query row says about itself, which
+                // are traffic for the reason its `tau` is: read out of a
+                // binding, once for the call, whether that binding turned out to
+                // be an allocation or the command buffer.
+                + size_of::<u32>() * WALKED * self.queries
         }
 
         /// The keys this call's threadgroups walk, counted one key at a time
@@ -2852,6 +2936,7 @@ mod tests {
                     + self.rel.len()
                     + self.keys.min(rel_extent) * self.config.d_rel
                     + self.queries)
+                + size_of::<u32>() * WALKED * self.queries
         }
 
         fn wrapped<'d>(
@@ -3015,6 +3100,22 @@ mod tests {
             .unwrap_or_else(|| panic!("no {name} case"))
     }
 
+    /// The rows of a call one sequence brings, which is what the accounting is
+    /// read against and what a batch of one hands the kernel.
+    fn alone(queries: usize, q_offset: usize, keys: usize) -> Walking {
+        walking(
+            &[Attending {
+                slot: 0,
+                first: 0,
+                queries,
+                q_offset,
+                taus: None,
+            }],
+            |_| (0, keys),
+            queries,
+        )
+    }
+
     /// **The claim the whole kernel rests on.** Every entry of the additive mask
     /// mlx-vlm wrote is reproduced by a kernel that never writes one, measured
     /// where it is used rather than where it is built: the same queries, keys
@@ -3136,15 +3237,15 @@ mod tests {
         assert_eq!(keys_walked(768, 769, 512, tile), 769 - 256);
         assert_eq!(keys_walked(400, 769, 512, tile), 401);
 
-        assert_eq!(keys_a_call_walks(4, 0, 4, 0, tile), 1 + 2 + 3 + 4);
+        assert_eq!(keys_a_call_walks(&alone(4, 0, 4), 0, tile), 1 + 2 + 3 + 4);
         assert_eq!(
-            keys_a_call_walks(2048, 0, 2048, 0, tile),
+            keys_a_call_walks(&alone(2048, 0, 2048), 0, tile),
             2048 * 2049 / 2,
             "a global prefill walks the square"
         );
         // The same prompt through a window is linear in it instead, at the
         // window plus what the tile alignment leaves.
-        assert!(keys_a_call_walks(2048, 0, 2048, 512, tile) < 2048 * 544);
+        assert!(keys_a_call_walks(&alone(2048, 0, 2048), 512, tile) < 2048 * 544);
     }
 
     /// What the bandwidth column divides by, against what the kernel reads.
@@ -3528,7 +3629,7 @@ mod tests {
                 let splits = splits_for(pairs, keys, head_dim);
                 assert!(
                     production
-                        .blocked(0, queries, head_dim, splits, shortest)
+                        .blocked(0, queries, head_dim, splits, 1, shortest)
                         .is_none(),
                     "{queries} queries over {keys} keys reached the block"
                 );
@@ -3542,7 +3643,7 @@ mod tests {
             assert_eq!(splits, 1, "{queries} queries were cut");
             assert_eq!(
                 production
-                    .blocked(0, queries, head_dim, splits, shortest)
+                    .blocked(0, queries, head_dim, splits, 1, shortest)
                     .is_some(),
                 wanted,
                 "{queries} queries against a floor of {shortest}"
@@ -3554,7 +3655,7 @@ mod tests {
         for head_dim in [MMA_MOST_CHANNELS + MMA_FRAGMENT, MMA_FRAGMENT - 1] {
             assert!(
                 production
-                    .blocked(0, shortest, head_dim, 1, shortest)
+                    .blocked(0, shortest, head_dim, 1, 1, shortest)
                     .is_none()
             );
         }
@@ -3601,6 +3702,7 @@ mod tests {
                         case.queries,
                         128,
                         splits,
+                        1,
                         FusedAttention::SHORTEST_BLOCKED_CALL,
                     )
                     .is_some(),
@@ -3694,8 +3796,8 @@ mod tests {
         for (end, from, to) in [
             (
                 "the causal end",
-                "min(shape.keys, (uint)position + 1u)",
-                "min(shape.keys, (uint)position)",
+                "min(keys, (uint)position + 1u)",
+                "min(keys, (uint)position)",
             ),
             (
                 "the window end",
@@ -6030,67 +6132,125 @@ mod tests {
         assert_eq!(batched[1], alone[1], "the sequence in slot 1");
     }
 
-    /// **A step placed at a row of a batch's buffers answers what the same step
-    /// alone answers**, bit for bit, and writes it where it was placed.
+    /// **A batch of sequences in one dispatch answer what each of them answers
+    /// alone**, bit for bit, each over its own span and into its own rows.
     ///
-    /// The query rows are this sequence's own — its head norm wrote them into a
-    /// buffer of its own — and the two buffers that are the batch's are the
-    /// relative features one `r_proj` produced for every sequence and the
-    /// answer one `o_proj` will read for every sequence. A step that indexed
-    /// either of those by its own row rather than by its place in the call
-    /// would read a neighbour's features and write over a neighbour's answer,
-    /// and both are rows of the right shape.
+    /// **This is the case the per-row slot index lives or dies by.** The step is
+    /// one dispatch for the whole call, so what says which sequence a query row
+    /// belongs to is the row rather than the call — and a kernel that read the
+    /// call's shape instead would attend over a neighbour's keys, read a
+    /// neighbour's relative features and write over a neighbour's answer. All
+    /// three are rows of the right shape and none of them shows in the output.
     ///
-    /// The rows in front of the placement and behind it are another sequence's
-    /// features rather than zeroes, so that reading the wrong ones is a wrong
-    /// answer rather than an empty one — and they are checked to have been left
-    /// alone, which is what says the write was placed and not merely offset.
+    /// Three sequences of different lengths, at different offsets, one of them
+    /// feeding two rows a step where the others feed one — so a call whose rows
+    /// were laid by position rather than by placement would land on the wrong
+    /// sequence at the second of them.
     #[test]
-    fn a_step_placed_in_a_batch_answers_what_the_same_step_alone_answers() {
+    fn a_batch_of_sequences_in_one_step_answer_what_each_answers_alone() {
         let Some(device) = device() else { return };
         let attention = FusedAttention::new(&device).expect("the kernel compiles");
-        let (case, k, v) = streaming(8);
+        let (case, k, v) = streaming(14);
         let (heads, head_dim, d_rel) = (case.config.heads, case.config.head_dim, case.config.d_rel);
         let channels = case.config.kv_channels();
-        let (q, rel) = (values(heads * head_dim, 5), values(heads * d_rel, 9));
-        let (keys, first, rows) = (4, 2, 5);
 
-        let layer = case.wrapped(&device, &attention);
-        let alone = through_the_span(
-            &device,
-            &layer,
-            0,
-            &k[..keys * channels],
-            &v[..keys * channels],
-            &q,
-            &rel,
-        );
+        // Keys each sequence has when the step runs, and how many of them are
+        // this step's own rows.
+        let held = [4, 7, 3];
+        let feeds = [1, 2, 1];
+        let rows: usize = feeds.iter().sum();
+        let starts = [0, 4, 11];
 
-        // The same features at row `first`, with another sequence's either side.
-        let others = values(heads * d_rel, 11);
-        assert_ne!(others, rel, "features a misplaced read could find");
-        let mut wide: Vec<f32> = (0..rows).flat_map(|_| others.clone()).collect();
-        wide[first * heads * d_rel..][..heads * d_rel].copy_from_slice(&rel);
+        let of = |s: usize| {
+            let (from, to) = (starts[s] * channels, (starts[s] + held[s]) * channels);
+            (k[from..to].to_vec(), v[from..to].to_vec())
+        };
+        // `[heads, queries, head_dim]` and `[queries, heads, d_rel]`, which are
+        // the two layouts the step reads and the two a placement has to index
+        // differently.
+        let queries: Vec<(Vec<f32>, Vec<f32>)> = (0..3)
+            .map(|s| {
+                (
+                    values(heads * feeds[s] * head_dim, 5 + s),
+                    values(feeds[s] * heads * d_rel, 9 + s),
+                )
+            })
+            .collect();
 
-        let placed = case.wrapped(&device, &attention);
-        placed.hold(0, 0, 1).expect("the span grows");
-        placed.append(0, &k[..keys * channels], &v[..keys * channels]);
-        let mut q = device.buffer(&q).expect("the query uploads");
-        let mut wide = device.buffer(&wide).expect("the features upload");
+        let alone: Vec<Vec<f32>> = (0..3)
+            .map(|s| {
+                let layer = case.wrapped(&device, &attention);
+                let (k, v) = of(s);
+                // The keys behind this step first, so that the sequence attends
+                // from where it actually is rather than from nothing.
+                let behind = (held[s] - feeds[s]) * channels;
+                layer
+                    .hold(0, 0, held[s] - feeds[s])
+                    .expect("the span grows");
+                layer.append(0, &k[..behind], &v[..behind]);
+                through_a_slot(
+                    &device,
+                    &layer,
+                    0,
+                    held[s] - feeds[s],
+                    &k[behind..],
+                    &v[behind..],
+                    &queries[s].0,
+                    &queries[s].1,
+                )
+            })
+            .collect();
+        for s in 1..3 {
+            assert_ne!(
+                alone[s - 1][..head_dim],
+                alone[s][..head_dim],
+                "sequences to tell apart"
+            );
+        }
+
+        // The batch's own buffers: the queries head-major over every row of the
+        // call, and the features and the answer row-major over the same rows.
+        let shared = LayerAttention::holding(&device, &attention, case.config, &case.proj, 3)
+            .expect("the layer wraps");
+        let mut wide_q = vec![0.0f32; heads * rows * head_dim];
+        let mut wide_rel = Vec::with_capacity(rows * heads * d_rel);
+        let mut first = 0;
+        let mut attending = Vec::new();
+        for s in 0..3 {
+            let (k, v) = of(s);
+            shared.hold(s, 0, held[s]).expect("the span grows");
+            shared.append(s, &k, &v);
+            for head in 0..heads {
+                let from = head * feeds[s] * head_dim;
+                let to = (head * rows + first) * head_dim;
+                wide_q[to..][..feeds[s] * head_dim]
+                    .copy_from_slice(&queries[s].0[from..][..feeds[s] * head_dim]);
+            }
+            wide_rel.extend_from_slice(&queries[s].1);
+            attending.push(Attending {
+                slot: s,
+                first,
+                queries: feeds[s],
+                q_offset: held[s] - feeds[s],
+                taus: None,
+            });
+            first += feeds[s];
+        }
+
+        let mut wide_q = device.buffer(&wide_q).expect("the queries upload");
+        let mut wide_rel = device.buffer(&wide_rel).expect("the features upload");
         let mut out = device
             .zeroed::<f32>(rows * heads * head_dim)
             .expect("the answer allocates");
         let mut batch = device.batch().expect("a command buffer opens");
-        placed
+        shared
             .encode_into(
                 &mut batch,
-                &mut placed.spans(),
-                0,
-                &mut q,
-                &mut wide,
-                None,
-                0,
-                Placed { first, rows },
+                &mut shared.spans(),
+                &mut wide_q,
+                &mut wide_rel,
+                &attending,
+                rows,
                 &mut out,
             )
             .expect("the step encodes");
@@ -6098,11 +6258,11 @@ mod tests {
 
         let out = out.to_vec();
         let row = heads * head_dim;
-        assert_eq!(&out[first * row..][..row], &alone[..], "the placed answer");
-        for at in (0..rows).filter(|at| *at != first) {
-            assert!(
-                out[at * row..][..row].iter().all(|value| *value == 0.0),
-                "row {at} of a neighbour's answer was written"
+        for (s, seat) in attending.iter().enumerate() {
+            assert_eq!(
+                &out[seat.first * row..][..feeds[s] * row],
+                &alone[s][..],
+                "the sequence in slot {s}"
             );
         }
     }

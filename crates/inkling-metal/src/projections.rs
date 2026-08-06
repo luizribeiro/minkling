@@ -59,7 +59,7 @@ use inkling_core::profile::{self, Op};
 use inkling_core::weights::{LayerBackend, LayerBanks, LayerPacked, Packed, PackedMlp};
 
 use crate::argmax::GreedyArgmax;
-use crate::attention::{AttentionError, FusedAttention, LayerAttention, Placed, Step};
+use crate::attention::{self, AttentionError, FusedAttention, LayerAttention, Step};
 use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
 use crate::experts::{ExpertKernels, LayerExperts};
@@ -486,15 +486,20 @@ impl<'a> LayerProjections<'a> {
     }
 
     /// The four projections over every row of the call, then the state each
-    /// sequence carries over its own rows, then `o_proj` over every row again.
+    /// sequence carries over its own rows, then the step and `o_proj` over every
+    /// row again.
     ///
     /// **This is where a batch pays.** `q_proj`, `k_proj`, `v_proj`, `r_proj`
     /// and `o_proj` are five weights read in full whatever the call is, so N
-    /// sequences advancing together read them once between them. What is left
-    /// per sequence is what touches its own span and its own two windows — a
-    /// pair of convolutions, a pair of head norms and a step apiece — and a
-    /// batch of one encodes what it always encoded, in the same order, with
-    /// every placement at row zero.
+    /// sequences advancing together read them once between them. **And so is
+    /// the attention step**, which reads no weight at all and used to be a
+    /// dispatch a slot regardless: its spans are runs of one allocation and its
+    /// queries are rows of one buffer, so what says which sequence a query row
+    /// belongs to is the row — see [`attention::Attending`](crate::attention).
+    ///
+    /// What is left per sequence is what touches its own two windows: a pair of
+    /// convolutions and a pair of head norms. A batch of one encodes what it
+    /// always encoded, in the same order, with every placement at row zero.
     fn encoding(
         &self,
         batch: &mut Batch<'_>,
@@ -515,10 +520,16 @@ impl<'a> LayerProjections<'a> {
             .sdpa;
         let (heads, head_dim) = (sdpa.heads(), sdpa.head_dim());
         let mut attended = device.zeroed::<f32>(rows * heads * head_dim)?;
+        // **The queries of every sequence in one buffer**, laid `[heads, rows,
+        // head_dim]` the way one sequence's always were: the head norms scatter
+        // each sequence's rows into their own run of it, which is the same write
+        // under a wider stride, and what the step then reads is one buffer for
+        // the whole call.
+        let mut headed = device.zeroed::<f32>(rows * heads * head_dim)?;
+        let mut spans = self.attention.spans();
         for seat in attending {
             let (slot, first, queries) = (seat.slot, seat.first, seat.queries);
             let step = seat.step;
-            let mut spans = self.attention.spans();
             let (keys, values) = spans.landings(slot);
             // One dispatch rather than two, for the reason the head norms below
             // are one: two sequences, different taps, each leaving its own
@@ -561,7 +572,6 @@ impl<'a> LayerProjections<'a> {
             // reads what the other writes — so what separated them was that they
             // are two tensors. See `norm::encode_pair`, which is where they part
             // company again if a checkpoint ever gives them different widths.
-            let mut headed = device.zeroed::<f32>(queries * heads * head_dim)?;
             norm::encode_pair(
                 batch,
                 Normalising {
@@ -575,8 +585,8 @@ impl<'a> LayerProjections<'a> {
                     landing: Landing {
                         out: &mut headed,
                         groups: heads,
-                        stride: queries,
-                        base: 0,
+                        stride: rows,
+                        base: first,
                     },
                 },
                 Normalising {
@@ -591,23 +601,33 @@ impl<'a> LayerProjections<'a> {
             // **The span grows here rather than when the batch completes**,
             // because the step below is what has to see this call's keys and it
             // is in the same command buffer as the two dispatches that wrote
-            // them. The step binds the span those two write, so the batch puts a
-            // barrier between them and those writes are done before it reads
+            // them. The step binds the spans those two write, so the batch puts
+            // a barrier between them and those writes are done before it reads
             // them — and a span that grew after the wait would attend over the
             // previous step's keys and leave this token out of its own row.
             spans.appended(slot, queries);
-            self.attention.encode_into(
-                batch,
-                &mut spans,
-                slot,
-                &mut headed,
-                &mut rel,
-                step.bias_taus,
-                step.q_offset,
-                Placed { first, rows },
-                &mut attended,
-            )?;
         }
+
+        let attending: Vec<attention::Attending<'_>> = attending
+            .iter()
+            .map(|seat| attention::Attending {
+                slot: seat.slot,
+                first: seat.first,
+                queries: seat.queries,
+                q_offset: seat.step.q_offset,
+                taus: seat.step.bias_taus,
+            })
+            .collect();
+        self.attention.encode_into(
+            batch,
+            &mut spans,
+            &mut headed,
+            &mut rel,
+            &attending,
+            rows,
+            &mut attended,
+        )?;
+        drop(spans);
         self.o_proj.encode_over(batch, &mut attended)
     }
 }
