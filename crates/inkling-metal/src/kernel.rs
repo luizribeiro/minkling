@@ -383,7 +383,7 @@ impl<'a> Batch<'a> {
         self.entry.get_or_insert_with(|| kernel.entry.clone());
         self.dispatches += 1;
         if let Some(samples) = &mut self.samples {
-            samples.moved(moves);
+            samples.encoded(moves, grid.groups());
         }
         Ok(())
     }

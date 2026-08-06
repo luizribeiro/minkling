@@ -48,7 +48,7 @@
 use std::ptr::NonNull;
 use std::time::Duration;
 
-use inkling_core::profile;
+use inkling_core::profile::{self, Dispatches};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
@@ -185,8 +185,17 @@ pub(crate) struct Sampled {
     kernels: Vec<String>,
     /// Which of those each pass ran, in the order the passes were encoded.
     passes: Vec<usize>,
-    /// What each of those said it moves, in the same order.
-    moved: Vec<usize>,
+    /// What each of those said it moves and how wide a grid it moves it over,
+    /// in the same order.
+    shapes: Vec<Shape>,
+}
+
+/// What one encoded dispatch declared about itself, which is everything a
+/// kernel's row carries that the device's clock does not say.
+#[derive(Debug, Default, Clone, Copy)]
+struct Shape {
+    bytes: usize,
+    groups: usize,
 }
 
 impl Sampled {
@@ -204,7 +213,7 @@ impl Sampled {
             attachment,
             kernels: Vec::new(),
             passes: Vec::new(),
-            moved: Vec::new(),
+            shapes: Vec::new(),
         }
     }
 
@@ -243,15 +252,15 @@ impl Sampled {
         self.passes.push(kernel);
     }
 
-    /// What the pass that just encoded moves between memory and the GPU, from
-    /// the caller that is the only one able to say — see
-    /// [`Batch::add`](crate::kernel::Batch::add).
+    /// What the pass that just encoded moves between memory and the GPU and how
+    /// many threadgroups it moves it over, from the caller that is the only one
+    /// able to say the first — see [`Batch::add`](crate::kernel::Batch::add).
     ///
     /// Separate from [`Sampled::ran`] because it happens after the dispatch is
     /// encoded rather than before the pass is opened, and one pass has exactly
     /// one of each.
-    pub(crate) fn moved(&mut self, bytes: usize) {
-        self.moved.push(bytes);
+    pub(crate) fn encoded(&mut self, bytes: usize, groups: usize) {
+        self.shapes.push(Shape { bytes, groups });
     }
 
     /// Charge what the device reported to the kernels that ran, once the
@@ -276,7 +285,7 @@ impl Sampled {
         let bytes = resolved.to_vec();
         let stamps: &[MTLCounterResultTimestamp] = as_timestamps(&bytes);
 
-        let mut totals = vec![Charge::default(); self.kernels.len()];
+        let mut totals = vec![Dispatches::default(); self.kernels.len()];
         for (pass, kernel) in self.passes.iter().enumerate() {
             let Some([started, ended]) = stamps.get(2 * pass..2 * pass + 2) else {
                 continue;
@@ -286,24 +295,19 @@ impl Sampled {
                 continue;
             }
             let ticks = ended.saturating_sub(started) as f64;
-            let total = &mut totals[*kernel];
-            total.calls += 1;
-            total.elapsed += Duration::from_nanos((ticks * self.nanos_per_tick) as u64);
-            total.bytes += self.moved.get(pass).copied().unwrap_or_default() as u64;
+            let shape = self.shapes.get(pass).copied().unwrap_or_default();
+            totals[*kernel] += Dispatches {
+                calls: 1,
+                elapsed: Duration::from_nanos((ticks * self.nanos_per_tick) as u64),
+                bytes: shape.bytes as u64,
+                groups: shape.groups as u64,
+            };
         }
 
         for (kernel, total) in self.kernels.iter().zip(totals) {
-            profile::dispatched(kernel, total.calls, total.elapsed, total.bytes);
+            profile::dispatched(kernel, total);
         }
     }
-}
-
-/// One kernel's share of one command buffer, on the way to the profile.
-#[derive(Debug, Default, Clone, Copy)]
-struct Charge {
-    calls: u64,
-    elapsed: Duration,
-    bytes: u64,
 }
 
 /// The resolved bytes as the timestamps they are.

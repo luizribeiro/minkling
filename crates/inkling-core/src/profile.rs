@@ -193,6 +193,15 @@ pub struct Dispatches {
     /// the eight there are. What a buffer *is* is not what a dispatch *moves*,
     /// and only the caller knows the difference.
     pub bytes: u64,
+    /// The threadgroups they were dispatched over, summed.
+    ///
+    /// **What a narrow dispatch costs is the machine it leaves idle**, which is
+    /// a property of this and not of `calls`: a batched decode step's attention
+    /// went from 32 dispatches of 32 threadgroups to one of 1024 and the launch
+    /// count was 14% of what that was worth. A row that carries only the count
+    /// cannot say which of two kernels is short of the machine, and the count
+    /// beside the sum is what makes the mean per dispatch readable.
+    pub groups: u64,
 }
 
 impl Dispatches {
@@ -206,6 +215,29 @@ impl Dispatches {
             0.0 => 0.0,
             elapsed => self.bytes as f64 / elapsed,
         }
+    }
+
+    /// Threadgroups one of these dispatches was given, which is the figure a
+    /// grid the machine wants is compared against.
+    ///
+    /// Zero for a row nobody dispatched, which is not a dispatch of no
+    /// threadgroups.
+    pub fn groups_a_dispatch(&self) -> f64 {
+        match self.calls {
+            0 => 0.0,
+            calls => self.groups as f64 / calls as f64,
+        }
+    }
+}
+
+/// One kernel's dispatches added to the ones already charged to it, which is
+/// what a second command buffer's share of the same kernel is.
+impl std::ops::AddAssign for Dispatches {
+    fn add_assign(&mut self, other: Self) {
+        self.calls += other.calls;
+        self.elapsed += other.elapsed;
+        self.bytes += other.bytes;
+        self.groups += other.groups;
     }
 }
 
@@ -297,15 +329,13 @@ pub fn ran_on_the_gpu(elapsed: Duration) {
 /// submission holding a thousand of them costs a handful of lookups: a backend
 /// that has timestamps for each one sums them by kernel first, which is the
 /// grain this is read at anyway.
-pub fn dispatched(kernel: &str, calls: u64, elapsed: Duration, bytes: u64) {
+pub fn dispatched(kernel: &str, added: Dispatches) {
     ACCOUNTS.with_borrow_mut(|accounts| {
         let account = match accounts.kernels.get_mut(kernel) {
             Some(account) => account,
             None => accounts.kernels.entry(kernel.to_owned()).or_default(),
         };
-        account.calls += calls;
-        account.elapsed += elapsed;
-        account.bytes += bytes;
+        *account += added;
     });
 }
 
@@ -430,6 +460,7 @@ impl Profile {
                             calls: account.calls / u64::from(steps),
                             elapsed: account.elapsed / steps,
                             bytes: account.bytes / u64::from(steps),
+                            groups: account.groups / u64::from(steps),
                         },
                     )
                 })
@@ -460,6 +491,16 @@ mod tests {
     /// racing itself — but two tests on one thread are not, and `take` clears.
     fn fresh() {
         take();
+    }
+
+    /// One kernel's share of one command buffer, as the cases here spell it.
+    fn over(calls: u64, elapsed: Duration, bytes: u64, groups: u64) -> Dispatches {
+        Dispatches {
+            calls,
+            elapsed,
+            bytes,
+            groups,
+        }
     }
 
     /// The discriminants index the accounts, so a variant added to the enum
@@ -620,8 +661,8 @@ mod tests {
         timed(Op::Submit, || {
             spin(SPIN);
             ran_on_the_gpu(SPIN / 2);
-            dispatched("packed_matmul", 3, SPIN / 4, 3_000);
-            dispatched("rms_norm", 1, SPIN / 8, 1_000);
+            dispatched("packed_matmul", over(3, SPIN / 4, 3_000, 96));
+            dispatched("rms_norm", over(1, SPIN / 8, 1_000, 32));
         });
 
         let profile = take();
@@ -639,32 +680,43 @@ mod tests {
     #[test]
     fn a_kernel_dispatched_from_several_command_buffers_is_one_row() {
         fresh();
-        dispatched("packed_matmul", 26, SPIN, 26);
-        dispatched("rms_norm", 2, 3 * SPIN, 2);
-        dispatched("packed_matmul", 4, SPIN, 4);
+        dispatched("packed_matmul", over(26, SPIN, 26, 260));
+        dispatched("rms_norm", over(2, 3 * SPIN, 2, 8));
+        dispatched("packed_matmul", over(4, SPIN, 4, 40));
 
         let profile = take();
         assert_eq!(
             profile.kernels(),
             [
-                (
-                    "rms_norm",
-                    Dispatches {
-                        calls: 2,
-                        elapsed: 3 * SPIN,
-                        bytes: 2
-                    }
-                ),
-                (
-                    "packed_matmul",
-                    Dispatches {
-                        calls: 30,
-                        elapsed: 2 * SPIN,
-                        bytes: 30
-                    }
-                ),
+                ("rms_norm", over(2, 3 * SPIN, 2, 8)),
+                ("packed_matmul", over(30, 2 * SPIN, 30, 300)),
             ],
             "heaviest first, and one row a kernel"
+        );
+    }
+
+    /// What the row is read for once the launch count stops being the answer:
+    /// the grid a dispatch was given, which is what a machine's wanted
+    /// threadgroups are compared against. Summed over the dispatches and meaned
+    /// by the reader, so that two command buffers' shares of one kernel add the
+    /// way every other column of the row does.
+    #[test]
+    fn a_kernels_grid_is_the_threadgroups_its_dispatches_were_given() {
+        fresh();
+        dispatched("fused_attention", over(2, SPIN, 0, 64));
+        dispatched("fused_attention", over(2, SPIN, 0, 2_048));
+
+        let profile = take();
+        let [(kernel, row)] = profile.kernels()[..] else {
+            panic!("one kernel ran")
+        };
+        assert_eq!(kernel, "fused_attention");
+        assert_eq!(row.groups, 2_112);
+        assert_eq!(row.groups_a_dispatch(), 528.0);
+        assert_eq!(
+            Dispatches::default().groups_a_dispatch(),
+            0.0,
+            "a row nobody dispatched is not a dispatch of no threadgroups"
         );
     }
 
@@ -673,11 +725,7 @@ mod tests {
     /// ceiling on. A kernel nobody timed is nought and not a division by one.
     #[test]
     fn a_kernels_bandwidth_is_what_it_moved_over_what_it_took() {
-        let moved = Dispatches {
-            calls: 2,
-            elapsed: Duration::from_millis(4),
-            bytes: 8_000_000,
-        };
+        let moved = over(2, Duration::from_millis(4), 8_000_000, 64);
         assert_eq!(moved.bytes_per_second(), 2e9);
 
         let untimed = Dispatches {
@@ -736,20 +784,13 @@ mod tests {
     fn a_profile_divides_its_kernel_rows_by_the_steps_too() {
         fresh();
         for _ in 0..2 {
-            dispatched("packed_matmul", 26, SPIN, 1_024);
+            dispatched("packed_matmul", over(26, SPIN, 1_024, 832));
         }
 
         let each = take().per_step(2);
         assert_eq!(
             each.kernels(),
-            [(
-                "packed_matmul",
-                Dispatches {
-                    calls: 26,
-                    elapsed: SPIN,
-                    bytes: 1_024
-                }
-            )]
+            [("packed_matmul", over(26, SPIN, 1_024, 832))]
         );
     }
 
