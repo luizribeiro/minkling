@@ -31,9 +31,9 @@ use inkling_core::profile::{self, Op, Profile};
 use inkling_core::quant::{BITS, dequantize_blocks_into};
 use inkling_core::workload::{DECODED, STRUCTURED_PROMPT, SWEPT, tiled};
 use inkling_core::{
-    AttentionCache, AttentionStep, BandedMask, Bf16, Checkpoint, CheckpointWeights, Dtype, Ending,
-    LayerStep, ModelCache, Packed as CorePacked, Projections, Sdpa, ShortConv, Tail, TensorView,
-    Tokenizer, split_heads,
+    Answered, AttentionCache, AttentionStep, BandedMask, Bf16, Checkpoint, CheckpointWeights,
+    Continuous, Dtype, Ending, LayerStep, ModelCache, Packed as CorePacked, Projections, Request,
+    Sdpa, ShortConv, Tail, TensorView, Tokenizer, split_heads,
 };
 // The ceiling every "of peak" column here is a fraction of, read from the crate
 // rather than written down again: `what_a_prefills_blocked_matmul_is_bound_by`
@@ -3769,6 +3769,127 @@ fn a_generation_in_a_batch_produces_what_it_produces_alone_on_the_device() {
             assert_eq!(
                 batched[at], alone[*seq],
                 "sequence {seq} at position {at} of {order:?}"
+            );
+        }
+    }
+}
+
+/// **The same claim about the two things a continuous engine does that a static
+/// batch does not, on the real checkpoint**: a request admitted into a batch
+/// already decoding, and a request given the slot a finished one left.
+///
+/// The case above holds the batch's membership still — every prompt is
+/// prefilled before any sequence decodes, and a slot a sequence vacates stays
+/// empty. Both of the shapes here are outside it, and both are ways for one
+/// sequence's state to reach another's tokens:
+///
+/// - A joining prompt's rows ride in the same call as its neighbours' decode
+///   rows, which is a seat feeding hundreds of rows beside seats feeding one.
+///   Nothing in this tree had put a prompt in a call with a decode step in it.
+/// - A slot handed on carries the span and the four convolution windows of the
+///   sequence that left. One still counting its keys would have the next
+///   sequence attend over them and go on producing fluent text.
+///
+/// **One of the prompts is the oracle's own**, so the recorded continuation is
+/// asserted from inside a joining request as well as beside one — and the
+/// engine's answers are held token for token against each prompt generated
+/// alone, which is the only thing a leak cannot survive.
+///
+/// **Four mutations, one for each way the two shapes can go wrong.** Handing a
+/// joining request the cache the sequence before it left rather than a fresh one
+/// in that slot fails the handover; handing it slot zero's cache is refused by
+/// the duplicate-slot check a layer down; ordering the call's seats
+/// decoders-first fails the join, because the tail is asked for the *last* rows
+/// of a call and a prompt's rows would be taken for the decoders' answers; and
+/// filling a prompt to its last token as well feeds that token twice.
+#[test]
+fn a_request_that_joins_or_takes_over_a_slot_produces_what_it_produces_alone() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let config = fixture::config(&dir).text_config;
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+
+    let recorded = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+    let oracle = indices(&fixture::tensor(
+        &fixture::open(ACTIVATIONS),
+        "greedy_continuation",
+    ));
+    // Four prompts of four lengths, the first of them the oracle's. Four
+    // against two slots, so two of them are handovers.
+    let asked: Vec<Request> = [
+        recorded.clone(),
+        recorded[..recorded.len() / 2].to_vec(),
+        recorded[recorded.len() - 3..].to_vec(),
+        recorded[1..].to_vec(),
+    ]
+    .into_iter()
+    .map(|prompt| Request {
+        prompt,
+        count: BATCHED,
+    })
+    .collect();
+
+    let alone: Vec<Vec<usize>> = {
+        let weights = gpu.wrap(&ckpt, &config, 0);
+        let generator = weights.generator();
+        asked
+            .iter()
+            .map(|request| {
+                generator.generate(
+                    &mut ModelCache::new(&config),
+                    &request.prompt,
+                    request.count,
+                    &weights,
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        alone[0],
+        oracle[..BATCHED],
+        "the recorded continuation, generated alone"
+    );
+    assert_ne!(alone[0], alone[1], "two generations to tell apart");
+
+    // Chunks that divide the prompts and chunks that do not, so a joining
+    // prompt is spread over a different number of steps each time — and the
+    // widest is a prompt entering in one call, which is the arm that stalls its
+    // neighbours the longest.
+    //
+    // **The recorded prompt is eight tokens**, so a chunk wider than seven
+    // fills every prompt in one step and no call ever carries a prompt row and
+    // a decode row at once — which is the case this exists for. The small
+    // chunks are what reach it and `mixed` is what says they did.
+    for chunk in [1, 2, 3, 4096] {
+        let weights = gpu.wrap_batch(&ckpt, &config, 2);
+        let generator = weights.generator();
+        let mut engine = Continuous::new(&config, 2, chunk);
+        for request in &asked {
+            engine.submit(request.clone());
+        }
+
+        let mut answered: Vec<Answered> = Vec::new();
+        let mut mixed = 0;
+        while !engine.idle() {
+            let stepped = engine.step(&generator, &weights);
+            assert!(!stepped.empty(), "a step that carried no rows");
+            mixed += usize::from(stepped.filling > 0 && stepped.decoding > 0);
+            answered.extend(stepped.done);
+        }
+        answered.sort_by_key(|answer| answer.ticket);
+        assert_eq!(
+            mixed > 0,
+            chunk < 7,
+            "{mixed} calls carried a prompt row and a decode row at {chunk} rows a chunk"
+        );
+
+        assert_eq!(answered.len(), asked.len(), "{chunk} rows a chunk");
+        for (at, answer) in answered.iter().enumerate() {
+            assert_eq!(answer.ticket, at);
+            assert_eq!(
+                answer.produced, alone[at],
+                "request {at} of a two-slot engine, {chunk} rows a chunk"
             );
         }
     }

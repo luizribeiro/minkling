@@ -3081,11 +3081,15 @@ mod tests {
     /// same keys in the same tiles, and the only thing a batch changes is which
     /// row of a buffer each of them is at.
     ///
-    /// **Two mutations, one for each half.** Not restarting a slot's caches
-    /// where a stay begins — the line in [`Batching::run`] that builds them
-    /// fresh — fails the handover; laying a step's rows in stay order rather
-    /// than in slot order fails the join, which is the mistake a scheduler that
-    /// admitted into the first free slot rather than the next one would make.
+    /// **Three mutations.** Not restarting a slot's caches where a stay begins —
+    /// the line in [`Batching::run`] that builds them fresh — fails the
+    /// handover; laying a step's rows in stay order rather than in slot order
+    /// fails the join, which is the mistake a scheduler that placed a seat by
+    /// its position in the call rather than by the slot its cache names would
+    /// make; and salting a stay's rows by the run's step rather than by its own
+    /// fails it too, which is what says the arm is the same sequence as the one
+    /// it is held against. Both cases here also fail on the kernel mutation the
+    /// case above exists for — every slot's keys based at row zero.
     #[test]
     fn a_slot_that_fills_and_empties_carries_what_each_sequence_carries_alone() {
         let Some(batching) = Batching::open() else {

@@ -384,6 +384,12 @@ mod tests {
         answered: Vec<Answered>,
         filling: usize,
         decoding: usize,
+        /// Calls that carried a prompt row and a decode row at once, which is
+        /// the shape a static batch never has and the one every case here is
+        /// about. Counted rather than assumed: a chunk wide enough to swallow
+        /// each prompt in one step would leave the engine alternating between
+        /// prefills and decode steps and never reach it.
+        mixed: usize,
     }
 
     impl Ran {
@@ -391,6 +397,7 @@ mod tests {
             assert!(!stepped.empty(), "a step that carried no rows");
             self.filling += stepped.filling;
             self.decoding += stepped.decoding;
+            self.mixed += usize::from(stepped.filling > 0 && stepped.decoding > 0);
             self.answered.extend(stepped.done);
         }
 
@@ -446,7 +453,7 @@ mod tests {
                 count: COUNT,
             },
             Request {
-                prompt: sequence[..1].to_vec(),
+                prompt: sequence[..4].to_vec(),
                 count: COUNT - 2,
             },
         ]
@@ -482,8 +489,10 @@ mod tests {
 
         // The third arrives after the first two have been decoding for `late`
         // steps, which is a slot filling beside neighbours mid-generation.
+        const CHUNKS: [usize; 3] = [1, 2, 8];
+        let mut mixed = [0usize; CHUNKS.len()];
         for late in 0..=COUNT {
-            for chunk in [1, 2, 8] {
+            for (which, chunk) in CHUNKS.into_iter().enumerate() {
                 let mut engine = Continuous::new(&stack.config, asked.len(), chunk);
                 engine.submit(asked[0].clone());
                 engine.submit(asked[1].clone());
@@ -495,6 +504,7 @@ mod tests {
                 }
                 engine.submit(asked[2].clone());
                 ran.on(&mut engine, &stack, &head);
+                mixed[which] += ran.mixed;
                 let answered = ran.against(&asked);
 
                 assert_eq!(answered.len(), asked.len(), "late {late}, chunk {chunk}");
@@ -506,6 +516,15 @@ mod tests {
                     );
                 }
             }
+        }
+        // **That the case reached the shape it is about**, at every chunk. A
+        // chunk wide enough to swallow each prompt in one step leaves the engine
+        // alternating prefills with decode steps and never puts a prompt row in
+        // a call beside one — which is a case that passes without asserting
+        // anything, and the widest chunk here reaches the shape only through the
+        // request that arrives late.
+        for (chunk, mixed) in CHUNKS.into_iter().zip(mixed) {
+            assert!(mixed > 0, "no mixed call at {chunk} rows a chunk");
         }
     }
 
