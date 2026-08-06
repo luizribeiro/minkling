@@ -1178,6 +1178,7 @@ impl<'a> LayerAttention<'a> {
     /// and hold it too — see [`KeyValues::landings`]. One borrow for the layer's
     /// whole encoding is what lets a key be written and read without leaving the
     /// device.
+    #[cfg(test)]
     pub(crate) fn encode_over(
         &self,
         batch: &mut Batch<'_>,

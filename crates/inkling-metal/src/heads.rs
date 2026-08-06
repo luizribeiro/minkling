@@ -29,6 +29,7 @@
 
 use inkling_core::attention::Projections;
 use inkling_core::head::Tail;
+use inkling_core::layer::Advancing;
 use inkling_core::layer::{DecoderCache, Passed};
 use inkling_core::mtp::{Guessed, HeadBackend, HeadDevice, HeadPacked, HeadStep, HeadWeight};
 use inkling_core::ops::{MlpProjections, Projection};
@@ -258,9 +259,15 @@ impl WrappedHead<'_> {
             .input_proj
             .encode_over(&mut batch, &mut input)?
             .buffer();
-        let mut rows = self
-            .block
-            .encode_into(&mut batch, cache, step.block, &mut x)?;
+        let mut rows = self.block.encode_into(
+            &mut batch,
+            &mut [Advancing {
+                cache,
+                first: 0,
+                step: step.block,
+            }],
+            &mut x,
+        )?;
         // The last row alone, and undivided rows nobody wants: what a head is
         // chained from is its own state, which is these rows before any norm,
         // and what the guess needs is the model's tail over the last of them.

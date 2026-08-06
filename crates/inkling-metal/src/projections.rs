@@ -51,9 +51,7 @@ use inkling_core::attention::{
     Sdpa,
 };
 use inkling_core::head::{Tail, Tailed};
-use inkling_core::layer::{
-    DecoderCache, DecoderDevice, DecoderStep, Experts, LayerMark, LayerMlp, Passed,
-};
+use inkling_core::layer::{Advancing, DecoderDevice, Experts, Hidden, LayerMark, LayerMlp, Passed};
 use inkling_core::mask::BandedMask;
 use inkling_core::model::CacheMark;
 use inkling_core::ops::{MlpProjections, Projection};
@@ -61,7 +59,7 @@ use inkling_core::profile::{self, Op};
 use inkling_core::weights::{LayerBackend, LayerBanks, LayerPacked, Packed, PackedMlp};
 
 use crate::argmax::GreedyArgmax;
-use crate::attention::{AttentionError, FusedAttention, KeyValues, LayerAttention, Step};
+use crate::attention::{AttentionError, FusedAttention, LayerAttention, Placed, Step};
 use crate::buffer::{Buffer, Landing};
 use crate::device::{Device, MetalError};
 use crate::experts::{ExpertKernels, LayerExperts};
@@ -481,12 +479,22 @@ impl<'a> LayerProjections<'a> {
         self.input_layernorm.encode(batch, x).map(Some)
     }
 
+    /// The four projections over every row of the call, then the state each
+    /// sequence carries over its own rows, then `o_proj` over every row again.
+    ///
+    /// **This is where a batch pays.** `q_proj`, `k_proj`, `v_proj`, `r_proj`
+    /// and `o_proj` are five weights read in full whatever the call is, so N
+    /// sequences advancing together read them once between them. What is left
+    /// per sequence is what touches its own span and its own two windows — a
+    /// pair of convolutions, a pair of head norms and a step apiece — and a
+    /// batch of one encodes what it always encoded, in the same order, with
+    /// every placement at row zero.
     fn encoding(
         &self,
         batch: &mut Batch<'_>,
-        span: &mut KeyValues,
+        attending: &[Attending<'_>],
         normed: &mut Buffer<f32>,
-        step: LayerStep<'_>,
+        rows: usize,
     ) -> Result<Pending, MatmulError> {
         let device = self.q_proj.device();
         let mut q = self.q_proj.encode_over(batch, normed)?.buffer();
@@ -494,87 +502,123 @@ impl<'a> LayerProjections<'a> {
         let mut v = self.v_proj.encode_over(batch, normed)?.buffer();
         let mut rel = self.r_proj.encode_over(batch, normed)?.buffer();
 
-        let queries = q.len() / (step.sdpa.heads() * step.sdpa.head_dim());
-        let (keys, values) = span.landings();
-        // One dispatch rather than two, for the reason the head norms below are
-        // one: two sequences, different taps, each leaving its own window, and
-        // neither reading what the other writes. The key's rows land in a buffer
-        // of their own because a head norm reads them next; the value's are keys
-        // of the span already.
-        let mut convolved = device.zeroed::<f32>(k.len())?;
-        sconv::encode_pair(
-            batch,
-            Convolving {
-                conv: &self.k_sconv,
-                x: &mut k,
-                reading: Reading::whole(queries),
-                carried: None,
-                scale: 1.0,
-                landing: Landing {
-                    out: &mut convolved,
-                    groups: 1,
-                    stride: queries,
-                    base: 0,
+        let sdpa = attending
+            .first()
+            .expect("a batch of at least one sequence")
+            .step
+            .sdpa;
+        let (heads, head_dim) = (sdpa.heads(), sdpa.head_dim());
+        let mut attended = device.zeroed::<f32>(rows * heads * head_dim)?;
+        for seat in attending {
+            let (slot, first, queries) = (seat.slot, seat.first, seat.queries);
+            let step = seat.step;
+            let mut span = self.attention.span(slot);
+            let (keys, values) = span.landings();
+            // One dispatch rather than two, for the reason the head norms below
+            // are one: two sequences, different taps, each leaving its own
+            // window, and neither reading what the other writes. The key's rows
+            // land in a buffer of their own because a head norm reads them next;
+            // the value's are keys of the span already.
+            let mut convolved = device.zeroed::<f32>(queries * self.k_sconv.channels())?;
+            let over = Reading {
+                slot,
+                from: first,
+                rows: queries,
+            };
+            sconv::encode_pair(
+                batch,
+                Convolving {
+                    conv: &self.k_sconv,
+                    x: &mut k,
+                    reading: over,
+                    carried: None,
+                    scale: 1.0,
+                    landing: Landing {
+                        out: &mut convolved,
+                        groups: 1,
+                        stride: queries,
+                        base: 0,
+                    },
                 },
-            },
-            Convolving {
-                conv: &self.v_sconv,
-                x: &mut v,
-                reading: Reading::whole(queries),
-                carried: None,
-                scale: 1.0,
-                landing: values,
-            },
-        )?;
-        let mut k = convolved;
-
-        // One dispatch rather than two: the two norms read different rows
-        // against different weights into different landings, and neither reads
-        // what the other writes — so what separated them was that they are two
-        // tensors. See `norm::encode_pair`, which is where they part company
-        // again if a checkpoint ever gives them different widths.
-        let mut headed = device.zeroed::<f32>(q.len())?;
-        norm::encode_pair(
-            batch,
-            Normalising {
-                norm: &self.q_norm,
-                x: &mut q,
-                reading: norm::Reading::whole(queries),
-                scale: step.q_taus,
-                landing: Landing {
-                    out: &mut headed,
-                    groups: step.sdpa.heads(),
-                    stride: queries,
-                    base: 0,
+                Convolving {
+                    conv: &self.v_sconv,
+                    x: &mut v,
+                    reading: over,
+                    carried: None,
+                    scale: 1.0,
+                    landing: values,
                 },
-            },
-            Normalising {
-                norm: &self.k_norm,
-                x: &mut k,
-                reading: norm::Reading::whole(queries),
-                scale: None,
-                landing: keys,
-            },
-        )?;
+            )?;
+            let mut convolved = convolved;
 
-        // **The span grows here rather than when the batch completes**, because
-        // the step below is what has to see this call's keys and it is in the
-        // same command buffer as the two dispatches that wrote them. The step
-        // binds the span those two write, so the batch puts a barrier between
-        // them and those writes are done before it reads them — and a span that
-        // grew after the wait would attend over the previous step's keys and
-        // leave this token out of its own row.
-        span.appended(queries);
-        let mut attended = self.attention.encode_over(
-            batch,
-            span,
-            &mut headed,
-            &mut rel,
-            step.bias_taus,
-            step.q_offset,
-        )?;
+            // One dispatch rather than two: the two norms read different rows
+            // against different weights into different landings, and neither
+            // reads what the other writes — so what separated them was that they
+            // are two tensors. See `norm::encode_pair`, which is where they part
+            // company again if a checkpoint ever gives them different widths.
+            let mut headed = device.zeroed::<f32>(queries * heads * head_dim)?;
+            norm::encode_pair(
+                batch,
+                Normalising {
+                    norm: &self.q_norm,
+                    x: &mut q,
+                    reading: norm::Reading {
+                        from: first,
+                        rows: queries,
+                    },
+                    scale: step.q_taus,
+                    landing: Landing {
+                        out: &mut headed,
+                        groups: heads,
+                        stride: queries,
+                        base: 0,
+                    },
+                },
+                Normalising {
+                    norm: &self.k_norm,
+                    x: &mut convolved,
+                    reading: norm::Reading::whole(queries),
+                    scale: None,
+                    landing: keys,
+                },
+            )?;
+
+            // **The span grows here rather than when the batch completes**,
+            // because the step below is what has to see this call's keys and it
+            // is in the same command buffer as the two dispatches that wrote
+            // them. The step binds the span those two write, so the batch puts a
+            // barrier between them and those writes are done before it reads
+            // them — and a span that grew after the wait would attend over the
+            // previous step's keys and leave this token out of its own row.
+            span.appended(queries);
+            self.attention.encode_into(
+                batch,
+                &mut span,
+                &mut headed,
+                &mut rel,
+                step.bias_taus,
+                step.q_offset,
+                Placed { first, rows },
+                &mut attended,
+            )?;
+        }
         self.o_proj.encode_over(batch, &mut attended)
     }
+}
+
+/// One sequence of a batch as the *attention* half of a layer sees it: where its
+/// state is, where its rows are, and what the step over them is.
+///
+/// The half of [`Advancing`](inkling_core::layer::Advancing) this needs, and
+/// separate from it because the attention half is reachable without the rest of
+/// the layer — [`Projections::layer`] is that caller, and it holds an
+/// [`AttentionCache`] where a whole layer holds a
+/// [`DecoderCache`](inkling_core::DecoderCache).
+struct Attending<'a> {
+    slot: usize,
+    first: usize,
+    queries: usize,
+    step: LayerStep<'a>,
 }
 
 /// What standing one layer's own weights up on the device can fail with, which
@@ -721,12 +765,17 @@ impl Projections for LayerProjections<'_> {
     fn layer(&self, cache: &mut AttentionCache, step: LayerStep<'_>) -> Option<Vec<f32>> {
         let queries = self.beginning(cache, step, step.x.len() / self.input_layernorm.width());
         let device = self.q_proj.device();
-        let mut span = self.attention.span(cache.slot());
+        let attending = [Attending {
+            slot: cache.slot(),
+            first: 0,
+            queries,
+            step,
+        }];
         let [out] = together(device, |batch| {
             let mut x = device.buffer(step.x)?;
             let mut normed = self.input_norm(batch, &mut x, step)?;
             let normed = normed.as_mut().unwrap_or(&mut x);
-            Ok([self.encoding(batch, &mut span, normed, step)?])
+            Ok([self.encoding(batch, &attending, normed, queries)?])
         })
         .unwrap_or_else(|err| panic!("the layer's attention did not run: {err}"));
         cache.appended(queries);
@@ -1472,10 +1521,11 @@ impl<'a> ModelLayers<'a> {
     fn encode(
         &self,
         layer: usize,
-        cache: &mut DecoderCache,
-        step: DecoderStep<'_>,
+        advancing: &mut [Advancing<'_>],
+        x: Hidden<'_>,
         held: &LayerDevice<'a>,
     ) -> Result<Passed, ProjectionError> {
+        let rows: usize = advancing.iter().map(Advancing::queries).sum();
         let mut carried = self.carried.borrow_mut();
         let (mut batch, mut x, opened) = match carried.take() {
             Some(run) => {
@@ -1500,28 +1550,26 @@ impl<'a> ModelLayers<'a> {
                 // Read before the row this call is handed is allocated, so that
                 // the first thing a run holds is charged to it.
                 let opened = self.device.allocated_bytes();
-                (
-                    self.device.batch()?,
-                    self.device.buffer(step.attention.x)?,
-                    opened,
-                )
+                (self.device.batch()?, self.device.buffer(x.rows())?, opened)
             }
         };
 
-        let rows = held.encode_into(&mut batch, cache, step, &mut x)?;
+        let produced = held.encode_into(&mut batch, advancing, &mut x)?;
         if self.carries(layer, self.device.allocated_bytes() - opened) {
             *carried = Some(Carried {
                 batch: self.relayed(batch)?,
                 at: layer,
-                rows,
+                rows: produced,
                 opened,
             });
-            return Ok(Passed::Carried(step.queries));
+            return Ok(Passed::Carried(rows));
         }
 
         self.flight.borrow_mut().push(batch.submit());
         self.landed()?;
-        Ok(Passed::Rows(profile::timed(Op::Readback, || rows.to_vec())))
+        Ok(Passed::Rows(profile::timed(Op::Readback, || {
+            produced.to_vec()
+        })))
     }
 
     /// The buffer the rest of the run encodes into: the one it is holding, or a
@@ -1583,10 +1631,10 @@ impl<'a> ModelLayers<'a> {
 /// reached the bytes it may hold — see [`ModelLayers::carries`], which is where
 /// the memory a run holds is traded against the round trips it saves.
 impl DecoderDevice for ModelLayers<'_> {
-    fn run(&self, layer: usize, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<Passed> {
+    fn run(&self, layer: usize, batch: &mut [Advancing<'_>], x: Hidden<'_>) -> Option<Passed> {
         let held = self.whole(layer)?;
         Some(
-            self.encode(layer, cache, step, held)
+            self.encode(layer, batch, x, held)
                 .unwrap_or_else(|err| panic!("the layer did not run: {err}")),
         )
     }
@@ -1615,8 +1663,7 @@ impl LayerDevice<'_> {
     pub(crate) fn encode_into(
         &self,
         batch: &mut Batch<'_>,
-        cache: &mut DecoderCache,
-        step: DecoderStep<'_>,
+        advancing: &mut [Advancing<'_>],
         x: &mut Buffer<f32>,
     ) -> Result<Buffer<f32>, ProjectionError> {
         let mlp = self
@@ -1624,56 +1671,137 @@ impl LayerDevice<'_> {
             .as_ref()
             .expect("a layer run whole holds its own MLP");
         let attention = &self.attention;
-        let queries = attention.beginning(cache.attention(), step.attention, step.queries);
-        assert_eq!(
-            [step.attn_sconv.kernel_size(), step.mlp_sconv.kernel_size()],
-            [self.attn_sconv.taps(), self.mlp_sconv.taps()],
-            "the layer's residual convolutions against the ones wrapped for it"
-        );
-        assert_eq!(
-            step.post_attention_layernorm.len(),
-            self.post_attention_layernorm.width(),
-            "the layer's second norm against the one wrapped for it"
-        );
-        assert_eq!(
-            step.eps,
-            self.post_attention_layernorm.eps(),
-            "rms_norm_eps"
-        );
+        let first = advancing
+            .first()
+            .expect("a batch of at least one sequence")
+            .step;
+        let mut rows = 0;
+        for seat in advancing.iter_mut() {
+            assert_eq!(seat.first, rows, "a sequence's rows follow the last one's");
+            rows += seat.queries();
+            let step = seat.step;
+            attention.beginning(seat.cache.attention(), step.attention, step.queries);
+            assert_eq!(
+                [step.attn_sconv.kernel_size(), step.mlp_sconv.kernel_size()],
+                [self.attn_sconv.taps(), self.mlp_sconv.taps()],
+                "the layer's residual convolutions against the ones wrapped for it"
+            );
+            assert_eq!(
+                step.post_attention_layernorm.len(),
+                self.post_attention_layernorm.width(),
+                "the layer's second norm against the one wrapped for it"
+            );
+            assert_eq!(
+                step.eps,
+                self.post_attention_layernorm.eps(),
+                "rms_norm_eps"
+            );
 
-        // Both residual convolutions' windows are this sequence's, and they
-        // advance exactly when the span and the two windows inside attention do
-        // — which `beginning` has already started over if this sequence has seen
-        // nothing.
-        let slot = cache.slot();
-        if cache.attention().seen() == 0 {
-            self.attn_sconv.restart(slot);
-            self.mlp_sconv.restart(slot);
+            // Both residual convolutions' windows are this sequence's, and they
+            // advance exactly when the span and the two windows inside attention
+            // do — which `beginning` has already started over if this sequence
+            // has seen nothing.
+            let slot = seat.slot();
+            if seat.cache.attention().seen() == 0 {
+                self.attn_sconv.restart(slot);
+                self.mlp_sconv.restart(slot);
+            }
         }
 
-        let mut span = attention.attention.span(slot);
+        let attending: Vec<Attending<'_>> = advancing
+            .iter()
+            .map(|seat| Attending {
+                slot: seat.slot(),
+                first: seat.first,
+                queries: seat.queries(),
+                step: seat.step.attention,
+            })
+            .collect();
+        let dim = self.post_attention_layernorm.width();
+        let device = attention.q_proj.device();
         let mut normed = attention
-            .input_norm(batch, x, step.attention)?
+            .input_norm(batch, x, first.attention)?
             .expect("a decoder layer normalises the state it is handed");
         let mut attended = attention
-            .encoding(batch, &mut span, &mut normed, step.attention)?
+            .encoding(batch, &attending, &mut normed, rows)?
             .buffer();
-        let mut h = self.attn_sconv.encode(batch, &mut attended, Some(x), 1.0)?;
+        let mut h = device.zeroed::<f32>(rows * dim)?;
+        self.residual(
+            batch,
+            advancing,
+            &self.attn_sconv,
+            &mut attended,
+            x,
+            1.0,
+            &mut h,
+        )?;
         let mut normed = self.post_attention_layernorm.encode(batch, &mut h)?;
-        let (projected, scale) = self.projected(batch, &mut normed, queries, mlp, step.mlp)?;
-        let out = self
-            .mlp_sconv
-            .encode(batch, &mut projected.buffer(), Some(&mut h), scale)?;
+        let (projected, scale) = self.projected(batch, &mut normed, rows, mlp, first.mlp)?;
+        let mut out = device.zeroed::<f32>(rows * dim)?;
+        self.residual(
+            batch,
+            advancing,
+            &self.mlp_sconv,
+            &mut projected.buffer(),
+            &mut h,
+            scale,
+            &mut out,
+        )?;
 
-        // **The count advances here rather than when the buffer completes**, for
-        // the reason the span's own does — see `LayerProjections::encoding`. A
-        // run of layers is encoded before any of it runs, so a sequence that
-        // counted its keys at the wait would count them all after the last
-        // layer of the run had already attended.
-        cache.attention().appended(queries);
-        cache.attention().convolved(queries);
-        cache.convolved(queries);
+        // **The counts advance here rather than when the buffer completes**, for
+        // the reason the spans' own do — see `LayerProjections::encoding`. A run
+        // of layers is encoded before any of it runs, so a sequence that counted
+        // its keys at the wait would count them all after the last layer of the
+        // run had already attended.
+        for seat in advancing.iter_mut() {
+            let queries = seat.queries();
+            seat.cache.attention().appended(queries);
+            seat.cache.attention().convolved(queries);
+            seat.cache.convolved(queries);
+        }
         Ok(out)
+    }
+
+    /// One of the layer's two residual convolutions, over each sequence's own
+    /// rows of what the block before it produced.
+    ///
+    /// **A dispatch a sequence rather than a dispatch a call**, because this is
+    /// the other place a sequence's state lives: the window this reads is the
+    /// last timesteps that sequence put through it, and one call over the whole
+    /// batch would run one window down every sequence's rows in turn. What is
+    /// shared is the taps, which is the weight and is read once.
+    #[allow(clippy::too_many_arguments)]
+    fn residual(
+        &self,
+        batch: &mut Batch<'_>,
+        advancing: &[Advancing<'_>],
+        conv: &LayerConv<'_>,
+        rows_in: &mut Buffer<f32>,
+        carried: &mut Buffer<f32>,
+        scale: f32,
+        out: &mut Buffer<f32>,
+    ) -> Result<(), ProjectionError> {
+        let rows = out.len() / self.post_attention_layernorm.width();
+        for seat in advancing {
+            conv.encode_rows(
+                batch,
+                Reading {
+                    slot: seat.slot(),
+                    from: seat.first,
+                    rows: seat.queries(),
+                },
+                rows_in,
+                Some(carried),
+                scale,
+                Landing {
+                    out,
+                    groups: 1,
+                    stride: rows,
+                    base: seat.first,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// What the layer's MLP produced, and the scale its rows still carry.
@@ -1723,7 +1851,9 @@ mod tests {
     use inkling_core::weights::PackedAttention;
 
     use inkling_core::attention::{AttentionProjections, AttentionWeights};
-    use inkling_core::layer::{DecoderLayer, DecoderWeights, Hidden, NoExperts};
+    use inkling_core::layer::{
+        DecoderCache, DecoderLayer, DecoderWeights, Hidden, NoExperts, Seat,
+    };
     use inkling_core::ops::DenseMlp;
 
     use crate::combine::MoeCombine;
@@ -2245,6 +2375,9 @@ mod tests {
         /// Timesteps every one of the layer's four windows can give back, which
         /// is zero for every case but the one that rewinds.
         slack: usize,
+        /// Sequences the layer can carry at once, which is one for every case
+        /// but the one that runs a batch.
+        slots: usize,
     }
 
     /// The shapes a `Narrow` layer is built to, which have to be whole groups of
@@ -2293,12 +2426,13 @@ mod tests {
         }
 
         fn conv(&self, channels: usize, weight: &[f32]) -> LayerConv<'a> {
-            LayerConv::with_slack(
+            LayerConv::holding(
                 self.device,
                 &self.kernels.conv,
                 channels,
                 weight,
                 self.slack,
+                self.slots,
             )
             .expect("the kernel uploads")
         }
@@ -2347,11 +2481,12 @@ mod tests {
             LayerDevice {
                 attention: LayerProjections {
                     input_layernorm: self.norm(&weights.input_layernorm),
-                    attention: LayerAttention::new(
+                    attention: LayerAttention::holding(
                         self.device,
                         &self.kernels.attention,
                         NARROW,
                         &weights.rel_proj,
+                        self.slots,
                     )
                     .expect("the step stands up"),
                     k_sconv: self.conv(kv, &weights.k_sconv),
@@ -2472,6 +2607,7 @@ mod tests {
             kernels: &kernels,
             swiglu: &swiglu,
             slack: 0,
+            slots: 1,
         };
         let weights = NarrowWeights::new();
         let stack = stack(&device, vec![narrow.layer(&weights, 0)], RETAINED_BUDGET);
@@ -2557,6 +2693,7 @@ mod tests {
             kernels: &kernels,
             swiglu: &swiglu,
             slack: 0,
+            slots: 1,
         };
         let weights = NarrowWeights::new();
         let stack = narrow.stack(&weights, RETAINED_BUDGET);
@@ -2607,6 +2744,7 @@ mod tests {
             kernels: &kernels,
             swiglu: &swiglu,
             slack: 0,
+            slots: 1,
         };
         let weights = NarrowWeights::new();
         let stack = narrow.stack_of(&weights, RETAINED_BUDGET, &[0, 0x99, 0xdd, 0x33, 0x77]);
@@ -2655,6 +2793,7 @@ mod tests {
             kernels: &kernels,
             swiglu: &swiglu,
             slack: 0,
+            slots: 1,
         };
         let weights = NarrowWeights::new();
         const ROWS: usize = 2;
@@ -2761,6 +2900,168 @@ mod tests {
                 (device.allocated_bytes() - bytes) / 2,
                 (device.submissions() - submissions) / 2,
             )
+        }
+    }
+
+    /// **The test this milestone lives or dies by, at the smallest thing that
+    /// can fail it.**
+    ///
+    /// The same sequence, run alone and run inside a batch, produces identical
+    /// rows: at every position of the batch, beside neighbours of different
+    /// lengths, beside neighbours feeding a different number of rows a step,
+    /// and after a neighbour has stopped feeding altogether.
+    ///
+    /// **Nothing else here can fail on contamination.** If sequence A's span,
+    /// window or rows leak into B, both answers are still rows of the right
+    /// shape out of a plausible softmax, `o_proj` still projects them and every
+    /// layer after still refines them — and against a real checkpoint both
+    /// sequences still produce fluent text and the recorded continuation still
+    /// passes. Exact equality against the same sequence run alone is the only
+    /// thing that says otherwise, and it is exact rather than bounded because
+    /// it has to be: the batched arm walks the same taps over the same window
+    /// and the same keys in the same tiles, and the only thing a batch changes
+    /// is which row of a buffer each of them is at.
+    ///
+    /// Two layers, because a leak a single layer hid would be carried in the
+    /// rows the second one is handed; and several steps in a row, because a
+    /// window written into a neighbour's slot is a state machine that is right
+    /// on the step that wrote it and wrong on the one after.
+    #[test]
+    fn a_sequence_in_a_batch_produces_what_it_produces_alone() {
+        let Some(device) = device() else { return };
+        let kernels = LayerKernels::compile(&device).expect("the kernels compile");
+        let swiglu = SwiGlu::new(&device).expect("the kernel compiles");
+        let weights = NarrowWeights::new();
+
+        // Three sequences that differ in every way a neighbour can: how many
+        // rows they feed a step, how many steps they take, and the values in
+        // them. The third stops after one step, which is the early finisher.
+        let feeding = [vec![1, 1, 1, 1], vec![3, 2, 1, 1], vec![2]];
+        let rows_of = |seq: usize, step: usize, rows: usize| -> Vec<f32> {
+            (0..rows * NARROW.hidden)
+                .map(|i| {
+                    let salt = (seq * 7 + step * 3) as f32;
+                    ((i % 23) as f32 - 11.0 + salt) / 16.0
+                })
+                .collect()
+        };
+
+        let run = |slots: usize, of: &[usize]| -> Vec<Vec<Vec<f32>>> {
+            let narrow = Narrow {
+                device: &device,
+                kernels: &kernels,
+                swiglu: &swiglu,
+                slack: 0,
+                slots,
+            };
+            let stack = stack(
+                &device,
+                vec![narrow.layer(&weights, 0), narrow.layer(&weights, 0x99)],
+                RETAINED_BUDGET,
+            );
+            let layers: Vec<DecoderLayer<'_>> = (0..2)
+                .map(|at| {
+                    let held = stack.layer(at).expect("the layer is here");
+                    DecoderLayer::new(
+                        NARROW,
+                        weights.decoder(&held.attention),
+                        LayerMlp::Dense(DenseMlp::backend(
+                            NARROW.hidden,
+                            NARROW_FFN,
+                            held.mlp.as_ref().and_then(dense).expect("a dense layer"),
+                            GLOBAL_SCALE,
+                        )),
+                    )
+                })
+                .collect();
+
+            let mut caches: Vec<[DecoderCache; 2]> = (0..of.len())
+                .map(|slot| {
+                    [0, 1].map(|_| {
+                        DecoderCache::new(NARROW, NARROW.hidden, KERNEL_SIZE).in_slot(slot)
+                    })
+                })
+                .collect();
+
+            let steps = of
+                .iter()
+                .map(|seq| feeding[*seq].len())
+                .max()
+                .expect("a sequence");
+            let mut produced: Vec<Vec<Vec<f32>>> = of.iter().map(|_| Vec::new()).collect();
+            for step in 0..steps {
+                let live: Vec<usize> = (0..of.len())
+                    .filter(|at| step < feeding[of[*at]].len())
+                    .collect();
+                if live.is_empty() {
+                    continue;
+                }
+                let queries: Vec<usize> = live.iter().map(|at| feeding[of[*at]][step]).collect();
+                let x: Vec<f32> = live
+                    .iter()
+                    .zip(&queries)
+                    .flat_map(|(at, rows)| rows_of(of[*at], step, *rows))
+                    .collect();
+
+                let mut h = Passed::Rows(x);
+                for (at, layer) in layers.iter().enumerate() {
+                    let mut held: Vec<&mut DecoderCache> = caches
+                        .iter_mut()
+                        .enumerate()
+                        .filter(|(slot, _)| live.contains(slot))
+                        .map(|(_, pair)| &mut pair[at])
+                        .collect();
+                    let mut seats: Vec<Seat<'_>> = held
+                        .drain(..)
+                        .zip(&queries)
+                        .map(|(cache, rows)| Seat {
+                            cache,
+                            queries: *rows,
+                        })
+                        .collect();
+                    let handed = h.handed();
+                    let next = layer
+                        .advancing(&mut seats, |batch| {
+                            (&stack as &dyn DecoderDevice).run(at, batch, handed)
+                        })
+                        .expect("the stack ran the layer");
+                    h = next;
+                }
+
+                let out = h.rows();
+                let mut from = 0;
+                for (at, rows) in live.iter().zip(&queries) {
+                    produced[*at]
+                        .push(out[from * NARROW.hidden..][..rows * NARROW.hidden].to_vec());
+                    from += rows;
+                }
+            }
+            produced
+        };
+
+        // Each sequence alone, which is the batch of one and is the oracle.
+        let alone: Vec<Vec<Vec<f32>>> = (0..feeding.len())
+            .map(|seq| run(1, &[seq]).remove(0))
+            .collect();
+        assert_ne!(alone[0], alone[1], "two sequences to tell apart");
+
+        // Every ordering of the three, so that a sequence is checked at the
+        // front of a batch, in the middle of one and at the back of one.
+        for order in [
+            vec![0, 1, 2],
+            vec![2, 1, 0],
+            vec![1, 0, 2],
+            vec![1, 2, 0],
+            vec![0, 1],
+            vec![1, 0],
+        ] {
+            let batched = run(order.len(), &order);
+            for (at, seq) in order.iter().enumerate() {
+                assert_eq!(
+                    batched[at], alone[*seq],
+                    "sequence {seq} at position {at} of {order:?}"
+                );
+            }
         }
     }
 
@@ -2873,6 +3174,7 @@ mod tests {
                 kernels,
                 swiglu,
                 slack,
+                slots: 1,
             };
             let stack = stack(
                 device,

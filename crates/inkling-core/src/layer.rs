@@ -34,7 +34,7 @@
 use std::borrow::Cow;
 
 use crate::attention::{
-    Attention, AttentionCache, AttentionConfig, AttentionMark, AttentionWeights, LayerStep,
+    Attention, AttentionCache, AttentionConfig, AttentionMark, AttentionWeights, LayerStep, Taus,
 };
 use crate::moe::{BankRows, Gathered, Routed, Rows, SparseMoe};
 use crate::ops::{DenseMlp, rms_norm};
@@ -66,9 +66,65 @@ use crate::sconv::{ConvMark, ConvState, ShortConv};
 /// spanning as many layers as it holds, rather than one a layer with a round
 /// trip between. The index is what lets it know whether there is a next layer
 /// to carry to; the stack asks in order and every layer's cache is its own.
+/// **And which is why a layer is asked for a batch rather than a call.** The
+/// weights a layer reads are the same weights for every sequence in flight —
+/// 5.9 GB of them for the stack — so N sequences that advance together read
+/// them once between them, and what is per sequence is the state: a span, four
+/// convolution windows, and where its own rows sit in the call. A batch of one
+/// is that with N equal to one, which is what every request here was before
+/// there was a batch and is not a second path.
 pub trait DecoderDevice {
-    /// Layer `layer`, or `None` where this backend does not hold all of it.
-    fn run(&self, layer: usize, cache: &mut DecoderCache, step: DecoderStep<'_>) -> Option<Passed>;
+    /// Layer `layer` over every sequence of `batch`, or `None` where this
+    /// backend does not hold all of it.
+    ///
+    /// `x` is the `[rows, hidden]` of the whole call — every sequence's rows,
+    /// in the order the batch names them — and each [`Advancing`] says which
+    /// run of it is its own.
+    fn run(&self, layer: usize, batch: &mut [Advancing<'_>], x: Hidden<'_>) -> Option<Passed>;
+}
+
+/// One sequence of a batch, as one layer sees it: the state that is its own,
+/// the rows of the call that are its own, and everything the layer will run
+/// for it.
+///
+/// **What is *not* here is the weights**, and that is the whole of what a batch
+/// buys: [`DecoderStep`] carries the layer's tensors and every sequence's copy
+/// of it names the same ones. What differs between two entries is where their
+/// rows are, how many keys each has seen, and which slot of the backend holds
+/// them.
+pub struct Advancing<'a> {
+    /// This sequence's state on this side, which carries the slot that names
+    /// its state on the backend — see
+    /// [`AttentionCache::in_slot`](crate::AttentionCache::in_slot).
+    pub cache: &'a mut DecoderCache,
+    /// The row of the call this sequence's first row is.
+    pub first: usize,
+    /// Everything the layer runs for it, described. `step.queries` is this
+    /// sequence's rows and `step.attention.q_offset` is where they sit in it.
+    pub step: DecoderStep<'a>,
+}
+
+/// One sequence a caller is putting into a batch: its state, and how many rows
+/// of the call it is feeding.
+///
+/// The other half of [`Advancing`], and separate from it because the two are
+/// filled in by different people: a caller names the sequence and the rows, and
+/// [`DecoderLayer::advancing`] works out the description and the placement.
+pub struct Seat<'a> {
+    pub cache: &'a mut DecoderCache,
+    pub queries: usize,
+}
+
+impl Advancing<'_> {
+    /// How many rows of the call are this sequence's.
+    pub fn queries(&self) -> usize {
+        self.step.queries
+    }
+
+    /// Which of the backend's slots holds this sequence's span and windows.
+    pub fn slot(&self) -> usize {
+        self.cache.slot()
+    }
 }
 
 /// The `[tokens, hidden]` one decoder layer is handed: the rows, or the promise
@@ -629,8 +685,59 @@ impl<'a> DecoderLayer<'a> {
         device: Option<&dyn DecoderDevice>,
     ) -> Option<Passed> {
         let device = device?;
-        let seen = cache.attention.seen();
-        self.described(seen, x, queries, |step| device.run(layer, cache, step))
+        self.advancing(&mut [Seat { cache, queries }], |batch| {
+            device.run(layer, batch, x)
+        })
+    }
+
+    /// Everything this layer runs for each sequence of a batch, described
+    /// rather than run — [`DecoderLayer::described`] over more than one
+    /// sequence, which is what [`DecoderDevice::run`] is handed.
+    ///
+    /// **A closure for the reason [`DecoderLayer::described`] takes one**: a
+    /// description borrows the log-scaling factors this call worked out for
+    /// each sequence's own position, and those outlive the descriptions and
+    /// nothing else.
+    ///
+    /// The rows are laid out in the order the seats are named, each sequence's
+    /// run following the last — which is what [`Advancing::first`] says and
+    /// what every dispatch that reads one sequence's rows out of the call's
+    /// buffer indexes by.
+    pub fn advancing<R>(
+        &self,
+        seats: &mut [Seat<'_>],
+        with: impl FnOnce(&mut [Advancing<'_>]) -> R,
+    ) -> R {
+        let shape: Vec<(usize, usize)> = seats
+            .iter()
+            .map(|seat| (seat.cache.attention.seen(), seat.queries))
+            .collect();
+        let taus: Vec<Taus> = shape
+            .iter()
+            .map(|(seen, queries)| self.attention.taus(*seen, *queries))
+            .collect();
+
+        let mut first = 0;
+        let mut batch: Vec<Advancing<'_>> = Vec::with_capacity(seats.len());
+        for ((seat, (seen, queries)), taus) in seats.iter_mut().zip(&shape).zip(&taus) {
+            batch.push(Advancing {
+                first,
+                step: DecoderStep {
+                    attention: self
+                        .attention
+                        .step(&[], Some(self.input_layernorm), taus, *seen),
+                    attn_sconv: self.attn_sconv,
+                    post_attention_layernorm: self.post_attention_layernorm,
+                    eps: self.rms_norm_eps,
+                    mlp: self.mlp,
+                    queries: *queries,
+                    mlp_sconv: self.mlp_sconv,
+                },
+                cache: seat.cache,
+            });
+            first += queries;
+        }
+        with(&mut batch)
     }
 }
 

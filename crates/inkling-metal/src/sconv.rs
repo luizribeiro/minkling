@@ -267,6 +267,12 @@ impl<'a> LayerConv<'a> {
         self.taps
     }
 
+    /// The channels a row of this convolution is, which is the width its rows
+    /// land in.
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
     /// The window a sequence starts from, which is `taps - 1` zeroed timesteps —
     /// and is what makes the first output causal.
     ///
