@@ -378,16 +378,14 @@ impl<'a> LayerNorm<'a> {
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
         let call = self.described(x.len(), seats, &landing);
-        let mut shared = self.device.inline(&call.shared)?;
-        let mut seated = self.device.inline(&call.seats)?;
+        let mut called = self.device.inline(&call.binding)?;
         let mut weight = self.weight.borrow_mut();
         let mut scales = self.device.inline(&call.scales)?;
 
         batch.add(
             &self.norm.kernel,
             &[
-                shared.arg(),
-                seated.arg(),
+                called.arg(),
                 x.arg(),
                 weight.arg(),
                 scales.arg(),
@@ -419,9 +417,13 @@ impl<'a> LayerNorm<'a> {
             landing.groups
         );
 
+        // The shared fields are decided by the loop below — the widest seat's
+        // span is one of them — so they are left as room at the front and
+        // written once it has run.
+        let mut binding = Vec::with_capacity(SHARED + seats.len() * FIELDS);
+        binding.resize(SHARED, 0);
         let mut call = Call {
-            shared: [0; SHARED],
-            seats: Vec::with_capacity(seats.len() * FIELDS),
+            binding,
             scales: Vec::new(),
             span: 0,
             // The one weight every row of every seat reads, which is read once
@@ -438,7 +440,7 @@ impl<'a> LayerNorm<'a> {
                 self.rows(values / landing.groups)
             );
             landing.fits_at(base, rows, self.width);
-            call.seats.extend([
+            call.binding.extend([
                 extent(rows, "rows of a seat"),
                 extent(from, "where a seat's rows are read from"),
                 extent(base, "where a seat's rows land"),
@@ -457,14 +459,14 @@ impl<'a> LayerNorm<'a> {
             // of them.
             call.moves += size_of::<f32>() * (2 * rows * landing.groups * self.width + rows);
         }
-        call.shared = [
+        call.binding[..SHARED].copy_from_slice(&[
             extent(landing.groups, "the groups of a row"),
             extent(self.width, "the width of a norm"),
             extent(landing.stride, "the rows a group has room for"),
             self.eps.to_bits(),
             extent(seats.len(), "the sequences of a call"),
             extent(call.span, "the threadgroups a seat is given"),
-        ];
+        ]);
         call
     }
 }
@@ -490,12 +492,20 @@ pub struct Seating<'a> {
 
 /// One norm's call as the dispatch that runs it describes it.
 struct Call {
-    shared: [u32; SHARED],
-    /// [`FIELDS`] `uint`s for each seat, in the order the seats were given —
-    /// which is the order the kernel indexes them in.
-    seats: Vec<u32>,
+    /// The [`SHARED`] `uint`s every seat reads, then [`FIELDS`] for each seat in
+    /// the order the seats were given — which is the order the kernel indexes
+    /// them in.
+    ///
+    /// **One binding**, because a dispatch pays for each argument it binds
+    /// whatever is in it and a decode step of one sequence encodes 168 seated
+    /// dispatches. The kernel cuts the seats out of the tail of the same
+    /// `setBytes` — see [`BODY`]'s `seated`.
+    binding: Vec<u32>,
     /// Every seat's per-row scales, one run after another, which is what each
     /// seat's own offset into indexes.
+    ///
+    /// A binding of its own because these are floats: a run a row long for every
+    /// row of every seat, where the fields above are one short record a seat.
     scales: Vec<f32>,
     /// Threadgroups each seat is given, which is a group of a row for the widest
     /// of them.
@@ -507,7 +517,7 @@ impl Call {
     /// The threadgroups the dispatch takes: every seat's span, whether or not it
     /// has the rows to fill one.
     fn slots(&self) -> usize {
-        self.span * (self.seats.len() / FIELDS)
+        self.span * ((self.binding.len() - SHARED) / FIELDS)
     }
 }
 
@@ -572,10 +582,8 @@ pub fn encode_pair(
     let first_call = one.described(first_x.len(), first_seats, &first_landing);
     let second_call = other.described(second_x.len(), second_seats, &second_landing);
     let device = one.device;
-    let mut first_shared = device.inline(&first_call.shared)?;
-    let mut second_shared = device.inline(&second_call.shared)?;
-    let mut first_seated = device.inline(&first_call.seats)?;
-    let mut second_seated = device.inline(&second_call.seats)?;
+    let mut first_called = device.inline(&first_call.binding)?;
+    let mut second_called = device.inline(&second_call.binding)?;
     let mut first_scales = device.inline(&first_call.scales)?;
     let mut second_scales = device.inline(&second_call.scales)?;
     let mut first_weight = one.weight.borrow_mut();
@@ -584,14 +592,12 @@ pub fn encode_pair(
     batch.add(
         &one.norm.paired,
         &[
-            first_shared.arg(),
-            first_seated.arg(),
+            first_called.arg(),
             first_x.arg(),
             first_weight.arg(),
             first_scales.arg(),
             first_landing.out.arg(),
-            second_shared.arg(),
-            second_seated.arg(),
+            second_called.arg(),
             second_x.arg(),
             second_weight.arg(),
             second_scales.arg(),
@@ -648,6 +654,23 @@ struct Seat {
     /// Where this sequence's own per-row scales start in the call's.
     uint scales;
 };
+
+/// **A call's shared fields and its seats are one binding**, the `Call` at the
+/// head of it and a `Seat` for each sequence behind them.
+///
+/// A dispatch pays for each argument it binds whatever is in it, and a decode
+/// step of one sequence encodes 168 seated dispatches — so the two shapes travel
+/// in one `setBytes` and are cut apart here, which is the one place that knows
+/// how wide the head is. Both are `uint` throughout, so the tail is aligned for
+/// a `Seat` wherever the head ends. The per-row scales stay a binding of their
+/// own because they are floats and are a run a row rather than a record a seat.
+inline constant Call &called(constant uint *packed) {
+    return *(constant Call *)packed;
+}
+
+inline constant Seat *seated(constant uint *packed) {
+    return (constant Seat *)(packed + sizeof(Call) / sizeof(uint));
+}
 
 /// What a lane contributes to each of the two reductions, and how it is brought
 /// into the row's scale — the three places the body below touches a value rather
@@ -848,12 +871,11 @@ static void normalise_slot(
 /// scaling's `tau` is the only thing that ever sets it and everywhere else it is
 /// a row of ones, which multiplies exactly.
 kernel void rms_norm(
-    constant Call &call [[buffer(0)]],
-    constant Seat *seats [[buffer(1)]],
-    device const float *x [[buffer(2)]],
-    device const float *weight [[buffer(3)]],
-    device const float *scale [[buffer(4)]],
-    device float *out [[buffer(5)]],
+    constant uint *packed [[buffer(0)]],
+    device const float *x [[buffer(1)]],
+    device const float *weight [[buffer(2)]],
+    device const float *scale [[buffer(3)]],
+    device float *out [[buffer(4)]],
     uint slot [[threadgroup_position_in_grid]],
     uint local [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -872,16 +894,18 @@ kernel void rms_norm(
     // pair is the threadgroup's own position — where a bounds check on `local`
     // would leave some threads at the barriers below and others past them,
     // which is undefined rather than slow.
+    constant Call &call = called(packed);
     const uint seat = slot / call.span;
     if (seat >= call.seats) {
         return;
     }
     const uint own = slot % call.span;
-    if (own >= seats[seat].rows * call.groups) {
+    constant Seat &seated_here = seated(packed)[seat];
+    if (own >= seated_here.rows * call.groups) {
         return;
     }
     normalise_slot(
-        call, seats[seat], x, weight, scale, out, own,
+        call, seated_here, x, weight, scale, out, own,
         peaks, sums, local, threads, lane, simd, simds
     );
 }
@@ -903,18 +927,16 @@ kernel void rms_norm(
 /// The two halves share one threadgroup width, which is why a pair is only
 /// formed where both call for the same one — see `norm::encode_pair`.
 kernel void rms_norm_pair(
-    constant Call &first [[buffer(0)]],
-    constant Seat *first_seats [[buffer(1)]],
-    device const float *first_x [[buffer(2)]],
-    device const float *first_weight [[buffer(3)]],
-    device const float *first_scale [[buffer(4)]],
-    device float *first_out [[buffer(5)]],
-    constant Call &second [[buffer(6)]],
-    constant Seat *second_seats [[buffer(7)]],
-    device const float *second_x [[buffer(8)]],
-    device const float *second_weight [[buffer(9)]],
-    device const float *second_scale [[buffer(10)]],
-    device float *second_out [[buffer(11)]],
+    constant uint *first_packed [[buffer(0)]],
+    device const float *first_x [[buffer(1)]],
+    device const float *first_weight [[buffer(2)]],
+    device const float *first_scale [[buffer(3)]],
+    device float *first_out [[buffer(4)]],
+    constant uint *second_packed [[buffer(5)]],
+    device const float *second_x [[buffer(6)]],
+    device const float *second_weight [[buffer(7)]],
+    device const float *second_scale [[buffer(8)]],
+    device float *second_out [[buffer(9)]],
     uint slot [[threadgroup_position_in_grid]],
     uint local [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -925,24 +947,28 @@ kernel void rms_norm_pair(
     threadgroup float peaks[MOST_SIMDGROUPS];
     threadgroup float sums[MOST_SIMDGROUPS];
 
+    constant Call &first = called(first_packed);
     const uint firsts = first.seats * first.span;
     if (slot < firsts) {
         const uint seat = slot / first.span;
         const uint own = slot % first.span;
-        if (own < first_seats[seat].rows * first.groups) {
+        if (own < seated(first_packed)[seat].rows * first.groups) {
             normalise_slot(
-                first, first_seats[seat], first_x, first_weight, first_scale,
+                first, seated(first_packed)[seat], first_x, first_weight, first_scale,
                 first_out, own,
                 peaks, sums, local, threads, lane, simd, simds
             );
         }
-    } else if (slot < firsts + second.seats * second.span) {
+        return;
+    }
+    constant Call &second = called(second_packed);
+    if (slot < firsts + second.seats * second.span) {
         const uint over = slot - firsts;
         const uint seat = over / second.span;
         const uint own = over % second.span;
-        if (own < second_seats[seat].rows * second.groups) {
+        if (own < seated(second_packed)[seat].rows * second.groups) {
             normalise_slot(
-                second, second_seats[seat], second_x, second_weight, second_scale,
+                second, seated(second_packed)[seat], second_x, second_weight, second_scale,
                 second_out, own,
                 peaks, sums, local, threads, lane, simd, simds
             );
@@ -1908,6 +1934,124 @@ mod tests {
 
         assert_eq!(first_out.to_vec(), seated(&one, &x, &seats));
         assert_eq!(second_out.to_vec(), seated(&other, &y, &seats));
+    }
+
+    /// **The merged kernel carries every seat of both its halves**, which is the
+    /// arm the case above cannot reach: that one is two dispatches, and
+    /// [`a_paired_norm_answers_what_the_two_norms_it_replaces_answer`] gives each
+    /// half one seat over the whole grid — so a pair that read seat zero of each
+    /// and no other answers both.
+    ///
+    /// The halves are ragged the other way round from each other because each
+    /// strides its own threadgroups by its own widest seat and cuts its own seats
+    /// out of its own binding. A half given the other's span, or reading the
+    /// other's seats, normalises rows this compares.
+    #[test]
+    fn a_merged_pair_seats_every_sequence_of_both_halves() {
+        let Some(device) = device() else { return };
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let width = 32;
+        let one =
+            LayerNorm::new(&device, &norm, &weight_of(width, 3), 1e-6).expect("the weight uploads");
+        let other =
+            LayerNorm::new(&device, &norm, &weight_of(width, 5), 1e-5).expect("the weight uploads");
+        assert_eq!(
+            one.threads, other.threads,
+            "the two ask for one threadgroup"
+        );
+
+        let taus: Vec<f32> = (0..3).map(|i| 0.5 + i as f32 / 4.0).collect();
+        fn ragged<'a>(taking: [usize; 2], scale: Option<&'a [f32]>) -> Vec<Seating<'a>> {
+            let mut at = 0;
+            taking
+                .into_iter()
+                .map(|rows| {
+                    let seat = Seating {
+                        from: at,
+                        rows,
+                        base: at,
+                        scale: scale.map(|scale| &scale[at..at + rows]),
+                    };
+                    at += rows;
+                    seat
+                })
+                .collect()
+        }
+        let first_seats = ragged([1, 2], Some(&taus));
+        let second_seats = ragged([2, 1], None);
+
+        let (x, y) = (values(3 * width, 7), values(3 * width, 9));
+        let seated = |norm: &LayerNorm<'_>, values: &[f32], seats: &[Seating<'_>]| {
+            let mut input = device.buffer(values).expect("the rows upload");
+            let mut out = device
+                .zeroed::<f32>(values.len())
+                .expect("the landing allocates");
+            let mut batch = device.batch().expect("a command buffer opens");
+            norm.encode_seats(
+                &mut batch,
+                &mut input,
+                seats,
+                Landing {
+                    out: &mut out,
+                    groups: 1,
+                    stride: 3,
+                    base: 0,
+                },
+            )
+            .expect("the dispatch encodes");
+            batch.wait().expect("the batch completes");
+            out.to_vec()
+        };
+
+        let mut first_x = device.buffer(&x).expect("the rows upload");
+        let mut second_x = device.buffer(&y).expect("the rows upload");
+        let mut first_out = device
+            .zeroed::<f32>(x.len())
+            .expect("the landing allocates");
+        let mut second_out = device
+            .zeroed::<f32>(y.len())
+            .expect("the landing allocates");
+        let dispatches = device.dispatches();
+        let mut batch = device.batch().expect("a command buffer opens");
+        super::encode_pair(
+            &mut batch,
+            Normalising {
+                norm: &one,
+                x: &mut first_x,
+                seats: &first_seats,
+                landing: Landing {
+                    out: &mut first_out,
+                    groups: 1,
+                    stride: 3,
+                    base: 0,
+                },
+            },
+            Normalising {
+                norm: &other,
+                x: &mut second_x,
+                seats: &second_seats,
+                landing: Landing {
+                    out: &mut second_out,
+                    groups: 1,
+                    stride: 3,
+                    base: 0,
+                },
+            },
+        )
+        .expect("the pair encodes");
+        batch.wait().expect("the batch completes");
+        assert_eq!(
+            device.dispatches() - dispatches,
+            1,
+            "the merged entry rather than the fallback"
+        );
+
+        assert_eq!(first_out.to_vec(), seated(&one, &x, &first_seats));
+        assert_eq!(second_out.to_vec(), seated(&other, &y, &second_seats));
+        assert!(
+            first_out.to_vec().iter().any(|value| *value != 0.0),
+            "a pair that wrote nothing would compare equal to another that did"
+        );
     }
 
     /// A weight that is not all one value, so a norm that dropped it or read it
