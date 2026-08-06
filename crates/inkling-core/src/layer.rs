@@ -358,6 +358,19 @@ impl DecoderCache {
         }
     }
 
+    /// The same, for a sequence whose state on a backend is that backend's slot
+    /// `slot` — see [`AttentionCache::in_slot`], which is where the whole of
+    /// what a slot is is said.
+    pub fn in_slot(mut self, slot: usize) -> Self {
+        self.attention = self.attention.in_slot(slot);
+        self
+    }
+
+    /// Which of a backend's slots holds the rest of this sequence's state.
+    pub fn slot(&self) -> usize {
+        self.attention.slot()
+    }
+
     /// Record that `rows` timesteps went through the two convolutions on this
     /// layer's residual paths somewhere else — see
     /// [`ConvState::advanced`](crate::sconv::ConvState::advanced). The two

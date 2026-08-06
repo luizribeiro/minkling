@@ -114,6 +114,12 @@ impl<'a> ModelHeads<'a> {
     /// for a chain is the frontier row every round runs and takes back again —
     /// see [`FRONTIER`](inkling_core::mtp::FRONTIER). A head wrapped with none
     /// holds its state as firmly as a layer of a run that never speculates.
+    ///
+    /// `slots` is how many sequences the chain serves at once, for the reason
+    /// [`StackShape::slots`](crate::StackShape::slots) gives: a head's block is
+    /// a decoder layer and carries a decoder layer's state, so a batch that
+    /// speculates needs a chain's state per sequence in it.
+    #[allow(clippy::too_many_arguments)]
     pub fn wrap(
         device: &'a Device,
         kernels: &'a LayerKernels,
@@ -122,6 +128,7 @@ impl<'a> ModelHeads<'a> {
         heads: &[HeadPacked<'a>],
         tail: Option<ModelTail<'a>>,
         slack: usize,
+        slots: usize,
     ) -> Result<Self, ProjectionError> {
         let wrapped = heads
             .iter()
@@ -159,6 +166,7 @@ impl<'a> ModelHeads<'a> {
                             mlp_sconv: &head.mlp_sconv,
                         },
                         slack,
+                        slots,
                     )?,
                 })
             })
@@ -203,9 +211,9 @@ impl HeadBackend for ModelHeads<'_> {
     /// which is the one way the two differ: the row a chain guessed from is a
     /// row the model has not been asked about yet, so the round after it runs
     /// that position again against the token the model produced.
-    fn rewind(&self, head: usize, rows: usize) {
+    fn rewind(&self, head: usize, slot: usize, rows: usize) {
         if let Some(held) = self.heads.get(head) {
-            held.block.rewind(rows);
+            held.block.rewind(slot, rows);
         }
     }
 }

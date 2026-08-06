@@ -156,11 +156,17 @@ pub fn open(backend: Backend, numerics: Numerics) -> Result<Option<Gpu>> {
 /// which is how far ahead this run will guess: the state a rejected token
 /// reached lives where the layer ran, so a device holding the layers has to be
 /// told before it wraps them. A run that speculates nothing asks for none.
+///
+/// `slots` is how many sequences the run will advance together — see
+/// [`StackShape::slots`], where what a slot costs is stated. A run serving one
+/// request asks for one, which is the batch of one the whole engine was before
+/// there was a batch.
 pub fn weights<'a>(
     gpu: Option<&'a Gpu>,
     ckpt: &'a Checkpoint,
     config: &'a TextConfig,
     speculation: usize,
+    slots: usize,
 ) -> Result<CheckpointWeights<'a>> {
     let weights = CheckpointWeights::open(ckpt, config)?;
     let Some(gpu) = gpu else {
@@ -197,6 +203,7 @@ pub fn weights<'a>(
             layers: config.num_hidden_layers,
             dim: config.hidden_size,
             slack: speculation,
+            slots,
         },
     )
     .context("giving the model's layers to the Metal device")?;
@@ -254,6 +261,7 @@ pub fn heads<'a>(
     config: &Config,
     depth: usize,
     tail: &TailWeights<'a>,
+    slots: usize,
 ) -> Result<Option<CheckpointHeads<'a>>> {
     if depth == 0 {
         return Ok(None);
@@ -285,6 +293,7 @@ pub fn heads<'a>(
         gpu.tail(tail)
             .context("giving the model's tail to the Metal device")?,
         FRONTIER,
+        slots,
     )
     .context("giving the MTP heads to the Metal device")?;
     eprintln!(

@@ -94,8 +94,31 @@ impl ShortConvolution {
     }
 }
 
-/// One short convolution's kernel on the device, and the window it carries
-/// between calls.
+/// The two windows one sequence carries through one convolution, and how much
+/// of each is filled.
+///
+/// **One of these per slot of a batch, and the weight is not among them.** N
+/// sequences advancing together read the same taps and carry their own
+/// timesteps, so what a slot holds is the state and what the convolution holds
+/// is the tensor — which is the whole of the bargain a batch is: one weight
+/// read, many tokens.
+#[derive(Debug)]
+struct Windows {
+    /// The two a call reads one of and writes the other — see the module
+    /// documentation.
+    windows: RefCell<[Buffer<f32>; 2]>,
+    /// Which of the two the next call reads.
+    reading: Cell<usize>,
+    /// What each of them holds, which is the `taps - 1` the convolution reads
+    /// and the timesteps behind them a rejected speculative token is taken back
+    /// out of. The arithmetic is
+    /// [`ConvState`](inkling_core::ConvState)'s and so is the argument for it;
+    /// what differs here is only that the rows are on a device.
+    held: Cell<Held>,
+}
+
+/// One short convolution's kernel on the device, and the windows it carries
+/// between calls — a pair for each slot of the batch it was wrapped for.
 ///
 /// The weight is `[channels, taps]` — one contiguous run of taps per channel,
 /// which is what both published checkpoints flatten to — and is copied once at
@@ -110,17 +133,9 @@ pub struct LayerConv<'a> {
     /// buffer to a dispatch borrows it exclusively, and the weight belongs to
     /// the layer rather than to the call.
     weight: RefCell<Buffer<f32>>,
-    /// The two windows a call reads one of and writes the other — see the
-    /// module documentation.
-    windows: RefCell<[Buffer<f32>; 2]>,
-    /// Which of the two the next call reads.
-    reading: Cell<usize>,
-    /// What each of them holds, which is the `taps - 1` the convolution reads
-    /// and the timesteps behind them a rejected speculative token is taken back
-    /// out of. The arithmetic is
-    /// [`ConvState`](inkling_core::ConvState)'s and so is the argument for it;
-    /// what differs here is only that the rows are on a device.
-    held: Cell<Held>,
+    /// A sequence's windows, one entry per slot the batch has room for. A
+    /// convolution serving one sequence holds one, which is slot zero.
+    slots: Vec<Windows>,
     channels: usize,
     taps: usize,
 }
@@ -153,6 +168,26 @@ impl<'a> LayerConv<'a> {
         weight: &[f32],
         slack: usize,
     ) -> Result<Self, MetalError> {
+        Self::holding(device, conv, channels, weight, slack, 1)
+    }
+
+    /// The same over `slots` sequences advancing together, each carrying its own
+    /// pair of windows.
+    ///
+    /// **The weight is wrapped once whatever the batch is**, which is what a
+    /// batch is for: the taps a slot reads are the taps every slot reads. What
+    /// the slots cost is the windows — `2 * held * channels` floats apiece, 21
+    /// KB a layer at the checkpoint's widths — and a slot nothing is scheduled
+    /// into costs those floats and no dispatch.
+    pub fn holding(
+        device: &'a Device,
+        conv: &'a ShortConvolution,
+        channels: usize,
+        weight: &[f32],
+        slack: usize,
+        slots: usize,
+    ) -> Result<Self, MetalError> {
+        assert!(slots > 0, "a convolution carries at least one sequence");
         assert!(channels > 0, "a convolution has channels");
         assert_eq!(
             weight.len() % channels,
@@ -171,9 +206,15 @@ impl<'a> LayerConv<'a> {
         let window = || device.zeroed::<f32>(held.floats());
         Ok(Self {
             weight: RefCell::new(device.buffer(weight)?),
-            windows: RefCell::new([window()?, window()?]),
-            reading: Cell::new(0),
-            held: Cell::new(held),
+            slots: (0..slots)
+                .map(|_| {
+                    Ok(Windows {
+                        windows: RefCell::new([window()?, window()?]),
+                        reading: Cell::new(0),
+                        held: Cell::new(held),
+                    })
+                })
+                .collect::<Result<Vec<Windows>, MetalError>>()?,
             device,
             conv,
             channels,
@@ -181,9 +222,25 @@ impl<'a> LayerConv<'a> {
         })
     }
 
-    /// How many timesteps may still be taken back.
-    pub fn rewindable(&self) -> usize {
-        self.held.get().rewindable()
+    /// How many sequences this can carry at once.
+    pub fn slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The windows of the sequence in slot `slot`.
+    ///
+    /// Refused rather than wrapped round: a slot past the batch this was
+    /// wrapped for is a sequence whose state is nowhere, and answering slot zero
+    /// instead would be one sequence's windows serving two.
+    fn slot(&self, slot: usize) -> &Windows {
+        self.slots
+            .get(slot)
+            .unwrap_or_else(|| panic!("slot {slot} of a convolution carrying {}", self.slots.len()))
+    }
+
+    /// How many timesteps slot `slot` may still take back.
+    pub fn rewindable(&self, slot: usize) -> usize {
+        self.slot(slot).held.get().rewindable()
     }
 
     /// Take back the last `rows` timesteps of the window the next call will
@@ -198,11 +255,12 @@ impl<'a> LayerConv<'a> {
     /// The same shift [`ConvState::rewind`](inkling_core::ConvState::rewind)
     /// makes, on the buffer the device holds: unified memory is what lets a
     /// window be moved along without a dispatch or a copy across a bus.
-    pub fn rewind(&self, rows: usize) {
-        let mut held = self.held.get();
-        let mut windows = self.windows.borrow_mut();
-        held.rewind(rows, windows[self.reading.get()].as_mut_slice());
-        self.held.set(held);
+    pub fn rewind(&self, slot: usize, rows: usize) {
+        let state = self.slot(slot);
+        let mut held = state.held.get();
+        let mut windows = state.windows.borrow_mut();
+        held.rewind(rows, windows[state.reading.get()].as_mut_slice());
+        state.held.set(held);
     }
 
     pub fn taps(&self) -> usize {
@@ -215,20 +273,23 @@ impl<'a> LayerConv<'a> {
     /// Only the window the next call will read is cleared. The other is written
     /// before it is read, so what a previous sequence left in it is memory
     /// nobody indexes.
-    pub fn restart(&self) {
-        self.windows.borrow_mut()[self.reading.get()]
+    pub fn restart(&self, slot: usize) {
+        let state = self.slot(slot);
+        state.windows.borrow_mut()[state.reading.get()]
             .as_mut_slice()
             .fill(0.0);
-        let mut held = self.held.get();
+        let mut held = state.held.get();
         held.restarted();
-        self.held.set(held);
+        state.held.set(held);
     }
 
     /// The `taps - 1` timesteps preceding the next input, oldest first — the
     /// window as [`ConvState::history`](inkling_core::ConvState::history) hands
     /// it out.
-    pub fn window(&self) -> Vec<f32> {
-        self.windows.borrow()[self.reading.get()].as_slice()[self.held.get().reading()..].to_vec()
+    pub fn window(&self, slot: usize) -> Vec<f32> {
+        let state = self.slot(slot);
+        state.windows.borrow()[state.reading.get()].as_slice()[state.held.get().reading()..]
+            .to_vec()
     }
 
     /// The rows this holds now, as something that can put them back later — the
@@ -237,11 +298,11 @@ impl<'a> LayerConv<'a> {
     /// **Between runs, and for the reason [`LayerConv::rewind`] says it**: what
     /// this reads is a window a dispatch wrote, so the command buffer that wrote
     /// it has to have completed.
-    pub fn mark(&self) -> ConvMark {
-        let held = self.held.get();
+    pub fn mark(&self, slot: usize) -> ConvMark {
+        let state = self.slot(slot);
         ConvMark::new(
-            held,
-            self.windows.borrow()[self.reading.get()]
+            state.held.get(),
+            state.windows.borrow()[state.reading.get()]
                 .as_slice()
                 .to_vec(),
         )
@@ -253,16 +314,17 @@ impl<'a> LayerConv<'a> {
     /// The window the *next* call reads and not the other, which is the one
     /// [`LayerConv::restart`] clears and [`LayerConv::rewind`] shifts: the other
     /// is written before it is read, so what is in it is memory nobody indexes.
-    pub fn resume(&self, mark: &ConvMark) {
-        let mut windows = self.windows.borrow_mut();
-        let window = windows[self.reading.get()].as_mut_slice();
+    pub fn resume(&self, slot: usize, mark: &ConvMark) {
+        let state = self.slot(slot);
+        let mut windows = state.windows.borrow_mut();
+        let window = windows[state.reading.get()].as_mut_slice();
         assert_eq!(
             (self.channels, window.len()),
             (mark.held().channels(), mark.timesteps().len()),
             "a mark of another convolution's width"
         );
         window.copy_from_slice(mark.timesteps());
-        self.held.set(mark.held());
+        state.held.set(mark.held());
     }
 
     /// `[rows, channels]` in and out, submitted on its own.
@@ -385,8 +447,9 @@ impl<'a> LayerConv<'a> {
         let scaled_by = [scale];
         let mut scaling = self.device.inline(&scaled_by)?;
         let mut weight = self.weight.borrow_mut();
-        let mut windows = self.windows.borrow_mut();
-        let (window, kept) = self.reading(&mut windows);
+        let state = self.slot(reading.slot);
+        let mut windows = state.windows.borrow_mut();
+        let (window, kept) = self.reading(reading.slot, &mut windows);
 
         // A slot the kernel is told to ignore still has to be filled, and one
         // float in the command buffer is what filling it costs — see
@@ -412,7 +475,7 @@ impl<'a> LayerConv<'a> {
             Grid::new(call.threads, THREADS_PER_GROUP),
             call.moves,
         )?;
-        self.advanced(call.rows);
+        self.advanced(reading.slot, call.rows);
         Ok(())
     }
 
@@ -430,7 +493,8 @@ impl<'a> LayerConv<'a> {
         carried: Option<&Buffer<f32>>,
         landing: &Landing<'_>,
     ) -> Call {
-        let Reading { from, rows } = reading;
+        let Reading { slot, from, rows } = reading;
+        let held = self.slot(slot).held.get();
         assert!(landing.groups > 0, "a row has groups");
         assert_eq!(
             self.channels % landing.groups,
@@ -458,7 +522,7 @@ impl<'a> LayerConv<'a> {
                 extent(rows, "the rows of a call"),
                 extent(self.channels, "the channels of a convolution"),
                 extent(self.taps, "the taps of a kernel"),
-                extent(self.held.get().rows(), "the timesteps a window holds"),
+                extent(held.rows(), "the timesteps a window holds"),
                 extent(landing.groups, "the groups of a row"),
                 extent(landing.stride, "the rows a group has room for"),
                 extent(landing.base, "where a call's rows start"),
@@ -470,7 +534,7 @@ impl<'a> LayerConv<'a> {
             // worth for the window left behind — which reads the same padded
             // sequence the outputs are cut from and writes somewhere no output
             // thread touches.
-            threads: (rows + self.held.get().rows()) * self.channels,
+            threads: (rows + held.rows()) * self.channels,
             // The sequence in and out, the kernel every timestep reads, the
             // window the call before this one left, the window this one leaves —
             // and the residual, where there is one to add. The scale and the
@@ -479,7 +543,7 @@ impl<'a> LayerConv<'a> {
             moves: size_of::<f32>()
                 * (2 * rows * self.channels
                     + self.channels * self.taps
-                    + 2 * self.held.get().floats()
+                    + 2 * held.floats()
                     + carried.map_or(0, |_| rows * self.channels)),
         }
     }
@@ -488,10 +552,11 @@ impl<'a> LayerConv<'a> {
     /// convolution alternates between.
     fn reading<'w>(
         &self,
+        slot: usize,
         windows: &'w mut [Buffer<f32>; 2],
     ) -> (&'w mut Buffer<f32>, &'w mut Buffer<f32>) {
         let [first, second] = windows;
-        match self.reading.get() {
+        match self.slot(slot).reading.get() {
             0 => (first, second),
             _ => (second, first),
         }
@@ -499,11 +564,12 @@ impl<'a> LayerConv<'a> {
 
     /// The two windows swapped and the sequence moved on by `rows`, which is
     /// what a call that has been encoded leaves behind it.
-    fn advanced(&self, rows: usize) {
-        self.reading.set(1 - self.reading.get());
-        let mut held = self.held.get();
+    fn advanced(&self, slot: usize, rows: usize) {
+        let state = self.slot(slot);
+        state.reading.set(1 - state.reading.get());
+        let mut held = state.held.get();
         held.advanced(rows);
-        self.held.set(held);
+        state.held.set(held);
     }
 
     /// How many rows of this convolution's width `values` is.
@@ -543,15 +609,19 @@ pub struct Convolving<'a> {
     pub landing: Landing<'a>,
 }
 
-/// Which rows of what a dispatch left on the device a convolution reads.
+/// Which sequence a convolution is advancing, and which rows of what a dispatch
+/// left on the device are that sequence's.
 ///
-/// **A range rather than a buffer because a batch's rows are one buffer.** The
+/// **A run rather than a buffer because a batch's rows are one buffer.** The
 /// projections of a batched step produce every sequence's rows together, and a
-/// convolution carries one sequence's window — so what it reads is a run of
-/// those rows and not all of them. A sequence advancing alone reads the whole
-/// call, which is [`Reading::whole`].
+/// convolution carries one sequence's window — so what a call reads is the run
+/// that is its own and what it advances is the slot that is its own. A sequence
+/// advancing alone is slot zero over the whole call, which is
+/// [`Reading::whole`].
 #[derive(Debug, Clone, Copy)]
 pub struct Reading {
+    /// Which of the convolution's slots carries this sequence's windows.
+    pub slot: usize,
     /// The row of `x` this call's first row is.
     pub from: usize,
     /// How many rows it takes from there.
@@ -559,10 +629,14 @@ pub struct Reading {
 }
 
 impl Reading {
-    /// Every row of what the call was handed, which is what a sequence
-    /// advancing alone reads.
+    /// Slot zero over every row of what the call was handed, which is what a
+    /// sequence advancing alone reads.
     pub fn whole(rows: usize) -> Self {
-        Self { from: 0, rows }
+        Self {
+            slot: 0,
+            from: 0,
+            rows,
+        }
     }
 }
 
@@ -627,10 +701,10 @@ pub fn encode_pair(
     let mut second_scaling = device.inline(&second_scaled)?;
     let mut first_weight = one.weight.borrow_mut();
     let mut second_weight = other.weight.borrow_mut();
-    let mut first_windows = one.windows.borrow_mut();
-    let mut second_windows = other.windows.borrow_mut();
-    let (first_window, first_kept) = one.reading(&mut first_windows);
-    let (second_window, second_kept) = other.reading(&mut second_windows);
+    let mut first_windows = one.slot(first_reading.slot).windows.borrow_mut();
+    let mut second_windows = other.slot(second_reading.slot).windows.borrow_mut();
+    let (first_window, first_kept) = one.reading(first_reading.slot, &mut first_windows);
+    let (second_window, second_kept) = other.reading(second_reading.slot, &mut second_windows);
 
     // One a side, for the reason `encode_over` gives — and two rather than one
     // because binding an inline value borrows it exclusively.
@@ -668,8 +742,8 @@ pub fn encode_pair(
         Grid::new(first_call.threads + second_call.threads, THREADS_PER_GROUP),
         first_call.moves + second_call.moves,
     )?;
-    one.advanced(first_call.rows);
-    other.advanced(second_call.rows);
+    one.advanced(first_reading.slot, first_call.rows);
+    other.advanced(second_reading.slot, second_call.rows);
     Ok(())
 }
 
@@ -976,7 +1050,7 @@ mod tests {
 
         for b in 0..fx.batch {
             let sequence = fx.sequence(&fx.input, b);
-            layer.restart();
+            layer.restart(0);
             let got = layer.forward(sequence).expect("the dispatch completes");
             let want = cpu.forward(&mut cpu.state(), sequence, None);
 
@@ -1018,7 +1092,7 @@ mod tests {
             layer
                 .forward(&wrong[split * fx.channels..])
                 .expect("the dispatch completes");
-            layer.rewind(taken);
+            layer.rewind(0, taken);
             let got = layer.forward(after).expect("the dispatch completes");
 
             let clean = LayerConv::with_slack(&device, &conv, fx.channels, &fx.weight, taken)
@@ -1026,7 +1100,7 @@ mod tests {
             clean.forward(before).expect("the dispatch completes");
             let want = clean.forward(after).expect("the dispatch completes");
             assert_eq!(got, want, "{taken} rows taken back at {split}");
-            assert_eq!(layer.window(), clean.window(), "the window at {split}");
+            assert_eq!(layer.window(0), clean.window(0), "the window at {split}");
 
             let mut state = cpu.state();
             cpu.forward(&mut state, before, None);
@@ -1045,8 +1119,8 @@ mod tests {
         let fx = Synthetic::load();
         let layer = fx.wrapped(&device, &conv, &fx.weight);
 
-        assert_eq!(layer.window().len(), (fx.kernel_size - 1) * fx.channels);
-        assert_eq!(layer.rewindable(), 0);
+        assert_eq!(layer.window(0).len(), (fx.kernel_size - 1) * fx.channels);
+        assert_eq!(layer.rewindable(0), 0);
     }
 
     /// **The property decode and continuous batching rest on**, on the device:
@@ -1076,7 +1150,7 @@ mod tests {
                 .encode(batch, &mut x, None, 1.0)
                 .expect("the dispatch encodes");
         });
-        layer.restart();
+        layer.restart(0);
         let mut x = device.buffer(sequence).expect("the rows upload");
         let mut residual = device.buffer(sequence).expect("the residual uploads");
         let carrying = crate::testing::moved(&device, |batch| {
@@ -1115,11 +1189,11 @@ mod tests {
 
         for b in 0..fx.batch {
             let sequence = fx.sequence(&fx.input, b);
-            layer.restart();
+            layer.restart(0);
             let whole = layer.forward(sequence).expect("the dispatch completes");
 
             for chunks in [vec![1; rows], vec![2, 1, rows - 3], vec![rows - 1, 1]] {
-                layer.restart();
+                layer.restart(0);
                 let mut streamed = Vec::new();
                 let mut at = 0;
                 for chunk in &chunks {
@@ -1163,7 +1237,7 @@ mod tests {
         assert_ne!(ahead, run, "rows a wrong range could be read from");
 
         let alone = |x: &[f32], residual: &[f32], from: usize| {
-            layer.restart();
+            layer.restart(0);
             let mut x = device.buffer(x).expect("the rows upload");
             let mut carried = device.buffer(residual).expect("the residual uploads");
             let mut out = device
@@ -1173,7 +1247,11 @@ mod tests {
             layer
                 .encode_rows(
                     &mut batch,
-                    Reading { from, rows },
+                    Reading {
+                        slot: 0,
+                        from,
+                        rows,
+                    },
                     &mut x,
                     Some(&mut carried),
                     1.0,
@@ -1186,7 +1264,7 @@ mod tests {
                 )
                 .expect("the dispatch encodes");
             batch.wait().expect("the batch completes");
-            (out.to_vec(), layer.window())
+            (out.to_vec(), layer.window(0))
         };
 
         let batched: Vec<f32> = [ahead, run, behind].concat();
@@ -1196,6 +1274,101 @@ mod tests {
             alone(run, ahead, 0),
             "the middle run of three against the same run alone"
         );
+    }
+
+    /// **Two sequences interleaved through one convolution's two slots are the
+    /// two sequences run alone**, bit for bit and at every step.
+    ///
+    /// This is the property a batch rests on stated at the smallest thing that
+    /// carries state. A window is what one sequence has seen, and a convolution
+    /// serving two of them holds two — so a slot that read the other's window,
+    /// or wrote into it, would still convolve and would still be causal, and the
+    /// text either sequence produced would still be fluent. Only the values say
+    /// otherwise.
+    ///
+    /// Interleaved a row at a time rather than a sequence at a time, because
+    /// what a slot has to survive is the other slot advancing in between:
+    /// running one to the end and then the other would pass against a
+    /// convolution whose two slots were one buffer used twice.
+    #[test]
+    fn two_sequences_in_two_slots_are_the_two_sequences_alone() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let fx = Synthetic::load();
+        let sequences = [
+            fx.sequence(&fx.input, 0),
+            fx.sequence(&fx.input, 1 % fx.batch),
+        ];
+        assert_ne!(sequences[0], sequences[1], "two sequences to tell apart");
+
+        let alone: Vec<Vec<f32>> = sequences
+            .iter()
+            .map(|sequence| {
+                let one = fx.wrapped(&device, &conv, &fx.weight);
+                one.restart(0);
+                sequence
+                    .chunks(fx.channels)
+                    .flat_map(|row| one.forward(row).expect("the dispatch completes"))
+                    .collect()
+            })
+            .collect();
+
+        let shared = LayerConv::holding(&device, &conv, fx.channels, &fx.weight, 0, 2)
+            .expect("the kernel uploads");
+        assert_eq!(shared.slots(), 2);
+        let mut batched = [Vec::new(), Vec::new()];
+        for slot in 0..2 {
+            shared.restart(slot);
+        }
+        for row in 0..fx.rows() {
+            for (slot, sequence) in sequences.iter().enumerate() {
+                let mut x = device
+                    .buffer(&sequence[row * fx.channels..][..fx.channels])
+                    .expect("the row uploads");
+                let mut out = device
+                    .zeroed::<f32>(fx.channels)
+                    .expect("the landing allocates");
+                let mut batch = device.batch().expect("a command buffer opens");
+                shared
+                    .encode_rows(
+                        &mut batch,
+                        Reading {
+                            slot,
+                            from: 0,
+                            rows: 1,
+                        },
+                        &mut x,
+                        None,
+                        1.0,
+                        Landing {
+                            out: &mut out,
+                            groups: 1,
+                            stride: 1,
+                            base: 0,
+                        },
+                    )
+                    .expect("the dispatch encodes");
+                batch.wait().expect("the batch completes");
+                batched[slot].extend(out.to_vec());
+            }
+        }
+        assert_eq!(batched[0], alone[0], "the sequence in slot 0");
+        assert_eq!(batched[1], alone[1], "the sequence in slot 1");
+    }
+
+    /// A slot past the batch a convolution was wrapped for is a sequence whose
+    /// windows are nowhere. Answering slot zero instead would be one sequence's
+    /// state serving two, which is the whole of what a batch must not do.
+    #[test]
+    #[should_panic(expected = "slot 1 of a convolution carrying 1")]
+    fn a_slot_past_the_batch_a_convolution_carries_is_refused() {
+        let Some(device) = device() else {
+            panic!("slot 1 of a convolution carrying 1")
+        };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        Synthetic::load()
+            .wrapped(&device, &conv, &Synthetic::load().weight)
+            .restart(1);
     }
 
     /// **A paired dispatch answers what the two dispatches it replaces answer,
@@ -1387,21 +1560,21 @@ mod tests {
 
         for b in 0..fx.batch {
             let sequence = fx.sequence(&fx.input, b);
-            layer.restart();
+            layer.restart(0);
             layer.forward(sequence).expect("the dispatch completes");
 
-            assert_eq!(layer.window(), sequence[sequence.len() - kept..]);
-            assert_eq!(layer.window(), fx.sequence(&want, b));
+            assert_eq!(layer.window(0), sequence[sequence.len() - kept..]);
+            assert_eq!(layer.window(0), fx.sequence(&want, b));
         }
 
         // A chunk of one timestep out of an empty window, which fills a third of
         // it: what is kept is two zeroed rows and the row just seen.
-        layer.restart();
+        layer.restart(0);
         let one = &fx.sequence(&fx.input, 0)[..fx.channels];
         layer.forward(one).expect("the dispatch completes");
         let mut carried = vec![0.0; kept - fx.channels];
         carried.extend_from_slice(one);
-        assert_eq!(layer.window(), carried);
+        assert_eq!(layer.window(0), carried);
     }
 
     /// A sequence that has seen nothing starts from a zeroed window, which is
@@ -1415,9 +1588,9 @@ mod tests {
         let layer = fx.wrapped(&device, &conv, &fx.weight);
         let sequence = fx.sequence(&fx.input, 0);
 
-        layer.restart();
+        layer.restart(0);
         assert_eq!(
-            layer.window(),
+            layer.window(0),
             vec![0.0; (fx.kernel_size - 1) * fx.channels]
         );
         let first = layer.forward(sequence).expect("the dispatch completes");
@@ -1425,7 +1598,7 @@ mod tests {
         let carried = layer.forward(sequence).expect("the dispatch completes");
         assert_ne!(carried, first, "a window that carried nothing forward");
 
-        layer.restart();
+        layer.restart(0);
         assert_eq!(
             layer.forward(sequence).expect("the dispatch completes"),
             first
@@ -1454,8 +1627,8 @@ mod tests {
         let layer = fx.wrapped(&device, &conv, &fx.weight);
         let mutant = fx.wrapped(&device, &conv, &backwards);
         let sequence = fx.sequence(&fx.input, 0);
-        layer.restart();
-        mutant.restart();
+        layer.restart(0);
+        mutant.restart(0);
 
         let deviation = deviation(
             &mutant.forward(sequence).expect("the dispatch completes"),
@@ -1476,7 +1649,7 @@ mod tests {
 
         let conv = ShortConvolution::new(&device).expect("the kernel compiles");
         let layer = fx.wrapped(&device, &conv, &fx.weight);
-        layer.restart();
+        layer.restart(0);
         let want = layer.forward(sequence).expect("the dispatch completes");
 
         let without = BODY.replace(
@@ -1486,7 +1659,7 @@ mod tests {
         assert_ne!(without, BODY, "the mutation changed nothing");
         let mutant = ShortConvolution::from_source(&device, &without).expect("the mutant compiles");
         let dropped = fx.wrapped(&device, &mutant, &fx.weight);
-        dropped.restart();
+        dropped.restart(0);
 
         let deviation = deviation(
             &dropped.forward(sequence).expect("the dispatch completes"),
@@ -1521,10 +1694,10 @@ mod tests {
             .collect();
         assert_ne!(carried, sequence, "a residual equal to the input");
 
-        layer.restart();
+        layer.restart(0);
         let alone = layer.forward(sequence).expect("the dispatch completes");
 
-        layer.restart();
+        layer.restart(0);
         let mut input = device.buffer(sequence).expect("the rows upload");
         let mut residual = device.buffer(&carried).expect("the residual uploads");
         let mut batch = device.batch().expect("a command buffer opens");
@@ -1536,7 +1709,7 @@ mod tests {
         let want: Vec<f32> = alone.iter().zip(&carried).map(|(a, b)| a + b).collect();
         assert_eq!(out.to_vec(), want);
         assert_eq!(
-            layer.window(),
+            layer.window(0),
             sequence[sequence.len() - (fx.kernel_size - 1) * fx.channels..],
             "the window is the input's, whatever was carried"
         );
@@ -1568,11 +1741,11 @@ mod tests {
         let scale = 1.75;
 
         let scaled: Vec<f32> = sequence.iter().map(|x| x * scale).collect();
-        layer.restart();
+        layer.restart(0);
         let want = layer.forward(&scaled).expect("the dispatch completes");
-        let kept = layer.window();
+        let kept = layer.window(0);
 
-        layer.restart();
+        layer.restart(0);
         let mut input = device.buffer(sequence).expect("the rows upload");
         let mut batch = device.batch().expect("a command buffer opens");
         let out = layer
@@ -1583,9 +1756,9 @@ mod tests {
         let agreed = deviation(&out.to_vec(), &want);
         eprintln!("a scaled call against rows already scaled: deviation {agreed:e}");
         assert!(agreed <= TOLERANCE, "the rows: deviation {agreed:e}");
-        assert_eq!(layer.window(), kept, "the window it left behind");
+        assert_eq!(layer.window(0), kept, "the window it left behind");
 
-        layer.restart();
+        layer.restart(0);
         let unscaled = layer.forward(sequence).expect("the dispatch completes");
         assert!(
             deviation(&want, &unscaled) > TOLERANCE,
@@ -1628,7 +1801,7 @@ mod tests {
             .zeroed::<f32>(groups * stride * width)
             .expect("the span allocates");
         let mut at = 0;
-        layer.restart();
+        layer.restart(0);
         for rows in chunks {
             let call = &sequence[at * channels..][..rows * channels];
             let mut input = device.buffer(call).expect("the rows upload");
@@ -1653,7 +1826,7 @@ mod tests {
 
         // The same sequence in the same two chunks, left flat and scattered
         // here — which is what the landing is instead of.
-        layer.restart();
+        layer.restart(0);
         let mut flat = Vec::new();
         at = 0;
         for rows in chunks {

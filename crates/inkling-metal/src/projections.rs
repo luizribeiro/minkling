@@ -270,7 +270,7 @@ impl<'a> LayerProjections<'a> {
         slack: usize,
     ) -> Result<Self, ProjectionError> {
         let wrapping = Wrapping::packed(device, &kernels.matmul, layer)?;
-        Self::wrapping(device, kernels, wrapping, slack)
+        Self::wrapping(device, kernels, wrapping, slack, 1)
     }
 
     /// The same layer over weights somebody else wrapped, which is what a second
@@ -280,10 +280,18 @@ impl<'a> LayerProjections<'a> {
         kernels: &'a LayerKernels,
         wrapping: Wrapping<'_, 'a>,
         slack: usize,
+        slots: usize,
     ) -> Result<Self, ProjectionError> {
         let config = wrapping.config;
         let sconv = |weight: &[f32]| {
-            LayerConv::with_slack(device, &kernels.conv, config.kv_channels(), weight, slack)
+            LayerConv::holding(
+                device,
+                &kernels.conv,
+                config.kv_channels(),
+                weight,
+                slack,
+                slots,
+            )
         };
         let head_norm =
             |weight: &[f32]| LayerNorm::new(device, &kernels.norm, weight, config.rms_norm_eps);
@@ -294,7 +302,13 @@ impl<'a> LayerProjections<'a> {
                 wrapping.input_layernorm,
                 config.rms_norm_eps,
             )?,
-            attention: LayerAttention::new(device, &kernels.attention, config, wrapping.rel_proj)?,
+            attention: LayerAttention::holding(
+                device,
+                &kernels.attention,
+                config,
+                wrapping.rel_proj,
+                slots,
+            )?,
             k_sconv: sconv(wrapping.k_sconv)?,
             v_sconv: sconv(wrapping.v_sconv)?,
             q_norm: head_norm(wrapping.q_norm)?,
@@ -313,30 +327,30 @@ impl<'a> LayerProjections<'a> {
     ///
     /// All three or none — a sequence whose keys stop one timestep before its
     /// windows do is one that still attends, over a position it half took back.
-    pub fn rewind(&self, rows: usize) {
-        self.attention.rewind(rows);
-        self.k_sconv.rewind(rows);
-        self.v_sconv.rewind(rows);
+    pub fn rewind(&self, slot: usize, rows: usize) {
+        self.attention.rewind(slot, rows);
+        self.k_sconv.rewind(slot, rows);
+        self.v_sconv.rewind(slot, rows);
     }
 
     /// Where this layer's attention is now, as something that can put it back
     /// here later — the device's half of
     /// [`AttentionCache::mark`](inkling_core::AttentionCache::mark).
-    pub fn mark(&self) -> AttentionMark {
+    pub fn mark(&self, slot: usize) -> AttentionMark {
         AttentionMark::new(
-            self.attention.held(),
-            self.k_sconv.mark(),
-            self.v_sconv.mark(),
+            self.attention.held(slot),
+            self.k_sconv.mark(slot),
+            self.v_sconv.mark(slot),
         )
     }
 
     /// The keys and the two windows this had when `mark` was taken. All three or
     /// none, for the reason [`LayerProjections::rewind`] moves all three.
-    pub fn resume(&self, mark: &AttentionMark) {
+    pub fn resume(&self, slot: usize, mark: &AttentionMark) {
         let (k, v) = mark.convolutions();
-        self.attention.resume(mark.seen());
-        self.k_sconv.resume(k);
-        self.v_sconv.resume(v);
+        self.attention.resume(slot, mark.seen());
+        self.k_sconv.resume(slot, k);
+        self.v_sconv.resume(slot, v);
     }
 
     /// That the step being asked for is over the shape this layer was wrapped
@@ -379,13 +393,13 @@ impl<'a> LayerProjections<'a> {
     /// timesteps either. Which sequence's they are is
     /// [`LayerAttention::hold`]'s to refuse, and it refuses for all three: the
     /// windows advance exactly when the span does.
-    fn starting(&self, keys: usize, queries: usize) {
+    fn starting(&self, slot: usize, keys: usize, queries: usize) {
         if keys == 0 {
-            self.k_sconv.restart();
-            self.v_sconv.restart();
+            self.k_sconv.restart(slot);
+            self.v_sconv.restart(slot);
         }
         self.attention
-            .hold(keys, queries)
+            .hold(slot, keys, queries)
             .unwrap_or_else(|err| panic!("the layer's span did not grow: {err}"));
     }
 
@@ -418,7 +432,7 @@ impl<'a> LayerProjections<'a> {
     /// opened.
     fn beginning(&self, cache: &mut AttentionCache, step: LayerStep<'_>, queries: usize) -> usize {
         self.shaped_for(step.sdpa, step.mask);
-        self.starting(cache.seen(), queries);
+        self.starting(cache.slot(), cache.seen(), queries);
         assert_eq!(
             [
                 step.k_sconv.kernel_size(),
@@ -705,7 +719,7 @@ impl Projections for LayerProjections<'_> {
     fn layer(&self, cache: &mut AttentionCache, step: LayerStep<'_>) -> Option<Vec<f32>> {
         let queries = self.beginning(cache, step, step.x.len() / self.input_layernorm.width());
         let device = self.q_proj.device();
-        let mut span = self.attention.span();
+        let mut span = self.attention.span(cache.slot());
         let [out] = together(device, |batch| {
             let mut x = device.buffer(step.x)?;
             let mut normed = self.input_norm(batch, &mut x, step)?;
@@ -1078,10 +1092,12 @@ impl<'a> LayerDevice<'a> {
         attention: Wrapping<'_, 'a>,
         block: Block<'_, 'a>,
         slack: usize,
+        slots: usize,
     ) -> Result<Self, ProjectionError> {
         let eps = attention.config.rms_norm_eps;
-        let residual =
-            |weight: &[f32]| LayerConv::with_slack(device, &kernels.conv, block.dim, weight, slack);
+        let residual = |weight: &[f32]| {
+            LayerConv::holding(device, &kernels.conv, block.dim, weight, slack, slots)
+        };
         Ok(Self {
             attn_sconv: residual(block.attn_sconv)?,
             post_attention_layernorm: LayerNorm::new(
@@ -1092,7 +1108,7 @@ impl<'a> LayerDevice<'a> {
             )?,
             mlp_sconv: residual(block.mlp_sconv)?,
             mlp: block.mlp,
-            attention: LayerProjections::wrapping(device, kernels, attention, slack)?,
+            attention: LayerProjections::wrapping(device, kernels, attention, slack, slots)?,
         })
     }
 }
@@ -1111,6 +1127,24 @@ pub struct StackShape {
     pub layers: usize,
     pub dim: usize,
     pub slack: usize,
+    /// How many sequences the stack can carry at once, which is what a batch
+    /// costs in memory: a slot is one sequence's span and four convolution
+    /// windows in every layer, and nothing else. One is a stack serving one
+    /// request, which is what it always served.
+    pub slots: usize,
+}
+
+impl StackShape {
+    /// The shape of a stack serving one sequence, which is the batch of one
+    /// every caller here asked for before there was a batch.
+    pub fn alone(layers: usize, dim: usize, slack: usize) -> Self {
+        Self {
+            layers,
+            dim,
+            slack,
+            slots: 1,
+        }
+    }
 }
 
 impl<'a> ModelLayers<'a> {
@@ -1130,7 +1164,12 @@ impl<'a> ModelLayers<'a> {
         tail: Option<ModelTail<'a>>,
         stack: StackShape,
     ) -> Result<Self, ProjectionError> {
-        let StackShape { layers, dim, slack } = stack;
+        let StackShape {
+            layers,
+            dim,
+            slack,
+            slots,
+        } = stack;
         let mut wrapped: Vec<Option<LayerDevice<'a>>> = (0..layers).map(|_| None).collect();
         for layer in packed {
             wrapped[layer.layer] = Some(LayerDevice::wrapping(
@@ -1151,6 +1190,7 @@ impl<'a> ModelLayers<'a> {
                     mlp_sconv: &layer.mlp_sconv,
                 },
                 slack,
+                slots,
             )?);
         }
         for bank in banks {
@@ -1260,10 +1300,10 @@ impl LayerBackend for ModelLayers<'_> {
     /// dispatches in it that have not. There is no such run here when a caller
     /// asks: what closes one is the last layer of the stack, whose rows every
     /// caller reads back before it can know there is anything to take back.
-    fn rewind(&self, rows: usize) {
+    fn rewind(&self, slot: usize, rows: usize) {
         self.settled("a rewind");
         for layer in self.layers.iter().flatten() {
-            layer.rewind(rows);
+            layer.rewind(slot, rows);
         }
     }
 
@@ -1277,18 +1317,18 @@ impl LayerBackend for ModelLayers<'_> {
     ///
     /// **Between runs**, and for the reason [`ModelLayers::rewind`] gives at
     /// length: what this reads is a window a dispatch wrote.
-    fn mark(&self) -> Option<CacheMark> {
+    fn mark(&self, slot: usize) -> Option<CacheMark> {
         self.settled("a mark");
         Some(CacheMark::new(
             self.layers
                 .iter()
                 .flatten()
-                .map(LayerDevice::mark)
+                .map(|layer| layer.mark(slot))
                 .collect(),
         ))
     }
 
-    fn resume(&self, mark: &CacheMark) {
+    fn resume(&self, slot: usize, mark: &CacheMark) {
         self.settled("a resume");
         let layers = self.layers.iter().flatten();
         assert_eq!(
@@ -1297,7 +1337,7 @@ impl LayerBackend for ModelLayers<'_> {
             "a mark of a stack this backend does not hold the layers of"
         );
         for (layer, mark) in layers.zip(mark.layers()) {
-            layer.resume(mark);
+            layer.resume(slot, mark);
         }
     }
 }
@@ -1311,30 +1351,30 @@ impl LayerDevice<'_> {
     /// [`DecoderCache`](inkling_core::DecoderCache) holds for a layer that runs
     /// here — see [`crate::LayerConv::rewind`] for what they need of the
     /// caller.
-    pub(crate) fn rewind(&self, rows: usize) {
-        self.attention.rewind(rows);
-        self.attn_sconv.rewind(rows);
-        self.mlp_sconv.rewind(rows);
+    pub(crate) fn rewind(&self, slot: usize, rows: usize) {
+        self.attention.rewind(slot, rows);
+        self.attn_sconv.rewind(slot, rows);
+        self.mlp_sconv.rewind(slot, rows);
     }
 
     /// Where this layer is now, as something that can put it back here later —
     /// the device's half of
     /// [`DecoderCache::mark`](inkling_core::DecoderCache::mark), and the same
     /// four places [`LayerDevice::rewind`] moves.
-    pub(crate) fn mark(&self) -> LayerMark {
+    pub(crate) fn mark(&self, slot: usize) -> LayerMark {
         LayerMark::new(
-            self.attention.mark(),
-            self.attn_sconv.mark(),
-            self.mlp_sconv.mark(),
+            self.attention.mark(slot),
+            self.attn_sconv.mark(slot),
+            self.mlp_sconv.mark(slot),
         )
     }
 
     /// The state this layer had when `mark` was taken.
-    pub(crate) fn resume(&self, mark: &LayerMark) {
+    pub(crate) fn resume(&self, slot: usize, mark: &LayerMark) {
         let (attn_sconv, mlp_sconv) = mark.convolutions();
-        self.attention.resume(mark.attention());
-        self.attn_sconv.resume(attn_sconv);
-        self.mlp_sconv.resume(mlp_sconv);
+        self.attention.resume(slot, mark.attention());
+        self.attn_sconv.resume(slot, attn_sconv);
+        self.mlp_sconv.resume(slot, mlp_sconv);
     }
 }
 
@@ -1603,12 +1643,13 @@ impl LayerDevice<'_> {
         // advance exactly when the span and the two windows inside attention do
         // — which `beginning` has already started over if this sequence has seen
         // nothing.
+        let slot = cache.slot();
         if cache.attention().seen() == 0 {
-            self.attn_sconv.restart();
-            self.mlp_sconv.restart();
+            self.attn_sconv.restart(slot);
+            self.mlp_sconv.restart(slot);
         }
 
-        let mut span = attention.attention.span();
+        let mut span = attention.attention.span(slot);
         let mut normed = attention
             .input_norm(batch, x, step.attention)?
             .expect("a decoder layer normalises the state it is handed");
@@ -2145,6 +2186,7 @@ mod tests {
                 layers: LAYERS,
                 dim: IN_DIM,
                 slack: 0,
+                slots: 1,
             },
         )
         .expect("the layers wrap");
@@ -2866,7 +2908,7 @@ mod tests {
 
             through(x, caches);
             let marks: Vec<_> = caches.iter().map(DecoderCache::mark).collect();
-            let theirs = LayerBackend::mark(&stack);
+            let theirs = LayerBackend::mark(&stack, 0);
             if back != Back::Nothing {
                 through(wrong, caches);
                 let rows = wrong.len() / NARROW.hidden;
@@ -2876,13 +2918,13 @@ mod tests {
                         for cache in caches.iter_mut() {
                             cache.rewind(rows);
                         }
-                        LayerBackend::rewind(&stack, rows);
+                        LayerBackend::rewind(&stack, 0, rows);
                     }
                     Back::Resume => {
                         for (cache, mark) in caches.iter_mut().zip(&marks) {
                             cache.resume(mark);
                         }
-                        LayerBackend::resume(&stack, theirs.as_ref().expect("a device mark"));
+                        LayerBackend::resume(&stack, 0, theirs.as_ref().expect("a device mark"));
                     }
                 }
             }

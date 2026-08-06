@@ -665,9 +665,9 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
         // Wrapped at the depth being measured rather than at the deepest one:
         // the windows a rejected token is taken back out of are wider by the
         // depth, so this is the configuration a run of that depth actually has.
-        let weights = backend::weights(gpu.as_ref(), &ckpt, text, depth)?;
+        let weights = backend::weights(gpu.as_ref(), &ckpt, text, depth, 1)?;
         let tail = backend::tail_weights(&weights, text);
-        let heads = backend::heads(gpu.as_ref(), &ckpt, &config, depth, &tail)?;
+        let heads = backend::heads(gpu.as_ref(), &ckpt, &config, depth, &tail, 1)?;
         let timed =
             |ids: &[usize], budget| generate(&weights, heads.as_ref(), text, ids, budget, depth);
 
@@ -979,11 +979,11 @@ fn guesses(dirs: &[PathBuf; 2], tokens: usize, depth: usize) -> Result<Vec<Readi
     let gpu = backend::open(Backend::Metal, Numerics::default())?;
     let stack = Checkpoint::open(&dirs[0])?;
     let beside = Checkpoint::open(&dirs[1])?;
-    let weights = backend::weights(gpu.as_ref(), &stack, text, depth)?;
+    let weights = backend::weights(gpu.as_ref(), &stack, text, depth, 1)?;
     let tail = backend::tail_weights(&weights, text);
-    let ran = backend::heads(gpu.as_ref(), &stack, &config, depth, &tail)?
+    let ran = backend::heads(gpu.as_ref(), &stack, &config, depth, &tail, 1)?
         .context("the first checkpoint has no heads to guess with")?;
-    let against = backend::heads(gpu.as_ref(), &beside, &config, depth, &tail)?
+    let against = backend::heads(gpu.as_ref(), &beside, &config, depth, &tail, 1)?
         .context("the second checkpoint has no heads to guess with")?;
 
     let generator = weights.generator();
@@ -1113,7 +1113,7 @@ fn diverge(dir: &Path, tokens: usize, against: Numerics) -> Result<Vec<Reading>>
     let mut dispatched = Vec::new();
     for numerics in [Numerics::Reference, against] {
         let gpu = backend::open(Backend::Metal, numerics)?;
-        let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0)?;
+        let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0, 1)?;
         let generator = weights.generator();
         let mut ran = Vec::new();
         let mut ran_entries = Dispatched::default();

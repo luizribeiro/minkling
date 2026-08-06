@@ -663,8 +663,8 @@ pub trait LayerBackend {
     /// its own span and its own windows, and a
     /// [`DecoderCache`](crate::layer::DecoderCache) rewound on this side would
     /// leave them where the rejected tokens put them.
-    fn rewind(&self, rows: usize) {
-        let _ = rows;
+    fn rewind(&self, slot: usize, rows: usize) {
+        let (_, _) = (slot, rows);
     }
 
     /// Where the sequence in flight is in whatever state this backend holds, as
@@ -679,13 +679,14 @@ pub trait LayerBackend {
     /// Between runs, for the reason [`LayerBackend::rewind`] is: what this reads
     /// is a window a dispatch wrote, so the command buffer that wrote it has to
     /// have completed.
-    fn mark(&self) -> Option<CacheMark> {
+    fn mark(&self, slot: usize) -> Option<CacheMark> {
+        let _ = slot;
         None
     }
 
     /// The state this backend held when `mark` was taken.
-    fn resume(&self, mark: &CacheMark) {
-        let _ = mark;
+    fn resume(&self, slot: usize, mark: &CacheMark) {
+        let (_, _) = (slot, mark);
     }
 
     /// The whole of layer `layer` in one command buffer, or `None` where this
@@ -1161,14 +1162,20 @@ impl ModelWeights for CheckpointWeights<'_> {
     }
 
     fn rewind(&self, cache: &mut ModelCache, rows: usize) {
+        let slot = cache.slot();
         cache.rewind(rows);
         if let Some(backend) = self.backend.as_deref() {
-            backend.rewind(rows);
+            backend.rewind(slot, rows);
         }
     }
 
     fn mark(&self, cache: &ModelCache) -> Mark {
-        Mark::new(cache.mark(), self.backend.as_deref().and_then(|b| b.mark()))
+        Mark::new(
+            cache.mark(),
+            self.backend
+                .as_deref()
+                .and_then(|backend| backend.mark(cache.slot())),
+        )
     }
 
     fn resume(&self, cache: &mut ModelCache, mark: &Mark) {
@@ -1181,7 +1188,7 @@ impl ModelWeights for CheckpointWeights<'_> {
         // what an empty mark means there.
         if let Some(backend) = self.backend.as_deref() {
             let empty = CacheMark::new(Vec::new());
-            backend.resume(mark.backend().unwrap_or(&empty));
+            backend.resume(cache.slot(), mark.backend().unwrap_or(&empty));
         }
     }
 

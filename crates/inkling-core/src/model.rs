@@ -181,6 +181,32 @@ impl ModelCache {
         Self::speculating(config, 0)
     }
 
+    /// The same, for a sequence whose state on a backend is that backend's slot
+    /// `slot` rather than its first — see
+    /// [`AttentionCache::in_slot`](crate::AttentionCache::in_slot), which is
+    /// where the whole of what a slot is is said.
+    ///
+    /// **This is how a batch is expressed on this side and it is the whole of
+    /// it.** N sequences advancing together are N of these, each naming the slot
+    /// of the backend that holds its span and its windows; a sequence advancing
+    /// alone is slot zero, which is what [`ModelCache::new`] leaves here. So a
+    /// batch of one is not a second path — it is this call with the number
+    /// nobody had to pass.
+    pub fn in_slot(config: &TextConfig, slack: usize, slot: usize) -> Self {
+        Self {
+            layers: Self::speculating(config, slack)
+                .layers
+                .into_iter()
+                .map(|layer| layer.in_slot(slot))
+                .collect(),
+        }
+    }
+
+    /// Which of a backend's slots holds the rest of this sequence's state.
+    pub fn slot(&self) -> usize {
+        self.layers.first().map_or(0, DecoderCache::slot)
+    }
+
     /// The same, able to give back `slack` timesteps in every layer.
     ///
     /// What that costs is `slack` more timesteps in each of a layer's four

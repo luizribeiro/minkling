@@ -736,6 +736,9 @@ pub struct AttentionCache {
     values: Vec<f32>,
     /// How many keys the sequence has seen, wherever they are.
     cached: usize,
+    /// Which of a backend's slots holds the rest of this sequence's state — see
+    /// [`AttentionCache::in_slot`].
+    slot: usize,
 }
 
 impl AttentionCache {
@@ -761,7 +764,31 @@ impl AttentionCache {
             keys: Vec::new(),
             values: Vec::new(),
             cached: 0,
+            slot: 0,
         }
+    }
+
+    /// The same, for a sequence whose state on a backend is that backend's slot
+    /// `slot` rather than its first.
+    ///
+    /// **A sequence's state is in two places and this is the name they share.**
+    /// What this side holds is a count and two windows; what a backend running
+    /// the layer holds is a span and two more windows, and a batch holds one of
+    /// those per sequence. So the cache carries which of them is its own, and
+    /// every caller that hands a cache over hands the slot over with it —
+    /// rather than the slot being a second argument that a caller could get
+    /// right for the rewind and wrong for the step.
+    ///
+    /// A sequence advancing alone is slot zero, which is what
+    /// [`AttentionCache::new`] leaves here.
+    pub fn in_slot(mut self, slot: usize) -> Self {
+        self.slot = slot;
+        self
+    }
+
+    /// Which of a backend's slots holds the rest of this sequence's state.
+    pub fn slot(&self) -> usize {
+        self.slot
     }
 
     /// How many keys the sequence has seen, which is also where this call's

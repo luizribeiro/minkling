@@ -872,6 +872,7 @@ impl OnTheDevice {
                 layers: config.num_hidden_layers,
                 dim: config.hidden_size,
                 slack: 0,
+                slots: 1,
             },
         )
         .expect("the layers wrap");
@@ -3394,6 +3395,7 @@ impl<'d> Kernels<'d> {
                 layers: config.num_hidden_layers,
                 dim: config.hidden_size,
                 slack,
+                slots: 1,
             },
         )
         .expect("the layers wrap");
@@ -3433,6 +3435,7 @@ impl<'d> Kernels<'d> {
             &held,
             tail,
             inkling_core::mtp::FRONTIER,
+            1,
         )
         .expect("the heads wrap");
         heads.with_backend(Box::new(wrapped))

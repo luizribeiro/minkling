@@ -72,7 +72,7 @@ fn a_session_served_from_a_kept_cache_produces_the_tokens_a_cold_one_produces() 
     let gpu = backend::open(Backend::default(), Numerics::default()).expect("a backend");
     let ckpt = Checkpoint::open(&dir).expect("the checkpoint opens");
     let weights =
-        backend::weights(gpu.as_ref(), &ckpt, &config.text_config, 0).expect("the weights wrap");
+        backend::weights(gpu.as_ref(), &ckpt, &config.text_config, 0, 1).expect("the weights wrap");
     let generator = weights.generator();
 
     // Cold first and warm second, against the same weights and the same device.

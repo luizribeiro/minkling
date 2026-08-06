@@ -318,8 +318,8 @@ pub trait HeadBackend {
     ///
     /// Per head rather than over all of them, because a round runs the heads its
     /// depth asked for and no others — see [`MtpProposer::propose`].
-    fn rewind(&self, head: usize, rows: usize) {
-        let (_, _) = (head, rows);
+    fn rewind(&self, head: usize, slot: usize, rows: usize) {
+        let (_, _, _) = (head, slot, rows);
     }
 }
 
@@ -739,9 +739,9 @@ impl<'a> CheckpointHeads<'a> {
     /// makes for the stack: a backend running the head holds the keys it
     /// appended and the windows it advanced, and a head rewound on one side only
     /// is one whose position is one thing here and another there.
-    pub fn rewind(&self, head: usize, rows: usize) {
+    pub fn rewind(&self, head: usize, slot: usize, rows: usize) {
         if let Some(backend) = self.backend.as_deref() {
-            backend.rewind(head, rows);
+            backend.rewind(head, slot, rows);
         }
     }
 
@@ -1005,8 +1005,9 @@ impl<W: ModelWeights> Proposer for MtpProposer<'_, W> {
         // produced rather than the one this chain guessed. Both sides of the
         // head's state, for the reason `CheckpointHeads::rewind` gives.
         for head in 0..round.depth {
+            let slot = self.caches.layer(head).slot();
             self.caches.layer(head).rewind(FRONTIER);
-            self.heads.rewind(head, FRONTIER);
+            self.heads.rewind(head, slot, FRONTIER);
         }
         self.carried = Some(Carried {
             hidden: chained_row(round.hidden, hidden),

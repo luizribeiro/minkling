@@ -974,7 +974,14 @@ pub struct LayerAttention<'a> {
     /// Behind a cell for the reason the projection is, and holding the same
     /// relation to the layer: it belongs to the layer rather than to the call,
     /// and a call binds it.
-    span: RefCell<KeyValues>,
+    /// One sequence's keys and values per slot of the batch this was wrapped
+    /// for. A layer serving one sequence holds one, which is slot zero.
+    ///
+    /// **The slots are what a batch costs in memory**, and they are the whole of
+    /// it: everything else this layer holds is a weight, and a weight is what a
+    /// batch reads once for every sequence in it. See
+    /// [`LayerAttention::span_bytes`].
+    spans: Vec<RefCell<KeyValues>>,
     config: AttentionConfig,
     rel_extent: usize,
     /// Splits a call cuts its span into, where a caller has pinned it rather
@@ -1012,6 +1019,24 @@ impl<'a> LayerAttention<'a> {
         config: AttentionConfig,
         proj: &[f32],
     ) -> Result<Self, AttentionError> {
+        Self::holding(device, attention, config, proj, 1)
+    }
+
+    /// The same layer attending for `slots` sequences at once, each carrying its
+    /// own span.
+    ///
+    /// **The band is wrapped once whatever the batch is.** `rel_proj` is a
+    /// weight and a weight is what a batch reads once for every sequence in it;
+    /// what a slot adds is the keys and values that sequence has seen, which is
+    /// the whole of what N sequences cost over one.
+    pub fn holding(
+        device: &'a Device,
+        attention: &'a FusedAttention,
+        config: AttentionConfig,
+        proj: &[f32],
+        slots: usize,
+    ) -> Result<Self, AttentionError> {
+        assert!(slots > 0, "a layer attends for at least one sequence");
         if config.d_rel == 0 || proj.len() % config.d_rel != 0 {
             return Err(AttentionError::PartialBand {
                 d_rel: config.d_rel,
@@ -1044,7 +1069,15 @@ impl<'a> LayerAttention<'a> {
         let rel_extent = proj.len() / config.d_rel;
         Ok(Self {
             proj: RefCell::new(device.buffer(&by_distance(proj, config.d_rel, rel_extent))?),
-            span: RefCell::new(KeyValues::new(device, config.kv_heads, config.head_dim)?),
+            spans: (0..slots)
+                .map(|_| {
+                    Ok(RefCell::new(KeyValues::new(
+                        device,
+                        config.kv_heads,
+                        config.head_dim,
+                    )?))
+                })
+                .collect::<Result<Vec<RefCell<KeyValues>>, MetalError>>()?,
             rel_extent,
             pinned: Cell::new(None),
             floor: Cell::new(None),
@@ -1164,8 +1197,8 @@ impl<'a> LayerAttention<'a> {
     }
 
     /// The span this layer is holding, borrowed for the whole of a call.
-    pub(crate) fn span(&self) -> RefMut<'_, KeyValues> {
-        self.span.borrow_mut()
+    pub(crate) fn span(&self, slot: usize) -> RefMut<'_, KeyValues> {
+        self.slot(slot).borrow_mut()
     }
 
     /// The dispatch itself, which is the same whichever of the two put the
@@ -1338,10 +1371,27 @@ impl<'a> LayerAttention<'a> {
         Ok(out)
     }
 
-    /// How many keys this layer is holding, which says which sequence's they
-    /// are.
-    pub fn held(&self) -> usize {
-        self.span.borrow().held
+    /// How many keys this layer is holding for slot `slot`, which says which
+    /// sequence's they are.
+    pub fn held(&self, slot: usize) -> usize {
+        self.slot(slot).borrow().held
+    }
+
+    /// How many sequences this layer can attend for at once.
+    pub fn slots(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// The span of the sequence in slot `slot`.
+    ///
+    /// Refused rather than wrapped round, for the reason
+    /// [`LayerConv`](crate::LayerConv)'s is: a slot past the batch this was
+    /// wrapped for is a sequence whose keys are nowhere, and answering slot
+    /// zero instead would be one sequence attending over another's.
+    fn slot(&self, slot: usize) -> &RefCell<KeyValues> {
+        self.spans
+            .get(slot)
+            .unwrap_or_else(|| panic!("slot {slot} of a layer holding {}", self.spans.len()))
     }
 
     /// Cut every call's span into `splits`, or `None` to leave it to
@@ -1374,7 +1424,7 @@ impl<'a> LayerAttention<'a> {
     /// `what_a_context_costs_in_keys_and_values`, which is where that is
     /// weighed against the window.
     pub fn span_bytes(&self) -> u64 {
-        self.span.borrow().bytes()
+        self.spans.iter().map(|span| span.borrow().bytes()).sum()
     }
 
     /// Take the span for a sequence that has seen `keys` keys, with room for
@@ -1385,8 +1435,8 @@ impl<'a> LayerAttention<'a> {
     /// sequence that has seen keys the span is not holding is a second sequence
     /// interleaved through the same layer, which would otherwise read the
     /// first's keys under its own offset and answer plausibly.
-    pub fn hold(&self, keys: usize, queries: usize) -> Result<(), MetalError> {
-        let mut span = self.span.borrow_mut();
+    pub fn hold(&self, slot: usize, keys: usize, queries: usize) -> Result<(), MetalError> {
+        let mut span = self.slot(slot).borrow_mut();
         if keys == 0 {
             span.restart();
         }
@@ -1399,8 +1449,8 @@ impl<'a> LayerAttention<'a> {
     }
 
     /// Append `[rows, kv_heads * head_dim]` keys and values to the span.
-    pub fn append(&self, k: &[f32], v: &[f32]) {
-        self.span.borrow_mut().append(k, v);
+    pub fn append(&self, slot: usize, k: &[f32], v: &[f32]) {
+        self.slot(slot).borrow_mut().append(k, v);
     }
 
     /// Unwant the last `rows` keys and values of the span this layer holds.
@@ -1408,8 +1458,8 @@ impl<'a> LayerAttention<'a> {
     /// The convolution windows those keys came through are
     /// [`LayerProjections`](crate::LayerProjections)'s to take back, and the
     /// two have to move together: see [`crate::LayerConv::rewind`].
-    pub fn rewind(&self, rows: usize) {
-        self.span.borrow_mut().rewind(rows);
+    pub fn rewind(&self, slot: usize, rows: usize) {
+        self.slot(slot).borrow_mut().rewind(rows);
     }
 
     /// Unwant every key past the `keys` the sequence had when a mark was taken.
@@ -1424,8 +1474,8 @@ impl<'a> LayerAttention<'a> {
     /// [`AttentionCache::resume`](inkling_core::AttentionCache::resume) is: a
     /// mark says where a sequence *was*, and a span asked to claim keys past
     /// what it holds would be counting slots no dispatch wrote.
-    pub fn resume(&self, keys: usize) {
-        let mut span = self.span.borrow_mut();
+    pub fn resume(&self, slot: usize, keys: usize) {
+        let mut span = self.slot(slot).borrow_mut();
         assert!(
             keys <= span.held,
             "a mark at {keys} keys against a span holding {}",
@@ -2832,7 +2882,7 @@ mod tests {
 
         let against = |attention: &FusedAttention, case: &Case, want: usize| -> u64 {
             let layer = case.wrapped(&device, attention);
-            layer.hold(0, case.keys).expect("the span reserves");
+            layer.hold(0, 0, case.keys).expect("the span reserves");
             let moved = crate::testing::moved(&device, |batch| {
                 layer.encode(batch, case.step()).expect("the step encodes");
             });
@@ -4160,7 +4210,7 @@ mod tests {
         );
         for context in LONG_CONTEXTS {
             for layer in &stack {
-                layer.hold(0, context).expect("the span reserves");
+                layer.hold(0, 0, context).expect("the span reserves");
             }
             let (held, of_window, capped) = stack
                 .iter()
@@ -4251,13 +4301,13 @@ mod tests {
         let cost = |keys: usize, sliding: usize, queries: usize, splits: usize| -> Duration {
             let case = blocked(keys, sliding, queries);
             let layer = case.wrapped(&device, &attention);
-            layer.hold(0, keys).expect("the span reserves");
-            layer.span().appended(keys);
+            layer.hold(0, 0, keys).expect("the span reserves");
+            layer.span(0).appended(keys);
             layer.split_into(Some(splits));
 
             let mut q = device.buffer(&case.q).expect("the queries upload");
             let mut rel = device.buffer(&case.rel).expect("the features upload");
-            let mut span = layer.span();
+            let mut span = layer.span(0);
             let calls = readings_of(keys);
             let mut held = Vec::with_capacity(calls);
             crate::testing::device_time(&device, calls, |batch| {
@@ -4365,12 +4415,12 @@ mod tests {
         let cost = |keys: usize, sliding: usize| -> Duration {
             let case = windowed(keys, sliding);
             let layer = case.wrapped(&device, &attention);
-            layer.hold(0, keys).expect("the span reserves");
-            layer.span().appended(keys);
+            layer.hold(0, 0, keys).expect("the span reserves");
+            layer.span(0).appended(keys);
 
             let mut q = device.buffer(&case.q).expect("the query uploads");
             let mut rel = device.buffer(&case.rel).expect("the features upload");
-            let mut span = layer.span();
+            let mut span = layer.span(0);
             let calls = readings_of(keys);
             let mut held = Vec::with_capacity(calls);
             crate::testing::device_time(&device, calls, |batch| {
@@ -4455,12 +4505,12 @@ mod tests {
         let cost = |tokens: usize, sliding: usize| -> Duration {
             let case = blocked(tokens, sliding, tokens);
             let layer = case.wrapped(&device, &attention);
-            layer.hold(0, tokens).expect("the span reserves");
-            layer.span().appended(tokens);
+            layer.hold(0, 0, tokens).expect("the span reserves");
+            layer.span(0).appended(tokens);
 
             let mut q = device.buffer(&case.q).expect("the queries upload");
             let mut rel = device.buffer(&case.rel).expect("the features upload");
-            let mut span = layer.span();
+            let mut span = layer.span(0);
             let mut held = None;
             crate::testing::device_time(&device, 1, |batch| {
                 held = Some(
@@ -4649,11 +4699,11 @@ mod tests {
         const ROUNDS: usize = 2;
         let layer = case.wrapped(device, attention);
         layer.block_from(floor);
-        layer.hold(0, case.keys).expect("the span reserves");
-        layer.span().appended(case.keys);
+        layer.hold(0, 0, case.keys).expect("the span reserves");
+        layer.span(0).appended(case.keys);
         let mut q = device.buffer(&case.q).expect("the queries upload");
         let mut rel = device.buffer(&case.rel).expect("the features upload");
-        let mut span = layer.span();
+        let mut span = layer.span(0);
         let mut held = None;
         let mut taken = Duration::MAX;
         for round in 0..=ROUNDS {
@@ -5687,18 +5737,134 @@ mod tests {
         q: &[f32],
         rel: &[f32],
     ) -> Vec<f32> {
+        through_a_slot(device, layer, 0, held, k, v, q, rel)
+    }
+
+    /// The same, against the span of the sequence in slot `slot`.
+    #[allow(clippy::too_many_arguments)]
+    fn through_a_slot(
+        device: &Device,
+        layer: &LayerAttention<'_>,
+        slot: usize,
+        held: usize,
+        k: &[f32],
+        v: &[f32],
+        q: &[f32],
+        rel: &[f32],
+    ) -> Vec<f32> {
         let rows = k.len() / (layer.config().kv_channels());
-        layer.hold(held, rows).expect("the span grows");
-        layer.append(k, v);
+        layer.hold(slot, held, rows).expect("the span grows");
+        layer.append(slot, k, v);
 
         let mut batch = device.batch().expect("a command buffer opens");
         let mut q = device.buffer(q).expect("the query uploads");
         let mut rel = device.buffer(rel).expect("the features upload");
         let out = layer
-            .encode_over(&mut batch, &mut layer.span(), &mut q, &mut rel, None, held)
+            .encode_over(
+                &mut batch,
+                &mut layer.span(slot),
+                &mut q,
+                &mut rel,
+                None,
+                held,
+            )
             .expect("the step encodes");
         batch.wait().expect("the batch completes");
         out.to_vec()
+    }
+
+    /// **Two sequences interleaved through one layer's two spans are the two
+    /// sequences run alone**, bit for bit and at every step.
+    ///
+    /// The companion of the convolution's own two-slot case, at the other piece
+    /// of state a sequence carries — and the one where contamination is
+    /// invisible in the output: a step that attended over the neighbour's keys
+    /// answers a row of the right shape, from a plausible softmax, which
+    /// `o_proj` goes on to project and forty-one more layers go on to refine.
+    ///
+    /// Interleaved a step at a time, because what a span has to survive is the
+    /// other span growing in between — a layer whose two slots were one buffer
+    /// used twice would pass a test that ran one sequence to the end and then
+    /// the other.
+    #[test]
+    fn two_sequences_in_two_slots_attend_over_their_own_keys() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let (case, k, v) = streaming(8);
+        let (heads, head_dim) = (case.config.heads, case.config.head_dim);
+        let channels = case.config.kv_channels();
+        let queries: Vec<(Vec<f32>, Vec<f32>)> = (0..2)
+            .map(|s| {
+                (
+                    values(heads * head_dim, 5 + s),
+                    values(heads * case.config.d_rel, 9 + s),
+                )
+            })
+            .collect();
+
+        // Two sequences of different lengths, so that a slot reading the
+        // other's span would attend over a different number of keys as well as
+        // over different ones.
+        let lengths = [3, 5];
+        let starts = [0, 3];
+        let of = |s: usize, at: usize| {
+            let start = (starts[s] + at) * channels;
+            (
+                k[start..start + channels].to_vec(),
+                v[start..start + channels].to_vec(),
+            )
+        };
+
+        let alone: Vec<Vec<Vec<f32>>> = (0..2)
+            .map(|s| {
+                let layer = case.wrapped(&device, &attention);
+                (0..lengths[s])
+                    .map(|at| {
+                        let (k, v) = of(s, at);
+                        through_the_span(&device, &layer, at, &k, &v, &queries[s].0, &queries[s].1)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let shared = LayerAttention::holding(&device, &attention, case.config, &case.proj, 2)
+            .expect("the layer wraps");
+        assert_eq!(shared.slots(), 2);
+        let mut batched: Vec<Vec<Vec<f32>>> = vec![Vec::new(), Vec::new()];
+        for at in 0..*lengths.iter().max().expect("a length") {
+            for slot in 0..2 {
+                if at >= lengths[slot] {
+                    continue;
+                }
+                let (k, v) = of(slot, at);
+                batched[slot].push(through_a_slot(
+                    &device,
+                    &shared,
+                    slot,
+                    at,
+                    &k,
+                    &v,
+                    &queries[slot].0,
+                    &queries[slot].1,
+                ));
+            }
+        }
+        assert_ne!(alone[0], alone[1], "two sequences to tell apart");
+        assert_eq!(batched[0], alone[0], "the sequence in slot 0");
+        assert_eq!(batched[1], alone[1], "the sequence in slot 1");
+    }
+
+    /// A slot past the batch a layer was wrapped for is a sequence whose keys
+    /// are nowhere, for the reason a convolution refuses one.
+    #[test]
+    #[should_panic(expected = "slot 1 of a layer holding 1")]
+    fn a_slot_past_the_batch_a_layer_holds_is_refused() {
+        let Some(device) = device() else {
+            panic!("slot 1 of a layer holding 1")
+        };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let (case, ..) = streaming(8);
+        case.wrapped(&device, &attention).held(1);
     }
 
     /// **The claim the residency rests on.** A sequence fed to a layer a chunk
@@ -5743,7 +5909,7 @@ mod tests {
             let streamed =
                 through_the_span(&device, &layer, held, &k[span.clone()], &v[span], &q, &rel);
             held += rows;
-            assert_eq!(layer.held(), held);
+            assert_eq!(layer.held(0), held);
 
             let whole = layer
                 .forward(Step {
@@ -5781,12 +5947,12 @@ mod tests {
 
         let first = &k[..4 * channels];
         let got = through_the_span(&device, &layer, 0, first, &v[..4 * channels], &q, &rel);
-        assert_eq!(layer.held(), 4);
+        assert_eq!(layer.held(0), 4);
 
         // A second sequence over the same four keys, after the first has left
         // its own behind.
         let alone = through_the_span(&device, &layer, 0, first, &v[..4 * channels], &q, &rel);
-        assert_eq!(layer.held(), 4, "the span started over");
+        assert_eq!(layer.held(0), 4, "the span started over");
         assert_eq!(alone, got);
     }
 
@@ -5823,14 +5989,14 @@ mod tests {
 
         through_the_span(&device, &layer, 0, &first_k, &first_v, &q, &rel);
         let want = through_the_span(&device, &layer, kept, &wrong_k, &wrong_v, &q, &rel);
-        assert_eq!(layer.held(), kept + rejected);
+        assert_eq!(layer.held(0), kept + rejected);
 
-        layer.rewind(rejected);
-        assert_eq!(layer.held(), kept, "the span gave the keys back");
+        layer.rewind(0, rejected);
+        assert_eq!(layer.held(0), kept, "the span gave the keys back");
         let got = through_the_span(&device, &layer, kept, &wrong_k, &wrong_v, &q, &rel);
         assert_eq!(got, want, "the same keys again are the same answer");
 
-        layer.rewind(rejected);
+        layer.rewind(0, rejected);
         let alone = through_the_span(&device, &layer, kept, &first_k, &first_v, &q, &rel);
         assert_ne!(alone, want, "keys the step attended over regardless");
     }
@@ -5849,9 +6015,9 @@ mod tests {
         let layer = case.wrapped(&device, &attention);
         let channels = case.config.kv_channels();
 
-        layer.hold(0, 4).expect("the span grows");
-        layer.append(&k[..4 * channels], &v[..4 * channels]);
-        layer.hold(7, 1).expect("the span grows");
+        layer.hold(0, 0, 4).expect("the span grows");
+        layer.append(0, &k[..4 * channels], &v[..4 * channels]);
+        layer.hold(0, 7, 1).expect("the span grows");
     }
 
     /// The two shapes a wrapped layer refuses, both of which the kernel would

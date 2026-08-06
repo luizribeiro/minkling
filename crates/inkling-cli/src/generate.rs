@@ -81,9 +81,10 @@ pub fn run(args: &Generate) -> Result<()> {
         &checkpoint,
         &config.text_config,
         args.speculate,
+        1,
     )?;
     let tail = backend::tail_weights(&weights, &config.text_config);
-    let heads = backend::heads(gpu.as_ref(), &checkpoint, &config, args.speculate, &tail)?;
+    let heads = backend::heads(gpu.as_ref(), &checkpoint, &config, args.speculate, &tail, 1)?;
     let generator = weights.generator();
     let ending = Ending {
         budget: args.max_tokens,

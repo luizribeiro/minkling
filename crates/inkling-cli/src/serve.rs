@@ -469,7 +469,13 @@ pub fn run(args: &Serve) -> Result<()> {
     let gpu = backend::open(args.backend, args.numerics)?;
     eprintln!("loading {}", args.checkpoint.display());
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
-    let weights = backend::weights(gpu.as_ref(), &checkpoint, &config.text_config, speculation)?;
+    let weights = backend::weights(
+        gpu.as_ref(),
+        &checkpoint,
+        &config.text_config,
+        speculation,
+        1,
+    )?;
     let generator = weights.generator();
 
     let mut engine = Engine {
