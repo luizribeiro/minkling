@@ -9090,6 +9090,9 @@ kernel void mma_lane_probe___T__(
         /// to redo per arm.
         packed: Vec<u8>,
         chosen: Vec<u32>,
+        /// Blocks the grid covers, where this arm is dispatched over fewer than
+        /// the plan was allocated for — see [`Blocked::over`].
+        blocks: Option<usize>,
     }
 
     impl Blocked {
@@ -9127,7 +9130,22 @@ kernel void mma_lane_probe___T__(
                 // Sorted already, so a block straddles two experts only where
                 // the run length made it and not by accident of the routing.
                 chosen: (0..rows).map(|row| (row * experts / rows) as u32).collect(),
+                blocks: None,
             }
+        }
+
+        /// The same call dispatched over `blocks` blocks rather than over the
+        /// bound the plan was allocated at.
+        ///
+        /// **The one thing about a grouped dispatch a caller can vary without
+        /// varying the work**, which is what makes it an arm: the plan is the
+        /// same plan and the blocks that hold rows are the same blocks, so what
+        /// a shorter grid removes is threadgroups that read a block of no rows
+        /// and return.
+        fn over(mut self, blocks: usize) -> Self {
+            assert!(self.grouped, "only a grouped call is covered in blocks");
+            self.blocks = Some(blocks);
+            self
         }
 
         /// The same call with its rows naming the experts `chosen` names rather
@@ -9179,8 +9197,18 @@ kernel void mma_lane_probe___T__(
                             bank.rows_a_block(self.rows),
                         )
                         .expect("the grouping encodes");
-                    bank.encode_grouped(batch, &mut sorted, x, 1, Through::Gathered)
-                        .expect("the dispatch encodes");
+                    match self.blocks {
+                        None => bank.encode_grouped(batch, &mut sorted, x, 1, Through::Gathered),
+                        Some(blocks) => bank.encode_grouped_over(
+                            batch,
+                            &mut sorted,
+                            x,
+                            1,
+                            Through::Gathered,
+                            blocks,
+                        ),
+                    }
+                    .expect("the dispatch encodes");
                 }
             }
         }
@@ -10567,6 +10595,13 @@ kernel void mma_lane_probe___T__(
     /// chosen by hand is a row whose reader cannot tell which — the median is a
     /// rule, and it moves with the fixture rather than with this file.
     fn as_the_model_routes(tokens: usize) -> Vec<u32> {
+        named_by(&the_routing_recorded_at(tokens))
+    }
+
+    /// The same routing as the counts it is, which is what an arm varying the
+    /// spread has to start from — [`as_the_model_routes`] is this laid out as a
+    /// selection and the layer rule is written once for both.
+    fn the_routing_recorded_at(tokens: usize) -> Vec<usize> {
         let bundle = fixture::open(fixture::ROUTING);
         let mut layers = fixture::routing(&bundle, tokens);
         // Ranked by what this table is about: the row-slots a call cut at the
@@ -10582,7 +10617,31 @@ kernel void mma_lane_probe___T__(
             blocks * Block::SHIPPED.rows * 1000 / rows.max(1)
         };
         layers.sort_by_key(slack);
-        named_by(&layers[layers.len() / 2])
+        layers.swap_remove(layers.len() / 2)
+    }
+
+    /// **The same rows over the same experts with the skew taken out of them**,
+    /// which is the one arm that separates a routing's peak from everything else
+    /// about a routed call.
+    ///
+    /// Held: the row count, the weights, the multiply-adds, and *which* experts
+    /// hold rows — so the distinct weights the call decodes are the same weights
+    /// and the same number of them. Varied: how long each run is, which the
+    /// recorded routing makes 27 to 36 times the mean at its peak and this makes
+    /// flat to a row.
+    ///
+    /// **The used experts and not all 256**, which is what separates this from
+    /// the even-run construction beside it. Spreading the rows over every expert
+    /// would move two things at once — the peak and the number of runs — and the
+    /// number of runs is the term T6 already priced.
+    fn flattened_over_the_same_experts(counts: &[usize]) -> Vec<u32> {
+        let rows: usize = counts.iter().sum();
+        let holding: Vec<usize> = (0..counts.len()).filter(|&at| counts[at] > 0).collect();
+        let mut flat = vec![0usize; counts.len()];
+        for (at, &expert) in holding.iter().enumerate() {
+            flat[expert] = rows / holding.len() + usize::from(at < rows % holding.len());
+        }
+        named_by(&flat)
     }
 
     /// **That the recorded routing is a router's and not an even layout**,
@@ -10628,6 +10687,233 @@ kernel void mma_lane_probe___T__(
         }
     }
 
+    /// **Whether a routing's long tail costs a grouped call anything**, which is
+    /// the largest thing T6 established and did not price.
+    ///
+    /// One expert holds 27 to 36 times the mean. If anything about the dispatch
+    /// ran an expert's rows in order — a barrier, a pass, a plan walked run by
+    /// run — the whole bank would wait on that one, and the remedy would be to
+    /// split a long run or to order the runs longest-first. **The arm that says
+    /// which is the same rows over the same experts with the peak taken out**:
+    /// [`flattened_over_the_same_experts`] holds the row count, the weights, the
+    /// multiply-adds and which experts hold rows, and flattens the runs.
+    ///
+    /// **What a difference between the two would have to be read against is the
+    /// block count**, which is why it is a column. A run reaches this kernel as
+    /// `ceil(run / height)` blocks and a block is one threadgroup that shares
+    /// nothing with any other, so a routing that costs more only in proportion
+    /// to the blocks it makes is a routing whose skew reaches the kernel as a
+    /// count and nothing else — the term T6 already priced and bounded. A
+    /// routing that costs more *per block* is one where something serialises,
+    /// and at a 27 to 36× peak it would cost multiples rather than percent.
+    ///
+    /// Warm and swept both ways, the sort taken off each arm — for the reason
+    /// every table on this kernel is.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn whether_a_routings_long_tail_costs_a_grouped_call_anything() {
+        let Some(device) = device() else { return };
+
+        let shipped =
+            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        let (routed, ..) = BOUND_SHAPES[1];
+
+        eprintln!("\n  {routed}, the kernel alone — the peak against the same rows spread flat");
+        eprintln!(
+            "  {:>7}{:>11}{:>9}{:>9}{:>10}{:>10}{:>11}{:>11}{:>9}",
+            "tokens",
+            "height",
+            "hottest",
+            "blocks",
+            "flat",
+            "as routed",
+            "flat",
+            "µs a block",
+            "flat"
+        );
+        for tokens in SWEPT_HEIGHT_LENGTHS {
+            let counts = the_routing_recorded_at(tokens);
+            let whole = Blocked::at(tokens, BOUND_SHAPES[1]);
+            let bank = whole.upload(&device, &shipped);
+            // Zero where this length reaches the entry laid over the rows, which
+            // reads no plan — there the blocks are the rows cut into the shipped
+            // height and a run's length reaches the kernel as passes instead.
+            let height = bank.rows_a_block(whole.rows);
+            let cut = |chosen: &[u32]| match height {
+                0 => whole.rows.div_ceil(Block::SHIPPED.rows),
+                held => blocks_a_run_is_cut_into(chosen, held),
+            };
+
+            let arms = [
+                ("as the model routes", named_by(&counts)),
+                (
+                    "flat over the same experts",
+                    flattened_over_the_same_experts(&counts),
+                ),
+            ];
+            let shapes: Vec<Blocked> = arms
+                .iter()
+                .map(|(_, chosen)| Blocked::at(tokens, BOUND_SHAPES[1]).named(chosen.clone()))
+                .collect();
+
+            crate::testing::warmed(|| {
+                whole.costs_on(&device, &bank, &grouping);
+            });
+            let listed: Vec<usize> = (0..shapes.len()).collect();
+            let (up, down) = crate::testing::both_ways(&listed, |at| {
+                shapes[at].costs_on(&device, &bank, &grouping)
+            });
+            // **Once an arm and not once a column.** The subtraction exists to
+            // take a dispatch this table is not about off every reading of it,
+            // and a sort re-measured per column would put a fresh sample of the
+            // same quantity under each — which is the noise the subtraction is
+            // there to remove, added back at the size of the effect.
+            let sorts: Vec<Duration> = shapes
+                .iter()
+                .map(|shape| shape.sorts(&device, &bank, &grouping))
+                .collect();
+            let alone = |at: usize| up[at].max(down[at]).saturating_sub(sorts[at]).as_secs_f64();
+
+            let (blocks, flat) = (cut(&arms[0].1), cut(&arms[1].1));
+            let hottest = *counts.iter().max().expect("a layer routes somewhere");
+            let apiece = |at: usize, over: usize| 1e6 * alone(at) / over as f64;
+            eprintln!(
+                "  {tokens:>7}{:>11}{hottest:>9}{blocks:>9}{flat:>10}{:>10}{:>11}{:>11}{:>9}",
+                match height {
+                    0 => "the rows".to_string(),
+                    held => format!("{held} rows"),
+                },
+                format!("{:.2}ms", 1e3 * alone(0)),
+                format!("{:.2}ms", 1e3 * alone(1)),
+                format!("{:.1}", apiece(0, blocks)),
+                format!("{:.1}", apiece(1, flat)),
+            );
+
+            // **The claim, and it is about the ratio rather than the times.** A
+            // block is a threadgroup that waits on nothing, so a run's length
+            // reaches this kernel as a block count — and the two arms' cost per
+            // block should agree even where their block counts do not. A kernel
+            // that serialised an expert's rows would put the routed arm's cost
+            // per block at the peak's own multiple of the flat one's, which is
+            // 27 to 36 and not this.
+            let ratio = apiece(0, blocks) / apiece(1, flat);
+            assert!(
+                (0.75..1.35).contains(&ratio),
+                "at {tokens} tokens a routed block costs {ratio:.2} times a flat one, so the \
+                 routing reaches this kernel as something other than a block count"
+            );
+        }
+    }
+
+    /// **What the blocks no run filled cost a grouped dispatch**, which is the
+    /// second thing T6's skew implies and did not price.
+    ///
+    /// Between 115 and 177 of the bank's 256 experts hold no rows at any length.
+    /// They take **no plan slot** — a run's blocks land at a prefix sum over the
+    /// runs before it, and an empty run adds `ceil(0 / height)` of them — but the
+    /// grid is sized by [`blocks_a_plan`], which charges a block per expert
+    /// whether that expert has rows or not, because the counts are on the device
+    /// and this side cannot read them. So the dispatch launches threadgroups the
+    /// runs never reached, and each reads a block of no rows and returns.
+    ///
+    /// **The arm is the same plan under a shorter grid.** Nothing about the work
+    /// moves: the blocks holding rows are the same blocks in the same places, and
+    /// what a grid stopping at the count the runs came to removes is exactly the
+    /// threadgroups that would have returned.
+    /// `a_grid_stopping_at_the_runs_answers_what_the_bound_answers` is what says
+    /// the shorter grid is the same answer, and it has to be said separately —
+    /// this is a clock and a clock cannot tell.
+    ///
+    /// **16384 tokens is not here and cannot be**: that length takes the entry
+    /// laid over the rows, which reads no plan and is covered by a grid with
+    /// nothing slack in it.
+    #[test]
+    #[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+    fn what_the_blocks_no_run_filled_cost_a_grouped_dispatch() {
+        let Some(device) = device() else { return };
+
+        let shipped =
+            PackedMatmul::under(&device, Numerics::Production).expect("the block compiles");
+        let grouping = ExpertGrouping::new(&device).expect("the grouping compiles");
+        let (routed, ..) = BOUND_SHAPES[1];
+
+        eprintln!("\n  {routed}, the kernel alone — the grid against the blocks the runs came to");
+        eprintln!(
+            "  {:>7}{:>8}{:>9}{:>8}{:>8}{:>12}{:>12}{:>9}",
+            "tokens", "used", "the runs", "bound", "null", "the bound", "the runs", "change"
+        );
+        let mut ran = 0;
+        for tokens in SWEPT_HEIGHT_LENGTHS {
+            let counts = the_routing_recorded_at(tokens);
+            let chosen = named_by(&counts);
+            let whole = Blocked::at(tokens, BOUND_SHAPES[1]);
+            let bank = whole.upload(&device, &shipped);
+            let height = bank.rows_a_block(whole.rows);
+            if height == 0 {
+                continue;
+            }
+            ran += 1;
+
+            let came = blocks_a_run_is_cut_into(&chosen, height);
+            let bound = blocks_a_plan(whole.rows, whole.experts, height);
+            let shapes = [
+                Blocked::at(tokens, BOUND_SHAPES[1]).named(chosen.clone()),
+                Blocked::at(tokens, BOUND_SHAPES[1])
+                    .named(chosen.clone())
+                    .over(came),
+            ];
+
+            crate::testing::warmed(|| {
+                whole.costs_on(&device, &bank, &grouping);
+            });
+            let listed: Vec<usize> = (0..shapes.len()).collect();
+            let (up, down) = crate::testing::both_ways(&listed, |at| {
+                shapes[at].costs_on(&device, &bank, &grouping)
+            });
+            // **One sort for both arms, because both arms dispatch one sort.**
+            // They differ in the grid the multiply is covered by and in nothing
+            // the sort can see — same selection, same height — so two samples
+            // here would be two readings of one quantity, subtracted from
+            // different columns of a table whose effect is a percent.
+            let sorts = shapes[0].sorts(&device, &bank, &grouping);
+            let alone = |at: usize| up[at].max(down[at]).saturating_sub(sorts).as_secs_f64();
+
+            let used = counts.iter().filter(|&&count| count > 0).count();
+            eprintln!(
+                "  {tokens:>7}{used:>8}{came:>9}{bound:>8}{:>8}{:>12}{:>12}{:>9}",
+                bound - came,
+                format!("{:.2}ms", 1e3 * alone(0)),
+                format!("{:.2}ms", 1e3 * alone(1)),
+                format!("{:+.1}%", 1e2 * (alone(1) / alone(0) - 1.0)),
+            );
+
+            // **That the arm is a real one**, which the grid rather than the
+            // clock decides: a length whose bound the runs happened to reach
+            // would be this measured against itself.
+            assert!(
+                bound > came,
+                "at {tokens} tokens the runs came to the whole {bound}-block bound, so the two \
+                 arms are one grid measured twice"
+            );
+        }
+        assert!(
+            ran > 0,
+            "no length here reached the entry that reads a plan"
+        );
+    }
+
+    /// **A grid stopping at the blocks the runs came to answers what the bound
+    /// answers**, which is what lets the row above be read as a cost rather than
+    /// as a trade.
+    ///
+    /// The plan is written compactly and the entries past the last run are the
+    /// zeros the buffer was allocated with, so the threadgroups a shorter grid
+    /// drops are the ones that would have read a block of no rows and returned.
+    /// That is an argument; this is the bits. Held to **equality** rather than to
+    /// a tolerance, for the reason
+    /// `the_two_grouped_entries_answer_one_call_the_same_bits` is: nothing about
+    /// a row's reduction changes, so nothing about its answer may.
     /// **A synthetic bank rather than the routed one**, for the reason
     /// `the_two_grouped_entries_answer_one_call_the_same_bits` uses one: what
     /// this is about is the grid, which is the same grid at seven experts as at
