@@ -71,7 +71,7 @@ use std::ops::ControlFlow;
 
 use crate::head::{LmHead, Tail, Tailed};
 use crate::layer::Passed;
-use crate::model::{Model, ModelCache, ModelWeights};
+use crate::model::{Batched, Model, ModelCache, ModelWeights};
 use crate::ops::{Projection, top_k};
 use crate::profile::{self, Op};
 
@@ -170,6 +170,29 @@ pub struct Round<'a> {
     /// capped by the budget the generation has left. Zero is a generation about
     /// to end.
     pub depth: usize,
+}
+
+/// What one sequence of a batch was answered: the row of the call its own rows
+/// started at, and the id the model produced for each of them.
+///
+/// **The ids of every row and not of the last**, for the reason
+/// [`Generator::step_batch`] runs the tail over the whole call: a sequence
+/// feeding more than one row is a speculative block, and every row of a block
+/// is a question. A sequence feeding one row has one id, which is a decode step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picked {
+    /// The row of the call this sequence's rows started at, which is what a
+    /// caller reading anything else the call produced indexes by.
+    pub first: usize,
+    pub picks: Vec<usize>,
+}
+
+impl Picked {
+    /// The id the model produced for this sequence's last row, which for a
+    /// sequence feeding one row is the token a decode step decided.
+    pub fn last(&self) -> usize {
+        *self.picks.last().expect("a row per sequence of a batch")
+    }
 }
 
 /// The proposer of a generation that does not speculate, which guesses nothing
@@ -310,6 +333,63 @@ impl<'a> Generator<'a> {
                 false => Vec::new(),
             },
         }
+    }
+
+    /// The whole stack and the back of the model over a batch of sequences
+    /// advancing together, and the id each of them produced.
+    ///
+    /// **The one call in this file whose subject is more than one request.**
+    /// Every other measure of a decode step is what it costs to produce one
+    /// token, and the weights it reads to produce that one — 5.9 GB of them —
+    /// are the same weights every other sequence in flight would read. So N
+    /// sequences fed together are one set of those reads and N tokens, and
+    /// nothing in a kernel had to change for it: what changed is that a
+    /// sequence's span and its four convolution windows are a slot's rather
+    /// than the layer's.
+    ///
+    /// **Every row of the call is asked, not the last of each sequence.** A
+    /// sequence feeding more than one row is a speculative block, and every row
+    /// of a block is a question the round has to have the answer to — so the
+    /// tail runs over the whole call and each sequence is handed back its own
+    /// rows' answers. That is also why this does not batch a *prefill*: a
+    /// prompt's every position would be a pass over 200058 rows of the head to
+    /// answer a question nothing asks, and a prompt already fills the machine
+    /// on its own.
+    ///
+    /// The ids each sequence fed are left in its own cache, as a step of its
+    /// own would leave them.
+    pub fn step_batch(
+        &self,
+        batch: &mut [Batched<'_>],
+        weights: &impl ModelWeights,
+    ) -> Vec<Picked> {
+        let counts: Vec<usize> = batch.iter().map(|sequence| sequence.ids.len()).collect();
+        let rows: usize = counts.iter().sum();
+        let want = Tail {
+            block: rows,
+            chained: false,
+            logits: false,
+        };
+        let tailed = match self.model.forward_batch(batch, weights) {
+            Passed::Carried(carried) => weights
+                .tail(carried, want)
+                .expect("a stack that carried its last layer's rows holds the tail behind them"),
+            Passed::Rows(h) => self.on_this_side(&h, want),
+        };
+        assert_eq!(tailed.picks.len(), rows, "an id per row of the batch");
+
+        let mut from = 0;
+        counts
+            .into_iter()
+            .map(|queries| {
+                let picked = Picked {
+                    first: from,
+                    picks: tailed.picks[from..from + queries].to_vec(),
+                };
+                from += queries;
+                picked
+            })
+            .collect()
     }
 
     /// `ids` into `cache`, with no token taken back out of it.
@@ -544,6 +624,70 @@ impl<'a> Generator<'a> {
                 .collect();
         }
         Stop::Budget
+    }
+
+    /// Several generations at once: each prompt prefilled on its own, then
+    /// every sequence decoded together until it has the tokens `counts` asked
+    /// it for.
+    ///
+    /// **The prompts are prefilled a sequence at a time and the tokens are
+    /// decoded together**, which is where the two regimes differ: a prefill of
+    /// any length already fills the machine, and a decode step's dispatches
+    /// carry a thousand output elements against eighty cores. So what a batch
+    /// is for is the second, and the first is left where it was.
+    ///
+    /// A sequence whose count runs out drops out of the batch and the rest go
+    /// on without it, which is what the tail of any real batch looks like: the
+    /// sequences do not finish together.
+    ///
+    /// `caches` is a cache a prompt, each built for its own slot of whatever
+    /// backend runs the layers — see [`ModelCache::in_slot`].
+    pub fn generate_batch(
+        &self,
+        caches: &mut [ModelCache],
+        prompts: &[&[usize]],
+        counts: &[usize],
+        weights: &impl ModelWeights,
+    ) -> Vec<Vec<usize>> {
+        assert_eq!(caches.len(), prompts.len(), "a cache a prompt");
+        assert_eq!(counts.len(), prompts.len(), "a budget a prompt");
+
+        let want = Tail {
+            block: 1,
+            chained: false,
+            logits: false,
+        };
+        let mut produced: Vec<Vec<usize>> = prompts.iter().map(|_| Vec::new()).collect();
+        for (at, (cache, prompt)) in caches.iter_mut().zip(prompts).enumerate() {
+            if counts[at] == 0 {
+                continue;
+            }
+            let picks = self.tailed(cache, prompt, want, weights).picks;
+            produced[at].push(*picks.first().expect("an id for the prompt's last row"));
+        }
+
+        loop {
+            let live: Vec<usize> = (0..prompts.len())
+                .filter(|at| produced[*at].len() < counts[*at])
+                .collect();
+            if live.is_empty() {
+                return produced;
+            }
+            let feeding: Vec<[usize; 1]> = live
+                .iter()
+                .map(|at| [*produced[*at].last().expect("a token to feed back")])
+                .collect();
+            let mut batch: Vec<Batched<'_>> = caches
+                .iter_mut()
+                .enumerate()
+                .filter(|(at, _)| live.contains(at))
+                .zip(&feeding)
+                .map(|((_, cache), ids)| Batched { cache, ids })
+                .collect();
+            for (at, picked) in live.iter().zip(self.step_batch(&mut batch, weights)) {
+                produced[*at].push(picked.last());
+            }
+        }
     }
 
     /// [`stream`](Self::stream) collected: `count` tokens decoded greedily, with
@@ -941,6 +1085,58 @@ mod tests {
         assert!(streamed.is_empty());
         assert_eq!(stop, Stop::Budget);
         assert_eq!(logits(&stack, cache, &stack.ids), whole(&stack, &stack.ids));
+    }
+
+    /// **The same generation, run alone and run inside a batch, produces
+    /// identical tokens** — at every position of the batch, beside neighbours
+    /// with prompts of different lengths, and beside a neighbour that finishes
+    /// early.
+    ///
+    /// This is the loop's half of the claim; the kernels' half is
+    /// `a_sequence_in_a_batch_produces_what_it_produces_alone` in
+    /// `inkling_metal::projections`, where the state a batch splits actually
+    /// lives. What this can fail on is the bookkeeping around it: a sequence
+    /// handed another's token to feed back, a sequence dropped from the batch
+    /// whose neighbours then read the wrong rows, or an id taken from the wrong
+    /// row of the call.
+    ///
+    /// A batch is exactly the tokens, not close to them: every arm multiplies
+    /// the same numbers in the same order.
+    #[test]
+    fn a_generation_in_a_batch_produces_what_it_produces_alone() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let generator = generator(&stack, &head);
+        let sequence = stack.sequence();
+        let prompts: [&[usize]; 3] = [&sequence[..3], &sequence[3..], &sequence[..1]];
+        // The third finishes two tokens before the others, which is what a
+        // batch's tail looks like: the sequences do not stop together.
+        let counts = [COUNT, COUNT, COUNT - 2];
+
+        let alone: Vec<Vec<usize>> = prompts
+            .iter()
+            .zip(&counts)
+            .map(|(ids, count)| {
+                generator.generate(&mut ModelCache::new(&stack.config), ids, *count, &stack)
+            })
+            .collect();
+        assert_ne!(alone[0], alone[1], "two generations to tell apart");
+
+        for order in [vec![0, 1, 2], vec![2, 1, 0], vec![1, 2], vec![2, 0]] {
+            let mut caches: Vec<ModelCache> = (0..order.len())
+                .map(|slot| ModelCache::in_slot(&stack.config, 0, slot))
+                .collect();
+            let ids: Vec<&[usize]> = order.iter().map(|at| prompts[*at]).collect();
+            let budgets: Vec<usize> = order.iter().map(|at| counts[*at]).collect();
+            let batched = generator.generate_batch(&mut caches, &ids, &budgets, &stack);
+
+            for (at, seq) in order.iter().enumerate() {
+                assert_eq!(
+                    batched[at], alone[*seq],
+                    "sequence {seq} at position {at} of {order:?}"
+                );
+            }
+        }
     }
 
     /// A proposer that guesses from the continuation the model actually
