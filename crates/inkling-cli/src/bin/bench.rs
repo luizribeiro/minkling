@@ -95,7 +95,7 @@ const USAGE: &str = "usage:\n  \
     bench session <checkpoint> [--tokens <n>] [--reuse-tokens <n>] [--numerics <which>]\n  \
     bench batch   <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>]\n  \
     bench clock   <checkpoint> [--tokens <n>] [--context <n>] [--idle <ms>] \
-[--prefill <n>] [--batch <n>]\n  \
+[--every <ms>] [--prefill <n>] [--batch <n>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench diverge <checkpoint> [--tokens <n>] [--against <which>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
@@ -249,9 +249,9 @@ enum Job {
         /// clock measurement runs *this* width and repeats it, which is what
         /// lets a gap be held constant while the work either side of it grows.
         widest: Option<usize>,
-        /// Host time left between one unit of work and the next, which only the
+        /// What is left between one unit of work and the next, which only the
         /// clock measurement has anywhere to put.
-        idle: Duration,
+        gap: Gap,
         /// The prompt each of the clock measurement's units prefills, and zero
         /// for the decode step it charges otherwise.
         prefill: usize,
@@ -326,10 +326,11 @@ impl Job {
         let mut reuse = None;
         // The widest batch a sweep runs, which only the batch sweep takes.
         let mut widest = None;
-        // The two the clock measurement takes and nothing else has anywhere to
+        // The three the clock measurement takes and nothing else has anywhere to
         // put, `Option` for the reason the numbers above are: zero is a duty
         // cycle this means something by, and so is a prompt of no tokens.
         let mut idle = None;
+        let mut every = None;
         let mut prefill = None;
         // A sweep runs every depth up to its own, where a cross-engine table
         // quotes one beside `k = 0` — so the default depth is what the flag
@@ -357,6 +358,13 @@ impl Job {
                         "a gap in milliseconds",
                         |_| true,
                     )? as u64));
+                }
+                // An interval of no milliseconds is not a request rate, which is
+                // what separates this from the gap above: the arm a rate is
+                // compared against is a gap of nothing, and it already has a
+                // word.
+                "--every" => {
+                    every = Some(Duration::from_millis(count(&arg, &mut args)? as u64));
                 }
                 "--prefill" => prefill = Some(count(&arg, &mut args)?),
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
@@ -414,8 +422,18 @@ impl Job {
         // and says so nowhere, which is the whole of what this measurement
         // exists to fix — so the two levers are refused to the measurements that
         // could only drop them, under the same rule as the numbers above.
-        if what != What::Clock && (idle.is_some() || prefill.is_some()) {
-            bail!("{what:?} takes no --idle or --prefill: it does not vary its own duty cycle");
+        if what != What::Clock && (idle.is_some() || every.is_some() || prefill.is_some()) {
+            bail!(
+                "{what:?} takes no --idle, --every or --prefill: it does not vary its own duty \
+                 cycle"
+            );
+        }
+        // **A gap and an interval are two answers to one question**, and the
+        // second is not the first plus arithmetic a reader can do in their head:
+        // what a run told both would have to decide is whether the interval
+        // holds the gap or follows it.
+        if idle.is_some() && every.is_some() {
+            bail!("--idle and --every are two answers to one question: a gap, or a rate to fit it");
         }
         // **A prefill's unit is its own prompt.** Its keys are the tokens
         // `--prefill` names and there is no step behind a context, so a number
@@ -456,7 +474,10 @@ impl Job {
             numerics: numerics.unwrap_or_default(),
             reuse: reuse.unwrap_or(DEFAULT_BOUND),
             widest,
-            idle: idle.unwrap_or_default(),
+            gap: match every {
+                Some(period) => Gap::Every(period),
+                None => Gap::After(idle.unwrap_or_default()),
+            },
             prefill: prefill.unwrap_or(0),
         })
     }
@@ -544,7 +565,7 @@ impl Job {
                 numerics,
                 reuse,
                 widest,
-                idle,
+                gap,
                 prefill,
             } => {
                 let asked = Asked {
@@ -554,7 +575,7 @@ impl Job {
                     numerics: *numerics,
                     reuse: *reuse,
                     widest: *widest,
-                    idle: *idle,
+                    gap: *gap,
                     prefill: *prefill,
                 };
                 for reading in measure(*what, checkpoint, asked)? {
@@ -754,9 +775,9 @@ struct Asked {
     /// How many sequences a unit of work decodes through: the widest of the
     /// sweep's doubling, or the one width the clock measurement repeats.
     widest: Option<usize>,
-    /// Host time the clock measurement leaves between its units, ignored by
+    /// What the clock measurement leaves between its units, ignored by
     /// everything else.
-    idle: Duration,
+    gap: Gap,
     /// The prompt each of the clock measurement's units prefills, and zero for
     /// the decode step it charges otherwise.
     prefill: usize,
@@ -770,7 +791,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
         numerics,
         reuse,
         widest,
-        idle,
+        gap,
         prefill,
     } = asked;
     let config = config::of_checkpoint(dir)?;
@@ -949,16 +970,13 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     text,
                     &unit,
                     tokens,
-                    idle,
+                    gap,
                 );
                 eprintln!(
-                    "clock: {} {}, {} idle between them",
+                    "clock: {} {}, {}",
                     ticks.len(),
                     unit.over(ticks.len()),
-                    match idle.is_zero() {
-                        true => "no".to_string(),
-                        false => format!("{:.0?}", idle),
-                    },
+                    gap.said(),
                 );
                 taken.extend(clocked(&ticks));
             }
@@ -1340,8 +1358,8 @@ struct Tick {
     gpu: Duration,
 }
 
-/// `count` repetitions of `unit`, back to back, with `idle` of host time
-/// deliberately left between them.
+/// `count` repetitions of `unit`, back to back, with whatever host time `gap`
+/// deliberately leaves between them.
 ///
 /// **What each arm discards before the ones that are timed is its own**, and
 /// every arm discards something for the reason the prefill measurement takes the
@@ -1355,10 +1373,10 @@ fn ticked(
     config: &TextConfig,
     unit: &Unit,
     count: usize,
-    idle: Duration,
+    gap: Gap,
 ) -> Vec<Tick> {
     profile::take();
-    let mut ticking = Ticking::new(idle, count + 1);
+    let mut ticking = Ticking::new(gap, count + 1);
     let warmed = match unit {
         // Every step of one generation rather than a generation apiece, so that
         // the gap `--idle` leaves falls between two decode steps — which is the
@@ -1408,6 +1426,45 @@ fn ticked(
     ticks
 }
 
+/// What a run leaves between one unit of work and the next.
+///
+/// **A gap and an interval are the same sleep counted from two different ends,
+/// and a server knows the second one.** Requests arrive every 200 ms whatever a
+/// step costs, so what the device is left idle for is the interval less the work
+/// — and at a width where the work is longer than the interval there is no idle
+/// at all. That last case is why both words exist: from the sleep's side a gap
+/// of nothing and an interval already spent are the same instruction, and about
+/// a server they are two different sentences. One says the operator asked for no
+/// gap; the other says the operator asked for 200 ms between requests and the
+/// batch cannot answer them that fast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gap {
+    /// Host time left after every unit, whatever the unit cost.
+    After(Duration),
+    /// A period a unit is answered inside, idle for whatever is left of it.
+    Every(Duration),
+}
+
+impl Gap {
+    /// What to sleep for at the end of a period `spent` of which has gone on the
+    /// work.
+    fn idle(&self, spent: Duration) -> Duration {
+        match self {
+            Self::After(idle) => *idle,
+            Self::Every(period) => period.saturating_sub(spent),
+        }
+    }
+
+    /// As the header says it, which is the flag that asked for it.
+    fn said(&self) -> String {
+        match self {
+            Self::After(idle) if idle.is_zero() => "no idle between them".to_string(),
+            Self::After(idle) => format!("{idle:.0?} idle between them"),
+            Self::Every(period) => format!("one of them every {period:.0?}"),
+        }
+    }
+}
+
 /// The clock a run of units is timed on, and the gap it leaves after each of
 /// them.
 ///
@@ -1416,15 +1473,15 @@ fn ticked(
 /// generator drives.
 struct Ticking {
     at: Instant,
-    idle: Duration,
+    gap: Gap,
     ticks: Vec<Tick>,
 }
 
 impl Ticking {
-    fn new(idle: Duration, count: usize) -> Self {
+    fn new(gap: Gap, count: usize) -> Self {
         Self {
             at: Instant::now(),
-            idle,
+            gap,
             ticks: Vec::with_capacity(count),
         }
     }
@@ -1444,8 +1501,9 @@ impl Ticking {
     /// syscall a run of any other measurement here would not: what this is
     /// timing is a decode step, and a decode step's own host side is 8% of it.
     fn tick(&mut self, gpu: Duration) {
-        if !self.idle.is_zero() {
-            std::thread::sleep(self.idle);
+        let idle = self.gap.idle(self.at.elapsed());
+        if !idle.is_zero() {
+            std::thread::sleep(idle);
         }
         self.ticks.push(Tick {
             wall: self.at.elapsed(),
@@ -2327,7 +2385,7 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                idle: Duration::ZERO,
+                gap: Gap::After(Duration::ZERO),
                 prefill: 0,
             }
         );
@@ -2342,7 +2400,7 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                idle: Duration::ZERO,
+                gap: Gap::After(Duration::ZERO),
                 prefill: 0,
             }
         );
@@ -2365,7 +2423,7 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                idle: Duration::ZERO,
+                gap: Gap::After(Duration::ZERO),
                 prefill: 0,
             }
         );
@@ -2394,7 +2452,7 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: 0,
                 widest: None,
-                idle: Duration::ZERO,
+                gap: Gap::After(Duration::ZERO),
                 prefill: 0,
             }
         );
@@ -2430,7 +2488,7 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: Some(8),
-                idle: Duration::ZERO,
+                gap: Gap::After(Duration::ZERO),
                 prefill: 0,
             }
         );
@@ -2493,7 +2551,7 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                idle: Duration::from_millis(40),
+                gap: Gap::After(Duration::from_millis(40)),
                 prefill: 0,
             }
         );
@@ -2526,7 +2584,7 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                idle: Duration::ZERO,
+                gap: Gap::After(Duration::ZERO),
                 prefill: 2048,
             }
         );
@@ -2553,6 +2611,56 @@ mod tests {
         );
     }
 
+    /// **A rate is a gap the work is taken out of**, which is the shape a server
+    /// has: requests arrive on their own schedule and what the device is left
+    /// idle for is whatever the step did not spend. A rate the work outruns
+    /// leaves no gap at all rather than a negative one — the saturated server,
+    /// which reads as the duty cycle it produced.
+    #[test]
+    fn a_rate_is_the_interval_less_whatever_the_work_spent() {
+        let period = Duration::from_millis(200);
+        let step = Duration::from_millis(15);
+        assert_eq!(Gap::Every(period).idle(step), period - step);
+        assert_eq!(
+            Gap::Every(period).idle(Duration::from_millis(223)),
+            Duration::ZERO
+        );
+        // Where a gap is what it says whatever the work cost, which is the lever
+        // the published sweep was taken with.
+        assert_eq!(Gap::After(period).idle(step), period);
+        assert_eq!(Gap::After(period).idle(Duration::from_millis(223)), period);
+        assert_eq!(Gap::After(Duration::ZERO).idle(step), Duration::ZERO);
+    }
+
+    /// **A gap and a rate are two answers to one question**, so a run given both
+    /// is refused rather than served one of them — and a rate of no milliseconds
+    /// is not a rate, unlike the gap of none every idled arm is compared
+    /// against.
+    #[test]
+    fn a_clock_run_takes_a_gap_or_a_rate_and_not_both() {
+        assert!(
+            matches!(
+                Job::parse(["clock", "models/small", "--every", "200"].map(str::to_string))
+                    .expect("parses"),
+                Job::Measure {
+                    gap: Gap::Every(period),
+                    ..
+                } if period == Duration::from_millis(200)
+            ),
+            "an interval did not reach the run"
+        );
+        for given in [
+            ["clock", "models/small", "--every", "200", "--idle", "8"].as_slice(),
+            ["clock", "models/small", "--every", "0"].as_slice(),
+            ["decode", "models/small", "--every", "200"].as_slice(),
+        ] {
+            assert!(
+                Job::parse(given.iter().map(|word| word.to_string())).is_err(),
+                "{given:?} was taken"
+            );
+        }
+    }
+
     /// **A gap of nothing is a gap this measurement means something by** — it is
     /// the arm every other measurement here runs at and the one the idled arm is
     /// compared against — so `--idle 0` is a run rather than a refusal, unlike
@@ -2562,7 +2670,7 @@ mod tests {
         let job = Job::parse(["clock", "models/small", "--idle", "0"].map(str::to_string))
             .expect("a gap of nothing parses");
         assert!(
-            matches!(job, Job::Measure { idle, .. } if idle.is_zero()),
+            matches!(job, Job::Measure { gap, .. } if gap == Gap::After(Duration::ZERO)),
             "{job:?}"
         );
     }
@@ -2598,7 +2706,7 @@ mod tests {
     /// the seating as a duty cycle the machine never ran at.
     #[test]
     fn the_first_period_opens_after_the_work_nobody_timed() {
-        let mut ticking = Ticking::new(Duration::ZERO, 4);
+        let mut ticking = Ticking::new(Gap::After(Duration::ZERO), 4);
         let opened = ticking.at;
         let seating = Duration::from_millis(2);
         std::thread::sleep(seating);
@@ -3109,7 +3217,7 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: None,
-                idle: Duration::ZERO,
+                gap: Gap::After(Duration::ZERO),
                 prefill: 0,
             }
         );
