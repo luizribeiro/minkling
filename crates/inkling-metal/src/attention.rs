@@ -748,10 +748,16 @@ const LEAST_KEYS: usize = 64;
 /// takes `key_stride` beside `keys`, and it is what [`KeyValues::landings`] hands
 /// a dispatch that means to write the keys itself.
 ///
-/// It is **one sequence's**, and nothing here makes it more than that: the layer
-/// holds one span, so two sequences interleaved through the same layer would
-/// overwrite each other's keys. [`LayerAttention::hold`] is where that is
-/// refused rather than discovered — a sequence's own
+/// It is **the whole batch's**, one span to a slot, laid `[kv_heads, slots,
+/// capacity, head_dim]` in one allocation apiece. **The slot is a row offset
+/// rather than a buffer**, which is what lets one dispatch attend for every
+/// sequence of a batch: a kernel binds one keys buffer whatever the batch is and
+/// finds a sequence's own keys at [`KeyValues::base`].
+///
+/// A slot is one sequence's and nothing here makes it more than that: two
+/// sequences interleaved through the same slot would overwrite each other's
+/// keys. [`LayerAttention::hold`] is where that is refused rather than
+/// discovered — a sequence's own
 /// [`AttentionCache`](inkling_core::AttentionCache) carries how many keys it has
 /// seen, and a span holding a different number is not its.
 ///
@@ -765,22 +771,73 @@ pub(crate) struct KeyValues {
     values: Buffer<f32>,
     kv_heads: usize,
     head_dim: usize,
-    /// Key slots each head has room for, which is the stride between heads.
+    /// Key slots each sequence has room for.
+    ///
+    /// **One number for every slot, which is what the layout costs.** The keys
+    /// of a KV head are `slots * capacity` rows and a slot's are a run of them,
+    /// so a slot that outgrew its own capacity would move every slot behind it.
+    /// Growing all of them together instead makes the reallocation the one it
+    /// always was and the footprint exactly `slots` times one sequence's — at
+    /// the price that a batch is allocated its longest sequence's capacity in
+    /// every slot. Powers of two, so that price is under a doubling.
     capacity: usize,
-    /// How many of them the sequence in flight has filled.
-    held: usize,
+    /// How many of them each sequence in flight has filled, a slot apiece.
+    held: Vec<usize>,
 }
 
 impl KeyValues {
-    fn new(device: &Device, kv_heads: usize, head_dim: usize) -> Result<Self, MetalError> {
+    fn new(
+        device: &Device,
+        kv_heads: usize,
+        head_dim: usize,
+        slots: usize,
+    ) -> Result<Self, MetalError> {
         Ok(Self {
-            keys: device.zeroed(kv_heads * LEAST_KEYS * head_dim)?,
-            values: device.zeroed(kv_heads * LEAST_KEYS * head_dim)?,
+            keys: device.zeroed(kv_heads * slots * LEAST_KEYS * head_dim)?,
+            values: device.zeroed(kv_heads * slots * LEAST_KEYS * head_dim)?,
             capacity: LEAST_KEYS,
-            held: 0,
+            held: vec![0; slots],
             kv_heads,
             head_dim,
         })
+    }
+
+    /// How many sequences these spans carry.
+    pub(crate) fn slots(&self) -> usize {
+        self.held.len()
+    }
+
+    /// `slot`, where these spans have one.
+    ///
+    /// Refused rather than wrapped round, for the reason
+    /// [`LayerConv`](crate::LayerConv)'s is: a slot past the batch this was
+    /// wrapped for is a sequence whose keys are nowhere, and answering slot
+    /// zero instead would be one sequence attending over another's. Every
+    /// method here that names a slot comes through this, so the refusal is one
+    /// place rather than one per caller.
+    fn named(&self, slot: usize) -> usize {
+        assert!(
+            slot < self.slots(),
+            "slot {slot} of a layer holding {}",
+            self.slots()
+        );
+        slot
+    }
+
+    /// Keys the sequence in slot `slot` has put in its span.
+    pub(crate) fn held(&self, slot: usize) -> usize {
+        self.held[self.named(slot)]
+    }
+
+    /// Rows one KV head has room for across every slot, which is the stride
+    /// between two KV heads and what the kernel is handed as `key_stride`.
+    pub(crate) fn stride(&self) -> usize {
+        self.held.len() * self.capacity
+    }
+
+    /// The row of a KV head that slot `slot`'s own keys start at.
+    pub(crate) fn base(&self, slot: usize) -> usize {
+        self.named(slot) * self.capacity
     }
 
     /// The span a sequence starts from, which is no keys.
@@ -788,8 +845,9 @@ impl KeyValues {
     /// The slots are not cleared. Nothing reads past `held` — the kernel's loop
     /// bound is `keys` — so what a previous sequence left in them is memory
     /// nobody indexes rather than values that could leak into an answer.
-    fn restart(&mut self) {
-        self.held = 0;
+    fn restart(&mut self, slot: usize) {
+        let slot = self.named(slot);
+        self.held[slot] = 0;
     }
 
     /// The span with the last `rows` keys unwanted.
@@ -800,37 +858,41 @@ impl KeyValues {
     /// not there. What is left over is a slot the next call writes. The
     /// convolution windows either side of this are the half that had to be
     /// designed for — see [`LayerConv::rewind`](crate::LayerConv::rewind).
-    fn rewind(&mut self, rows: usize) {
+    fn rewind(&mut self, slot: usize, rows: usize) {
         assert!(
-            rows <= self.held,
+            rows <= self.held(slot),
             "a rewind of {rows} against a span holding {}",
-            self.held
+            self.held(slot)
         );
-        self.held -= rows;
+        self.held[slot] -= rows;
     }
 
-    /// Room for `keys` keys a head, growing the span if there is not.
+    /// Room for `keys` keys a slot, growing every slot if there is not.
     ///
     /// Powers of two, so a decode loop reallocates a logarithmic number of times
     /// over a generation and copies each key a constant number of times. What is
-    /// copied is the prefix each head has filled, which is what makes the growth
-    /// invisible to the sequence.
+    /// copied is the prefix each slot of each head has filled, which is what
+    /// makes the growth invisible to the sequence.
     fn reserve(&mut self, device: &Device, keys: usize) -> Result<(), MetalError> {
         if keys <= self.capacity {
             return Ok(());
         }
         let capacity = Self::capacity_for(keys);
+        let slots = self.slots();
         let mut grown = [
-            device.zeroed::<f32>(self.kv_heads * capacity * self.head_dim)?,
-            device.zeroed::<f32>(self.kv_heads * capacity * self.head_dim)?,
+            device.zeroed::<f32>(self.kv_heads * slots * capacity * self.head_dim)?,
+            device.zeroed::<f32>(self.kv_heads * slots * capacity * self.head_dim)?,
         ];
-        let filled = self.held * self.head_dim;
         for (grown, held) in grown.iter_mut().zip([&self.keys, &self.values]) {
             let (grown, held) = (grown.as_mut_slice(), held.as_slice());
             for kv in 0..self.kv_heads {
-                let (to, from) = (kv * capacity, kv * self.capacity);
-                grown[to * self.head_dim..][..filled]
-                    .copy_from_slice(&held[from * self.head_dim..][..filled]);
+                for (slot, filled) in self.held.iter().enumerate() {
+                    let filled = filled * self.head_dim;
+                    let to = (kv * slots + slot) * capacity;
+                    let from = (kv * slots + slot) * self.capacity;
+                    grown[to * self.head_dim..][..filled]
+                        .copy_from_slice(&held[from * self.head_dim..][..filled]);
+                }
             }
         }
         let [keys, values] = grown;
@@ -860,21 +922,28 @@ impl KeyValues {
     /// actually holds, so that the claim is measured rather than repeated.
     ///
     /// The capacity and not the keys: a span is allocated in powers of two and
-    /// what it costs is what it reserved.
+    /// what it costs is what it reserved. Every slot, because every slot is
+    /// allocated whether a sequence is in it or not.
     pub(crate) fn bytes(&self) -> u64 {
-        2 * (self.kv_heads * self.capacity * self.head_dim) as u64 * size_of::<f32>() as u64
+        2 * (self.kv_heads * self.stride() * self.head_dim) as u64 * size_of::<f32>() as u64
     }
 
-    /// Where a dispatch writing this call's keys should put them, and where one
-    /// writing its values should.
+    /// Where a dispatch writing slot `slot`'s keys should put them, and where
+    /// one writing its values should.
     ///
     /// Both at once because a call writes both and they are separate buffers, so
     /// the borrow of one has to be able to outlive the other's dispatch.
     ///
+    /// **The slot is in the base and the layout is in the stride**, which is the
+    /// same three numbers a landing always carries: a KV head's rows are every
+    /// slot's, so what separates two heads is `slots * capacity` and what places
+    /// a sequence inside one is where its own span starts.
+    ///
     /// Neither advances `held`: the rows are not there until the batch has run,
     /// and [`KeyValues::appended`] is what says they are.
-    pub(crate) fn landings(&mut self) -> (Landing<'_>, Landing<'_>) {
-        let (groups, stride, base) = (self.kv_heads, self.capacity, self.held);
+    pub(crate) fn landings(&mut self, slot: usize) -> (Landing<'_>, Landing<'_>) {
+        let (groups, stride) = (self.kv_heads, self.stride());
+        let base = self.base(slot) + self.held(slot);
         (
             Landing {
                 out: &mut self.keys,
@@ -900,13 +969,13 @@ impl KeyValues {
     /// [`LayerProjections::layer`](crate::LayerProjections) is the only caller
     /// and treats a batch that does not run as a panic, which is the same thing
     /// every dispatch in this crate does with one.
-    pub(crate) fn appended(&mut self, rows: usize) {
+    pub(crate) fn appended(&mut self, slot: usize, rows: usize) {
         assert!(
-            self.held + rows <= self.capacity,
+            self.held(slot) + rows <= self.capacity,
             "{rows} keys past a span reserved for {}",
             self.capacity
         );
-        self.held += rows;
+        self.held[slot] += rows;
     }
 
     /// Append `[rows, kv_heads * head_dim]` keys and values held in this
@@ -921,28 +990,29 @@ impl KeyValues {
     /// what the projections produce is head-major within a row and what the
     /// kernel reads is key-major within a head, and a copy that walks the first
     /// can address the second.
-    fn append(&mut self, k: &[f32], v: &[f32]) {
-        let stride = self.kv_heads * self.head_dim;
+    fn append(&mut self, slot: usize, k: &[f32], v: &[f32]) {
+        let width = self.kv_heads * self.head_dim;
         assert_eq!(k.len(), v.len(), "values against keys");
-        assert_eq!(k.len() % stride, 0, "{} values are not keys", k.len());
-        let rows = k.len() / stride;
+        assert_eq!(k.len() % width, 0, "{} values are not keys", k.len());
+        let rows = k.len() / width;
         assert!(
-            self.held + rows <= self.capacity,
+            self.held(slot) + rows <= self.capacity,
             "{rows} keys past a span reserved for {}",
             self.capacity
         );
 
+        let (stride, base) = (self.stride(), self.base(slot) + self.held(slot));
         for (span, rows_of) in [(&mut self.keys, k), (&mut self.values, v)] {
             let span = span.as_mut_slice();
-            for (t, row) in rows_of.chunks_exact(stride).enumerate() {
+            for (t, row) in rows_of.chunks_exact(width).enumerate() {
                 for kv in 0..self.kv_heads {
-                    let at = (kv * self.capacity + self.held + t) * self.head_dim;
+                    let at = (kv * stride + base + t) * self.head_dim;
                     span[at..][..self.head_dim]
                         .copy_from_slice(&row[kv * self.head_dim..][..self.head_dim]);
                 }
             }
         }
-        self.held += rows;
+        self.held[slot] += rows;
     }
 }
 
@@ -977,11 +1047,17 @@ pub struct LayerAttention<'a> {
     /// One sequence's keys and values per slot of the batch this was wrapped
     /// for. A layer serving one sequence holds one, which is slot zero.
     ///
+    /// **One cell over every slot rather than a cell apiece**, because one
+    /// dispatch attends for all of them and a dispatch binds what it reads: the
+    /// spans are rows of one allocation — see [`KeyValues`] — and a borrow that
+    /// could hand out one slot at a time is a borrow that could not hand the
+    /// buffer to the kernel.
+    ///
     /// **The slots are what a batch costs in memory**, and they are the whole of
     /// it: everything else this layer holds is a weight, and a weight is what a
     /// batch reads once for every sequence in it. See
     /// [`LayerAttention::span_bytes`].
-    spans: Vec<RefCell<KeyValues>>,
+    spans: RefCell<KeyValues>,
     config: AttentionConfig,
     rel_extent: usize,
     /// Splits a call cuts its span into, where a caller has pinned it rather
@@ -1069,15 +1145,12 @@ impl<'a> LayerAttention<'a> {
         let rel_extent = proj.len() / config.d_rel;
         Ok(Self {
             proj: RefCell::new(device.buffer(&by_distance(proj, config.d_rel, rel_extent))?),
-            spans: (0..slots)
-                .map(|_| {
-                    Ok(RefCell::new(KeyValues::new(
-                        device,
-                        config.kv_heads,
-                        config.head_dim,
-                    )?))
-                })
-                .collect::<Result<Vec<RefCell<KeyValues>>, MetalError>>()?,
+            spans: RefCell::new(KeyValues::new(
+                device,
+                config.kv_heads,
+                config.head_dim,
+                slots,
+            )?),
             rel_extent,
             pinned: Cell::new(None),
             floor: Cell::new(None),
@@ -1154,6 +1227,7 @@ impl<'a> LayerAttention<'a> {
                 rel: &mut rel,
                 keys,
                 key_stride: keys,
+                span: 0,
                 taus: step.taus,
                 q_offset: step.q_offset,
                 first: 0,
@@ -1179,10 +1253,12 @@ impl<'a> LayerAttention<'a> {
     /// whole encoding is what lets a key be written and read without leaving the
     /// device.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_over(
         &self,
         batch: &mut Batch<'_>,
-        span: &mut KeyValues,
+        spans: &mut KeyValues,
+        slot: usize,
         q: &mut Buffer<f32>,
         rel: &mut Buffer<f32>,
         taus: Option<&[f32]>,
@@ -1194,7 +1270,8 @@ impl<'a> LayerAttention<'a> {
             .zeroed::<f32>(rows * self.config.heads * self.config.head_dim)?;
         self.encode_into(
             batch,
-            span,
+            spans,
+            slot,
             q,
             rel,
             taus,
@@ -1212,7 +1289,8 @@ impl<'a> LayerAttention<'a> {
     pub(crate) fn encode_into(
         &self,
         batch: &mut Batch<'_>,
-        span: &mut KeyValues,
+        spans: &mut KeyValues,
+        slot: usize,
         q: &mut Buffer<f32>,
         rel: &mut Buffer<f32>,
         taus: Option<&[f32]>,
@@ -1221,16 +1299,17 @@ impl<'a> LayerAttention<'a> {
         out: &mut Buffer<f32>,
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
-        let (keys, key_stride) = (span.held, span.capacity);
+        let (keys, key_stride, span) = (spans.held(slot), spans.stride(), spans.base(slot));
         self.encoding(
             batch,
             Encoding {
                 q,
-                k: &mut span.keys,
-                v: &mut span.values,
+                k: &mut spans.keys,
+                v: &mut spans.values,
                 rel,
                 keys,
                 key_stride,
+                span,
                 taus,
                 q_offset,
                 first: placed.first,
@@ -1240,9 +1319,9 @@ impl<'a> LayerAttention<'a> {
         )
     }
 
-    /// The span this layer is holding, borrowed for the whole of a call.
-    pub(crate) fn span(&self, slot: usize) -> RefMut<'_, KeyValues> {
-        self.slot(slot).borrow_mut()
+    /// The spans this layer is holding, borrowed for the whole of a call.
+    pub(crate) fn spans(&self) -> RefMut<'_, KeyValues> {
+        self.spans.borrow_mut()
     }
 
     /// The dispatch itself, which is the same whichever of the two put the
@@ -1319,6 +1398,7 @@ impl<'a> LayerAttention<'a> {
             extent(queries, "the queries of a call"),
             extent(step.keys, "the keys of a call"),
             extent(step.key_stride, "the keys a span has room for"),
+            extent(step.span, "where a slot's keys start"),
             extent(step.q_offset, "the offset of a call"),
             extent(self.config.d_rel, "the relative features of a layer"),
             extent(self.rel_extent, "the band of a layer"),
@@ -1435,24 +1515,12 @@ impl<'a> LayerAttention<'a> {
     /// How many keys this layer is holding for slot `slot`, which says which
     /// sequence's they are.
     pub fn held(&self, slot: usize) -> usize {
-        self.slot(slot).borrow().held
+        self.spans.borrow().held(slot)
     }
 
     /// How many sequences this layer can attend for at once.
     pub fn slots(&self) -> usize {
-        self.spans.len()
-    }
-
-    /// The span of the sequence in slot `slot`.
-    ///
-    /// Refused rather than wrapped round, for the reason
-    /// [`LayerConv`](crate::LayerConv)'s is: a slot past the batch this was
-    /// wrapped for is a sequence whose keys are nowhere, and answering slot
-    /// zero instead would be one sequence attending over another's.
-    fn slot(&self, slot: usize) -> &RefCell<KeyValues> {
-        self.spans
-            .get(slot)
-            .unwrap_or_else(|| panic!("slot {slot} of a layer holding {}", self.spans.len()))
+        self.spans.borrow().slots()
     }
 
     /// Cut every call's span into `splits`, or `None` to leave it to
@@ -1485,7 +1553,7 @@ impl<'a> LayerAttention<'a> {
     /// `what_a_context_costs_in_keys_and_values`, which is where that is
     /// weighed against the window.
     pub fn span_bytes(&self) -> u64 {
-        self.spans.iter().map(|span| span.borrow().bytes()).sum()
+        self.spans.borrow().bytes()
     }
 
     /// Take the span for a sequence that has seen `keys` keys, with room for
@@ -1497,21 +1565,22 @@ impl<'a> LayerAttention<'a> {
     /// interleaved through the same layer, which would otherwise read the
     /// first's keys under its own offset and answer plausibly.
     pub fn hold(&self, slot: usize, keys: usize, queries: usize) -> Result<(), MetalError> {
-        let mut span = self.slot(slot).borrow_mut();
+        let mut spans = self.spans.borrow_mut();
         if keys == 0 {
-            span.restart();
+            spans.restart(slot);
         }
         assert_eq!(
-            span.held, keys,
+            spans.held(slot),
+            keys,
             "a sequence at {keys} keys against a span holding {}",
-            span.held
+            spans.held(slot)
         );
-        span.reserve(self.device, keys + queries)
+        spans.reserve(self.device, keys + queries)
     }
 
     /// Append `[rows, kv_heads * head_dim]` keys and values to the span.
     pub fn append(&self, slot: usize, k: &[f32], v: &[f32]) {
-        self.slot(slot).borrow_mut().append(k, v);
+        self.spans.borrow_mut().append(slot, k, v);
     }
 
     /// Unwant the last `rows` keys and values of the span this layer holds.
@@ -1520,7 +1589,7 @@ impl<'a> LayerAttention<'a> {
     /// [`LayerProjections`](crate::LayerProjections)'s to take back, and the
     /// two have to move together: see [`crate::LayerConv::rewind`].
     pub fn rewind(&self, slot: usize, rows: usize) {
-        self.slot(slot).borrow_mut().rewind(rows);
+        self.spans.borrow_mut().rewind(slot, rows);
     }
 
     /// Unwant every key past the `keys` the sequence had when a mark was taken.
@@ -1536,13 +1605,13 @@ impl<'a> LayerAttention<'a> {
     /// mark says where a sequence *was*, and a span asked to claim keys past
     /// what it holds would be counting slots no dispatch wrote.
     pub fn resume(&self, slot: usize, keys: usize) {
-        let mut span = self.slot(slot).borrow_mut();
+        let mut spans = self.spans.borrow_mut();
         assert!(
-            keys <= span.held,
+            keys <= spans.held(slot),
             "a mark at {keys} keys against a span holding {}",
-            span.held
+            spans.held(slot)
         );
-        span.held = keys;
+        spans.held[slot] = keys;
     }
 }
 
@@ -1554,8 +1623,12 @@ struct Encoding<'a> {
     rel: &'a mut Buffer<f32>,
     /// Keys the sequence has, which is the kernel's loop bound.
     keys: usize,
-    /// Key slots a head has room for, which is the stride between two heads.
+    /// Rows a KV head has room for, which is the stride between two heads —
+    /// every slot's, where the layer is holding the span.
     key_stride: usize,
+    /// The row of a KV head this sequence's own keys start at, which is what
+    /// places a slot inside a head. Zero for a call handed the span whole.
+    span: usize,
     taus: Option<&'a [f32]>,
     q_offset: usize,
     /// The row of the relative features and of the answer that this call's
@@ -1657,6 +1730,7 @@ struct Shape {
     uint queries;
     uint keys;
     uint key_stride;
+    uint span;
     uint q_offset;
     uint d_rel;
     uint rel_extent;
@@ -1803,10 +1877,13 @@ kernel void fused_attention(
     // `key_stride` rather than `keys`: a span the layer keeps between steps has
     // room for more keys than the sequence has put in it, so what separates one
     // KV head's keys from the next is the slots allocated and not the slots
-    // filled. A call handed the span whole passes the same number twice.
+    // filled — every sequence's, since a KV head's rows carry the whole batch.
+    // `span` is where this sequence's own start inside them, and a call handed
+    // the span whole passes `keys` for the stride and zero for the start.
     device const float *q_row = q + (ulong)pair * shape.head_dim;
-    device const float *keys_of = k + (ulong)kv * shape.key_stride * shape.head_dim;
-    device const float *values_of = v + (ulong)kv * shape.key_stride * shape.head_dim;
+    const ulong own = (ulong)kv * shape.key_stride + shape.span;
+    device const float *keys_of = k + own * shape.head_dim;
+    device const float *values_of = v + own * shape.head_dim;
     device const float *rel_row =
         rel + ((ulong)(shape.first + i) * shape.heads + head) * shape.d_rel;
 
@@ -2204,8 +2281,9 @@ kernel void mma_attention(
     const float tau = taus[i] * M_LOG2E_F;
 
     device const float *q_row = q + ((ulong)head * shape.queries + i) * shape.head_dim;
-    device const float *keys_of = k + (ulong)kv * shape.key_stride * shape.head_dim;
-    device const float *values_of = v + (ulong)kv * shape.key_stride * shape.head_dim;
+    const ulong own = (ulong)kv * shape.key_stride + shape.span;
+    device const float *keys_of = k + own * shape.head_dim;
+    device const float *values_of = v + own * shape.head_dim;
     device const float *features =
         rel + ((ulong)(shape.first + i) * shape.heads + head) * shape.d_rel;
 
@@ -4399,18 +4477,18 @@ mod tests {
             let case = blocked(keys, sliding, queries);
             let layer = case.wrapped(&device, &attention);
             layer.hold(0, 0, keys).expect("the span reserves");
-            layer.span(0).appended(keys);
+            layer.spans().appended(0, keys);
             layer.split_into(Some(splits));
 
             let mut q = device.buffer(&case.q).expect("the queries upload");
             let mut rel = device.buffer(&case.rel).expect("the features upload");
-            let mut span = layer.span(0);
+            let mut spans = layer.spans();
             let calls = readings_of(keys);
             let mut held = Vec::with_capacity(calls);
             crate::testing::device_time(&device, calls, |batch| {
                 held.push(
                     layer
-                        .encode_over(batch, &mut span, &mut q, &mut rel, None, keys - queries)
+                        .encode_over(batch, &mut spans, 0, &mut q, &mut rel, None, keys - queries)
                         .expect("the step encodes"),
                 );
             })
@@ -4513,17 +4591,17 @@ mod tests {
             let case = windowed(keys, sliding);
             let layer = case.wrapped(&device, &attention);
             layer.hold(0, 0, keys).expect("the span reserves");
-            layer.span(0).appended(keys);
+            layer.spans().appended(0, keys);
 
             let mut q = device.buffer(&case.q).expect("the query uploads");
             let mut rel = device.buffer(&case.rel).expect("the features upload");
-            let mut span = layer.span(0);
+            let mut spans = layer.spans();
             let calls = readings_of(keys);
             let mut held = Vec::with_capacity(calls);
             crate::testing::device_time(&device, calls, |batch| {
                 held.push(
                     layer
-                        .encode_over(batch, &mut span, &mut q, &mut rel, None, keys - 1)
+                        .encode_over(batch, &mut spans, 0, &mut q, &mut rel, None, keys - 1)
                         .expect("the step encodes"),
                 );
             })
@@ -4603,16 +4681,16 @@ mod tests {
             let case = blocked(tokens, sliding, tokens);
             let layer = case.wrapped(&device, &attention);
             layer.hold(0, 0, tokens).expect("the span reserves");
-            layer.span(0).appended(tokens);
+            layer.spans().appended(0, tokens);
 
             let mut q = device.buffer(&case.q).expect("the queries upload");
             let mut rel = device.buffer(&case.rel).expect("the features upload");
-            let mut span = layer.span(0);
+            let mut spans = layer.spans();
             let mut held = None;
             crate::testing::device_time(&device, 1, |batch| {
                 held = Some(
                     layer
-                        .encode_over(batch, &mut span, &mut q, &mut rel, None, 0)
+                        .encode_over(batch, &mut spans, 0, &mut q, &mut rel, None, 0)
                         .expect("the prefill encodes"),
                 );
             })
@@ -4797,17 +4875,17 @@ mod tests {
         let layer = case.wrapped(device, attention);
         layer.block_from(floor);
         layer.hold(0, 0, case.keys).expect("the span reserves");
-        layer.span(0).appended(case.keys);
+        layer.spans().appended(0, case.keys);
         let mut q = device.buffer(&case.q).expect("the queries upload");
         let mut rel = device.buffer(&case.rel).expect("the features upload");
-        let mut span = layer.span(0);
+        let mut spans = layer.spans();
         let mut held = None;
         let mut taken = Duration::MAX;
         for round in 0..=ROUNDS {
             let each = crate::testing::device_time(device, 1, |batch| {
                 held = Some(
                     layer
-                        .encode_over(batch, &mut span, &mut q, &mut rel, None, case.q_offset)
+                        .encode_over(batch, &mut spans, 0, &mut q, &mut rel, None, case.q_offset)
                         .expect("the call encodes"),
                 );
             });
@@ -5859,7 +5937,8 @@ mod tests {
         let out = layer
             .encode_over(
                 &mut batch,
-                &mut layer.span(slot),
+                &mut layer.spans(),
+                slot,
                 &mut q,
                 &mut rel,
                 None,
@@ -6005,7 +6084,8 @@ mod tests {
         placed
             .encode_into(
                 &mut batch,
-                &mut placed.span(0),
+                &mut placed.spans(),
+                0,
                 &mut q,
                 &mut wide,
                 None,

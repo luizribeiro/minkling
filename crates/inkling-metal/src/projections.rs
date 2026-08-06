@@ -518,8 +518,8 @@ impl<'a> LayerProjections<'a> {
         for seat in attending {
             let (slot, first, queries) = (seat.slot, seat.first, seat.queries);
             let step = seat.step;
-            let mut span = self.attention.span(slot);
-            let (keys, values) = span.landings();
+            let mut spans = self.attention.spans();
+            let (keys, values) = spans.landings(slot);
             // One dispatch rather than two, for the reason the head norms below
             // are one: two sequences, different taps, each leaving its own
             // window, and neither reading what the other writes. The key's rows
@@ -595,10 +595,11 @@ impl<'a> LayerProjections<'a> {
             // barrier between them and those writes are done before it reads
             // them — and a span that grew after the wait would attend over the
             // previous step's keys and leave this token out of its own row.
-            span.appended(queries);
+            spans.appended(slot, queries);
             self.attention.encode_into(
                 batch,
-                &mut span,
+                &mut spans,
+                slot,
                 &mut headed,
                 &mut rel,
                 step.bias_taus,
