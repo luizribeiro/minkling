@@ -608,7 +608,7 @@ impl<'a> LayerProjections<'a> {
             spans.appended(slot, queries);
         }
 
-        let attending: Vec<attention::Attending<'_>> = attending
+        let walking: Vec<attention::Attending<'_>> = attending
             .iter()
             .map(|seat| attention::Attending {
                 slot: seat.slot,
@@ -623,11 +623,10 @@ impl<'a> LayerProjections<'a> {
             &mut spans,
             &mut headed,
             &mut rel,
-            &attending,
+            &walking,
             rows,
             &mut attended,
         )?;
-        drop(spans);
         self.o_proj.encode_over(batch, &mut attended)
     }
 }

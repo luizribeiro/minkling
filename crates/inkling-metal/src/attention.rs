@@ -874,6 +874,18 @@ impl KeyValues {
         self.held[slot] -= rows;
     }
 
+    /// Unwant every key past the `keys` the sequence in `slot` had when a mark
+    /// was taken — see [`LayerAttention::resume`], which is where the rule this
+    /// is half of is written down.
+    fn resume(&mut self, slot: usize, keys: usize) {
+        assert!(
+            keys <= self.held(slot),
+            "a mark at {keys} keys against a span holding {}",
+            self.held(slot)
+        );
+        self.held[slot] = keys;
+    }
+
     /// Room for `keys` keys a slot, growing every slot if there is not.
     ///
     /// Powers of two, so a decode loop reallocates a logarithmic number of times
@@ -1591,13 +1603,7 @@ impl<'a> LayerAttention<'a> {
     /// mark says where a sequence *was*, and a span asked to claim keys past
     /// what it holds would be counting slots no dispatch wrote.
     pub fn resume(&self, slot: usize, keys: usize) {
-        let mut spans = self.spans.borrow_mut();
-        assert!(
-            keys <= spans.held(slot),
-            "a mark at {keys} keys against a span holding {}",
-            spans.held(slot)
-        );
-        spans.held[slot] = keys;
+        self.spans.borrow_mut().resume(slot, keys);
     }
 }
 
@@ -3659,6 +3665,94 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    /// **A sequence in a slot of its own is the same sequence in slot zero**,
+    /// bit for bit, through the entry the flag puts behind `production`.
+    ///
+    /// **The block is the one entry no other case here reaches at a nonzero
+    /// slot.** It is refused a call carrying more than one sequence — a block
+    /// stages one tile of keys for the 64 query rows sharing it — so the
+    /// contamination case below, which is three sequences in three slots,
+    /// structurally cannot drive it. What is left to check is the offset
+    /// itself, and the way to check it is to run one sequence at two places in
+    /// the same layout and require the same bits.
+    ///
+    /// Exact equality rather than a tolerance, for the reason
+    /// `a_span_the_layer_keeps_answers_the_span_handed_over_whole` is exact: the
+    /// two arms walk the same keys in the same tiles and the only thing that
+    /// differs is where in the binding those keys lie. The sequence is in the
+    /// last of four slots, so they lie `3 * capacity` rows into each KV head —
+    /// which a kernel that read the call's shape instead of the row's would
+    /// answer over the zeroes at row zero, plausibly and quietly.
+    #[test]
+    fn a_block_reads_the_slot_its_rows_name() {
+        let Some(device) = device() else { return };
+        let production =
+            FusedAttention::compiling(&device, Numerics::Production).expect("the block compiles");
+        let case = blocked(512, 0, 512);
+        let (kv_heads, head_dim) = (case.config.kv_heads, case.config.head_dim);
+
+        let splits = splits_for(case.config.heads * case.queries, case.keys, head_dim);
+        assert!(
+            production
+                .blocked(
+                    case.config.sliding,
+                    case.queries,
+                    head_dim,
+                    splits,
+                    1,
+                    FusedAttention::SHORTEST_BLOCKED_CALL,
+                )
+                .is_some(),
+            "{}: the case does not reach the block",
+            case.name
+        );
+
+        // The span is `[kv_heads, keys, head_dim]` where an append is
+        // `[keys, kv_heads * head_dim]`, which is the transpose the write's own
+        // indexing performs — see `KeyValues::append`.
+        let appended = |split: &[f32]| -> Vec<f32> {
+            (0..case.keys)
+                .flat_map(|t| {
+                    (0..kv_heads).flat_map(move |kv| {
+                        split[(kv * case.keys + t) * head_dim..][..head_dim].to_vec()
+                    })
+                })
+                .collect()
+        };
+        let (k, v) = (appended(&case.k), appended(&case.v));
+
+        let through = |slots: usize, slot: usize| -> Vec<f32> {
+            let layer =
+                LayerAttention::holding(&device, &production, case.config, &case.proj, slots)
+                    .expect("the layer wraps");
+            layer.hold(slot, 0, case.keys).expect("the span grows");
+            layer.append(slot, &k, &v);
+            let mut batch = device.batch().expect("a command buffer opens");
+            let mut q = device.buffer(&case.q).expect("the queries upload");
+            let mut rel = device.buffer(&case.rel).expect("the features upload");
+            let out = layer
+                .encode_over(
+                    &mut batch,
+                    &mut layer.spans(),
+                    slot,
+                    &mut q,
+                    &mut rel,
+                    None,
+                    case.q_offset,
+                )
+                .expect("the step encodes");
+            batch.wait().expect("the batch completes");
+            out.to_vec()
+        };
+
+        let last = through(4, 3);
+        assert_eq!(last, through(1, 0), "{}", case.name);
+        assert!(
+            last.iter().any(|value| *value != 0.0),
+            "a block over a span of zeroes would agree with anything"
+        );
     }
 
     /// **The block against the CPU path, at both kinds of layer and at heights
