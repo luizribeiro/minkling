@@ -1141,6 +1141,10 @@ impl<'a> LayerAttention<'a> {
         let mut k = self.device.buffer(step.k)?;
         let mut v = self.device.buffer(step.v)?;
         let mut rel = self.device.buffer(step.rel)?;
+        let rows = q.len() / (self.config.heads * self.config.head_dim);
+        let mut out = self
+            .device
+            .zeroed::<f32>(rows * self.config.heads * self.config.head_dim)?;
         self.encoding(
             batch,
             Encoding {
@@ -1152,8 +1156,12 @@ impl<'a> LayerAttention<'a> {
                 key_stride: keys,
                 taus: step.taus,
                 q_offset: step.q_offset,
+                first: 0,
+                rows,
             },
-        )
+            &mut out,
+        )?;
+        Ok(out)
     }
 
     /// The step over a query and a relative-feature row a dispatch already left
@@ -1179,6 +1187,38 @@ impl<'a> LayerAttention<'a> {
         taus: Option<&[f32]>,
         q_offset: usize,
     ) -> Result<Buffer<f32>, MetalError> {
+        let rows = q.len() / (self.config.heads * self.config.head_dim);
+        let mut out = self
+            .device
+            .zeroed::<f32>(rows * self.config.heads * self.config.head_dim)?;
+        self.encode_into(
+            batch,
+            span,
+            q,
+            rel,
+            taus,
+            q_offset,
+            Placed::alone(rows),
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// The same step, writing its rows into an answer the caller owns rather
+    /// than one of its own — which is what a batch needs of it: N sequences
+    /// attend over N spans and one `o_proj` reads what they all produced.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_into(
+        &self,
+        batch: &mut Batch<'_>,
+        span: &mut KeyValues,
+        q: &mut Buffer<f32>,
+        rel: &mut Buffer<f32>,
+        taus: Option<&[f32]>,
+        q_offset: usize,
+        placed: Placed,
+        out: &mut Buffer<f32>,
+    ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
         let (keys, key_stride) = (span.held, span.capacity);
         self.encoding(
@@ -1192,7 +1232,10 @@ impl<'a> LayerAttention<'a> {
                 key_stride,
                 taus,
                 q_offset,
+                first: placed.first,
+                rows: placed.rows,
             },
+            out,
         )
     }
 
@@ -1203,11 +1246,16 @@ impl<'a> LayerAttention<'a> {
 
     /// The dispatch itself, which is the same whichever of the two put the
     /// buffers where they are.
+    ///
+    /// `out` is written at [`Encoding::first`], which for a sequence advancing
+    /// alone is row zero of a buffer of its own — and for a sequence of a batch
+    /// is its own run of the rows `o_proj` will read for all of them.
     fn encoding(
         &self,
         batch: &mut Batch<'_>,
         step: Encoding<'_>,
-    ) -> Result<Buffer<f32>, MetalError> {
+        out: &mut Buffer<f32>,
+    ) -> Result<(), MetalError> {
         let (heads, kv_heads) = (self.config.heads, self.config.kv_heads);
         let head_dim = self.config.head_dim;
 
@@ -1228,9 +1276,21 @@ impl<'a> LayerAttention<'a> {
         };
         assert_eq!(
             step.rel.len(),
-            queries * heads * self.config.d_rel,
-            "{} relative features are not {queries} rows of {heads} heads",
-            step.rel.len()
+            step.rows * heads * self.config.d_rel,
+            "{} relative features are not {} rows of {heads} heads",
+            step.rel.len(),
+            step.rows
+        );
+        assert!(
+            step.first + queries <= step.rows,
+            "{queries} queries at {} of a call holding {}",
+            step.first,
+            step.rows
+        );
+        assert_eq!(
+            out.len(),
+            step.rows * heads * head_dim,
+            "the answer against the rows the call is one of"
         );
         // **Every query's own key is one of the keys**, which the module
         // documentation states and which nothing checked while the kernel scored
@@ -1264,11 +1324,11 @@ impl<'a> LayerAttention<'a> {
             extent(self.config.sliding, "the window of a layer"),
             extent(splits, "the splits of a call"),
             (1.0 / head_dim as f32).to_bits(),
+            extent(step.first, "where a call's rows start"),
         ];
         let mut shape = self.device.inline(&fields)?;
         let mut scaled = self.device.inline(&taus)?;
         let mut proj = self.proj.borrow_mut();
-        let mut out = self.device.zeroed::<f32>(queries * heads * head_dim)?;
         // What each split leaves for the fold: its weighted sum, its peak and
         // its total. An unsplit call writes its row straight out and this is the
         // smallest allocation the device will make rather than the buffer it
@@ -1322,7 +1382,7 @@ impl<'a> LayerAttention<'a> {
         // charged the row once between them however many splits made it. The
         // walk itself is charged the same whichever way it is cut: the splits
         // partition `[0, keys)`, so between them they hold each live key once.
-        let row = out.len();
+        let row = queries * heads * head_dim;
         let staged = pairs * splits * partial;
         let walked = match blocked {
             None => keys_a_call_walks(
@@ -1338,7 +1398,7 @@ impl<'a> LayerAttention<'a> {
             * (step.q.len()
                 + if splits == 1 { row } else { staged }
                 + 2 * heads * walked * head_dim
-                + step.rel.len()
+                + queries * heads * self.config.d_rel
                 + step.keys.min(self.rel_extent) * self.config.d_rel
                 + queries);
         batch.add(
@@ -1368,7 +1428,7 @@ impl<'a> LayerAttention<'a> {
                 size_of::<f32>() * (staged + row),
             )?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// How many keys this layer is holding for slot `slot`, which says which
@@ -1497,6 +1557,36 @@ struct Encoding<'a> {
     key_stride: usize,
     taus: Option<&'a [f32]>,
     q_offset: usize,
+    /// The row of the relative features and of the answer that this call's
+    /// first query is.
+    ///
+    /// **The query is not indexed by it and the other two are**, which is what
+    /// a batched step's shapes come to: the query rows a step reads were normed
+    /// into a buffer of this sequence's own, while the relative features one
+    /// dispatch produced for every sequence and the answer one `o_proj` will
+    /// read for every sequence are shared. Zero for a sequence advancing alone.
+    first: usize,
+    /// How many rows those two buffers hold, which for a sequence advancing
+    /// alone is its own queries.
+    rows: usize,
+}
+
+/// Where one sequence's query rows sit in the two buffers a batched step
+/// shares: the relative features one dispatch produced for every sequence, and
+/// the answer one `o_proj` will read for every sequence.
+#[derive(Debug, Clone, Copy)]
+pub struct Placed {
+    /// The row of those two that this call's first query is.
+    pub first: usize,
+    /// How many rows they hold.
+    pub rows: usize,
+}
+
+impl Placed {
+    /// A sequence advancing alone, whose rows are the whole of both buffers.
+    pub fn alone(rows: usize) -> Self {
+        Self { first: 0, rows }
+    }
 }
 
 /// The checkpoint's `[d_rel, rel_extent]` projection as `[rel_extent, d_rel]`,
@@ -1572,6 +1662,7 @@ struct Shape {
     uint sliding;
     uint splits;
     uint scale_bits;
+    uint first;
 };
 
 /// One query-key pair's entry of the banded relative-position mask, from the
@@ -1715,7 +1806,8 @@ kernel void fused_attention(
     device const float *q_row = q + (ulong)pair * shape.head_dim;
     device const float *keys_of = k + (ulong)kv * shape.key_stride * shape.head_dim;
     device const float *values_of = v + (ulong)kv * shape.key_stride * shape.head_dim;
-    device const float *rel_row = rel + ((ulong)i * shape.heads + head) * shape.d_rel;
+    device const float *rel_row =
+        rel + ((ulong)(shape.first + i) * shape.heads + head) * shape.d_rel;
 
     // The residency is read for the zero it was filled with, and by the thread
     // that filled it, so nothing here needs a barrier. **What says the array
@@ -1887,7 +1979,8 @@ kernel void fused_attention(
     // A call over no keys leaves a total of zero, which is a forward pass over
     // no tokens rather than a row to divide by it.
     if (shape.splits == 1u) {
-        device float *result = out + ((ulong)i * shape.heads + head) * shape.head_dim;
+        device float *result =
+            out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
         const float norm = total > 0.0f ? 1.0f / total : 0.0f;
         for (uint d = local; d < shape.head_dim; d += threads) {
             result[d] = weighted[d] * norm;
@@ -1939,7 +2032,8 @@ kernel void attention_combine(
     const uint i = pair % shape.queries;
     const uint stride = shape.head_dim + 2u;
     device const float *base = partials + (ulong)pair * shape.splits * stride;
-    device float *result = out + ((ulong)i * shape.heads + head) * shape.head_dim;
+    device float *result =
+            out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
 
     // Every thread reduces the same handful of entries rather than one reducing
     // and broadcasting, which is what the tile loop above does with its scores
@@ -2111,7 +2205,8 @@ kernel void mma_attention(
     device const float *q_row = q + ((ulong)head * shape.queries + i) * shape.head_dim;
     device const float *keys_of = k + (ulong)kv * shape.key_stride * shape.head_dim;
     device const float *values_of = v + (ulong)kv * shape.key_stride * shape.head_dim;
-    device const float *features = rel + ((ulong)i * shape.heads + head) * shape.d_rel;
+    device const float *features =
+        rel + ((ulong)(shape.first + i) * shape.heads + head) * shape.d_rel;
 
     // The row's own channels, held as the fragments the first multiply wants:
     // element `jj` of fragment `dd` is channel `dd * MMA_FRAGMENT + fn + jj`,
@@ -2268,7 +2363,8 @@ kernel void mma_attention(
     if (!live) {
         return;
     }
-    device float *result = out + ((ulong)i * shape.heads + head) * shape.head_dim;
+    device float *result =
+            out + ((ulong)(shape.first + i) * shape.heads + head) * shape.head_dim;
     for (uint dd = 0; dd < MMA_FRAGS_A_ROW; ++dd) {
         const uint d = dd * MMA_FRAGMENT + fn;
         if (d < shape.head_dim) {
@@ -5852,6 +5948,82 @@ mod tests {
         assert_ne!(alone[0], alone[1], "two sequences to tell apart");
         assert_eq!(batched[0], alone[0], "the sequence in slot 0");
         assert_eq!(batched[1], alone[1], "the sequence in slot 1");
+    }
+
+    /// **A step placed at a row of a batch's buffers answers what the same step
+    /// alone answers**, bit for bit, and writes it where it was placed.
+    ///
+    /// The query rows are this sequence's own — its head norm wrote them into a
+    /// buffer of its own — and the two buffers that are the batch's are the
+    /// relative features one `r_proj` produced for every sequence and the
+    /// answer one `o_proj` will read for every sequence. A step that indexed
+    /// either of those by its own row rather than by its place in the call
+    /// would read a neighbour's features and write over a neighbour's answer,
+    /// and both are rows of the right shape.
+    ///
+    /// The rows in front of the placement and behind it are another sequence's
+    /// features rather than zeroes, so that reading the wrong ones is a wrong
+    /// answer rather than an empty one — and they are checked to have been left
+    /// alone, which is what says the write was placed and not merely offset.
+    #[test]
+    fn a_step_placed_in_a_batch_answers_what_the_same_step_alone_answers() {
+        let Some(device) = device() else { return };
+        let attention = FusedAttention::new(&device).expect("the kernel compiles");
+        let (case, k, v) = streaming(8);
+        let (heads, head_dim, d_rel) = (case.config.heads, case.config.head_dim, case.config.d_rel);
+        let channels = case.config.kv_channels();
+        let (q, rel) = (values(heads * head_dim, 5), values(heads * d_rel, 9));
+        let (keys, first, rows) = (4, 2, 5);
+
+        let layer = case.wrapped(&device, &attention);
+        let alone = through_the_span(
+            &device,
+            &layer,
+            0,
+            &k[..keys * channels],
+            &v[..keys * channels],
+            &q,
+            &rel,
+        );
+
+        // The same features at row `first`, with another sequence's either side.
+        let others = values(heads * d_rel, 11);
+        assert_ne!(others, rel, "features a misplaced read could find");
+        let mut wide: Vec<f32> = (0..rows).flat_map(|_| others.clone()).collect();
+        wide[first * heads * d_rel..][..heads * d_rel].copy_from_slice(&rel);
+
+        let placed = case.wrapped(&device, &attention);
+        placed.hold(0, 0, 1).expect("the span grows");
+        placed.append(0, &k[..keys * channels], &v[..keys * channels]);
+        let mut q = device.buffer(&q).expect("the query uploads");
+        let mut wide = device.buffer(&wide).expect("the features upload");
+        let mut out = device
+            .zeroed::<f32>(rows * heads * head_dim)
+            .expect("the answer allocates");
+        let mut batch = device.batch().expect("a command buffer opens");
+        placed
+            .encode_into(
+                &mut batch,
+                &mut placed.span(0),
+                &mut q,
+                &mut wide,
+                None,
+                0,
+                Placed { first, rows },
+                &mut out,
+            )
+            .expect("the step encodes");
+        batch.wait().expect("the batch completes");
+
+        let out = out.to_vec();
+        let row = heads * head_dim;
+        assert_eq!(&out[first * row..][..row], &alone[..], "the placed answer");
+        for at in (0..rows).filter(|at| *at != first) {
+            assert!(
+                out[at * row..][..row].iter().all(|value| *value == 0.0),
+                "row {at} of a neighbour's answer was written"
+            );
+        }
     }
 
     /// A slot past the batch a layer was wrapped for is a sequence whose keys
