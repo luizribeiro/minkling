@@ -1406,6 +1406,57 @@ runs**, which moves `rows_e / height` and leaves both conclusions where they are
   the two tables.
 - **The whole matmul timing tier re-run green**, 30 of 30, which is where T6's
   own tables live.
+- **The decode step.** `just bench 257e70b HEAD decode`, seven pairs:
+  **16.265 → 16.256 ms** on the wall and 15.195 → 15.182 on the device, ranges
+  across on both, no claim. Nothing here is reachable from a decode step.
+
+### Against the other engine, standalone
+
+**Seven pairs, one sitting, the order flipped each pair**, on the packed heads,
+our arm under `--numerics production` — `just bench-engines` and not a column
+lifted out of anything else, for T4's reason: the alternation inflates our
+long-prompt decode columns by 39% from the other engine's residency, so a
+cross-engine row is taken as its own sitting or not taken.
+
+    prompt × generated   ours k = 0   ours k = 2    mlx-vlm   k = 2 against it
+     97 × 128               2.534 s      2.321 s    3.199 s       1.38× ahead
+    385 × 128               3.151 s      3.017 s    3.664 s       1.21× ahead
+    769 × 128               5.291 s      5.376 s    4.186 s       0.78×
+     97 × 512               9.235 s      7.886 s   12.103 s       1.53× ahead
+
+    to the first token       ours    mlx-vlm     gap
+       97                  438.9ms    283.1ms   ×1.55
+      385                  893.5ms    706.6ms   ×1.26
+      769                 2124.8ms   1172.9ms   ×1.81
+
+**Every row is T6's and the reference column reproduces** — 283.1, 706.6 and
+1172.9 ms of prefill against T6's 283.1, 706.5 and 1167.8. The four wall ratios
+read 1.38, 1.21, 0.78 and 1.53 against T6's 1.37, 1.21, 0.78 and 1.53, and every
+row is a claim at seven of seven with the ranges apart.
+
+### The session, standalone
+
+**`just bench-session kept-production reference` on the packed heads, three
+pairs, the 8192 opening**, ours keeping against mlx-vlm keeping its own Automatic
+Prefix Cache:
+
+    turn            ours     mlx-vlm
+    0 (8192)     19.322 s    14.793 s
+    1 (+321)      2.422 s     2.627 s
+    2 (+321)      2.423 s     2.655 s
+    3 (+321)      2.423 s     2.691 s
+    4 (+321)      2.442 s     2.696 s
+    the session  29.032 s    25.463 s    1.14× behind
+
+**1.14× where T6 recorded 1.14×**, and the other engine reproduces — 25.463 s
+against T6's 25.486. **The per-turn wall is ours by 8.5 to 11.1%**, which is T6's
+8 to 11, and what is left is the opening prefill.
+
+**The kept cache's bookkeeping reads 1.008 ms a turn**, against the 1.013 to
+1.267 K1 recorded and T6's 1.153. That is **0.5% under the floor of the band**
+and it is stated rather than rounded into it: this arm carries `--numerics
+production` where K1's band was taken without it, and 1.008 against 1.013 is a
+figure at the edge of its record rather than a figure outside it.
 
 ## The height a run can fill, and the runs nobody had looked at
 
