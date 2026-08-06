@@ -450,6 +450,18 @@ impl Job {
         if idle.is_some() && every.is_some() {
             bail!("--idle and --every are two answers to one question: a gap, or a rate to fit it");
         }
+        // **A burst longer than the run is a run with no gap in it.** The gap
+        // falls behind every `burst`-th unit, so a run of four units in bursts
+        // of eight leaves none at all — and would report the duty cycle of the
+        // back-to-back arm under a header announcing the gap it was asked for.
+        if burst.is_some_and(|burst| burst > tokens.unwrap_or(TICKED)) {
+            bail!(
+                "a burst of {} does not fit in {} units: the run would leave no gap between two \
+                 of them",
+                burst.unwrap_or_default(),
+                tokens.unwrap_or(TICKED)
+            );
+        }
         // **A gap of nothing has nowhere to put a dispatch.** The lever exists
         // to fill an idle device, so a run that asked for one without asking
         // for a gap is asking for a busy loop between two units that are
@@ -988,7 +1000,10 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 // in every layer, allocated when the stack is wrapped rather
                 // than when a sequence sits in one.
                 let wrapped = match widest {
-                    None => None,
+                    // A batch of one is the wrap this loop already made, and a
+                    // second one is a second binding over the same mapped pages
+                    // for nothing.
+                    None | Some(1) => None,
                     Some(slots) => Some(backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?),
                 };
                 // One row of the model's own width, which is the smallest
@@ -1015,7 +1030,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     unit.over(ticks.len()),
                     shape.said(),
                 );
-                taken.extend(clocked(ticks));
+                taken.extend(clocked(ticks, shape.burst));
                 taken.extend(after_a_gap(ticks, shape.burst));
                 // **What the lever cost, beside what it bought.** A keep-warm
                 // is device time spent on nothing, and a run that reported only
@@ -1651,6 +1666,14 @@ impl<'a> Ticking<'a> {
     /// The device time they cost is taken off the account here, so that the
     /// unit after the gap is charged for itself alone — and reported, because
     /// what the lever costs is half of what it is worth.
+    ///
+    /// **A subdivided gap comes back closer to the deadline than one sleep
+    /// does**, because a `sleep` on this host overshoots what it was asked for
+    /// and the chunks that follow absorb it: a 200 ms gap left empty measures
+    /// 240 ms of period against 235 for the same gap kept warm every 20 ms. So
+    /// the two arms of that pair do not idle for exactly as long as each other,
+    /// and the arm that idles *less* is the kept-warm one — which is the
+    /// direction that flatters it.
     fn idled(&mut self, idle: Duration) {
         let Some(warm) = self.warm else {
             std::thread::sleep(idle);
@@ -1724,7 +1747,16 @@ impl<'a> Ticking<'a> {
 /// The run in [`PARTS`] parts, each part's mean device time and duty cycle, and
 /// the last part against the first — which is the number that says whether the
 /// part held its speed, and in which direction it did not.
-fn clocked(ticks: &[Tick]) -> Vec<Reading> {
+///
+/// **Whole bursts, for the reason [`after_a_gap`] takes whole bursts.** The unit
+/// after a gap costs about three and a half milliseconds more than the ones
+/// behind it, so a part holding four of those where the next part holds three is
+/// a part that reads slower for no reason but where the cut fell — 128 units in
+/// bursts of eight report a drift of −0.98% that way, on units that are all
+/// identical and a clock that never moved. Cut on burst boundaries and every
+/// part holds the same proportion of gaps, which is what makes the column a
+/// reading about the machine.
+fn clocked(ticks: &[Tick], burst: usize) -> Vec<Reading> {
     let mean = |part: &[Tick]| match part.is_empty() {
         true => (Duration::ZERO, Duration::ZERO),
         false => (
@@ -1732,15 +1764,20 @@ fn clocked(ticks: &[Tick]) -> Vec<Reading> {
             part.iter().map(|tick| tick.wall).sum::<Duration>() / part.len() as u32,
         ),
     };
+    let burst = burst.max(1);
+    // The units of whole bursts, which for a run of one unit a gap is every unit
+    // it has.
+    let ticks = &ticks[..ticks.len() / burst * burst];
     let (whole_gpu, whole_wall) = mean(ticks);
-    // **[`PARTS`] parts wherever there are units for them**, cut at the
+    // **[`PARTS`] parts wherever there are bursts for them**, cut at the
     // proportion rather than by a fixed chunk: a chunk wide enough for the last
     // part to be short is one that leaves a run of eleven reporting four parts
     // and a run of ten reporting five, so the shape a reader compares would
     // depend on a count nobody chose for its divisibility.
-    let cuts = PARTS.min(ticks.len());
+    let bursts = ticks.len() / burst;
+    let cuts = PARTS.min(bursts);
     let parts: Vec<(Duration, Duration)> = (0..cuts)
-        .map(|at| mean(&ticks[at * ticks.len() / cuts..(at + 1) * ticks.len() / cuts]))
+        .map(|at| mean(&ticks[at * bursts / cuts * burst..(at + 1) * bursts / cuts * burst]))
         .collect();
 
     eprintln!("  part      device       wall    duty    against the first");
@@ -2911,6 +2948,40 @@ mod tests {
         }
     }
 
+    /// **A part is whole bursts or it is a reading about where the cut fell.**
+    /// The unit after a gap is the dear one, so a part holding four of them
+    /// where the next holds three reads slower on units that are identical —
+    /// 128 units in bursts of eight, cut at the proportion, report a drift of
+    /// about a percent that way.
+    #[test]
+    fn the_parts_of_a_bursted_run_hold_the_same_share_of_gaps() {
+        // Sixteen bursts of eight, every burst dear in its first position and
+        // flat behind it: a run whose clock never moved.
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            held.push(19_000);
+            held.extend([15_500; 7]);
+        }
+        let bursted = ticks(&held, &[20_000; 128]);
+
+        let readings = clocked(&bursted, 8);
+        reads(&readings, "clock.drift", 0.0);
+        for part in 1..=PARTS {
+            reads(
+                &readings,
+                &format!("part{part}.device"),
+                (19.0 + 7.0 * 15.5) / 8.0,
+            );
+        }
+        // And told nothing about the burst, the same run reports a drift it
+        // does not have — which is the reading this is here to keep out.
+        let blind = reading(&clocked(&bursted, 1), "clock.drift");
+        assert!(
+            blind < -0.5,
+            "a proportional cut hid its own artefact: {blind}"
+        );
+    }
+
     /// **A gap that is dispatched into is still a gap.** What the lever is for
     /// is to leave the device something to do without shortening the idle it is
     /// being asked about, so a run that came back early would be measuring a
@@ -2941,6 +3012,14 @@ mod tests {
         // At least one and no more than the gap holds, which is what a cadence
         // is: the count itself is the host's to decide, because a sleep of 20 ms
         // on this machine is 20 ms and however much longer it feels like.
+        // And the gap is a gap rather than a cadence run until something else
+        // stops it: a loop that slept `every` without watching the deadline
+        // would still be dispatching a minute later.
+        assert!(
+            started.elapsed() < 2 * GAP,
+            "the gap ran long: {:?}",
+            started.elapsed()
+        );
         assert!(
             (1..=(GAP.as_millis() / EVERY.as_millis()) as usize).contains(&dispatched.get()),
             "{} dispatches in a {GAP:?} gap at one every {EVERY:?}",
@@ -3016,9 +3095,53 @@ mod tests {
         let mut held = vec![15_000; 9];
         held.push(150_000);
         let stalled = ticks(&held, &[20_000; 10]);
-        let readings = clocked(&stalled);
+        let readings = clocked(&stalled, 1);
         reads(&readings, "clock.median", 15.0);
         reads(&readings, "clock.device", 28.5);
+    }
+
+    /// **A burst longer than the run leaves no gap at all**, and a run that
+    /// took it would report the back-to-back arm's duty cycle under a header
+    /// announcing a gap — so it is refused, like every other lever that could
+    /// only be dropped.
+    #[test]
+    fn a_burst_longer_than_the_run_is_refused() {
+        assert!(
+            Job::parse(
+                [
+                    "clock",
+                    "models/small",
+                    "--tokens",
+                    "4",
+                    "--idle",
+                    "200",
+                    "--burst",
+                    "8"
+                ]
+                .map(str::to_string)
+            )
+            .is_err(),
+            "a burst of eight fitted in four units"
+        );
+        // A burst of exactly the run is one gap behind one burst, which is a
+        // shape rather than a mistake.
+        assert!(
+            Job::parse(
+                [
+                    "clock",
+                    "models/small",
+                    "--tokens",
+                    "8",
+                    "--idle",
+                    "200",
+                    "--burst",
+                    "8"
+                ]
+                .map(str::to_string)
+            )
+            .is_ok(),
+            "a burst of the whole run was refused"
+        );
     }
 
     /// **A burst is units back to back and one gap behind them**, which is the
@@ -3196,7 +3319,7 @@ mod tests {
             ],
             &[20_000; 10],
         );
-        let readings = clocked(&rising);
+        let readings = clocked(&rising, 1);
         assert_eq!(
             names(&readings),
             [
@@ -3225,12 +3348,12 @@ mod tests {
     fn the_duty_cycle_is_the_device_against_the_period_the_gap_is_inside() {
         let busy = ticks(&[18_400; 4], &[20_000; 4]);
         let idled = ticks(&[18_400; 4], &[60_000; 4]);
-        reads(&clocked(&busy), "clock.duty", 92.0);
-        reads(&clocked(&idled), "clock.duty", 100.0 * 18.4 / 60.0);
+        reads(&clocked(&busy, 1), "clock.duty", 92.0);
+        reads(&clocked(&idled, 1), "clock.duty", 100.0 * 18.4 / 60.0);
         // And the device column is what says the two ran at the same clock,
         // which is the whole of what the idle arm is for.
-        reads(&clocked(&idled), "clock.device", 18.4);
-        reads(&clocked(&busy), "clock.device", 18.4);
+        reads(&clocked(&idled, 1), "clock.device", 18.4);
+        reads(&clocked(&busy, 1), "clock.device", 18.4);
     }
 
     /// **The parts are cut at the proportion**, so a run reports as many of them
@@ -3239,7 +3362,7 @@ mod tests {
     #[test]
     fn a_run_reports_as_many_parts_as_it_has_units_for() {
         let parts = |units: usize| {
-            clocked(&ticks(&vec![1_000; units], &vec![2_000; units]))
+            clocked(&ticks(&vec![1_000; units], &vec![2_000; units]), 1)
                 .iter()
                 .filter(|reading| reading.name.starts_with("part"))
                 .count()
@@ -3262,7 +3385,7 @@ mod tests {
         // Eleven units, which no chunk width divides, rising by a tenth of a
         // millisecond each.
         let gpu: Vec<u64> = (0..11).map(|at| 10_000 + at * 100).collect();
-        let readings = clocked(&ticks(&gpu, &[20_000; 11]));
+        let readings = clocked(&ticks(&gpu, &[20_000; 11]), 1);
         reads(&readings, "clock.device", 10.5);
         // Two units in the first part and three in the last, which is where
         // cutting at the proportion puts them.
@@ -3275,7 +3398,7 @@ mod tests {
     /// the shape every other reading here answers an empty run with.
     #[test]
     fn a_clock_run_over_no_units_divides_by_nothing() {
-        let readings = clocked(&[]);
+        let readings = clocked(&[], 1);
         reads(&readings, "clock.device", 0.0);
         reads(&readings, "clock.duty", 0.0);
         reads(&readings, "clock.drift", 0.0);
