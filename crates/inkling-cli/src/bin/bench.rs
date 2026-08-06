@@ -42,7 +42,9 @@ use anyhow::{Context, Result, bail};
 use inkling_cli::args::Backend;
 use inkling_cli::kept::{DEFAULT_BOUND, Kept};
 use inkling_cli::{backend, config, session};
-use inkling_core::generate::{Proposer, Round};
+use inkling_core::generate::{Picked, Proposer, Round};
+use inkling_core::head::Tail;
+use inkling_core::model::Batched as Batching;
 use inkling_core::mtp::{CheckpointHeads, MtpProposer};
 use inkling_core::workload::{
     BEST, CORPUS, DECODED, DIFFERENTIAL, REALISTIC, STRUCTURED_PROMPT, SWEPT, Session, tiled,
@@ -56,6 +58,12 @@ use inkling_metal::{FusedAttention, Numerics, PackedMatmul};
 /// How long a prefill's prompt is, when nobody says. The middle of the three
 /// lengths this repo quotes.
 const PREFILLED: usize = 385;
+
+/// The widest batch the batch sweep runs, when nobody says.
+///
+/// Doubling from one, so that the curve is read on a log axis and the row that
+/// says where it stops is the row where doubling stopped halving the token.
+const WIDEST: usize = 16;
 
 /// How many pairs `alternate` runs, when nobody says. Seven, which is what every
 /// paired figure in the README was taken over.
@@ -157,6 +165,15 @@ enum What {
     /// Its arms are the same binary told to keep a different number of
     /// positions, which is the shape `bench-numerics` puts one word through.
     Session,
+    /// What a decode step costs as more sequences are decoded through it, which
+    /// is the curve this engine's batching exists to produce.
+    ///
+    /// **The one measurement here that sweeps how many requests are in flight.**
+    /// A decode step reads 5.9 GB of weights to produce one token, and at batch
+    /// N the same read produces N — so the row that matters is not the step but
+    /// the token, and where the two stop diverging is where a batch stops
+    /// paying.
+    Batch,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -186,6 +203,9 @@ enum Job {
         /// Positions a session keeps between its turns, and zero for the arm
         /// that keeps nothing — which is the server as it was.
         reuse: usize,
+        /// The widest batch the batch sweep runs, which every other measurement
+        /// ignores.
+        widest: usize,
     },
     /// The harness: two commands that already exist, run against each other.
     Alternate {
@@ -232,12 +252,13 @@ impl Job {
             Some("sweep") => Some(What::Sweep),
             Some("engines") => Some(What::Engines),
             Some("session") => Some(What::Session),
+            Some("batch") => Some(What::Batch),
             Some("alternate") => return Self::alternating(args),
             Some("diverge") => return Self::diverging(args),
             Some("guesses") => None,
             Some(word) => bail!(
-                "{word} is not one of decode, prefill, sweep, engines, session, guesses, \
-                 diverge or alternate"
+                "{word} is not one of decode, prefill, sweep, engines, session, batch, \
+                 guesses, diverge or alternate"
             ),
             None => bail!("no measurement given"),
         };
@@ -253,6 +274,8 @@ impl Job {
         // about is whether the number was *given*, and zero is a number this
         // measurement means something by.
         let mut reuse = None;
+        // The widest batch a sweep runs, which only the batch sweep takes.
+        let mut widest = None;
         // A sweep runs every depth up to its own, where a cross-engine table
         // quotes one beside `k = 0` — so the default depth is what the flag
         // means to the measurement asking for it.
@@ -267,6 +290,7 @@ impl Job {
                 "--depth" | "-k" => depth = count(&arg, &mut args)?,
                 "--numerics" => numerics = Some(which(&arg, &mut args)?),
                 "--reuse-tokens" => reuse = Some(positions(&arg, &mut args)?),
+                "--batch" | "-b" => widest = Some(count(&arg, &mut args)?),
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
                 _ => checkpoints.push(PathBuf::from(arg)),
             }
@@ -314,8 +338,15 @@ impl Job {
         // acceptance is the workload's. Silently dropping the number would leave
         // a row saying something other than what was asked for, which is the
         // same rule the length above is refused under.
-        if what != What::Decode && context.is_some() {
+        if !matches!(what, What::Decode | What::Batch) && context.is_some() {
             bail!("{what:?} takes no --context: only a decode step has one to be taken at");
+        }
+        // **Only the batch sweep has a width to be swept.** Every other
+        // measurement here decodes one sequence, so a widest batch handed to one
+        // of them could only be dropped — the same rule the numbers above are
+        // refused under.
+        if what != What::Batch && widest.is_some() {
+            bail!("{what:?} takes no --batch: it decodes one sequence");
         }
         // **Only a session has a between-requests to keep anything across.**
         // Every other measurement here is one call or a series of them against
@@ -336,6 +367,7 @@ impl Job {
             depth,
             numerics: numerics.unwrap_or_default(),
             reuse: reuse.unwrap_or(DEFAULT_BOUND),
+            widest: widest.unwrap_or(WIDEST),
         })
     }
 
@@ -421,6 +453,7 @@ impl Job {
                 depth,
                 numerics,
                 reuse,
+                widest,
             } => {
                 let asked = Asked {
                     tokens: *tokens,
@@ -428,6 +461,7 @@ impl Job {
                     depth: *depth,
                     numerics: *numerics,
                     reuse: *reuse,
+                    widest: *widest,
                 };
                 for reading in measure(*what, checkpoint, asked)? {
                     println!("{}", reading.line());
@@ -623,6 +657,8 @@ struct Asked {
     depth: usize,
     numerics: Numerics,
     reuse: usize,
+    /// The widest batch the batch sweep runs, ignored by everything else.
+    widest: usize,
 }
 
 fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
@@ -632,6 +668,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
         depth,
         numerics,
         reuse,
+        widest,
     } = asked;
     let config = config::of_checkpoint(dir)?;
     let text = &config.text_config;
@@ -733,6 +770,65 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 let run = timed(&behind_a_step(&prompt, context), tokens);
                 taken.push(Reading::new("decode", millis(run.step()), "ms"));
                 taken.push(Reading::new("device", millis(run.gpu), "ms"));
+            }
+            // **The amortisation curve, and it is the result of this
+            // milestone.** Every other row here is what one token costs; these
+            // are what a token costs as more sequences are decoded through the
+            // same weight reads, doubling from one. The step grows and the token
+            // falls, and where the token stops falling is where a batch stops
+            // paying — which is a shape rather than a number, so the sweep
+            // prints every width rather than the best one.
+            //
+            // Wrapped once per width, because the slots are allocated at wrap
+            // time: a slot is a span and four convolution windows in every
+            // layer, and a stack wrapped for sixteen holds sixteen of them
+            // whether or not sixteen sequences are in flight.
+            What::Batch => {
+                for slots in widths(widest) {
+                    let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?;
+                    let ids = behind_a_step(&prompt, context);
+                    let held = gpu.as_ref().map_or(0, backend::Gpu::allocated_bytes);
+                    let run = batched(&weights, text, &ids, slots, tokens);
+                    let grew = gpu.as_ref().map_or(0, backend::Gpu::allocated_bytes) - held;
+                    // A step is what the batch waits; a token is what one
+                    // sequence in it waits, which is the step divided by the
+                    // sequences that took a token out of it.
+                    taken.push(Reading::new(
+                        format!("batch{slots}.step"),
+                        millis(run.step),
+                        "ms",
+                    ));
+                    taken.push(Reading::new(
+                        format!("batch{slots}.token"),
+                        millis(run.step) / slots as f64,
+                        "ms",
+                    ));
+                    taken.push(Reading::new(
+                        format!("batch{slots}.device"),
+                        millis(run.gpu),
+                        "ms",
+                    ));
+                    taken.push(Reading::new(
+                        format!("batch{slots}.rate"),
+                        slots as f64 / run.step.as_secs_f64(),
+                        "tok/s",
+                    ));
+                    taken.push(Reading::new(
+                        format!("batch{slots}.held"),
+                        grew as f64 / (1u64 << 20) as f64,
+                        "MiB",
+                    ));
+                    eprintln!(
+                        "batch {slots}: step {:.2?}, token {:.2?}, device {:.2?}, \
+                         {:.1} tok/s, {:.1} MiB of spans and windows ({:.1} a sequence)",
+                        run.step,
+                        run.step / slots as u32,
+                        run.gpu,
+                        slots as f64 / run.step.as_secs_f64(),
+                        grew as f64 / (1u64 << 20) as f64,
+                        grew as f64 / (1u64 << 20) as f64 / slots as f64,
+                    );
+                }
             }
             What::Prefill => {
                 // A prefill is one step and its prompt is the measurement, so
@@ -903,6 +999,98 @@ impl<P: Proposer> Proposer for Held<P> {
 }
 
 /// One generation of `budget` tokens, timed a step at a time.
+/// The widths a batch sweep runs, doubling from one up to `widest`.
+///
+/// Doubling rather than every width, because what the curve says is where
+/// halving stops: a token that halves from one width to the next is a batch
+/// that is still free, and the row where it stops is the answer. The widest is
+/// included whether or not it is a power of two.
+fn widths(widest: usize) -> Vec<usize> {
+    let mut widths: Vec<usize> = std::iter::successors(Some(1usize), |n| Some(n * 2))
+        .take_while(|n| *n <= widest)
+        .collect();
+    if widths.last() != Some(&widest) {
+        widths.push(widest);
+    }
+    widths
+}
+
+/// What one batched decode step costs, over `slots` copies of `ids` decoded
+/// together.
+struct Batched {
+    /// The wall one step of the whole batch takes, meaned over the steps.
+    step: Duration,
+    /// The device time inside it, on the same account every other row here
+    /// reads.
+    gpu: Duration,
+}
+
+/// `slots` sequences prefilled one at a time and then decoded together, timed
+/// over the decode steps alone.
+///
+/// **The prompts are made distinct rather than copied**, because the routing is
+/// the prompt's: a batch of identical sequences routes every row of every step
+/// to the same six experts, which is the one distribution a grouped dispatch is
+/// least like the real one at. Each sequence's prompt is rotated by its own slot,
+/// so the sequences are the same length and not the same tokens.
+///
+/// The prefills are not timed. A prefill of any length already fills the machine
+/// — which is why this milestone batches the other regime — so what a batch is
+/// worth is the steps after them, and a mean that included N prefills would be a
+/// measurement of the prompts.
+fn batched(
+    weights: &CheckpointWeights<'_>,
+    config: &TextConfig,
+    ids: &[usize],
+    slots: usize,
+    budget: usize,
+) -> Batched {
+    let generator = weights.generator();
+    let prompts: Vec<Vec<usize>> = (0..slots)
+        .map(|slot| {
+            let mut own = ids.to_vec();
+            own.rotate_left(slot % ids.len());
+            own
+        })
+        .collect();
+    let mut caches: Vec<ModelCache> = (0..slots)
+        .map(|slot| ModelCache::in_slot(config, 0, slot))
+        .collect();
+
+    let want = Tail {
+        block: 1,
+        chained: false,
+        logits: false,
+    };
+    let mut pending: Vec<usize> = caches
+        .iter_mut()
+        .zip(&prompts)
+        .map(|(cache, prompt)| generator.tailed(cache, prompt, want, weights).picks[0])
+        .collect();
+
+    profile::take();
+    let started = Instant::now();
+    for _ in 0..budget {
+        let feeding: Vec<[usize; 1]> = pending.iter().map(|id| [*id]).collect();
+        let mut batch: Vec<Batching<'_>> = caches
+            .iter_mut()
+            .zip(&feeding)
+            .map(|(cache, ids)| Batching { cache, ids })
+            .collect();
+        pending = generator
+            .step_batch(&mut batch, weights)
+            .iter()
+            .map(Picked::last)
+            .collect();
+    }
+    let wall = started.elapsed();
+    let charged = u32::try_from(budget.max(1)).unwrap_or(1);
+    Batched {
+        step: wall / charged,
+        gpu: profile::take().per_step(charged).gpu(),
+    }
+}
+
 fn generate(
     weights: &CheckpointWeights<'_>,
     heads: Option<&CheckpointHeads<'_>>,
@@ -1692,6 +1880,7 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
+                widest: WIDEST,
             }
         );
         assert_eq!(
@@ -1704,6 +1893,7 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
+                widest: WIDEST,
             }
         );
     }
@@ -1724,6 +1914,7 @@ mod tests {
                 depth: BEST,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
+                widest: WIDEST,
             }
         );
         assert_ne!(BEST, SWEPT);
@@ -1750,6 +1941,7 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: 0,
+                widest: WIDEST,
             }
         );
         for what in ["decode", "prefill", "sweep", "engines"] {
@@ -1759,6 +1951,49 @@ mod tests {
                 "{what} took a count of positions to keep"
             );
         }
+    }
+
+    /// **Only the batch sweep has a width to be swept**, so it is the only
+    /// measurement here the number means anything to — and every other one
+    /// refuses it rather than dropping it, which is the rule the numbers above
+    /// are refused under.
+    ///
+    /// It takes a context for the reason a decode step does: a batch is decode
+    /// steps, and a step is the one measurement here with a context to be taken
+    /// at.
+    #[test]
+    fn only_the_batch_sweep_takes_a_width() {
+        assert_eq!(
+            Job::parse(
+                ["batch", "models/small", "--batch", "8", "--context", "8192"].map(str::to_string)
+            )
+            .expect("parses"),
+            Job::Measure {
+                what: What::Batch,
+                checkpoint: PathBuf::from("models/small"),
+                tokens: DECODED,
+                context: 8192,
+                depth: SWEPT,
+                numerics: Numerics::default(),
+                reuse: DEFAULT_BOUND,
+                widest: 8,
+            }
+        );
+        for what in ["decode", "prefill", "sweep", "engines", "session"] {
+            assert!(
+                Job::parse([what, "models/small", "--batch", "8"].map(str::to_string)).is_err(),
+                "{what} took a width to sweep"
+            );
+        }
+    }
+
+    /// The widths a sweep runs double from one, and the widest is run whether or
+    /// not doubling reaches it.
+    #[test]
+    fn a_batch_sweep_doubles_from_one_and_ends_at_the_width_it_was_given() {
+        assert_eq!(widths(1), vec![1]);
+        assert_eq!(widths(8), vec![1, 2, 4, 8]);
+        assert_eq!(widths(12), vec![1, 2, 4, 8, 12]);
     }
 
     /// **The numerics are an arm's own word and every measurement takes it**,
@@ -2125,6 +2360,7 @@ mod tests {
                 depth: SWEPT,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
+                widest: WIDEST,
             }
         );
         for what in ["prefill", "sweep", "engines", "session"] {
