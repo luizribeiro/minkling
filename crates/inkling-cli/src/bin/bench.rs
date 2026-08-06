@@ -50,7 +50,8 @@ use inkling_core::workload::{
     BEST, CORPUS, DECODED, DIFFERENTIAL, REALISTIC, STRUCTURED_PROMPT, SWEPT, Session, tiled,
 };
 use inkling_core::{
-    Checkpoint, CheckpointWeights, Ending, ModelCache, TextConfig, Tokenizer, profile,
+    Checkpoint, CheckpointWeights, Continuous, Ending, ModelCache, Request, TextConfig, Tokenizer,
+    profile,
 };
 use inkling_metal::trace;
 use inkling_metal::{FusedAttention, Numerics, PackedMatmul};
@@ -96,6 +97,10 @@ const USAGE: &str = "usage:\n  \
     bench batch   <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>]\n  \
     bench clock   <checkpoint> [--tokens <n>] [--context <n>] [--idle <ms>] \
 [--every <ms>] [--burst <n>] [--keep-warm <ms>] [--prefill <n>] [--batch <n>]\n  \
+    bench joining <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>] \
+[--admit <n>]\n  \
+    bench fleet   <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>] \
+[--admit <n>] [--agents <n>] [--every <ms>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench diverge <checkpoint> [--tokens <n>] [--against <which>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
@@ -211,6 +216,48 @@ enum What {
     /// host time deliberately left between them, which is a lower duty cycle at
     /// identical work.
     Clock,
+    /// What a request waits for its first token when a batch is already
+    /// running, against the same request at an idle engine and against the same
+    /// request waiting for the batch to drain.
+    ///
+    /// **The one measurement here whose subject is a latency rather than a
+    /// rate.** Every other row in this file is what some quantity of work costs;
+    /// this is what one request waits, which is what a fleet of agents feels and
+    /// is the number a static batch has no way to improve — a slot that fills
+    /// sooner earns the same throughput sooner, and earns a wait that is not the
+    /// batch's remaining budget.
+    Joining,
+    /// A fleet of agents asking at irregular intervals, through one engine.
+    ///
+    /// **The one measurement here that reports a distribution.** A mean over a
+    /// fleet's requests describes none of them: what a scheduler does to the
+    /// request that arrived at the wrong moment is the whole of the difference
+    /// between admitting continuously and admitting in batches, and only the
+    /// tail says it.
+    Fleet,
+}
+
+/// How a request reaches a slot, which is the one thing the two arms of the two
+/// measurements above differ in.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Admitting {
+    /// Into a free slot as soon as there is one, which is what
+    /// [`Continuous`](inkling_core::Continuous) does.
+    Continuously,
+    /// Only into an engine that has drained — N prompts prefilled, all of them
+    /// decoded together, and the next request admitted when the last of them
+    /// finishes, which is what `generate_batch` does and what every batching
+    /// figure in this repo was taken at.
+    InBatches,
+}
+
+impl Admitting {
+    fn named(self) -> &'static str {
+        match self {
+            Self::Continuously => "joining",
+            Self::InBatches => "draining",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -255,6 +302,16 @@ enum Job {
         /// The prompt each of the clock measurement's units prefills, and zero
         /// for the decode step it charges otherwise.
         prefill: usize,
+        /// Prompt rows a joining request feeds in one step.
+        ///
+        /// **The knob the two latency measurements trade on.** A prompt fed
+        /// whole is one call the sequences already in flight wait the whole of;
+        /// fed this many rows a step it is spread over as many steps, and what
+        /// any one of them costs those sequences is bounded by this.
+        admit: usize,
+        /// How many requests a fleet makes, and nothing at all for the
+        /// measurements that make one.
+        agents: usize,
     },
     /// The harness: two commands that already exist, run against each other.
     Alternate {
@@ -303,12 +360,14 @@ impl Job {
             Some("session") => Some(What::Session),
             Some("batch") => Some(What::Batch),
             Some("clock") => Some(What::Clock),
+            Some("joining") => Some(What::Joining),
+            Some("fleet") => Some(What::Fleet),
             Some("alternate") => return Self::alternating(args),
             Some("diverge") => return Self::diverging(args),
             Some("guesses") => None,
             Some(word) => bail!(
                 "{word} is not one of decode, prefill, sweep, engines, session, batch, \
-                 clock, guesses, diverge or alternate"
+                 clock, joining, fleet, guesses, diverge or alternate"
             ),
             None => bail!("no measurement given"),
         };
@@ -334,6 +393,10 @@ impl Job {
         let mut burst = None;
         let mut warm = None;
         let mut prefill = None;
+        // The two the latency measurements take, `Option` for the reason above:
+        // what the refusals below are about is whether the number was given.
+        let mut admit = None;
+        let mut agents = None;
         // A sweep runs every depth up to its own, where a cross-engine table
         // quotes one beside `k = 0` — so the default depth is what the flag
         // means to the measurement asking for it.
@@ -376,6 +439,10 @@ impl Job {
                     warm = Some(Duration::from_millis(count(&arg, &mut args)? as u64));
                 }
                 "--prefill" => prefill = Some(count(&arg, &mut args)?),
+                // A prompt entering no rows a step never enters a cache at all,
+                // which is a joining request that is never answered.
+                "--admit" => admit = Some(count(&arg, &mut args)?),
+                "--agents" => agents = Some(count(&arg, &mut args)?),
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
                 _ => checkpoints.push(PathBuf::from(arg)),
             }
@@ -423,7 +490,15 @@ impl Job {
         // acceptance is the workload's. Silently dropping the number would leave
         // a row saying something other than what was asked for, which is the
         // same rule the length above is refused under.
-        if !matches!(what, What::Decode | What::Batch | What::Clock) && context.is_some() {
+        //
+        // The two latency measurements take one for a different reason and it is
+        // worth saying which: their context is the *joining prompt's* length,
+        // which is the whole of what a time to first token is a function of.
+        if !matches!(
+            what,
+            What::Decode | What::Batch | What::Clock | What::Joining | What::Fleet
+        ) && context.is_some()
+        {
             bail!("{what:?} takes no --context: only a decode step has one to be taken at");
         }
         // **Only the clock measurement has a duty cycle it is asking about.**
@@ -431,12 +506,16 @@ impl Job {
         // and says so nowhere, which is the whole of what this measurement
         // exists to fix — so the two levers are refused to the measurements that
         // could only drop them, under the same rule as the numbers above.
-        if what != What::Clock
-            && (idle.is_some()
-                || every.is_some()
-                || burst.is_some()
-                || warm.is_some()
-                || prefill.is_some())
+        //
+        // **A fleet takes `--every` and none of the rest**, and it means by it
+        // what the clock measurement means: a rate rather than a gap. What
+        // arrives every so often there is a unit of work and here it is a
+        // request, which is the same sentence about a server said at the two
+        // ends of it.
+        let rated = matches!(what, What::Clock | What::Fleet);
+        if (what != What::Clock
+            && (idle.is_some() || burst.is_some() || warm.is_some() || prefill.is_some()))
+            || (!rated && every.is_some())
         {
             bail!(
                 "{what:?} takes no --idle, --every, --burst or --prefill: it does not vary its \
@@ -478,8 +557,36 @@ impl Job {
         // **Only the two measurements that have a width take one.** Every other
         // one here decodes a single sequence, so a width handed to it could only
         // be dropped — the same rule the numbers above are refused under.
-        if !matches!(what, What::Batch | What::Clock) && widest.is_some() {
+        if !matches!(
+            what,
+            What::Batch | What::Clock | What::Joining | What::Fleet
+        ) && widest.is_some()
+        {
             bail!("{what:?} takes no --batch: it decodes one sequence");
+        }
+        // **Only the two latency measurements have a request that joins.**
+        // Every other one here prefills before it decodes and never puts a
+        // prompt row in a call with a decode row in it, so a chunk given to one
+        // could only be dropped — the same rule the numbers above are refused
+        // under. `--agents` is a fleet's alone for the same reason: everything
+        // else makes one request.
+        if !matches!(what, What::Joining | What::Fleet) && admit.is_some() {
+            bail!("{what:?} takes no --admit: nothing joins a batch it is running");
+        }
+        if what != What::Fleet && agents.is_some() {
+            bail!("{what:?} takes no --agents: it makes one request");
+        }
+        // **A slot free for the joiner is what a joining measurement needs.** An
+        // engine of one slot has none, so the request would be measuring a queue
+        // rather than a batch it joined — and the arm that measures the queue is
+        // the one this already runs beside it.
+        if what == What::Joining && widest.is_some_and(|slots| slots < 2) {
+            bail!("joining takes a --batch of at least two: one of the slots is the joiner's");
+        }
+        // A prompt entering no rows a step never enters a cache at all, which is
+        // a request nothing here would ever answer.
+        if admit == Some(0) {
+            bail!("--admit 0 is a prompt that never enters a cache");
         }
         // **A prefill already fills the machine**, which is why the batching
         // milestone batched the other regime — so a width given to the arm whose
@@ -501,6 +608,7 @@ impl Job {
                 What::Prefill => PREFILLED,
                 What::Session => Session::OPENING,
                 What::Clock => TICKED,
+                What::Fleet | What::Joining => ASKED,
                 _ => DECODED,
             }),
             context: context.unwrap_or(0),
@@ -517,6 +625,8 @@ impl Job {
                 warm,
             },
             prefill: prefill.unwrap_or(0),
+            admit: admit.unwrap_or(ADMITTED),
+            agents: agents.unwrap_or(AGENTS),
         })
     }
 
@@ -605,6 +715,8 @@ impl Job {
                 widest,
                 shape,
                 prefill,
+                admit,
+                agents,
             } => {
                 let asked = Asked {
                     tokens: *tokens,
@@ -615,6 +727,8 @@ impl Job {
                     widest: *widest,
                     shape: *shape,
                     prefill: *prefill,
+                    admit: *admit,
+                    agents: *agents,
                 };
                 for reading in measure(*what, checkpoint, asked)? {
                     println!("{}", reading.line());
@@ -819,6 +933,11 @@ struct Asked {
     /// The prompt each of the clock measurement's units prefills, and zero for
     /// the decode step it charges otherwise.
     prefill: usize,
+    /// Prompt rows a joining request feeds in one step, which only the two
+    /// latency measurements have anywhere to put.
+    admit: usize,
+    /// How many requests a fleet makes.
+    agents: usize,
 }
 
 fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
@@ -831,6 +950,8 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
         widest,
         shape,
         prefill,
+        admit,
+        agents,
     } = asked;
     let config = config::of_checkpoint(dir)?;
     let text = &config.text_config;
@@ -1048,6 +1169,133 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     ));
                 }
             }
+            // **The wait a request makes, which is the number nobody had.**
+            // Every row above says what some quantity of work costs; this says
+            // what one request waits for its first token with a batch already
+            // running, and the arm beside it is the same request waiting for
+            // that batch to drain — which is what static batching makes it do.
+            What::Joining => {
+                let ids = tiled(&prompt, context.max(prompt.len()));
+                let slots = widest.unwrap_or(WIDEST);
+                let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?;
+                eprintln!(
+                    "joining: {slots} slots, a {}-token prompt entering {admit} rows a step, \
+                     {tokens} tokens a request",
+                    ids.len(),
+                );
+                let engine = Engine {
+                    weights: &weights,
+                    config: text,
+                    prompt: &ids,
+                    slots,
+                    admit,
+                    tokens,
+                };
+                for held in occupancies(slots) {
+                    for policy in [Admitting::Continuously, Admitting::InBatches] {
+                        // At an idle engine the two policies are the same run,
+                        // and a second one of it would be a row saying the same
+                        // thing under a different name.
+                        if held == 0 && policy == Admitting::InBatches {
+                            continue;
+                        }
+                        let run = joined(&engine, held, policy);
+                        let row = format!("{}{held}", policy.named());
+                        eprintln!(
+                            "  {held} decoding, {}: first token in {:.0?} over {} steps, \
+                             {:.2?} of device{}",
+                            policy.named(),
+                            run.ttft,
+                            run.steps,
+                            run.gpu,
+                            match (run.settled, run.mixed) {
+                                (Some(settled), Some(mixed)) => format!(
+                                    "; the batch's step {:.2?} against {:.2?} with the prompt \
+                                     riding in it",
+                                    settled, mixed
+                                ),
+                                _ => String::new(),
+                            },
+                        );
+                        taken.push(Reading::new(format!("{row}.ttft"), millis(run.ttft), "ms"));
+                        taken.push(Reading::new(format!("{row}.steps"), run.steps as f64, "n"));
+                        taken.push(Reading::new(format!("{row}.device"), millis(run.gpu), "ms"));
+                        // **What the joining prompt costs the sequences already
+                        // in flight**, which is the other half of the trade and
+                        // is a row rather than a sentence.
+                        if let (Some(settled), Some(mixed)) = (run.settled, run.mixed) {
+                            taken.push(Reading::new(format!("{row}.step"), millis(settled), "ms"));
+                            taken.push(Reading::new(format!("{row}.riding"), millis(mixed), "ms"));
+                        }
+                    }
+                }
+            }
+            // **The fleet shape, and the distribution rather than the mean.**
+            // What a scheduler does to the request that arrived at the wrong
+            // moment is the whole of what separates the two policies, and a mean
+            // over the fleet describes none of them.
+            What::Fleet => {
+                let ids = tiled(&prompt, context.max(prompt.len()));
+                let slots = widest.unwrap_or(WIDEST);
+                let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?;
+                let every = shape.gap.every().unwrap_or(ARRIVAL);
+                let arrivals: Vec<Duration> = (0..agents).map(|at| every * at as u32).collect();
+                eprintln!(
+                    "fleet: {agents} requests one every {:.0?}, {tokens} tokens each, \
+                     {slots} slots, a {}-token prompt entering {admit} rows a step",
+                    every,
+                    ids.len(),
+                );
+                let engine = Engine {
+                    weights: &weights,
+                    config: text,
+                    prompt: &ids,
+                    slots,
+                    admit,
+                    tokens,
+                };
+                for policy in [Admitting::Continuously, Admitting::InBatches] {
+                    let run = fleeted(&engine, &arrivals, policy);
+                    assert_eq!(
+                        run.tokens,
+                        agents * tokens,
+                        "every request answered in full"
+                    );
+                    let name = policy.named();
+                    for (what, waits) in [
+                        ("first", run.waits(|felt| felt.first)),
+                        ("whole", run.waits(|felt| felt.last)),
+                    ] {
+                        eprintln!(
+                            "  {name}, {what} token: p50 {:.0?}, p90 {:.0?}, worst {:.0?}",
+                            percentile(&waits, 0.5),
+                            percentile(&waits, 0.9),
+                            percentile(&waits, 1.0),
+                        );
+                        for (at, q) in [("p50", 0.5), ("p90", 0.9), ("worst", 1.0)] {
+                            taken.push(Reading::new(
+                                format!("{name}.{what}.{at}"),
+                                millis(percentile(&waits, q)),
+                                "ms",
+                            ));
+                        }
+                    }
+                    eprintln!(
+                        "  {name}: {:.1} tok/s over {:.1?}, {} steps carrying {} rows, \
+                         {:.1}% duty",
+                        run.rate(),
+                        run.wall,
+                        run.steps,
+                        run.rows,
+                        run.duty(),
+                    );
+                    taken.push(Reading::new(format!("{name}.rate"), run.rate(), "tok/s"));
+                    taken.push(Reading::new(format!("{name}.wall"), millis(run.wall), "ms"));
+                    taken.push(Reading::new(format!("{name}.steps"), run.steps as f64, "n"));
+                    taken.push(Reading::new(format!("{name}.rows"), run.rows as f64, "n"));
+                    taken.push(Reading::new(format!("{name}.duty"), run.duty(), "%"));
+                }
+            }
             What::Prefill => {
                 // A prefill is one step and its prompt is the measurement, so
                 // the prompt is tiled to the length asked for.
@@ -1216,6 +1464,22 @@ impl<P: Proposer> Proposer for Held<P> {
     }
 }
 
+/// How many sequences are already decoding when a request arrives, at each
+/// occupancy a `slots`-wide engine has room to leave a slot free at.
+///
+/// Zero first, which is the idle engine and is the arm every other row is read
+/// against; then doubling, for [`widths`]'s reason — what the rows say is where
+/// the wait stops halving, and a row where it stopped is the answer. The
+/// fullest is `slots - 1`, because a request arriving at an engine with no free
+/// slot is a queueing measurement rather than a joining one.
+fn occupancies(slots: usize) -> Vec<usize> {
+    let mut held = vec![0];
+    if slots > 1 {
+        held.extend(widths(slots - 1));
+    }
+    held
+}
+
 /// The widths a batch sweep runs, doubling from one up to `widest`.
 ///
 /// Doubling rather than every width, because what the curve says is where
@@ -1347,6 +1611,283 @@ fn batched(
     Amortised {
         step: wall / charged,
         gpu: profile::take().per_step(charged).gpu(),
+    }
+}
+
+/// Prompt rows a joining request feeds in one step, when nobody says.
+///
+/// **The knob the latency of a joining request trades against the latency of
+/// the sequences it joins**, and 64 is the smaller of the two prices at this
+/// checkpoint's shapes: a decode step of eight sequences is 64 ms of device, so
+/// 64 prompt rows riding with it is a step of the same order rather than the
+/// second the whole prompt would be.
+const ADMITTED: usize = 64;
+
+/// Requests a fleet makes, when nobody says. Two per slot at the default width,
+/// so that a request waits for one to finish as well as arriving into a free
+/// slot.
+const AGENTS: usize = 16;
+
+/// What one request of a fleet asks for, when nobody says — a few hundred
+/// tokens, which is the shape an agent's turn has and is long enough that the
+/// wake toll amortises to nothing over it.
+const ASKED: usize = 200;
+
+/// How long a fleet leaves between two arrivals, when nobody says.
+const ARRIVAL: Duration = Duration::from_millis(200);
+
+/// One request's life, as the thing that asked for it feels it.
+#[derive(Debug, Clone, Copy)]
+struct Felt {
+    /// When it was made, from the run's start.
+    arrived: Duration,
+    /// What it waited for its first token, and `None` for one that never got
+    /// there.
+    first: Option<Duration>,
+    /// What it waited for its last.
+    last: Option<Duration>,
+}
+
+/// What a fleet of requests through one engine came to.
+struct Fleeted {
+    felt: Vec<Felt>,
+    /// The whole run, from the first arrival being made to the last request
+    /// being answered.
+    wall: Duration,
+    gpu: Duration,
+    steps: usize,
+    /// Rows every step of the run carried between them, which is what the
+    /// engine was actually charged for.
+    rows: usize,
+    /// Tokens it produced, which is what the rate divides.
+    tokens: usize,
+}
+
+impl Fleeted {
+    /// Tokens a second over the whole run, which is the throughput column
+    /// C2's static table is the other half of.
+    fn rate(&self) -> f64 {
+        self.tokens as f64 / self.wall.as_secs_f64()
+    }
+
+    fn duty(&self) -> f64 {
+        duty(self.gpu, self.wall)
+    }
+
+    /// The waits, sorted, for whichever of the two a caller is quoting.
+    fn waits(&self, of: impl Fn(&Felt) -> Option<Duration>) -> Vec<Duration> {
+        let mut waits: Vec<Duration> = self.felt.iter().filter_map(of).collect();
+        waits.sort_unstable();
+        waits
+    }
+}
+
+/// The `q`th percentile of a sorted run of durations, by nearest rank.
+///
+/// **A value that was measured rather than one interpolated between two that
+/// were**, which is what a tail of sixteen requests can support: an
+/// interpolated p90 of sixteen samples is a number no request waited.
+fn percentile(sorted: &[Duration], q: f64) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let rank = (q * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+/// What both latency measurements hold still: the width of the engine, how many
+/// rows a joining prompt enters in, the prompt itself, and what one request
+/// asks for.
+///
+/// **Every arm of both is this held and one thing moved** — the occupancy a
+/// request arrives at, or the policy that admits it — which is the rule C2's
+/// tables are built on and the one C1 nearly published a clock drift for
+/// breaking.
+struct Engine<'a, 'w> {
+    weights: &'a CheckpointWeights<'w>,
+    config: &'a TextConfig,
+    prompt: &'a [usize],
+    slots: usize,
+    admit: usize,
+    tokens: usize,
+}
+
+impl Engine<'_, '_> {
+    fn seating(&self) -> Continuous<'_> {
+        Continuous::new(self.config, self.slots, self.admit)
+    }
+
+    /// What every request of both measurements asks for, which is one prompt and
+    /// one budget: two requests of different lengths would be two measurements
+    /// with the wait attributed to whichever of them the reader assumed.
+    fn asking(&self) -> Request {
+        Request {
+            prompt: self.prompt.to_vec(),
+            count: self.tokens,
+        }
+    }
+}
+
+/// A fleet of requests arriving on `arrivals`, each asking for what
+/// [`Engine::asking`] says, through one engine.
+///
+/// **The arrivals are wall-clock and the engine is not driven ahead of them**: a
+/// request that has not been made yet is not in the queue, and an engine with
+/// nothing seated sleeps until the next one. That is what makes the wait this
+/// reports a wait rather than a position in a list.
+fn fleeted(engine: &Engine<'_, '_>, arrivals: &[Duration], policy: Admitting) -> Fleeted {
+    let Engine { weights, slots, .. } = *engine;
+    let generator = weights.generator();
+    let asking = engine.asking();
+    let mut engine = engine.seating();
+    let mut felt: Vec<Felt> = arrivals
+        .iter()
+        .map(|arrived| Felt {
+            arrived: *arrived,
+            first: None,
+            last: None,
+        })
+        .collect();
+
+    profile::take();
+    let started = Instant::now();
+    let (mut next, mut steps, mut rows, mut tokens_out) = (0, 0, 0, 0);
+    loop {
+        // **A batch is admitted only into an engine that has drained**, which is
+        // the whole of what the static arm is: `slots` requests at a time, and
+        // the ones that arrived while they ran wait for the last of them.
+        let taking = match policy {
+            Admitting::Continuously => usize::MAX,
+            Admitting::InBatches if engine.idle() => slots,
+            Admitting::InBatches => 0,
+        };
+        let mut took = 0;
+        while took < taking && next < felt.len() && felt[next].arrived <= started.elapsed() {
+            assert_eq!(
+                engine.submit(asking.clone()),
+                next,
+                "a ticket per request, in arrival order"
+            );
+            next += 1;
+            took += 1;
+        }
+
+        if engine.idle() {
+            let Some(waiting) = felt.get(next) else { break };
+            // Nothing is in flight and the next request has not been made, so
+            // there is no work to do and no clock to hold. What this leaves is
+            // the gap a wake is charged for — see the README's toll.
+            std::thread::sleep(waiting.arrived.saturating_sub(started.elapsed()));
+            continue;
+        }
+
+        let stepped = engine.step(&generator, weights);
+        steps += 1;
+        rows += stepped.rows();
+        tokens_out += stepped.decoding;
+        let now = started.elapsed();
+        for ticket in &stepped.first {
+            felt[*ticket].first = Some(now - felt[*ticket].arrived);
+        }
+        for answer in &stepped.done {
+            felt[answer.ticket].last = Some(now - felt[answer.ticket].arrived);
+        }
+    }
+
+    Fleeted {
+        felt,
+        wall: started.elapsed(),
+        gpu: profile::take().gpu(),
+        steps,
+        rows,
+        tokens: tokens_out,
+    }
+}
+
+/// What one request waited for its first token, and what the batch it joined
+/// paid for it.
+struct Joined {
+    /// From the request being made to its first token reaching whoever asked.
+    ttft: Duration,
+    /// Steps the engine ran inside that, which is what the wait is made of.
+    steps: usize,
+    gpu: Duration,
+    /// What one step of the batch cost while the joining prompt was riding in
+    /// it, and what the same batch's step cost with nothing joining. **The
+    /// price the sequences already in flight pay is the difference.**
+    mixed: Option<Duration>,
+    settled: Option<Duration>,
+}
+
+/// `held` sequences settled and decoding, then one more request made — and what
+/// it waited.
+///
+/// **The held sequences are settled before the clock starts** for the reason
+/// [`Seated::new`] throws its own settling steps away: a width is a fresh wrap,
+/// and the first steps of one pay for allocating its spans and its windows.
+///
+/// `held` of zero is the same request at an idle engine, which is the arm every
+/// other one here is read against — and it is the same code rather than a
+/// second path, so what differs between the two rows is the batch and nothing
+/// else.
+fn joined(engine: &Engine<'_, '_>, held: usize, policy: Admitting) -> Joined {
+    let Engine { weights, slots, .. } = *engine;
+    assert!(held < slots, "{held} held sequences in {slots} slots");
+    let generator = weights.generator();
+    let asking = engine.asking();
+    let mut engine = engine.seating();
+    for _ in 0..held {
+        engine.submit(asking.clone());
+    }
+
+    let mut settled = None;
+    if held > 0 {
+        while engine.step(&generator, weights).filling > 0 {}
+        let at = Instant::now();
+        for _ in 0..SETTLED {
+            engine.step(&generator, weights);
+        }
+        settled = Some(at.elapsed() / u32::try_from(SETTLED).unwrap_or(1));
+    }
+
+    profile::take();
+    let at = Instant::now();
+    let mut steps = 0;
+    if policy == Admitting::InBatches {
+        // The wait a request makes of a static batch, measured rather than
+        // reasoned about: it is admitted when the batch it arrived behind has
+        // decoded the last token any of its sequences asked for.
+        while !engine.idle() {
+            engine.step(&generator, weights);
+            steps += 1;
+        }
+    }
+    let ticket = engine.submit(asking);
+
+    let (mut mixed, mut riding) = (Duration::ZERO, 0u32);
+    loop {
+        let before = Instant::now();
+        let stepped = engine.step(&generator, weights);
+        let took = before.elapsed();
+        steps += 1;
+        // Only the steps that carried the joining prompt *and* the batch it
+        // joined, which is the comparison `settled` is the other half of. The
+        // step that produces the first token carries no prompt rows and belongs
+        // to neither.
+        if stepped.filling > 0 && stepped.decoding == held {
+            mixed += took;
+            riding += 1;
+        }
+        if stepped.first.contains(&ticket) {
+            break;
+        }
+    }
+    Joined {
+        ttft: at.elapsed(),
+        steps,
+        gpu: profile::take().gpu(),
+        mixed: (riding > 0).then(|| mixed / riding),
+        settled,
     }
 }
 
@@ -1572,6 +2113,16 @@ impl Gap {
         match self {
             Self::After(idle) => *idle,
             Self::Every(period) => period.saturating_sub(spent),
+        }
+    }
+
+    /// The interval `--every` named, and `None` where a gap was asked for
+    /// instead — which is what a fleet's arrivals are spaced by and is the one
+    /// of the two words that means a rate.
+    fn every(&self) -> Option<Duration> {
+        match self {
+            Self::Every(period) => Some(*period),
+            Self::After(_) => None,
         }
     }
 
@@ -2650,6 +3201,8 @@ mod tests {
                     warm: None,
                 },
                 prefill: 0,
+                admit: ADMITTED,
+                agents: AGENTS,
             }
         );
         assert_eq!(
@@ -2669,6 +3222,8 @@ mod tests {
                     warm: None,
                 },
                 prefill: 0,
+                admit: ADMITTED,
+                agents: AGENTS,
             }
         );
     }
@@ -2696,6 +3251,8 @@ mod tests {
                     warm: None,
                 },
                 prefill: 0,
+                admit: ADMITTED,
+                agents: AGENTS,
             }
         );
         assert_ne!(BEST, SWEPT);
@@ -2729,6 +3286,8 @@ mod tests {
                     warm: None,
                 },
                 prefill: 0,
+                admit: ADMITTED,
+                agents: AGENTS,
             }
         );
         for what in ["decode", "prefill", "sweep", "engines"] {
@@ -2769,6 +3328,8 @@ mod tests {
                     warm: None,
                 },
                 prefill: 0,
+                admit: ADMITTED,
+                agents: AGENTS,
             }
         );
         assert!(
@@ -2836,6 +3397,8 @@ mod tests {
                     warm: None,
                 },
                 prefill: 0,
+                admit: ADMITTED,
+                agents: AGENTS,
             }
         );
         for what in ["decode", "prefill", "sweep", "engines", "session", "batch"] {
@@ -2873,6 +3436,8 @@ mod tests {
                     warm: None,
                 },
                 prefill: 2048,
+                admit: ADMITTED,
+                agents: AGENTS,
             }
         );
         assert!(
@@ -2896,6 +3461,72 @@ mod tests {
             Job::parse(["clock", "models/small", "--prefill", "0"].map(str::to_string)).is_err(),
             "a prefill of no tokens was taken for a unit"
         );
+    }
+
+    /// **The occupancies a joining request is measured at**: the idle engine
+    /// first, then doubling, and never an engine with no slot for it.
+    ///
+    /// The last is the one worth asserting rather than reading: a request
+    /// arriving at a full engine measures a queue, and the arm that measures the
+    /// queue is the draining one this runs beside it.
+    #[test]
+    fn a_joining_request_is_measured_against_an_engine_with_a_slot_for_it() {
+        assert_eq!(occupancies(1), vec![0]);
+        assert_eq!(occupancies(2), vec![0, 1]);
+        assert_eq!(occupancies(8), vec![0, 1, 2, 4, 7]);
+        assert_eq!(occupancies(32), vec![0, 1, 2, 4, 8, 16, 31]);
+        for slots in [1, 2, 8, 32] {
+            assert!(
+                occupancies(slots).iter().all(|held| *held < slots),
+                "an occupancy with no slot left for the joiner at {slots}"
+            );
+        }
+    }
+
+    /// **A percentile is a wait some request actually had.** Interpolating
+    /// between two of sixteen samples would report a tail nobody waited, which
+    /// is the one thing a tail is quoted for.
+    #[test]
+    fn a_percentile_is_one_of_the_waits_it_is_taken_over() {
+        let waits: Vec<Duration> = [10u64, 20, 30, 40].map(Duration::from_millis).to_vec();
+        assert_eq!(percentile(&waits, 0.5), Duration::from_millis(20));
+        assert_eq!(percentile(&waits, 0.9), Duration::from_millis(40));
+        assert_eq!(percentile(&waits, 1.0), Duration::from_millis(40));
+        // The lowest rank is the first sample rather than a step before it.
+        assert_eq!(percentile(&waits, 0.0), Duration::from_millis(10));
+        assert_eq!(percentile(&[], 0.5), Duration::ZERO);
+    }
+
+    /// **The two latency measurements' flags are theirs alone**, for the reason
+    /// every other flag here is refused to the measurements that could only drop
+    /// it: a row that silently ignored the number it was given says something
+    /// other than what was asked for.
+    #[test]
+    fn the_flags_a_joining_request_takes_are_refused_to_what_does_not_join() {
+        let parsed = |args: &[&str]| Job::parse(args.iter().map(|arg| arg.to_string()));
+        assert!(parsed(&["joining", "models/small", "--admit", "64"]).is_ok());
+        assert!(parsed(&["fleet", "models/small", "--agents", "8"]).is_ok());
+        assert!(parsed(&["fleet", "models/small", "--every", "200"]).is_ok());
+        assert!(
+            parsed(&["batch", "models/small", "--admit", "64"]).is_err(),
+            "a sweep took a chunk for a prompt nothing in it joins with"
+        );
+        assert!(
+            parsed(&["joining", "models/small", "--agents", "8"]).is_err(),
+            "a measurement of one request took a fleet's size"
+        );
+        assert!(
+            parsed(&["fleet", "models/small", "--idle", "200"]).is_err(),
+            "a fleet took a clock run's gap"
+        );
+        assert!(
+            parsed(&["joining", "models/small", "--every", "200"]).is_err(),
+            "a measurement of one request took an arrival rate"
+        );
+        // One slot is an engine with none free for the joiner, and a prompt
+        // entering no rows a step never enters a cache at all.
+        assert!(parsed(&["joining", "models/small", "--batch", "1"]).is_err());
+        assert!(parsed(&["joining", "models/small", "--admit", "0"]).is_err());
     }
 
     /// **A rate is a gap the work is taken out of**, which is the shape a server
@@ -3809,6 +4440,8 @@ mod tests {
                     warm: None,
                 },
                 prefill: 0,
+                admit: ADMITTED,
+                agents: AGENTS,
             }
         );
         for what in ["prefill", "sweep", "engines", "session"] {
