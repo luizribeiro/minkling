@@ -316,6 +316,10 @@ impl<'a> LayerNorm<'a> {
     /// is given the threadgroups the widest of them needs, so a threadgroup
     /// finds its sequence by a divide and a short seat's spare threadgroups
     /// return whole. A batch of one is one seat over the whole grid.
+    ///
+    /// **A seat's own base is where its rows land and the landing's is not
+    /// read**, which is what a landing shared between sequences means: the
+    /// methods above fold theirs into the one seat they make.
     pub fn encode_seats(
         &self,
         batch: &mut Batch<'_>,

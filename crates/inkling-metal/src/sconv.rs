@@ -482,6 +482,10 @@ impl<'a> LayerConv<'a> {
     ///
     /// A batch of one is one seat over the whole call, which encodes what it
     /// always encoded over the grid it always had.
+    ///
+    /// **A seat's own base is where its rows land and the landing's is not
+    /// read**, which is what a landing shared between sequences means:
+    /// [`LayerConv::encode_over`] folds its own into the one seat it makes.
     pub fn encode_seats(
         &self,
         batch: &mut Batch<'_>,

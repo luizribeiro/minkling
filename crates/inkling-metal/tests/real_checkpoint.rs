@@ -1844,8 +1844,9 @@ fn which_kernels_own_a_batched_step() {
 
     let mut alone = 0.0;
     for slots in BATCHED_WIDTHS {
-        let unsampled = batched_steps(&device, &gpu, &ckpt, &config, &recorded, slots, false);
-        let run = batched_steps(&device, &gpu, &ckpt, &config, &recorded, slots, true);
+        let full = Batching::full(slots);
+        let unsampled = batched_steps(&device, &gpu, &ckpt, &config, &recorded, full, false);
+        let run = batched_steps(&device, &gpu, &ckpt, &config, &recorded, full, true);
         eprintln!("{}", step_table(&run.measured()));
         eprintln!(
             "  against a {:.2?} unsampled step of {:.2?} device time, so the rows carry \
@@ -1919,6 +1920,108 @@ fn which_kernels_own_a_batched_step() {
     }
 }
 
+/// **What an empty seat costs, which is what decides whether a batch can be left
+/// on.**
+///
+/// Every batched figure in this file feeds every slot it wrapped, so all of them
+/// answer "what do N sequences cost together" and none answers "what does one
+/// sequence cost in a wrap that has room for 32". **That is the question a
+/// server asks**: a batch held open between requests has slots nobody is
+/// decoding through, and if an idle one is not free then the width has to follow
+/// the load rather than be configured once.
+///
+/// **The grid is the occupancy's and not the allocation's, and this is where
+/// that stops being a reading of the source.** A call's seats are the sequences
+/// it was handed — `LayerProjections::encoding` builds one per [`Attending`] and
+/// the residual convolutions one per [`Advancing`] — so a wrap of 32 carrying
+/// one sequence dispatches one seat's threadgroups and not 32. What an idle slot
+/// does hold is memory: 30.8 MiB a slot a layer of spans and windows, which
+/// `a_slot_costs_a_span_and_four_windows_in_every_layer` already bounds and which
+/// no dispatch reads.
+///
+/// So the two things asserted are the two that would break if a grid were ever
+/// sized by the wrap: **the same dispatches, and the same threadgroups per
+/// dispatch, for one sequence in a wrap of 32 as for one in a wrap of one.** The
+/// durations are printed rather than asserted, for the reason every timing in
+/// this file is: what they are compared against is the arm beside them, taken in
+/// the same process, in an order that alternates.
+#[test]
+#[ignore = "a measurement: `just test-timing`, or `just test-full`"]
+fn what_an_empty_seat_costs() {
+    let Some((dir, device)) = sampling_device() else {
+        return;
+    };
+    let config = fixture::config(&dir).text_config;
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+    let recorded = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+    let timed = |batching: Batching| {
+        batched_steps(&device, &gpu, &ckpt, &config, &recorded, batching, false)
+    };
+
+    eprintln!(
+        "{:>8}{:>12}{:>12}{:>14}{:>12}",
+        "in a wrap", "step", "device", "dispatches", "against 1"
+    );
+    // **A B B A at every width**, so that a host drifting through the sitting
+    // moves both arms the same way rather than the second one alone.
+    for slots in EMPTY_SEAT_WIDTHS {
+        let alone = [timed(Batching::full(1)), timed(Batching::alone(slots))];
+        let held = [timed(Batching::alone(slots)), timed(Batching::full(1))];
+        let mean = |first: &BatchedSteps, second: &BatchedSteps| {
+            (
+                (first.step + second.step) / 2,
+                (first.profile.gpu() + second.profile.gpu()) / 2,
+            )
+        };
+        let (one_step, one_device) = mean(&alone[0], &held[1]);
+        let (held_step, held_device) = mean(&alone[1], &held[0]);
+        eprintln!(
+            "{:>8}{:>12}{:>12}{:>14}{:>11.1}%",
+            format!("1 of {slots}"),
+            format!("{held_step:.2?}"),
+            format!("{held_device:.2?}"),
+            alone[1].counters.0,
+            100.0 * (held_device.as_secs_f64() / one_device.as_secs_f64() - 1.0),
+        );
+        eprintln!(
+            "{:>8}{:>12}{:>12}{:>14}",
+            "1 of 1",
+            format!("{one_step:.2?}"),
+            format!("{one_device:.2?}"),
+            alone[0].counters.0,
+        );
+        assert_eq!(
+            alone[1].counters.0, alone[0].counters.0,
+            "one sequence in a wrap of {slots} dispatched what one in a wrap of one did not"
+        );
+    }
+
+    // And the grids, which the counters cannot say: a dispatch sized by the wrap
+    // would encode the same count over a wider grid, and every row of the table
+    // would read further from the machine at no gain.
+    let widest = EMPTY_SEAT_WIDTHS[EMPTY_SEAT_WIDTHS.len() - 1];
+    let sampled = |batching: Batching| {
+        let run = batched_steps(&device, &gpu, &ckpt, &config, &recorded, batching, true);
+        run.profile
+            .kernels()
+            .iter()
+            .map(|(kernel, each)| ((*kernel).to_owned(), each.groups_a_dispatch()))
+            .collect::<BTreeMap<String, f64>>()
+    };
+    let one = sampled(Batching::full(1));
+    let held = sampled(Batching::alone(widest));
+    assert_eq!(
+        held, one,
+        "one sequence in a wrap of {widest} was given grids a wrap of one was not"
+    );
+    eprintln!("the grids of one sequence are the same in a wrap of 1 and of {widest}: {one:?}");
+}
+
+/// The wraps an empty seat is priced in, which are the batch sweep's own widths
+/// past the one it is measured against.
+const EMPTY_SEAT_WIDTHS: [usize; 3] = [4, 8, 32];
+
 /// `slots` sequences prefilled apart and then decoded together, timed over the
 /// steps after them.
 ///
@@ -1937,15 +2040,19 @@ fn batched_steps(
     ckpt: &Checkpoint,
     config: &inkling_core::TextConfig,
     ids: &[usize],
-    slots: usize,
+    batching: Batching,
     sampling: bool,
 ) -> BatchedSteps {
+    let Batching { slots, seats } = batching;
+    assert!(seats <= slots, "{seats} sequences in a wrap of {slots}");
     device
         .time_each_dispatch(sampling)
         .expect("the device times a dispatch");
     let weights = gpu.wrap_batch(ckpt, config, slots);
     let generator = weights.generator();
-    let mut caches: Vec<ModelCache> = (0..slots)
+    // **A slot the caller never feeds is never prefilled either**, which is what
+    // an empty seat is: memory the wrap holds and rows nobody sends it.
+    let mut caches: Vec<ModelCache> = (0..seats)
         .map(|slot| ModelCache::in_slot(config, 0, slot))
         .collect();
     let want = Tail {
@@ -1994,7 +2101,7 @@ fn batched_steps(
     let (dispatches, submissions, allocations, bytes) = since(before, counters(device));
     let each = |total: u64| total / u64::from(charged);
     let steps = BatchedSteps {
-        slots,
+        batching,
         prompt: ids.len(),
         step: elapsed / charged,
         counters: (
@@ -2010,9 +2117,37 @@ fn batched_steps(
     steps
 }
 
+/// How wide a batch is wrapped and how many of its slots are fed.
+///
+/// **The two are not the same question and B2's own table asked only the
+/// first.** A server that holds a batch open between requests has slots nobody
+/// is decoding through, and what those cost decides whether a batch can be left
+/// on — see `what_an_empty_seat_costs`.
+#[derive(Debug, Clone, Copy)]
+struct Batching {
+    slots: usize,
+    seats: usize,
+}
+
+impl Batching {
+    /// Every slot fed, which is what a batch sweep measures.
+    fn full(slots: usize) -> Self {
+        Self {
+            slots,
+            seats: slots,
+        }
+    }
+
+    /// One sequence in a wrap of `slots`, which is what a server holds when the
+    /// other requests have finished.
+    fn alone(slots: usize) -> Self {
+        Self { slots, seats: 1 }
+    }
+}
+
 /// One batched decode step, priced the way a single sequence's is.
 struct BatchedSteps {
-    slots: usize,
+    batching: Batching,
     prompt: usize,
     step: Duration,
     counters: (u64, u64, u64, u64),
@@ -2025,10 +2160,10 @@ impl BatchedSteps {
     /// decode step, a prefill and a chain of heads.
     fn measured(&self) -> Measured<'_> {
         let first = self.prompt + SETTLED;
+        let Batching { slots, seats } = self.batching;
         Measured {
             regime: format!(
-                "step over a batch of {}, {}-token prompts and {first} to {} keys",
-                self.slots,
+                "step over {seats} of {slots} slots, {}-token prompts and {first} to {} keys",
                 self.prompt,
                 first + CHARGED - 1
             ),
