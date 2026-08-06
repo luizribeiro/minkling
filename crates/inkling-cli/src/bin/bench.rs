@@ -42,7 +42,7 @@ use anyhow::{Context, Result, bail};
 use inkling_cli::args::Backend;
 use inkling_cli::kept::{DEFAULT_BOUND, Kept};
 use inkling_cli::{backend, config, session};
-use inkling_core::generate::{Picked, Proposer, Round};
+use inkling_core::generate::{Generator, Picked, Proposer, Round};
 use inkling_core::head::Tail;
 use inkling_core::model::Batched;
 use inkling_core::mtp::{CheckpointHeads, MtpProposer};
@@ -1130,19 +1130,92 @@ struct Amortised {
     gpu: Duration,
 }
 
-/// `slots` sequences prefilled one at a time and then decoded together, timed
-/// over the decode steps alone.
+/// `slots` sequences in slots of their own, prefilled and settled, as the thing
+/// that advances all of them one step.
 ///
 /// **The prompts are made distinct rather than copied**, because the routing is
 /// the prompt's: a batch of identical sequences routes every row of every step
 /// to the same six experts, which is the one distribution a grouped dispatch is
 /// least like the real one at. Each sequence's prompt is rotated by its own slot,
 /// so the sequences are the same length and not the same tokens.
-///
-/// The prefills are not timed. A prefill of any length already fills the machine
-/// — which is why this milestone batches the other regime — so what a batch is
-/// worth is the steps after them, and a mean that included N prefills would be a
-/// measurement of the prompts.
+struct Seated<'a> {
+    generator: Generator<'a>,
+    caches: Vec<ModelCache>,
+    pending: Vec<usize>,
+}
+
+impl<'a> Seated<'a> {
+    /// `slots` sequences prefilled one at a time and stepped [`SETTLED`] times
+    /// before whoever asked for them starts timing.
+    ///
+    /// The prefills are not timed by anyone. A prefill of any length already
+    /// fills the machine — which is why this engine batches the other regime —
+    /// so what a batch is worth is the steps after them, and a mean that
+    /// included N prefills would be a measurement of the prompts.
+    ///
+    /// **The settling steps are thrown away for the reason the warm generation
+    /// above the sweep is.** A width is a fresh wrap — a slot is buffers this
+    /// device has not allocated before — so the first steps of a width pay for
+    /// allocating its spans and its windows, which belongs to the wrap rather
+    /// than to the step. The device's own clock does not see it and the wall
+    /// does: unsettled, the batch of one read 25.9 ms against its own 16.4.
+    fn new(
+        weights: &'a CheckpointWeights<'_>,
+        config: &TextConfig,
+        ids: &[usize],
+        slots: usize,
+    ) -> Self {
+        let generator = weights.generator();
+        let want = Tail {
+            block: 1,
+            chained: false,
+            logits: false,
+        };
+        let mut caches: Vec<ModelCache> = (0..slots)
+            .map(|slot| ModelCache::in_slot(config, 0, slot))
+            .collect();
+        let pending: Vec<usize> = caches
+            .iter_mut()
+            .enumerate()
+            .map(|(slot, cache)| {
+                let mut own = ids.to_vec();
+                own.rotate_left(slot % ids.len());
+                generator.tailed(cache, &own, want, weights).picks[0]
+            })
+            .collect();
+
+        let mut seated = Self {
+            generator,
+            caches,
+            pending,
+        };
+        for _ in 0..SETTLED {
+            seated.step(weights);
+        }
+        seated
+    }
+
+    /// One step of the whole batch, each sequence fed the id its own last step
+    /// named.
+    fn step(&mut self, weights: &CheckpointWeights<'_>) {
+        let feeding: Vec<[usize; 1]> = self.pending.iter().map(|id| [*id]).collect();
+        let mut batch: Vec<Batched<'_>> = self
+            .caches
+            .iter_mut()
+            .zip(&feeding)
+            .map(|(cache, ids)| Batched { cache, ids })
+            .collect();
+        self.pending = self
+            .generator
+            .step_batch(&mut batch, weights)
+            .iter()
+            .map(Picked::last)
+            .collect();
+    }
+}
+
+/// `slots` sequences prefilled one at a time and then decoded together, timed
+/// over the decode steps alone.
 fn batched(
     weights: &CheckpointWeights<'_>,
     config: &TextConfig,
@@ -1150,57 +1223,12 @@ fn batched(
     slots: usize,
     budget: usize,
 ) -> Amortised {
-    let generator = weights.generator();
-    let prompts: Vec<Vec<usize>> = (0..slots)
-        .map(|slot| {
-            let mut own = ids.to_vec();
-            own.rotate_left(slot % ids.len());
-            own
-        })
-        .collect();
-    let mut caches: Vec<ModelCache> = (0..slots)
-        .map(|slot| ModelCache::in_slot(config, 0, slot))
-        .collect();
-
-    let want = Tail {
-        block: 1,
-        chained: false,
-        logits: false,
-    };
-    let mut pending: Vec<usize> = caches
-        .iter_mut()
-        .zip(&prompts)
-        .map(|(cache, prompt)| generator.tailed(cache, prompt, want, weights).picks[0])
-        .collect();
-
-    let step = |pending: &[usize], caches: &mut Vec<ModelCache>| -> Vec<usize> {
-        let feeding: Vec<[usize; 1]> = pending.iter().map(|id| [*id]).collect();
-        let mut batch: Vec<Batched<'_>> = caches
-            .iter_mut()
-            .zip(&feeding)
-            .map(|(cache, ids)| Batched { cache, ids })
-            .collect();
-        generator
-            .step_batch(&mut batch, weights)
-            .iter()
-            .map(Picked::last)
-            .collect()
-    };
-
-    // **Thrown away, for the reason the warm generation above the sweep is.** A
-    // width is a fresh wrap — a slot is buffers this device has not allocated
-    // before — so the first steps of a width pay for allocating its spans and
-    // its windows, which belongs to the wrap rather than to the step. The
-    // device's own clock does not see it and the wall does: unsettled, the batch
-    // of one read 25.9 ms against its own 16.4.
-    for _ in 0..SETTLED {
-        pending = step(&pending, &mut caches);
-    }
+    let mut seated = Seated::new(weights, config, ids, slots);
 
     profile::take();
     let started = Instant::now();
     for _ in 0..budget {
-        pending = step(&pending, &mut caches);
+        seated.step(weights);
     }
     let wall = started.elapsed();
     let charged = u32::try_from(budget.max(1)).unwrap_or(1);
