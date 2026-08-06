@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **715 of the 794 tests, no
+`just test` is the one to run while iterating: **716 of the 795 tests, no
 checkpoint, thirteen seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -32,9 +32,9 @@ a crate's tests in one process: opening a Metal device costs a second, so the 25
 kernel tests are 13.6 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 794 against a
+`just test-full` is what has to pass at the ends of a series: **all 795 against a
 real checkpoint, twenty minutes and forty more for the measurements after it.**
-The 715 the gated tier runs and the 79 the timing tier does. The 57 gated tests — the 41
+The 716 the gated tier runs and the 79 the timing tier does. The 57 gated tests — the 41
 above and sixteen of the measurements below, which need weights as well as a
 clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -1210,6 +1210,238 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## The dispatches a slot kept, and which of them was the gap
+
+**A slot kept five dispatches a layer to itself, and one of the five was the
+whole of the gap.** B1 left the batch within 1.32× of what N rows through one
+sequence cost and named the 210 dispatches a slot keeps as the reason. This
+milestone takes one of the five — the attention step — and gives it a slot index
+per *row* instead of a call per slot, so N sequences over N spans are one
+dispatch. **That is 42 of the 210, and it closes 53% of the gap.**
+
+    N     step      a token   device   a token   tokens/s   against N=1
+                                        (device)              (device)
+    1    19.65 ms   19.65 ms  15.28 ms  15.28 ms     50.9      1.00x
+    2    25.79      12.90     24.83     12.41        77.5      1.23x
+    4    38.43       9.61     37.05      9.26       104.1      1.65x
+    8    69.86       8.73     68.14      8.52       114.5      1.79x
+   16   128.24       8.02    124.81      7.80       124.8      1.96x
+   32   253.30       7.92    241.12      7.54       126.3      2.03x
+
+**The ratio is taken on the device column and not on the wall, and that is a
+correction to how B1 read its own table.** B1 reported 1.78× from tokens a
+second, which divides a wall; in this sitting B1's *own binary* reads batch 1 at
+19.65 ms of wall against the 16.22 ms its section quotes, while
+its device row reads 15.287 against 15.25. The device column is the same
+instrument between sittings to a quarter of a percent and the wall at batch 1 is
+not, because batch 1 is the one width where a step's host-side encode is a
+quarter of what a user waits. So: **1.75× to 2.03× on the device, measured
+against B1 in one sitting**, and 109.3 to 126.3 tokens a second on the wall in
+that same sitting.
+
+    N     B1's device   this   change    seven pairs, alternating
+    1      15.287 ms   15.278   -0.1%    ranges across, 4 of 7   no claim
+    2      26.350      24.826   -5.8%    ranges apart, 7 of 7
+    4      40.897      37.047   -9.4%    ranges apart, 7 of 7
+    8      76.864      68.140  -11.3%    ranges apart, 7 of 7
+   16     143.547     124.810  -13.1%    ranges apart, 7 of 7
+   32     279.015     241.120  -13.6%    ranges apart, 7 of 7
+
+`just bench cd73438 . batch --batch 32` is the sitting, and a null pair of the
+same sweep — the same binary on both arms — reads the device column to within
+0.1% at every width including batch 1.
+
+### What a slot is a row of, which is where the dispatch went
+
+**A kernel binds what it reads, so N spans in N allocations is N dispatches
+however the rows are indexed.** That, and not anything about the work, is what
+made the attention step per slot: it reads no weight, the five projections either
+side of it are already read once for the whole batch, and what it does to
+sequence A's rows is what it does to B's. Two things had to move.
+
+**The spans of a layer are one allocation**, laid `[kv_heads, slots, capacity,
+head_dim]`, so a slot is a row offset. What that costs is a capacity shared
+between the slots — a slot that outgrew its own would move every slot behind it,
+so they grow together and a batch is allocated its longest sequence's capacity in
+every slot. The capacities are powers of two, which bounds that at under a
+doubling, and the footprint stays exactly `slots` times one sequence's.
+
+**And the shape names no sequence at all.** What used to be `keys`, `q_offset`
+and `first` in the dispatch's shape struct is a table the kernel indexes by query
+row: three numbers a row — where that sequence's keys start in the binding, how
+many it has, and where the row sits among them. A batch's sequences may be at
+different lengths and feed different numbers of rows because the call no longer
+*has* a length; each of its rows does.
+
+    dispatches      B1     this        barriers      B1    this
+      batch 1      876      876         batch 1     617     617
+      batch 2     1086     1044         batch 2     781     739
+      batch 4     1546     1420         batch 4    1111     985
+
+The attention step is 42 dispatches — one a layer — at batch 1, 2 and 4 where it
+was 42, 84 and 168, which
+`the_barriers_a_batched_step_encodes_are_the_ones_its_dependencies_need` now
+asserts per entry rather than in a total: a step that went back to one a slot
+would otherwise still satisfy a count that a convolution had meanwhile given up.
+**A slot costs four dispatches a layer now**, and the same test holds each of the
+four to its own count.
+
+### Why it was worth 37.9 ms, which is not the dispatches
+
+**1302 dispatches came out of a batch-32 step and they are not what fell.** A
+dispatch's own cost on the device is 4.15 microseconds — what the fusion in "The
+three pairs a decode step had left" measured, and what the reduction sweep's 4.4
+agrees with — so 1302 of them are 5.4 ms of the 37.9 the device column lost. The
+other 32.5 is the grid.
+
+An attention dispatch is a threadgroup to each query row of each head, so a
+single sequence's decode step is **32 of them** where `WANTED_GROUPS` says the
+machine wants 2048 — and a batch of 32 made 32 such dispatches. It is now **one
+of 1024**. Nothing about the arithmetic changed and no key is read fewer times;
+what changed is that the work is offered to the machine at once.
+
+**And wherever the span has tiles to cut, it also takes the fold out.**
+`splits_for` cuts a span exactly where the grid is short of the machine, which is
+what a narrow per-slot call is and what a call of 1024 threadgroups is not — so
+at any context long enough to be cut, 32 narrow calls each pay a second dispatch
+to fold their partials back and one wide call pays none. How much of the 32.5 ms
+that is rather than the walk itself is not separated here; a batched per-kernel
+table would separate it and this milestone did not take one.
+
+**This is the finding to carry forward, and it is not the one B1 predicted.** B1
+read the gap as the dispatch count. The count was the symptom: what a per-slot
+dispatch costs is not its launch but the machine it leaves idle, and that is a
+property of how narrow the dispatch is rather than of how many there are.
+
+### How close to the ceiling this got
+
+The ceiling is B1's, re-measured in this sitting so that the two columns are one
+instrument — a prefill of N rows is N rows through *one* sequence, so it pays
+what N rows cost the model and none of what N *sequences* cost the scheduler:
+
+    rows    N rows, one sequence    N rows, N sequences    batched / alone
+                                                            B1      this
+      1          13.93 ms                15.28 ms          1.10x    1.10x
+      2          22.40                   24.83             1.18     1.11
+      4          33.24                   37.05             1.23     1.11
+      8          59.93                   68.14             1.28     1.14
+     16         108.32                  124.81             1.33     1.15
+     32         207.64                  241.12             1.34     1.16
+
+**1.34× to 1.16× at the widest, which is 53% of the excess.** At 32 sequences the
+batch was 71.4 ms over the floor and is now 33.5; at 16 it was 35.2 and is now
+16.5 — the same 53% at both. The 1.10× at batch 1 is not a slot cost and never
+was: a decode step's one row attends over the prompt's keys and the steps behind
+it where a one-row prefill attends over one key, which is what makes this column
+a floor rather than an equal comparison.
+
+Fitted through the device column at N = 1 and N = 32, a step is **7.99 ms read
+once between the sequences and 7.29 ms a sequence**, against B1's 6.75 and 8.50.
+It predicts 37.13 ms at N = 4 against 37.05 measured and 124.55 at N = 16 against
+124.81. Of that 7.29, **6.49 ms is what a row costs the model** — 207.64 over 32
+rows through one sequence — so what is left to the scheduler is **0.80 ms a
+sequence, where B1 left 2.01**.
+
+### What is left, priced
+
+**0.80 ms a sequence, and the four dispatches a layer that are still a slot's
+own.** At batch 32 that is 24.7 ms of a 241 ms step, and the column above says
+reaching all of it is the floor rather than a target — the model's own per-row
+cost falls only 2.09× from one row to sixteen, for the reason B1 gave and this
+milestone does not touch: three quarters of the 5.9 GB a step reads is routed
+experts, sixteen tokens draw about 80 distinct ones of 256, and only the quarter
+every token reads all of amortises.
+
+What is left per slot is the key and value convolutions as one paired dispatch,
+the two head norms as one, and the two convolutions on the layer's residual
+paths. **The same remedy fits all four and the same arithmetic says what it would
+buy.** Their dispatch count is 168 a slot against the step's 42, so on B1's
+reading they are four times the prize; on the reading this milestone establishes
+they are worth what their grids are short of the machine by, and a residual
+convolution at Inkling's width is 64 threadgroups where the attention step was
+32. Nothing here measures them apart, and that is the next thing to measure
+rather than the next thing to build: a batched per-kernel table would say which
+of the four owns the 0.80 ms, and this milestone did not take one.
+
+**Why the convolutions are more work than the step was.** A slot's windows are
+double-buffered and its two buffers swap per call, so a shared allocation needs a
+read base and a write base per row rather than one offset; and a convolution's
+grid is its rows *plus the window it leaves behind*, which is per sequence rather
+than per row — so the thread-to-row map stops being a divide. That is a kernel
+change to `short_conv` and `short_conv_pair`, whose bit-exactness the committed
+sconv fixtures pin, for a prize nothing has yet sized.
+
+### What did not move
+
+**No token moved under any word.** `just test-full` is green — 716 gated and 79
+timing — the recorded continuation `[656, 13, 623, 180069, 86333, 60500, 220,
+23]` is what the engine generates, `--backend cpu` is unmoved, and `production`
+is still 448 of 448 against `reference`.
+
+**Batch 1 is unmoved**, which is the claim this path lives on: its device row
+reads 15.287 → 15.278 ms, -0.1%, ranges across in 4 of 7 pairs, no claim. A batch
+of one lays its one sequence's rows exactly where a call handed the span whole
+lays them — `span` zero, `keys` the whole span, `position` the offset plus the
+row — so every expression in the kernel collapses to the one it was.
+
+**And speculation is unmoved, digit for digit.** Three pairs on the packed heads,
+`k = 3` still the best depth, acceptance identical on both arms:
+
+    84.85 / 86.96-78.26 / 85-65-55 / 82.35-64.71-52.94-47.06
+
+with 1.829, 2.560, 2.909 and 3.368 tokens a round, and `k = 3` at 1.106 against
+`k = 2`'s 1.091. Every row of the sitting reads no claim, device and wall. The first sitting of it read `k = 3`'s *wall* 0.8% slower with its device
+row unmoved, which is encode: the table of three numbers a row is a few dozen
+bytes and a decode step was building 42 of them, so what it cost was not the
+bytes but two allocations a layer a step. The layer holds the table and refills
+it now, the way it holds the band and the spans.
+
+**Memory is still 30.8 MiB a sequence, exactly linear in the slots**, and
+`a_slot_costs_a_span_and_four_windows_in_every_layer` still holds the device's own
+accounting to exactly `N` times one.
+
+### The tests, and the one the review found missing
+
+The four contamination scales B1 built are unchanged and still exact, and the
+layer-level case is still mutation-tested: pinning the residual convolution to
+slot 0 fails it at the first sequence of the first ordering. Two more mutations
+are now checked, on the thing this milestone added — pinning a row's span base to
+slot 0, and laying a row's position by its place in the call rather than by where
+it is in its sequence — and each fails both the attention-level case and the
+layer-level one.
+
+The attention-level case is new and is the one the per-row index lives or dies
+by: three sequences of different lengths, in three slots, one of them feeding two
+query rows a step where the others feed one, through **one** dispatch, against
+each of the three run alone. What it replaces was a case about a single
+sequence's *placement* in a wider buffer, which the dispatch can no longer
+express — a batched step covers every row of the call, so there are no longer
+rows in it that belong to nobody.
+
+**And the block needed a case of its own, which the code-reviewer found.** The
+entry behind `production` is refused a call carrying more than one sequence — a
+block stages one tile of keys for the 64 query rows sharing it, so rows attending
+over different spans cannot be in one — which means the three-sequence case
+structurally cannot drive it, and every other case that runs it hands the span
+over whole, where a slot's keys start at row zero. So the one entry with a
+per-row slot index had no case that ever gave it a nonzero one.
+`a_block_reads_the_slot_its_rows_name` runs one sequence in the last of four
+slots against the same sequence in the only slot of one, bit for bit; pinning the
+block's base to row zero fails it.
+
+### What this leaves
+
+**Static still, and prefill still one sequence at a time**, for the reasons B1
+gave: what continuous scheduling would be worth is bounded above by the curve,
+and a prompt of any length already fills the machine.
+
+**The MTP chain is still not batched**, and this milestone makes the note B1 left
+sharper rather than settling it: a `k = 3` verify at batch 8 is 32 rows, which is
+exactly the matmul's MMA floor — but it is also 8 sequences, and the attention
+block is now refused a call carrying more than one. So a batch that speculates
+would reach the matmul's fast path and not the attention step's, and what that
+costs is not measured here.
+
 ## One weight read, many tokens — and what that turns out to be worth
 
 **A decode step reads 5.9 GB of weights to produce one token. At batch N the
@@ -1356,9 +1588,11 @@ attention dispatch — so it pays whatever N rows cost the model and none of wha
 Two things follow, and they point in different directions.
 
 **The batch is within a third of the best any batching could do here**, and the
-gap is the dispatches a slot keeps to itself: five a layer — the convolution
-pair, the head-norm pair and the attention step — which is 210 more dispatches a
-slot, asserted rather than described. (What a slot adds is exactly that; what the
+gap is the dispatches a slot keeps to itself: five a layer — the key and value
+convolutions as one paired dispatch, the two head norms as one, the attention
+step, and the two convolutions on the layer's residual paths — which is 210 more
+dispatches a slot, asserted rather than described. (What a slot adds is exactly
+that; what the
 *rows* add beside it is one dispatch to each of the 40 routed layers from four
 rows up, which is the grouped block reading its own shape off a taller call and
 is the batch working rather than costing.) The remedy is a step and a convolution that take a slot index per
