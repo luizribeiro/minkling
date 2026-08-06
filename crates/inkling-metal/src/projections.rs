@@ -539,6 +539,7 @@ impl<'a> LayerProjections<'a> {
             Normalising {
                 norm: &self.q_norm,
                 x: &mut q,
+                reading: norm::Reading::whole(queries),
                 scale: step.q_taus,
                 landing: Landing {
                     out: &mut headed,
@@ -550,6 +551,7 @@ impl<'a> LayerProjections<'a> {
             Normalising {
                 norm: &self.k_norm,
                 x: &mut k,
+                reading: norm::Reading::whole(queries),
                 scale: None,
                 landing: keys,
             },

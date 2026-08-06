@@ -256,7 +256,7 @@ impl<'a> LayerNorm<'a> {
         self.encoding(
             batch,
             x,
-            from,
+            Reading { from, rows },
             None,
             Landing {
                 out: &mut out,
@@ -288,7 +288,28 @@ impl<'a> LayerNorm<'a> {
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
-        self.encoding(batch, x, 0, scale, landing)
+        let rows = self.rows(x.len() / landing.groups.max(1));
+        self.encoding(batch, x, Reading { from: 0, rows }, scale, landing)
+    }
+
+    /// The same, over a run of the rows a dispatch left rather than all of them.
+    ///
+    /// **A run because a batch's rows are one buffer.** The projections of a
+    /// batched step produce every sequence's rows together, and a head norm
+    /// writes into the span of the sequence whose rows it is norming — so what
+    /// a call reads is the run that is its own. A sequence advancing alone
+    /// reads the whole call, which is [`Reading::whole`] and is what
+    /// [`LayerNorm::encode_over`] passes.
+    pub fn encode_rows(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        reading: Reading,
+        scale: Option<&[f32]>,
+        landing: Landing<'_>,
+    ) -> Result<(), MetalError> {
+        let _timed = profile::scope(Op::Encode);
+        self.encoding(batch, x, reading, scale, landing)
     }
 
     /// Threads the threadgroup over one group holds: whole simdgroups enough to
@@ -334,11 +355,11 @@ impl<'a> LayerNorm<'a> {
         &self,
         batch: &mut Batch<'_>,
         x: &mut Buffer<f32>,
-        from: usize,
+        reading: Reading,
         scale: Option<&[f32]>,
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
-        let (call, scale) = self.described(x.len(), from, scale, &landing);
+        let (call, scale) = self.described(x.len(), reading, scale, &landing);
         let mut shape = self.device.inline(&call.fields)?;
         let mut weight = self.weight.borrow_mut();
         let mut scales = self.device.inline(&scale)?;
@@ -371,10 +392,11 @@ impl<'a> LayerNorm<'a> {
     fn described<'s>(
         &self,
         values: usize,
-        from: usize,
+        reading: Reading,
         scale: Option<&'s [f32]>,
         landing: &Landing<'_>,
     ) -> (Call, Cow<'s, [f32]>) {
+        let Reading { from, rows } = reading;
         assert!(landing.groups > 0, "a row has groups");
         assert_eq!(
             values % landing.groups,
@@ -382,7 +404,11 @@ impl<'a> LayerNorm<'a> {
             "{values} values are not {} groups",
             landing.groups
         );
-        let rows = self.rows(values / landing.groups) - from;
+        assert!(
+            from + rows <= self.rows(values / landing.groups),
+            "{rows} rows at {from} of a call holding {}",
+            self.rows(values / landing.groups)
+        );
         let scale = match scale {
             Some(scale) => {
                 assert_eq!(scale.len(), rows, "a scale a row");
@@ -412,6 +438,29 @@ impl<'a> LayerNorm<'a> {
     }
 }
 
+/// Which rows of what a dispatch left on the device a norm reads.
+///
+/// **A run rather than a buffer because a batch's rows are one buffer**, for
+/// the reason a convolution's [`Reading`](crate::sconv::Reading) is one. The
+/// two are separate types because the two kernels index a row differently —
+/// this one by group and that one by channel — and one type over both would be
+/// a field each of them has to be told to ignore.
+#[derive(Debug, Clone, Copy)]
+pub struct Reading {
+    /// The row of `x` this call's first row is.
+    pub from: usize,
+    /// How many rows it takes from there.
+    pub rows: usize,
+}
+
+impl Reading {
+    /// Every row of what the call was handed, which is what a sequence
+    /// advancing alone reads.
+    pub fn whole(rows: usize) -> Self {
+        Self { from: 0, rows }
+    }
+}
+
 /// One norm's call as a paired dispatch describes it.
 struct Call {
     fields: [u32; FIELDS],
@@ -429,6 +478,8 @@ struct Call {
 pub struct Normalising<'a> {
     pub norm: &'a LayerNorm<'a>,
     pub x: &'a mut Buffer<f32>,
+    /// Which rows of `x` this half reads — see [`LayerNorm::encode_rows`].
+    pub reading: Reading,
     /// Log scaling's `tau`, one value per row. `None` is a row of ones.
     pub scale: Option<&'a [f32]>,
     pub landing: Landing<'a>,
@@ -462,24 +513,37 @@ pub fn encode_pair(
     let Normalising {
         norm: one,
         x: first_x,
+        reading: first_reading,
         scale: first_scale,
         landing: first_landing,
     } = first;
     let Normalising {
         norm: other,
         x: second_x,
+        reading: second_reading,
         scale: second_scale,
         landing: second_landing,
     } = second;
 
     if one.threads != other.threads {
-        one.encoding(batch, first_x, 0, first_scale, first_landing)?;
-        return other.encoding(batch, second_x, 0, second_scale, second_landing);
+        one.encoding(batch, first_x, first_reading, first_scale, first_landing)?;
+        return other.encoding(
+            batch,
+            second_x,
+            second_reading,
+            second_scale,
+            second_landing,
+        );
     }
 
-    let (first_call, first_scale) = one.described(first_x.len(), 0, first_scale, &first_landing);
-    let (second_call, second_scale) =
-        other.described(second_x.len(), 0, second_scale, &second_landing);
+    let (first_call, first_scale) =
+        one.described(first_x.len(), first_reading, first_scale, &first_landing);
+    let (second_call, second_scale) = other.described(
+        second_x.len(),
+        second_reading,
+        second_scale,
+        &second_landing,
+    );
     let device = one.device;
     let mut first_shape = device.inline(&first_call.fields)?;
     let mut second_shape = device.inline(&second_call.fields)?;
@@ -927,6 +991,67 @@ mod tests {
                 whole[(ROWS - last) * WIDTH..],
                 "the last {last} rows"
             );
+        }
+    }
+
+    /// **A norm over a run of a call's rows answers what the whole call answers
+    /// for those rows**, and writes only its own.
+    ///
+    /// This is what a batched step needs of the head norm: one `q_proj`
+    /// produces every sequence's rows into one buffer, and the norm in front of
+    /// a sequence's attention step reads the run that is its own. The suffix
+    /// above is the same indexing with the run pinned to the end, which is what
+    /// the back of the model wants; neither end is where a batch's middle
+    /// sequence sits.
+    #[test]
+    fn a_norm_over_a_run_of_rows_answers_what_the_whole_call_answers_for_them() {
+        let Some(device) = device() else { return };
+        const WIDTH: usize = 128;
+        const ROWS: usize = 5;
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let weight: Vec<f32> = (0..WIDTH).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+        let layer = LayerNorm::new(&device, &norm, &weight, 1e-6).expect("the weight uploads");
+        let rows: Vec<f32> = (0..ROWS * WIDTH)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) * (1 + i / WIDTH) as f32)
+            .collect();
+        let whole = layer.forward(&rows).expect("the dispatch completes");
+
+        for from in 0..ROWS {
+            for taken in 1..=ROWS - from {
+                let mut x = device.buffer(&rows).expect("the rows upload");
+                let mut out = device
+                    .zeroed::<f32>(ROWS * WIDTH)
+                    .expect("the landing allocates");
+                let mut batch = device.batch().expect("a command buffer opens");
+                layer
+                    .encode_rows(
+                        &mut batch,
+                        &mut x,
+                        Reading { from, rows: taken },
+                        None,
+                        Landing {
+                            out: &mut out,
+                            groups: 1,
+                            stride: ROWS,
+                            base: from,
+                        },
+                    )
+                    .expect("the dispatch encodes");
+                batch.wait().expect("the dispatch completes");
+
+                let out = out.to_vec();
+                assert_eq!(
+                    out[from * WIDTH..(from + taken) * WIDTH],
+                    whole[from * WIDTH..(from + taken) * WIDTH],
+                    "{taken} rows from {from}"
+                );
+                for at in (0..ROWS).filter(|at| !(from..from + taken).contains(at)) {
+                    assert!(
+                        out[at * WIDTH..][..WIDTH].iter().all(|value| *value == 0.0),
+                        "row {at} was written by a call over {taken} rows from {from}"
+                    );
+                }
+            }
         }
     }
 
@@ -1482,6 +1607,7 @@ mod tests {
             Normalising {
                 norm: one,
                 x: &mut first_x,
+                reading: Reading::whole(x.len() / (groups * one.width())),
                 scale,
                 landing: Landing {
                     out: &mut first_out,
@@ -1493,6 +1619,7 @@ mod tests {
             Normalising {
                 norm: other,
                 x: &mut second_x,
+                reading: Reading::whole(y.len() / (other_groups * other.width())),
                 scale: other_scale,
                 landing: Landing {
                     out: &mut second_out,
