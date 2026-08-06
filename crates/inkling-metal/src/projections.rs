@@ -69,7 +69,7 @@ use crate::kernel::{Batch, Submitted};
 use crate::matmul::{MatmulError, Multiply, PackedMatmul, PackedProjection, Pending, together};
 use crate::norm::{self, LayerNorm, Normalising, RmsNorm};
 use crate::numerics::Numerics;
-use crate::sconv::{self, Convolving, LayerConv, ShortConvolution};
+use crate::sconv::{self, Convolving, LayerConv, Reading, ShortConvolution};
 use crate::swiglu::SwiGlu;
 use crate::tail::ModelTail;
 
@@ -493,6 +493,7 @@ impl<'a> LayerProjections<'a> {
             Convolving {
                 conv: &self.k_sconv,
                 x: &mut k,
+                reading: Reading::whole(queries),
                 carried: None,
                 scale: 1.0,
                 landing: Landing {
@@ -505,6 +506,7 @@ impl<'a> LayerProjections<'a> {
             Convolving {
                 conv: &self.v_sconv,
                 x: &mut v,
+                reading: Reading::whole(queries),
                 carried: None,
                 scale: 1.0,
                 landing: values,

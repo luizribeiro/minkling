@@ -53,7 +53,7 @@ const ENTRY: &str = "short_conv";
 const PAIRED_ENTRY: &str = "short_conv_pair";
 
 /// How many `uint`s the kernel's `Shape` struct declares.
-const FIELDS: usize = 8;
+const FIELDS: usize = 9;
 
 /// Threads one threadgroup of a dispatch holds.
 ///
@@ -351,8 +351,36 @@ impl<'a> LayerConv<'a> {
         scale: f32,
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
+        self.encode_rows(
+            batch,
+            Reading::whole(self.rows(x.len())),
+            x,
+            carried,
+            scale,
+            landing,
+        )
+    }
+
+    /// The same convolution over `reading`'s rows of what a dispatch left on
+    /// the device rather than over all of them.
+    ///
+    /// **A range because a batch's rows are one buffer.** N sequences advance
+    /// through one set of projections, so what a convolution carrying one
+    /// sequence's window has to read is that sequence's rows out of what they
+    /// all produced — and the residual beside them is the same rows of the same
+    /// call. A sequence advancing alone reads the whole of what it was handed,
+    /// which is [`Reading::whole`] and is the indexing this always did.
+    pub fn encode_rows(
+        &self,
+        batch: &mut Batch<'_>,
+        reading: Reading,
+        x: &mut Buffer<f32>,
+        carried: Option<&mut Buffer<f32>>,
+        scale: f32,
+        landing: Landing<'_>,
+    ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
-        let call = self.described(x.len(), carried.as_deref(), &landing);
+        let call = self.described(reading, x.len(), carried.as_deref(), &landing);
         let mut shape = self.device.inline(&call.fields)?;
         let scaled_by = [scale];
         let mut scaling = self.device.inline(&scaled_by)?;
@@ -397,11 +425,12 @@ impl<'a> LayerConv<'a> {
     /// struct is one that could drift from the kernel's own.
     fn described(
         &self,
+        reading: Reading,
         values: usize,
         carried: Option<&Buffer<f32>>,
         landing: &Landing<'_>,
     ) -> Call {
-        let rows = self.rows(values);
+        let Reading { from, rows } = reading;
         assert!(landing.groups > 0, "a row has groups");
         assert_eq!(
             self.channels % landing.groups,
@@ -411,6 +440,11 @@ impl<'a> LayerConv<'a> {
             landing.groups
         );
         landing.fits(rows, self.channels / landing.groups);
+        assert!(
+            from + rows <= self.rows(values),
+            "{rows} rows at {from} of a call holding {}",
+            self.rows(values)
+        );
 
         if let Some(carried) = carried {
             assert_eq!(
@@ -429,6 +463,7 @@ impl<'a> LayerConv<'a> {
                 extent(landing.stride, "the rows a group has room for"),
                 extent(landing.base, "where a call's rows start"),
                 carried.is_some() as u32,
+                extent(from, "where a call's rows are read from"),
             ],
             rows,
             // A thread to each channel of each timestep, and one more timestep's
@@ -442,10 +477,10 @@ impl<'a> LayerConv<'a> {
             // shape are in the command buffer rather than in memory, so they are
             // not traffic.
             moves: size_of::<f32>()
-                * (2 * values
+                * (2 * rows * self.channels
                     + self.channels * self.taps
                     + 2 * self.held.get().floats()
-                    + carried.map_or(0, |_| values)),
+                    + carried.map_or(0, |_| rows * self.channels)),
         }
     }
 
@@ -500,9 +535,35 @@ struct Call {
 pub struct Convolving<'a> {
     pub conv: &'a LayerConv<'a>,
     pub x: &'a mut Buffer<f32>,
+    /// Which rows of `x` and of the residual beside it this half reads — see
+    /// [`LayerConv::encode_rows`].
+    pub reading: Reading,
     pub carried: Option<&'a mut Buffer<f32>>,
     pub scale: f32,
     pub landing: Landing<'a>,
+}
+
+/// Which rows of what a dispatch left on the device a convolution reads.
+///
+/// **A range rather than a buffer because a batch's rows are one buffer.** The
+/// projections of a batched step produce every sequence's rows together, and a
+/// convolution carries one sequence's window — so what it reads is a run of
+/// those rows and not all of them. A sequence advancing alone reads the whole
+/// call, which is [`Reading::whole`].
+#[derive(Debug, Clone, Copy)]
+pub struct Reading {
+    /// The row of `x` this call's first row is.
+    pub from: usize,
+    /// How many rows it takes from there.
+    pub rows: usize,
+}
+
+impl Reading {
+    /// Every row of what the call was handed, which is what a sequence
+    /// advancing alone reads.
+    pub fn whole(rows: usize) -> Self {
+        Self { from: 0, rows }
+    }
 }
 
 /// **Two convolutions as one dispatch.**
@@ -532,6 +593,7 @@ pub fn encode_pair(
     let Convolving {
         conv: one,
         x: first_x,
+        reading: first_reading,
         carried: first_carried,
         scale: first_scale,
         landing: first_landing,
@@ -539,13 +601,24 @@ pub fn encode_pair(
     let Convolving {
         conv: other,
         x: second_x,
+        reading: second_reading,
         carried: second_carried,
         scale: second_scale,
         landing: second_landing,
     } = second;
 
-    let first_call = one.described(first_x.len(), first_carried.as_deref(), &first_landing);
-    let second_call = other.described(second_x.len(), second_carried.as_deref(), &second_landing);
+    let first_call = one.described(
+        first_reading,
+        first_x.len(),
+        first_carried.as_deref(),
+        &first_landing,
+    );
+    let second_call = other.described(
+        second_reading,
+        second_x.len(),
+        second_carried.as_deref(),
+        &second_landing,
+    );
     let device = one.device;
     let mut first_shape = device.inline(&first_call.fields)?;
     let mut second_shape = device.inline(&second_call.fields)?;
@@ -615,6 +688,7 @@ struct Shape {
     uint stride;
     uint base;
     uint carried;
+    uint from;
 };
 
 /// One channel of one timestep of `window ++ scale * x`, which is the padded
@@ -631,6 +705,11 @@ struct Shape {
 /// was given, and a previous call was given rows already scaled — it is scaled
 /// where a value *enters* the sequence, once, so that the window this leaves
 /// behind is the same window `ConvState` would hold on the other side.
+///
+/// **`from` is where this call's rows start in `x`**, which is what lets a
+/// sequence of a batch be convolved out of the buffer every sequence's rows are
+/// in. It is zero for a call that was handed its own rows, and then this is the
+/// indexing it always was.
 inline float padded(
     device const float *x,
     device const float *window,
@@ -642,7 +721,7 @@ inline float padded(
     if (at < shape.held) {
         return window[at * shape.channels + c];
     }
-    return scale * x[(at - shape.held) * shape.channels + c];
+    return scale * x[(shape.from + at - shape.held) * shape.channels + c];
 }
 
 /// A depthwise causal convolution with a residual add, one thread to a channel
@@ -712,9 +791,9 @@ static void convolve(
         acc += taps[k] * padded(x, window, shape, scale, t + slack + k, c);
     }
 
-    acc += scale * x[t * shape.channels + c];
+    acc += scale * x[(shape.from + t) * shape.channels + c];
     if (shape.carried) {
-        acc += carried[t * shape.channels + c];
+        acc += carried[(shape.from + t) * shape.channels + c];
     }
 
     // Where the row lands, which for the value's convolution is the span the
@@ -1057,6 +1136,68 @@ mod tests {
         }
     }
 
+    /// **A call over a run of a buffer's rows is the call over those rows
+    /// handed alone**, bit for bit, and leaves the same window behind.
+    ///
+    /// This is what a batched step needs of the convolution: one set of
+    /// projections produces every sequence's rows into one buffer, and the
+    /// window a sequence carries is convolved out of the run that is its own.
+    /// A range that read the wrong rows would still convolve, still be causal
+    /// and still leave a window — so the rows in front of the run and behind it
+    /// are made different values rather than padding, and the answer is
+    /// compared exactly.
+    ///
+    /// The residual is carried, because it is indexed by the same row and a
+    /// range applied to one and not the other is a layer adding another
+    /// sequence's state to its own.
+    #[test]
+    fn a_convolution_over_a_run_of_rows_answers_what_that_run_alone_answers() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let fx = Synthetic::load();
+        let layer = fx.wrapped(&device, &conv, &fx.weight);
+        let rows = fx.rows();
+        let ahead = fx.sequence(&fx.input, 0);
+        let run = fx.sequence(&fx.input, 1);
+        let behind = fx.sequence(&fx.input, 2 % fx.batch);
+        assert_ne!(ahead, run, "rows a wrong range could be read from");
+
+        let alone = |x: &[f32], residual: &[f32], from: usize| {
+            layer.restart();
+            let mut x = device.buffer(x).expect("the rows upload");
+            let mut carried = device.buffer(residual).expect("the residual uploads");
+            let mut out = device
+                .zeroed::<f32>(fx.rows() * fx.channels)
+                .expect("the landing allocates");
+            let mut batch = device.batch().expect("a command buffer opens");
+            layer
+                .encode_rows(
+                    &mut batch,
+                    Reading { from, rows },
+                    &mut x,
+                    Some(&mut carried),
+                    1.0,
+                    Landing {
+                        out: &mut out,
+                        groups: 1,
+                        stride: rows,
+                        base: 0,
+                    },
+                )
+                .expect("the dispatch encodes");
+            batch.wait().expect("the batch completes");
+            (out.to_vec(), layer.window())
+        };
+
+        let batched: Vec<f32> = [ahead, run, behind].concat();
+        let residual: Vec<f32> = [behind, ahead, run].concat();
+        assert_eq!(
+            alone(&batched, &residual, rows),
+            alone(run, ahead, 0),
+            "the middle run of three against the same run alone"
+        );
+    }
+
     /// **A paired dispatch answers what the two dispatches it replaces answer,
     /// exactly, and leaves the same two windows behind** — which is the whole of
     /// what a merge is allowed to be, and here the window is half of it: a
@@ -1147,6 +1288,7 @@ mod tests {
             Convolving {
                 conv: one,
                 x: &mut first_x,
+                reading: Reading::whole(rows),
                 carried: Some(&mut residual),
                 scale: 1.5,
                 landing: Landing {
@@ -1159,6 +1301,7 @@ mod tests {
             Convolving {
                 conv: other,
                 x: &mut second_x,
+                reading: Reading::whole(rows),
                 carried: None,
                 scale: 1.0,
                 landing: Landing {
@@ -1336,7 +1479,10 @@ mod tests {
         layer.restart();
         let want = layer.forward(sequence).expect("the dispatch completes");
 
-        let without = BODY.replace("acc += scale * x[t * shape.channels + c];", "");
+        let without = BODY.replace(
+            "acc += scale * x[(shape.from + t) * shape.channels + c];",
+            "",
+        );
         assert_ne!(without, BODY, "the mutation changed nothing");
         let mutant = ShortConvolution::from_source(&device, &without).expect("the mutant compiles");
         let dropped = fx.wrapped(&device, &mutant, &fx.weight);
