@@ -1191,6 +1191,13 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     admit,
                     tokens,
                 };
+                // **[`WARM`] runs thrown away.** A wall this reports is what a
+                // request waits, so it is the one figure here that cannot be
+                // read off the device's own clock — and the host side of a
+                // fresh wrap takes three runs to settle.
+                for _ in 0..WARM {
+                    joined(&engine, 0, Admitting::Continuously);
+                }
                 for held in occupancies(slots) {
                     for policy in [Admitting::Continuously, Admitting::InBatches] {
                         // At an idle engine the two policies are the same run,
@@ -1202,10 +1209,10 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                         let run = joined(&engine, held, policy);
                         let row = format!("{}{held}", policy.named());
                         eprintln!(
-                            "  {held} decoding, {}: first token in {:.0?} over {} steps, \
+                            "  {held} decoding, {}: first token in {:.0} ms over {} steps, \
                              {:.2?} of device{}",
                             policy.named(),
-                            run.ttft,
+                            millis(run.ttft),
                             run.steps,
                             run.gpu,
                             match (run.settled, run.mixed) {
@@ -1254,6 +1261,10 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     admit,
                     tokens,
                 };
+                // Thrown away, for the reason the joining arm's are.
+                for _ in 0..WARM {
+                    joined(&engine, 0, Admitting::Continuously);
+                }
                 for policy in [Admitting::Continuously, Admitting::InBatches] {
                     let run = fleeted(&engine, &arrivals, policy);
                     assert_eq!(
@@ -1262,15 +1273,15 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                         "every request answered in full"
                     );
                     let name = policy.named();
-                    for (what, waits) in [
-                        ("first", run.waits(|felt| felt.first)),
-                        ("whole", run.waits(|felt| felt.last)),
+                    for (what, said, waits) in [
+                        ("first", "to the first token", run.waits(|felt| felt.first)),
+                        ("whole", "to the whole answer", run.waits(|felt| felt.last)),
                     ] {
                         eprintln!(
-                            "  {name}, {what} token: p50 {:.0?}, p90 {:.0?}, worst {:.0?}",
-                            percentile(&waits, 0.5),
-                            percentile(&waits, 0.9),
-                            percentile(&waits, 1.0),
+                            "  {name}, {said}: p50 {:.0} ms, p90 {:.0} ms, worst {:.0} ms",
+                            millis(percentile(&waits, 0.5)),
+                            millis(percentile(&waits, 0.9)),
+                            millis(percentile(&waits, 1.0)),
                         );
                         for (at, q) in [("p50", 0.5), ("p90", 0.9), ("worst", 1.0)] {
                             taken.push(Reading::new(
@@ -1613,6 +1624,18 @@ fn batched(
         gpu: profile::take().per_step(charged).gpu(),
     }
 }
+
+/// Runs of the idle arm the two latency measurements throw away before they
+/// report anything.
+///
+/// **Three, because a wall is what these report and a wall takes three.** Every
+/// other measurement here quotes the device's own clock beside its wall and can
+/// say which of the two moved; a time to first token is a wall and nothing else,
+/// so what settles it has to be settled before the clock starts. At a 32-row
+/// chunk into two slots the same run read **823.9 ms, 455.0, 248.7, then 267.7,
+/// 267.6 and 267.9** — against a device column of 254.5, 243.0, 237.9, 237.5,
+/// 237.6 and 237.6, which had settled by the third and moved 0.1% after it.
+const WARM: usize = 3;
 
 /// Prompt rows a joining request feeds in one step, when nobody says.
 ///
