@@ -47,7 +47,7 @@ use inkling_metal::{
     DISPATCHES_A_SUBMISSION, DenseMatmul, DenseWeight, Device, ExpertGrouping, ExpertKernels,
     LayerKernels, LayerProjections, LayerRouter, MetalError, ModelHeads, ModelLayers, ModelTail,
     MoeCombine, Numerics, PackedBank, PackedMatmul, PackedProjection, RoundTrip, Router,
-    RouterWeights, StackShape, SwiGlu, TailWeights,
+    RouterWeights, StackShape, SwiGlu, TailWeights, WANTED_GROUPS,
 };
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
@@ -1386,6 +1386,14 @@ struct Measured<'a> {
 /// or a chain of heads is read for is which rows differ from a decode step's —
 /// and two tables that could rank, divide or round differently could not answer
 /// it.
+///
+/// **The `groups` column is the one B2 was missing.** Its attention step was
+/// read as a dispatch count and the count turned out to be 14% of what the
+/// change was worth: what a narrow dispatch costs is the machine it leaves idle,
+/// which is its grid against [`WANTED_GROUPS`] and is a column no table here
+/// carried. A row at 2% of the wanted threadgroups is a kernel with a batched
+/// version worth taking whatever its share says; a row already at 100% has
+/// nothing there to win.
 fn step_table(run: &Measured<'_>) -> String {
     let &Measured {
         step,
@@ -1445,16 +1453,19 @@ fn step_table(run: &Measured<'_>) -> String {
     let sampled = run.profile.dispatched();
     let executing = |part: Duration| 100.0 * part.as_secs_f64() / sampled.as_secs_f64();
     table.push(format!(
-        "  {:<18}{:>7}{:>12}{:>8}{:>14}{:>11}{:>8}",
-        "kernel", "calls", "device", "share", "moved", "achieved", "of peak"
+        "  {:<18}{:>7}{:>12}{:>8}{:>10}{:>9}{:>14}{:>11}{:>8}",
+        "kernel", "calls", "device", "share", "groups", "of want", "moved", "achieved", "of peak"
     ));
     for (kernel, dispatches) in &kernels {
         let achieved = dispatches.bytes_per_second();
+        let groups = dispatches.groups_a_dispatch();
         table.push(format!(
-            "  {kernel:<18}{:>7}{:>12}{:>7.1}%{:>14}{:>11}{:>7.0}%",
+            "  {kernel:<18}{:>7}{:>12}{:>7.1}%{:>10}{:>8.0}%{:>14}{:>11}{:>7.0}%",
             dispatches.calls,
             format!("{:.2?}", dispatches.elapsed),
             executing(dispatches.elapsed),
+            format!("{groups:.0}"),
+            100.0 * groups / WANTED_GROUPS as f64,
             format!("{:.2} MB", dispatches.bytes as f64 / 1e6),
             format!("{:.0} GB/s", achieved / 1e9),
             100.0 * achieved / MEMORY_BANDWIDTH,

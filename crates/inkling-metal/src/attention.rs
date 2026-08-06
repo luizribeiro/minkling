@@ -229,7 +229,11 @@ const LEAST_SPLIT: usize = 16;
 /// 97, 385 and 769 keys have 4, 13 and 25 of them where 2048 and up have 64 or
 /// more. One number and a clamp lands within a few percent of the swept best at
 /// every length, which two numbers and a length threshold would have to earn.
-const WANTED_GROUPS: usize = 2048;
+///
+/// **Public because it is the denominator every other kernel's grid is now read
+/// against**, and not only this one's: the per-kernel table divides each row's
+/// threadgroups by it, which is the column that would have predicted B2's win.
+pub const WANTED_GROUPS: usize = 2048;
 
 /// The square edge of the hardware matrix instruction, which every fragment
 /// below is a tile of.

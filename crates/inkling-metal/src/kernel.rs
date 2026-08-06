@@ -1621,6 +1621,16 @@ kernel void streaming_copy4(
         assert_eq!(rows[0].0, SAXPY_ENTRY);
         assert_eq!(rows[0].1.calls, 2, "both dispatches were timed");
         assert!(rows[0].1.elapsed > Duration::ZERO, "{rows:?}");
+        // **The grid the dispatch was given and not the threads it covers**,
+        // which is the whole use the column is put to: a row is read against
+        // `WANTED_GROUPS`, and threads there would read 64 times over.
+        let grid = Grid::new(LEN, THREADS_PER_GROUP);
+        assert_eq!(
+            rows[0].1.groups,
+            2 * grid.groups() as u64,
+            "the threadgroups charged are not the ones dispatched"
+        );
+        assert_eq!(rows[0].1.groups_a_dispatch(), grid.groups() as f64);
         eprintln!(
             "{:.2?} over two sampled passes, inside a command buffer the device clocked at {:.2?}",
             profile.dispatched(),

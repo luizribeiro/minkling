@@ -53,7 +53,7 @@ pub mod trace;
 mod testing;
 
 pub use argmax::{GreedyArgmax, Vocabulary};
-pub use attention::{AttentionError, FusedAttention, LayerAttention, Step};
+pub use attention::{AttentionError, FusedAttention, LayerAttention, Step, WANTED_GROUPS};
 pub use buffer::{Arg, Buffer, Bytes, Element, Inline, Landing, Mapped};
 pub use combine::MoeCombine;
 pub use dense::{DenseMatmul, DenseWeight};
