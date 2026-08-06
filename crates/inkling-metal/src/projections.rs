@@ -67,7 +67,7 @@ use crate::kernel::{Batch, Submitted};
 use crate::matmul::{MatmulError, Multiply, PackedMatmul, PackedProjection, Pending, together};
 use crate::norm::{self, LayerNorm, Normalising, RmsNorm};
 use crate::numerics::Numerics;
-use crate::sconv::{self, Convolving, LayerConv, Reading, ShortConvolution};
+use crate::sconv::{self, Convolving, LayerConv, Seating, ShortConvolution};
 use crate::swiglu::SwiGlu;
 use crate::tail::ModelTail;
 
@@ -527,46 +527,57 @@ impl<'a> LayerProjections<'a> {
         // the whole call.
         let mut headed = device.zeroed::<f32>(rows * heads * head_dim)?;
         let mut spans = self.attention.spans();
+        // **The key and value convolutions of the whole batch as one dispatch.**
+        // The rows each sequence reads are a run of the projections' own, the
+        // windows it carries are a run of the convolution's own allocation, and
+        // its keys are a run of the span — so what used to be a dispatch a
+        // sequence is a seat of one, the way the attention step below already
+        // is. The key's rows land in a buffer of their own because a head norm
+        // reads them next; the value's are keys of the span already.
+        let mut convolved = device.zeroed::<f32>(rows * self.k_sconv.channels())?;
+        let keyed: Vec<Seating> = attending
+            .iter()
+            .map(|seat| Seating::over(seat.slot, seat.first, seat.queries))
+            .collect();
+        // The same seats, landing in the span rather than in a buffer of their
+        // own: a sequence's keys go where its span has reached.
+        let valued: Vec<Seating> = keyed
+            .iter()
+            .map(|seat| Seating {
+                base: spans.writing(seat.slot),
+                ..*seat
+            })
+            .collect();
+        let (_, values) = spans.spanning();
+        sconv::encode_pair(
+            batch,
+            Convolving {
+                conv: &self.k_sconv,
+                x: &mut k,
+                seats: &keyed,
+                carried: None,
+                scale: 1.0,
+                landing: Landing {
+                    out: &mut convolved,
+                    groups: 1,
+                    stride: rows,
+                    base: 0,
+                },
+            },
+            Convolving {
+                conv: &self.v_sconv,
+                x: &mut v,
+                seats: &valued,
+                carried: None,
+                scale: 1.0,
+                landing: values,
+            },
+        )?;
+
         for seat in attending {
             let (slot, first, queries) = (seat.slot, seat.first, seat.queries);
             let step = seat.step;
-            let (keys, values) = spans.landings(slot);
-            // One dispatch rather than two, for the reason the head norms below
-            // are one: two sequences, different taps, each leaving its own
-            // window, and neither reading what the other writes. The key's rows
-            // land in a buffer of their own because a head norm reads them next;
-            // the value's are keys of the span already.
-            let mut convolved = device.zeroed::<f32>(queries * self.k_sconv.channels())?;
-            let over = Reading {
-                slot,
-                from: first,
-                rows: queries,
-            };
-            sconv::encode_pair(
-                batch,
-                Convolving {
-                    conv: &self.k_sconv,
-                    x: &mut k,
-                    reading: over,
-                    carried: None,
-                    scale: 1.0,
-                    landing: Landing {
-                        out: &mut convolved,
-                        groups: 1,
-                        stride: queries,
-                        base: 0,
-                    },
-                },
-                Convolving {
-                    conv: &self.v_sconv,
-                    x: &mut v,
-                    reading: over,
-                    carried: None,
-                    scale: 1.0,
-                    landing: values,
-                },
-            )?;
-
+            let (keys, _) = spans.landings(slot);
             // One dispatch rather than two: the two norms read different rows
             // against different weights into different landings, and neither
             // reads what the other writes — so what separated them was that they
@@ -592,7 +603,10 @@ impl<'a> LayerProjections<'a> {
                 Normalising {
                     norm: &self.k_norm,
                     x: &mut convolved,
-                    reading: norm::Reading::whole(queries),
+                    reading: norm::Reading {
+                        from: first,
+                        rows: queries,
+                    },
                     scale: None,
                     landing: keys,
                 },
@@ -1831,11 +1845,13 @@ impl LayerDevice<'_> {
     /// One of the layer's two residual convolutions, over each sequence's own
     /// rows of what the block before it produced.
     ///
-    /// **A dispatch a sequence rather than a dispatch a call**, because this is
-    /// the other place a sequence's state lives: the window this reads is the
-    /// last timesteps that sequence put through it, and one call over the whole
-    /// batch would run one window down every sequence's rows in turn. What is
-    /// shared is the taps, which is the weight and is read once.
+    /// **One dispatch over every sequence of the call**, which it could not be
+    /// while a slot's windows were an allocation of their own: the window a
+    /// sequence reads is the last timesteps that sequence put through it, and
+    /// what makes them one call is that they are now runs of one allocation the
+    /// way the batch's spans are. A seat says which run, which rows of the input
+    /// are its own and where they land — see
+    /// [`Seating`](crate::sconv::Seating).
     #[allow(clippy::too_many_arguments)]
     fn residual(
         &self,
@@ -1848,25 +1864,23 @@ impl LayerDevice<'_> {
         out: &mut Buffer<f32>,
     ) -> Result<(), ProjectionError> {
         let rows = out.len() / self.post_attention_layernorm.width();
-        for seat in advancing {
-            conv.encode_rows(
-                batch,
-                Reading {
-                    slot: seat.slot(),
-                    from: seat.first,
-                    rows: seat.queries(),
-                },
-                rows_in,
-                Some(carried),
-                scale,
-                Landing {
-                    out,
-                    groups: 1,
-                    stride: rows,
-                    base: seat.first,
-                },
-            )?;
-        }
+        let seats: Vec<Seating> = advancing
+            .iter()
+            .map(|seat| Seating::over(seat.slot(), seat.first, seat.queries()))
+            .collect();
+        conv.encode_seats(
+            batch,
+            &seats,
+            rows_in,
+            Some(carried),
+            scale,
+            Landing {
+                out,
+                groups: 1,
+                stride: rows,
+                base: 0,
+            },
+        )?;
         Ok(())
     }
 

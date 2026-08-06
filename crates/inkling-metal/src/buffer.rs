@@ -344,11 +344,18 @@ impl Landing<'_> {
     /// fault. `width` is the caller's because only it knows what a row of its
     /// own is.
     pub fn fits(&self, rows: usize, width: usize) {
+        self.fits_at(self.base, rows, width);
+    }
+
+    /// The same, for `rows` starting at `base` rather than at this landing's own
+    /// — which is what a dispatch writing several sequences' rows into one
+    /// landing has: the buffer, the groups and the stride are the call's and the
+    /// base is each sequence's.
+    pub fn fits_at(&self, base: usize, rows: usize, width: usize) {
         assert!(self.groups > 0, "a row has groups");
         assert!(
-            self.base + rows <= self.stride,
-            "{rows} rows at {} past a landing of {}",
-            self.base,
+            base + rows <= self.stride,
+            "{rows} rows at {base} past a landing of {}",
             self.stride
         );
         assert_eq!(

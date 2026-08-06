@@ -3799,19 +3799,23 @@ fn the_barriers_a_batched_step_encodes_are_the_ones_its_dependencies_need() {
             divisions[0], divisions[1],
             "a batch of {slots} divides two steps differently"
         );
-        // **The step is one dispatch a layer at every width**, which is the
-        // milestone's own claim and the one the count above states only in
-        // aggregate: a per-row slot index is what lets N sequences over N spans
-        // be one dispatch, and a step that went back to one a slot would still
-        // satisfy a total that a convolution had meanwhile given up.
+        // **The step and the three convolutions are one dispatch a layer at
+        // every width**, which is the milestone's own claim and the one the
+        // count above states only in aggregate: a per-row slot index is what
+        // lets N sequences over N spans be one dispatch, and a kernel that went
+        // back to one a slot would still satisfy a total that another had
+        // meanwhile given up.
         eprintln!("slots {slots} by symbol: {by_symbol:?}");
-        assert_eq!(
-            by_symbol.get(ATTENTION_STEP).copied(),
-            Some(config.num_hidden_layers),
-            "a batch of {slots} does not attend once a layer"
-        );
-        // And the four that are still a sequence's own, which is what a slot now
-        // costs and where the next 168 dispatches are.
+        for entry in PER_CALL {
+            let (name, each) = entry;
+            assert_eq!(
+                by_symbol.get(*name).copied(),
+                Some(each * config.num_hidden_layers),
+                "a batch of {slots} against {each} {name} a layer whatever the batch"
+            );
+        }
+        // And the one that is still a sequence's own, which is what a slot now
+        // costs and where the remaining per-slot dispatches are.
         for entry in PER_SLOT {
             let (name, each) = entry;
             assert_eq!(
@@ -3827,10 +3831,10 @@ fn the_barriers_a_batched_step_encodes_are_the_ones_its_dependencies_need() {
     // costs.** The five weights every sequence reads are one dispatch each
     // whatever the batch is, and so is the attention step: it reads no weight at
     // all, and what used to make it a dispatch a slot was a span per allocation
-    // rather than anything about the work. What stays one a sequence is what
-    // touches that sequence's own windows — the key and value convolutions as
-    // one dispatch, the two head norms as one, and the two residual
-    // convolutions. So a slot adds four a layer, and a dispatch that quietly
+    // rather than anything about the work. **The three convolutions are the
+    // same story one layer down** — what made them a dispatch a slot was two
+    // window allocations a slot, and their windows are now runs of one. So a
+    // slot adds the head norms alone, one a layer, and a dispatch that quietly
     // became per sequence would show up here before it showed up in a timing.
     //
     // **The upper bound is the rows and not the slots**, and it is why this is a
@@ -3845,7 +3849,7 @@ fn the_barriers_a_batched_step_encodes_are_the_ones_its_dependencies_need() {
     let (_, alone) = dispatched[0];
     for (slots, dispatches) in &dispatched[1..] {
         let added = dispatches - alone;
-        let slotted = 4 * config.num_hidden_layers * (slots - 1);
+        let slotted = config.num_hidden_layers * (slots - 1);
         assert!(
             (slotted..=slotted + routed).contains(&added),
             "a batch of {slots} adds {added} dispatches where its slots need {slotted} \
@@ -3859,15 +3863,19 @@ fn the_barriers_a_batched_step_encodes_are_the_ones_its_dependencies_need() {
 /// to two different rows — see [`trace::Encoded::symbol`].
 const ATTENTION_STEP: &str = "fused_attention";
 
-/// What is left per sequence once the step is shared, and how many dispatches of
-/// each a layer takes: the key and value convolutions as one paired dispatch,
-/// the query and key head norms as one, and the two residual convolutions on the
-/// layer's own paths.
-const PER_SLOT: &[(&str, usize)] = &[
+/// What a layer dispatches once whatever the batch is: the attention step, the
+/// key and value convolutions as one paired dispatch, and the two on the layer's
+/// residual paths. Each carries a seat per sequence — a run of the rows, a run
+/// of the spans or windows, and where the answer goes.
+const PER_CALL: &[(&str, usize)] = &[
+    (ATTENTION_STEP, 1),
     ("short_conv_pair", 1),
-    ("rms_norm_pair", 1),
     ("short_conv", 2),
 ];
+
+/// What is left per sequence once those are shared, and how many dispatches of
+/// each a layer takes: the query and key head norms, as one paired dispatch.
+const PER_SLOT: &[(&str, usize)] = &[("rms_norm_pair", 1)];
 
 /// How many tokens each sequence of the batched case generates.
 ///

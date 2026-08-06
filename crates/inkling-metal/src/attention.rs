@@ -965,20 +965,40 @@ impl KeyValues {
     /// Neither advances `held`: the rows are not there until the batch has run,
     /// and [`KeyValues::appended`] is what says they are.
     pub(crate) fn landings(&mut self, slot: usize) -> (Landing<'_>, Landing<'_>) {
+        let base = self.writing(slot);
+        let (mut keys, mut values) = self.spanning();
+        keys.base = base;
+        values.base = base;
+        (keys, values)
+    }
+
+    /// The row of a KV head that slot `slot`'s next keys go to, which is where
+    /// its span starts plus what it already holds.
+    ///
+    /// Apart from [`KeyValues::landings`] for the dispatch that writes every
+    /// sequence's keys at once: what such a call carries is one landing and a
+    /// base per sequence, so the base has to be askable without the landing
+    /// that would borrow the buffer for one slot.
+    pub(crate) fn writing(&self, slot: usize) -> usize {
+        self.base(slot) + self.held(slot)
+    }
+
+    /// The two landings without any slot's base in them, for a caller carrying
+    /// its own — see [`KeyValues::writing`].
+    pub(crate) fn spanning(&mut self) -> (Landing<'_>, Landing<'_>) {
         let (groups, stride) = (self.kv_heads, self.stride());
-        let base = self.base(slot) + self.held(slot);
         (
             Landing {
                 out: &mut self.keys,
                 groups,
                 stride,
-                base,
+                base: 0,
             },
             Landing {
                 out: &mut self.values,
                 groups,
                 stride,
-                base,
+                base: 0,
             },
         )
     }

@@ -52,8 +52,13 @@ const ENTRY: &str = "short_conv";
 /// The entry that runs two of those calls as one dispatch — see [`encode_pair`].
 const PAIRED_ENTRY: &str = "short_conv_pair";
 
-/// How many `uint`s the kernel's `Shape` struct declares.
-const FIELDS: usize = 11;
+/// How many `uint`s the kernel's `Seat` struct declares, which one sequence of
+/// a call has of its own.
+const FIELDS: usize = 6;
+
+/// How many its `Call` struct declares, which every sequence of one dispatch
+/// shares.
+const SHARED: usize = 7;
 
 /// Threads one threadgroup of a dispatch holds.
 ///
@@ -455,37 +460,41 @@ impl<'a> LayerConv<'a> {
         scale: f32,
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
-        self.encode_rows(
-            batch,
-            Reading::whole(self.rows(x.len())),
-            x,
-            carried,
-            scale,
-            landing,
-        )
+        let seats = [Seating::whole(self.rows(x.len()), landing.base)];
+        self.encode_seats(batch, &seats, x, carried, scale, landing)
     }
 
-    /// The same convolution over `reading`'s rows of what a dispatch left on
-    /// the device rather than over all of them.
+    /// The same convolution over every sequence of a batch, in one dispatch.
     ///
-    /// **A range because a batch's rows are one buffer.** N sequences advance
-    /// through one set of projections, so what a convolution carrying one
-    /// sequence's window has to read is that sequence's rows out of what they
-    /// all produced — and the residual beside them is the same rows of the same
-    /// call. A sequence advancing alone reads the whole of what it was handed,
-    /// which is [`Reading::whole`] and is the indexing this always did.
-    pub fn encode_rows(
+    /// **A seat rather than a call, because a batch's rows are one buffer.** N
+    /// sequences advance through one set of projections, so what each sequence's
+    /// convolution reads is the run of those rows that is its own, against the
+    /// windows of the slot that is its own, landing where its own rows go. All
+    /// three are per sequence and everything else — the taps, the channels, the
+    /// buffers — is the call's, which is why this can be one dispatch at all.
+    ///
+    /// **What a seat costs the grid is a stride and not a division.** A seat is
+    /// given [`Described::span`] threads whether or not it has the rows to fill
+    /// them, so the map from a thread to its sequence is a divide the way the
+    /// single-sequence one was; what it costs is the threads a short seat
+    /// leaves idle, which is nothing at all where the sequences are the same
+    /// length. A batched decode step is one row apiece.
+    ///
+    /// A batch of one is one seat over the whole call, which encodes what it
+    /// always encoded over the grid it always had.
+    pub fn encode_seats(
         &self,
         batch: &mut Batch<'_>,
-        reading: Reading,
+        seats: &[Seating],
         x: &mut Buffer<f32>,
         carried: Option<&mut Buffer<f32>>,
         scale: f32,
         landing: Landing<'_>,
     ) -> Result<(), MetalError> {
         let _timed = profile::scope(Op::Encode);
-        let call = self.described(reading, x.len(), carried.as_deref(), &landing);
-        let mut shape = self.device.inline(&call.fields)?;
+        let call = self.described(seats, x.len(), carried.as_deref(), &landing);
+        let mut shared = self.device.inline(&call.shared)?;
+        let mut seated = self.device.inline(&call.seats)?;
         let scaled_by = [scale];
         let mut scaling = self.device.inline(&scaled_by)?;
         let mut weight = self.weight.borrow_mut();
@@ -503,7 +512,8 @@ impl<'a> LayerConv<'a> {
         batch.add(
             &self.conv.kernel,
             &[
-                shape.arg(),
+                shared.arg(),
+                seated.arg(),
                 scaling.arg(),
                 x.arg(),
                 weight.arg(),
@@ -511,29 +521,28 @@ impl<'a> LayerConv<'a> {
                 landing.out.arg(),
                 carried,
             ],
-            Grid::new(call.threads, THREADS_PER_GROUP),
+            Grid::new(call.threads(), THREADS_PER_GROUP),
             call.moves,
         )?;
-        self.advanced(reading.slot, call.rows);
+        self.advance(seats);
         Ok(())
     }
 
     /// Everything about a call that does not depend on whether it has a
-    /// dispatch to itself: the eight fields the kernel reads, the threads it
-    /// needs, and the bytes it moves.
+    /// dispatch to itself: the fields every seat shares, the fields each seat
+    /// has of its own, the span a seat is given and the bytes the call moves.
     ///
-    /// Here rather than inside [`LayerConv::encode_over`] because a paired
+    /// Here rather than inside [`LayerConv::encode_seats`] because a paired
     /// dispatch asks the same of each half, and a second spelling of the shape
     /// struct is one that could drift from the kernel's own.
     fn described(
         &self,
-        reading: Reading,
+        seats: &[Seating],
         values: usize,
         carried: Option<&Buffer<f32>>,
         landing: &Landing<'_>,
-    ) -> Call {
-        let Reading { slot, from, rows } = reading;
-        let held = self.slot(slot).held.get();
+    ) -> Described {
+        assert!(!seats.is_empty(), "a convolution over no sequence at all");
         assert!(landing.groups > 0, "a row has groups");
         assert_eq!(
             self.channels % landing.groups,
@@ -542,13 +551,6 @@ impl<'a> LayerConv<'a> {
             self.channels,
             landing.groups
         );
-        landing.fits(rows, self.channels / landing.groups);
-        assert!(
-            from + rows <= self.rows(values),
-            "{rows} rows at {from} of a call holding {}",
-            self.rows(values)
-        );
-
         if let Some(carried) = carried {
             assert_eq!(
                 carried.len(),
@@ -556,48 +558,75 @@ impl<'a> LayerConv<'a> {
                 "a residual against what it is added to"
             );
         }
-        let reads = self.slot(slot).reading.get();
-        Call {
-            fields: [
-                extent(rows, "the rows of a call"),
-                extent(self.channels, "the channels of a convolution"),
-                extent(self.taps, "the taps of a kernel"),
+
+        let width = self.channels / landing.groups;
+        let mut described = Described {
+            shared: [0; SHARED],
+            seats: Vec::with_capacity(seats.len() * FIELDS),
+            span: 0,
+            moves: size_of::<f32>() * self.channels * self.taps,
+        };
+        for seat in seats {
+            let &Seating {
+                slot,
+                from,
+                rows,
+                base,
+            } = seat;
+            let held = self.slot(slot).held.get();
+            landing.fits_at(base, rows, width);
+            assert!(
+                from + rows <= self.rows(values),
+                "{rows} rows at {from} of a call holding {}",
+                self.rows(values)
+            );
+            let reads = self.slot(slot).reading.get();
+            described.seats.extend([
+                extent(rows, "the rows of a seat"),
                 extent(held.rows(), "the timesteps a window holds"),
-                extent(landing.groups, "the groups of a row"),
-                extent(landing.stride, "the rows a group has room for"),
-                extent(landing.base, "where a call's rows start"),
-                carried.is_some() as u32,
-                extent(from, "where a call's rows are read from"),
-                extent(self.at(reads, slot), "where a call's window starts"),
-                extent(self.at(1 - reads, slot), "where a call's window is left"),
-            ],
-            rows,
-            // A thread to each channel of each timestep, and one more timestep's
-            // worth for the window left behind — which reads the same padded
-            // sequence the outputs are cut from and writes somewhere no output
-            // thread touches.
-            threads: (rows + held.rows()) * self.channels,
-            // The sequence in and out, the kernel every timestep reads, the
-            // window the call before this one left, the window this one leaves —
-            // and the residual, where there is one to add. The scale and the
-            // shape are in the command buffer rather than in memory, so they are
-            // not traffic.
-            moves: size_of::<f32>()
+                extent(from, "where a seat's rows are read from"),
+                extent(base, "where a seat's rows land"),
+                extent(self.at(reads, slot), "where a seat's window starts"),
+                extent(self.at(1 - reads, slot), "where a seat's window is left"),
+            ]);
+            // A thread to each channel of each timestep, and one more
+            // timestep's worth for the window left behind — which reads the
+            // same padded sequence the outputs are cut from and writes
+            // somewhere no output thread touches.
+            described.span = described.span.max((rows + held.rows()) * self.channels);
+            // The sequence in and out, the window the call before this one
+            // left, the window this one leaves — and the residual, where there
+            // is one to add. The taps are the call's and are counted once above:
+            // one weight read is what a batch is for. The scale and the shapes
+            // are in the command buffer rather than in memory, so they are not
+            // traffic.
+            described.moves += size_of::<f32>()
                 * (2 * rows * self.channels
-                    + self.channels * self.taps
                     + 2 * held.floats()
-                    + carried.map_or(0, |_| rows * self.channels)),
+                    + carried.map_or(0, |_| rows * self.channels));
         }
+        described.shared = [
+            extent(self.channels, "the channels of a convolution"),
+            extent(self.taps, "the taps of a kernel"),
+            extent(landing.groups, "the groups of a row"),
+            extent(landing.stride, "the rows a group has room for"),
+            carried.is_some() as u32,
+            extent(seats.len(), "the sequences of a call"),
+            extent(described.span, "the threads a seat is given"),
+        ];
+        described
     }
 
-    /// The two windows swapped and the sequence moved on by `rows`, which is
-    /// what a call that has been encoded leaves behind it.
-    fn advanced(&self, slot: usize, rows: usize) {
-        let state = self.slot(slot);
-        state.reading.set(1 - state.reading.get());
-        let mut held = state.held.get();
-        held.advanced(rows);
-        state.held.set(held);
+    /// Every seat's two windows swapped and its sequence moved on by its own
+    /// rows, which is what a call that has been encoded leaves behind it.
+    fn advance(&self, seats: &[Seating]) {
+        for seat in seats {
+            let state = self.slot(seat.slot);
+            state.reading.set(1 - state.reading.get());
+            let mut held = state.held.get();
+            held.advanced(seat.rows);
+            state.held.set(held);
+        }
     }
 
     /// How many rows of this convolution's width `values` is.
@@ -612,16 +641,29 @@ impl<'a> LayerConv<'a> {
     }
 }
 
-/// One convolution's call as a paired dispatch describes it.
-struct Call {
-    fields: [u32; FIELDS],
-    rows: usize,
-    threads: usize,
+/// One convolution's call as the dispatch that runs it describes it: the fields
+/// every seat shares, the fields each seat has of its own, and the two figures
+/// the dispatch is sized by.
+struct Described {
+    shared: [u32; SHARED],
+    /// [`FIELDS`] `uint`s for each seat, in the order the seats were given —
+    /// which is the order the kernel indexes them in.
+    seats: Vec<u32>,
+    /// Threads each seat is given, which is what the widest of them needs. See
+    /// [`LayerConv::encode_seats`] for why a stride rather than a sum.
+    span: usize,
     moves: usize,
 }
 
-/// One half of a paired convolution: the rows it reads, what it scales and adds,
-/// and where its own rows land.
+impl Described {
+    /// The grid: every seat's span, whether or not it has the rows to fill one.
+    fn threads(&self) -> usize {
+        self.span * (self.seats.len() / FIELDS)
+    }
+}
+
+/// One half of a paired convolution: the sequences it advances, what it scales
+/// and adds, and the landing their rows go into.
 ///
 /// A struct rather than five more arguments because [`encode_pair`] takes two of
 /// everything, and ten positional arguments of which five repeat is a call
@@ -629,41 +671,57 @@ struct Call {
 pub struct Convolving<'a> {
     pub conv: &'a LayerConv<'a>,
     pub x: &'a mut Buffer<f32>,
-    /// Which rows of `x` and of the residual beside it this half reads — see
-    /// [`LayerConv::encode_rows`].
-    pub reading: Reading,
+    /// Which rows of `x` and of the residual beside it each sequence of this
+    /// half reads — see [`LayerConv::encode_seats`].
+    pub seats: &'a [Seating],
     pub carried: Option<&'a mut Buffer<f32>>,
     pub scale: f32,
     pub landing: Landing<'a>,
 }
 
-/// Which sequence a convolution is advancing, and which rows of what a dispatch
-/// left on the device are that sequence's.
+/// One sequence's place in a convolution's call: which rows of it are that
+/// sequence's, whose windows they go through, and where they land.
 ///
 /// **A run rather than a buffer because a batch's rows are one buffer.** The
 /// projections of a batched step produce every sequence's rows together, and a
-/// convolution carries one sequence's window — so what a call reads is the run
-/// that is its own and what it advances is the slot that is its own. A sequence
-/// advancing alone is slot zero over the whole call, which is
-/// [`Reading::whole`].
+/// convolution carries one sequence's window — so what a seat reads is the run
+/// that is its own, what it advances is the slot that is its own, and what it
+/// writes is the rows of the landing that are its own. A sequence advancing
+/// alone is slot zero over the whole call, which is [`Seating::whole`].
 #[derive(Debug, Clone, Copy)]
-pub struct Reading {
+pub struct Seating {
     /// Which of the convolution's slots carries this sequence's windows.
     pub slot: usize,
-    /// The row of `x` this call's first row is.
+    /// The row of `x` this seat's first row is.
     pub from: usize,
     /// How many rows it takes from there.
     pub rows: usize,
+    /// The row of the landing this seat's first row goes to.
+    pub base: usize,
 }
 
-impl Reading {
+impl Seating {
     /// Slot zero over every row of what the call was handed, which is what a
     /// sequence advancing alone reads.
-    pub fn whole(rows: usize) -> Self {
+    pub fn whole(rows: usize, base: usize) -> Self {
         Self {
             slot: 0,
             from: 0,
             rows,
+            base,
+        }
+    }
+
+    /// A sequence's own rows of a call, landing where they already are — which
+    /// is what a convolution writing back into the shape of the call it read
+    /// has, and is every seat of one but the value's: those keys go where that
+    /// sequence's span has reached instead.
+    pub fn over(slot: usize, from: usize, rows: usize) -> Self {
+        Self {
+            slot,
+            from,
+            rows,
+            base: from,
         }
     }
 }
@@ -695,7 +753,7 @@ pub fn encode_pair(
     let Convolving {
         conv: one,
         x: first_x,
-        reading: first_reading,
+        seats: first_seats,
         carried: first_carried,
         scale: first_scale,
         landing: first_landing,
@@ -703,27 +761,29 @@ pub fn encode_pair(
     let Convolving {
         conv: other,
         x: second_x,
-        reading: second_reading,
+        seats: second_seats,
         carried: second_carried,
         scale: second_scale,
         landing: second_landing,
     } = second;
 
     let first_call = one.described(
-        first_reading,
+        first_seats,
         first_x.len(),
         first_carried.as_deref(),
         &first_landing,
     );
     let second_call = other.described(
-        second_reading,
+        second_seats,
         second_x.len(),
         second_carried.as_deref(),
         &second_landing,
     );
     let device = one.device;
-    let mut first_shape = device.inline(&first_call.fields)?;
-    let mut second_shape = device.inline(&second_call.fields)?;
+    let mut first_shared = device.inline(&first_call.shared)?;
+    let mut second_shared = device.inline(&second_call.shared)?;
+    let mut first_seated = device.inline(&first_call.seats)?;
+    let mut second_seated = device.inline(&second_call.seats)?;
     let (first_scaled, second_scaled) = ([first_scale], [second_scale]);
     let mut first_scaling = device.inline(&first_scaled)?;
     let mut second_scaling = device.inline(&second_scaled)?;
@@ -748,14 +808,16 @@ pub fn encode_pair(
     batch.add(
         &one.conv.paired,
         &[
-            first_shape.arg(),
+            first_shared.arg(),
+            first_seated.arg(),
             first_scaling.arg(),
             first_x.arg(),
             first_weight.arg(),
             first_windows.arg(),
             first_landing.out.arg(),
             first_carried,
-            second_shape.arg(),
+            second_shared.arg(),
+            second_seated.arg(),
             second_scaling.arg(),
             second_x.arg(),
             second_weight.arg(),
@@ -763,11 +825,14 @@ pub fn encode_pair(
             second_landing.out.arg(),
             second_carried,
         ],
-        Grid::new(first_call.threads + second_call.threads, THREADS_PER_GROUP),
+        Grid::new(
+            first_call.threads() + second_call.threads(),
+            THREADS_PER_GROUP,
+        ),
         first_call.moves + second_call.moves,
     )?;
-    one.advanced(first_reading.slot, first_call.rows);
-    other.advanced(second_reading.slot, second_call.rows);
+    one.advance(first_seats);
+    other.advance(second_seats);
     Ok(())
 }
 
@@ -777,18 +842,29 @@ const BODY: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-struct Shape {
-    uint rows;
+/// What every sequence of a call shares, which is everything that is not a
+/// sequence's own state or place.
+struct Call {
     uint channels;
     uint taps;
-    uint held;
     uint groups;
     uint stride;
-    uint base;
     uint carried;
+    /// How many sequences this dispatch is convolving.
+    uint seats;
+    /// Threads each of them is given, which is what the widest of them needs —
+    /// so a thread's own sequence is `id / span` and its work is `id % span`.
+    uint span;
+};
+
+/// One sequence's place in that call.
+struct Seat {
+    uint rows;
+    uint held;
     uint from;
-    /// Where in the windows allocation this call's own window starts, and where
-    /// the one it leaves behind does. **A slot is an offset rather than a
+    uint base;
+    /// Where in the windows allocation this sequence's own window starts, and
+    /// where the one it leaves behind does. **A slot is an offset rather than a
     /// buffer**: every slot's two windows are one allocation, and a dispatch
     /// binds it once because binding it twice would borrow it twice.
     uint reads;
@@ -817,15 +893,16 @@ struct Shape {
 inline float padded(
     device const float *x,
     device const float *window,
-    constant Shape &shape,
+    constant Call &call,
+    constant Seat &seat,
     constant float &scale,
     uint at,
     uint c
 ) {
-    if (at < shape.held) {
-        return window[at * shape.channels + c];
+    if (at < seat.held) {
+        return window[at * call.channels + c];
     }
-    return scale * x[(shape.from + at - shape.held) * shape.channels + c];
+    return scale * x[(seat.from + at - seat.held) * call.channels + c];
 }
 
 /// A depthwise causal convolution with a residual add, one thread to a channel
@@ -860,78 +937,89 @@ inline float padded(
 /// changes is which call put a value in the window.
 ///
 /// Here rather than inside an entry point because two entry points run it,
-/// and what a paired dispatch changes is which of two shapes a thread reads
+/// and what a paired dispatch changes is which of two calls a thread reads
 /// and nothing else.
 static void convolve(
-    constant Shape &shape,
+    constant Call &call,
+    constant Seat &seat,
     constant float &scale,
     device const float *x,
     device const float *weight,
-    device const float *window,
+    device float *windows,
     device float *out,
-    device float *kept,
     device const float *carried,
     uint id
 ) {
-    const uint t = id / shape.channels;
-    const uint c = id % shape.channels;
+    const uint t = id / call.channels;
+    const uint c = id % call.channels;
+    if (t >= seat.rows + seat.held) {
+        return;
+    }
+    // **The two windows are one allocation and the seat says where in it its
+    // own are.** A dispatch cannot bind the same buffer twice — a binding
+    // borrows it exclusively — so the halves are cut here, out of the one
+    // pointer, at the offsets the slot decided.
+    device const float *window = windows + seat.reads;
     // What the window holds beyond what the convolution reads, which an output
     // row skips to reach its own timesteps.
-    const uint slack = shape.held - (shape.taps - 1);
+    const uint slack = seat.held - (call.taps - 1);
 
     // The last `held` timesteps of the padded sequence, which is what the next
     // call reads and what a rewind reaches back into. A call shorter than the
     // window cannot fill it, so part of what it keeps is part of what it was
     // given — the reference takes the tail of the padding either way, and
     // decoding one token at a time is entirely that case.
-    if (t >= shape.rows) {
-        kept[(t - shape.rows) * shape.channels + c] = padded(x, window, shape, scale, t, c);
+    if (t >= seat.rows) {
+        windows[seat.writes + (t - seat.rows) * call.channels + c] =
+            padded(x, window, call, seat, scale, t, c);
         return;
     }
 
-    device const float *taps = weight + (ulong)c * shape.taps;
+    device const float *taps = weight + (ulong)c * call.taps;
     float acc = 0.0f;
-    for (uint k = 0; k < shape.taps; ++k) {
-        acc += taps[k] * padded(x, window, shape, scale, t + slack + k, c);
+    for (uint k = 0; k < call.taps; ++k) {
+        acc += taps[k] * padded(x, window, call, seat, scale, t + slack + k, c);
     }
 
-    acc += scale * x[(shape.from + t) * shape.channels + c];
-    if (shape.carried) {
-        acc += carried[(shape.from + t) * shape.channels + c];
+    acc += scale * x[(seat.from + t) * call.channels + c];
+    if (call.carried) {
+        acc += carried[(seat.from + t) * call.channels + c];
     }
 
     // Where the row lands, which for the value's convolution is the span the
     // layer keeps — see `Landing`. With one group and a stride of `rows` this is
     // `out[t * channels + c]`, the row where it was computed.
-    const uint width = shape.channels / shape.groups;
+    const uint width = call.channels / call.groups;
     const uint group = c / width;
     device float *result =
-        out + ((ulong)group * shape.stride + shape.base + t) * width + (c % width);
+        out + ((ulong)group * call.stride + seat.base + t) * width + (c % width);
     *result = acc;
 }
 
-/// One call of it, over the threads a call's own rows and window need.
+/// One call of it, over every sequence the call is convolving.
 ///
-/// **The windows are one allocation and the shape says where in it this call's
-/// two are.** A dispatch cannot bind the same buffer twice — a binding borrows
-/// it exclusively — so the halves are cut here, out of the one pointer, at the
-/// offsets the slot decided.
+/// **A sequence is a stride of the grid rather than a dispatch.** Each is given
+/// `span` threads — what the widest of them needs — so a thread finds its own
+/// sequence by a divide, exactly as it finds its own timestep inside one, and a
+/// short sequence's spare threads return. A call over one sequence is one seat
+/// spanning the whole grid, which is the dispatch this always was.
 kernel void short_conv(
-    constant Shape &shape [[buffer(0)]],
-    constant float &scale [[buffer(1)]],
-    device const float *x [[buffer(2)]],
-    device const float *weight [[buffer(3)]],
-    device float *windows [[buffer(4)]],
-    device float *out [[buffer(5)]],
-    device const float *carried [[buffer(6)]],
+    constant Call &call [[buffer(0)]],
+    constant Seat *seats [[buffer(1)]],
+    constant float &scale [[buffer(2)]],
+    device const float *x [[buffer(3)]],
+    device const float *weight [[buffer(4)]],
+    device float *windows [[buffer(5)]],
+    device float *out [[buffer(6)]],
+    device const float *carried [[buffer(7)]],
     uint id [[thread_position_in_grid]]
 ) {
-    if (id >= (shape.rows + shape.held) * shape.channels) {
+    const uint seat = id / call.span;
+    if (seat >= call.seats) {
         return;
     }
     convolve(
-        shape, scale, x, weight, windows + shape.reads,
-        out, windows + shape.writes, carried, id
+        call, seats[seat], scale, x, weight, windows, out, carried, id % call.span
     );
 }
 
@@ -950,32 +1038,35 @@ kernel void short_conv(
 /// answer is the same bits — the same taps walked from zero in the same order
 /// over the same padded sequence.
 kernel void short_conv_pair(
-    constant Shape &first [[buffer(0)]],
-    constant float &first_scale [[buffer(1)]],
-    device const float *first_x [[buffer(2)]],
-    device const float *first_weight [[buffer(3)]],
-    device float *first_windows [[buffer(4)]],
-    device float *first_out [[buffer(5)]],
-    device const float *first_carried [[buffer(6)]],
-    constant Shape &second [[buffer(7)]],
-    constant float &second_scale [[buffer(8)]],
-    device const float *second_x [[buffer(9)]],
-    device const float *second_weight [[buffer(10)]],
-    device float *second_windows [[buffer(11)]],
-    device float *second_out [[buffer(12)]],
-    device const float *second_carried [[buffer(13)]],
+    constant Call &first [[buffer(0)]],
+    constant Seat *first_seats [[buffer(1)]],
+    constant float &first_scale [[buffer(2)]],
+    device const float *first_x [[buffer(3)]],
+    device const float *first_weight [[buffer(4)]],
+    device float *first_windows [[buffer(5)]],
+    device float *first_out [[buffer(6)]],
+    device const float *first_carried [[buffer(7)]],
+    constant Call &second [[buffer(8)]],
+    constant Seat *second_seats [[buffer(9)]],
+    constant float &second_scale [[buffer(10)]],
+    device const float *second_x [[buffer(11)]],
+    device const float *second_weight [[buffer(12)]],
+    device float *second_windows [[buffer(13)]],
+    device float *second_out [[buffer(14)]],
+    device const float *second_carried [[buffer(15)]],
     uint id [[thread_position_in_grid]]
 ) {
-    const uint firsts = (first.rows + first.held) * first.channels;
+    const uint firsts = first.seats * first.span;
     if (id < firsts) {
         convolve(
-            first, first_scale, first_x, first_weight, first_windows + first.reads,
-            first_out, first_windows + first.writes, first_carried, id
+            first, first_seats[id / first.span], first_scale, first_x, first_weight,
+            first_windows, first_out, first_carried, id % first.span
         );
-    } else if (id - firsts < (second.rows + second.held) * second.channels) {
+    } else if (id - firsts < second.seats * second.span) {
+        const uint own = id - firsts;
         convolve(
-            second, second_scale, second_x, second_weight, second_windows + second.reads,
-            second_out, second_windows + second.writes, second_carried, id - firsts
+            second, second_seats[own / second.span], second_scale, second_x, second_weight,
+            second_windows, second_out, second_carried, own % second.span
         );
     }
 }
@@ -1280,13 +1371,14 @@ mod tests {
                 .expect("the landing allocates");
             let mut batch = device.batch().expect("a command buffer opens");
             layer
-                .encode_rows(
+                .encode_seats(
                     &mut batch,
-                    Reading {
+                    &[Seating {
                         slot: 0,
                         from,
                         rows,
-                    },
+                        base: 0,
+                    }],
                     &mut x,
                     Some(&mut carried),
                     1.0,
@@ -1365,13 +1457,14 @@ mod tests {
                     .expect("the landing allocates");
                 let mut batch = device.batch().expect("a command buffer opens");
                 shared
-                    .encode_rows(
+                    .encode_seats(
                         &mut batch,
-                        Reading {
+                        &[Seating {
                             slot,
                             from: 0,
                             rows: 1,
-                        },
+                            base: 0,
+                        }],
                         &mut x,
                         None,
                         1.0,
@@ -1389,6 +1482,90 @@ mod tests {
         }
         assert_eq!(batched[0], alone[0], "the sequence in slot 0");
         assert_eq!(batched[1], alone[1], "the sequence in slot 1");
+    }
+
+    /// **The two sequences of one dispatch are the two sequences alone**, which
+    /// is what a seat has to buy and the one thing batching a convolution can
+    /// get wrong.
+    ///
+    /// The case above interleaves two slots a dispatch apiece; this puts them in
+    /// the *same* dispatch, where a wrong seat is not a wrong buffer but a right
+    /// buffer read at another sequence's offset. Both rows of the call are the
+    /// same call — so a seat that read seat zero's rows, or wrote seat zero's
+    /// window, or landed at seat zero's row, would answer something plausible
+    /// for every one of them.
+    ///
+    /// A row at a time and several of them, because a window that is right once
+    /// and swapped wrongly is a state machine that fails on the second call: at
+    /// `K = 4` the third row is the first that reads a window this dispatch's
+    /// own predecessor wrote for that seat and not for its neighbour.
+    #[test]
+    fn two_sequences_in_one_dispatch_are_the_two_sequences_alone() {
+        let Some(device) = device() else { return };
+        let conv = ShortConvolution::new(&device).expect("the kernel compiles");
+        let fx = Synthetic::load();
+        let sequences = [
+            fx.sequence(&fx.input, 0),
+            fx.sequence(&fx.input, 1 % fx.batch),
+        ];
+        assert_ne!(sequences[0], sequences[1], "two sequences to tell apart");
+
+        let alone: Vec<Vec<f32>> = sequences
+            .iter()
+            .map(|sequence| {
+                let one = fx.wrapped(&device, &conv, &fx.weight);
+                one.restart(0);
+                sequence
+                    .chunks(fx.channels)
+                    .flat_map(|row| one.forward(row).expect("the dispatch completes"))
+                    .collect()
+            })
+            .collect();
+
+        let shared = LayerConv::holding(&device, &conv, fx.channels, &fx.weight, 0, 2)
+            .expect("the kernel uploads");
+        for slot in 0..2 {
+            shared.restart(slot);
+        }
+        let mut batched = [Vec::new(), Vec::new()];
+        for row in 0..fx.rows() {
+            // The two sequences' rows in one call, the way a batched step's
+            // projections leave them: seat `s` reads row `s` and lands at row
+            // `s`.
+            let call: Vec<f32> = sequences
+                .iter()
+                .flat_map(|sequence| &sequence[row * fx.channels..][..fx.channels])
+                .copied()
+                .collect();
+            let mut x = device.buffer(&call).expect("the rows upload");
+            let mut out = device
+                .zeroed::<f32>(call.len())
+                .expect("the landing allocates");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let seats: Vec<Seating> = (0..2).map(|slot| Seating::over(slot, slot, 1)).collect();
+            shared
+                .encode_seats(
+                    &mut batch,
+                    &seats,
+                    &mut x,
+                    None,
+                    1.0,
+                    Landing {
+                        out: &mut out,
+                        groups: 1,
+                        stride: 2,
+                        base: 0,
+                    },
+                )
+                .expect("the dispatch encodes");
+            batch.wait().expect("the batch completes");
+            let answered = out.to_vec();
+            for (slot, rows) in batched.iter_mut().enumerate() {
+                rows.extend_from_slice(&answered[slot * fx.channels..][..fx.channels]);
+            }
+        }
+        assert_eq!(batched[0], alone[0], "the sequence in seat 0");
+        assert_eq!(batched[1], alone[1], "the sequence in seat 1");
     }
 
     /// A slot past the batch a convolution was wrapped for is a sequence whose
@@ -1496,7 +1673,7 @@ mod tests {
             Convolving {
                 conv: one,
                 x: &mut first_x,
-                reading: Reading::whole(rows),
+                seats: &[Seating::whole(rows, 0)],
                 carried: Some(&mut residual),
                 scale: 1.5,
                 landing: Landing {
@@ -1509,7 +1686,7 @@ mod tests {
             Convolving {
                 conv: other,
                 x: &mut second_x,
-                reading: Reading::whole(rows),
+                seats: &[Seating::whole(rows, 0)],
                 carried: None,
                 scale: 1.0,
                 landing: Landing {
@@ -1687,10 +1864,7 @@ mod tests {
         layer.restart(0);
         let want = layer.forward(sequence).expect("the dispatch completes");
 
-        let without = BODY.replace(
-            "acc += scale * x[(shape.from + t) * shape.channels + c];",
-            "",
-        );
+        let without = BODY.replace("acc += scale * x[(seat.from + t) * call.channels + c];", "");
         assert_ne!(without, BODY, "the mutation changed nothing");
         let mutant = ShortConvolution::from_source(&device, &without).expect("the mutant compiles");
         let dropped = fx.wrapped(&device, &mutant, &fx.weight);
