@@ -72,12 +72,30 @@ const WIDEST: usize = 16;
 /// paired figure in the README was taken over.
 const PAIRS: usize = 7;
 
+/// Units the clock measurement times, when nobody says.
+///
+/// Enough decode steps that the run is minutes rather than seconds: what it is
+/// asking is whether the part holds a clock under sustained load, and a question
+/// about sustained load cannot be put to a run that does not sustain one.
+const TICKED: usize = 600;
+
+/// Parts a clock run's units are reported in.
+///
+/// **A drift is a shape and not a number**, so a run that quoted only its mean
+/// could not tell a part that ramped once from one that fell throughout. Five is
+/// enough parts to see which, and few enough that each holds tens of units at
+/// the default length.
+const PARTS: usize = 5;
+
 const USAGE: &str = "usage:\n  \
     bench decode  <checkpoint> [--tokens <n>] [--context <n>] [--numerics <which>]\n  \
     bench prefill <checkpoint> [--tokens <n>] [--numerics <which>]\n  \
     bench sweep   <checkpoint> [--tokens <n>] [--depth <k>] [--numerics <which>]\n  \
     bench engines <checkpoint> [--depth <k>] [--numerics <which>]\n  \
     bench session <checkpoint> [--tokens <n>] [--reuse-tokens <n>] [--numerics <which>]\n  \
+    bench batch   <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>]\n  \
+    bench clock   <checkpoint> [--tokens <n>] [--context <n>] [--idle <ms>] \
+[--prefill <n>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench diverge <checkpoint> [--tokens <n>] [--against <which>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
@@ -177,6 +195,22 @@ enum What {
     /// the token, and where the two stop diverging is where a batch stops
     /// paying.
     Batch,
+    /// What the same unit of work costs the device over and over, and how much
+    /// of the wall around each one the device was busy for.
+    ///
+    /// **The one measurement here whose subject is the machine rather than the
+    /// engine.** An Apple GPU moves between power states, and a decode step is
+    /// milliseconds of work with a host gap after it where a prefill is a
+    /// minute of continuous work — so two figures taken at those two duty
+    /// cycles are taken at whatever clocks the part chose to hold, and nothing
+    /// else here says what those were.
+    ///
+    /// The work is fixed, so the device column is the clock read backwards: the
+    /// same dispatches over the same shapes cost more device time only if the
+    /// part was running slower. `--idle` is the lever — the same steps with
+    /// host time deliberately left between them, which is a lower duty cycle at
+    /// identical work.
+    Clock,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -185,7 +219,8 @@ enum Job {
     Measure {
         what: What,
         checkpoint: PathBuf,
-        /// Tokens decoded, or — for a prefill — tokens in the prompt.
+        /// Tokens decoded, or — for a prefill — tokens in the prompt, or — for
+        /// the clock measurement — units of its own work it repeats.
         tokens: usize,
         /// Keys the sequence already holds when the steps being timed run, which
         /// is the one axis a decode step moves along: the README's own table
@@ -209,6 +244,12 @@ enum Job {
         /// The widest batch the batch sweep runs, which every other measurement
         /// ignores.
         widest: usize,
+        /// Host time left between one unit of work and the next, which only the
+        /// clock measurement has anywhere to put.
+        idle: Duration,
+        /// The prompt each of the clock measurement's units prefills, and zero
+        /// for the decode step it charges otherwise.
+        prefill: usize,
     },
     /// The harness: two commands that already exist, run against each other.
     Alternate {
@@ -256,12 +297,13 @@ impl Job {
             Some("engines") => Some(What::Engines),
             Some("session") => Some(What::Session),
             Some("batch") => Some(What::Batch),
+            Some("clock") => Some(What::Clock),
             Some("alternate") => return Self::alternating(args),
             Some("diverge") => return Self::diverging(args),
             Some("guesses") => None,
             Some(word) => bail!(
                 "{word} is not one of decode, prefill, sweep, engines, session, batch, \
-                 guesses, diverge or alternate"
+                 clock, guesses, diverge or alternate"
             ),
             None => bail!("no measurement given"),
         };
@@ -279,6 +321,11 @@ impl Job {
         let mut reuse = None;
         // The widest batch a sweep runs, which only the batch sweep takes.
         let mut widest = None;
+        // The two the clock measurement takes and nothing else has anywhere to
+        // put, `Option` for the reason the numbers above are: zero is a duty
+        // cycle this means something by, and so is a prompt of no tokens.
+        let mut idle = None;
+        let mut prefill = None;
         // A sweep runs every depth up to its own, where a cross-engine table
         // quotes one beside `k = 0` — so the default depth is what the flag
         // means to the measurement asking for it.
@@ -294,6 +341,19 @@ impl Job {
                 "--numerics" => numerics = Some(which(&arg, &mut args)?),
                 "--reuse-tokens" => reuse = Some(positions(&arg, &mut args)?),
                 "--batch" | "-b" => widest = Some(count(&arg, &mut args)?),
+                // A gap of nothing is the arm every other measurement here runs
+                // at and is what this one compares against, so zero is a number
+                // it means something by — see `positions`, which is the other
+                // flag that takes one.
+                "--idle" => {
+                    idle = Some(Duration::from_millis(parsed(
+                        &arg,
+                        &mut args,
+                        "a gap in milliseconds",
+                        |_| true,
+                    )? as u64));
+                }
+                "--prefill" => prefill = Some(count(&arg, &mut args)?),
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
                 _ => checkpoints.push(PathBuf::from(arg)),
             }
@@ -341,8 +401,22 @@ impl Job {
         // acceptance is the workload's. Silently dropping the number would leave
         // a row saying something other than what was asked for, which is the
         // same rule the length above is refused under.
-        if !matches!(what, What::Decode | What::Batch) && context.is_some() {
+        if !matches!(what, What::Decode | What::Batch | What::Clock) && context.is_some() {
             bail!("{what:?} takes no --context: only a decode step has one to be taken at");
+        }
+        // **Only the clock measurement has a duty cycle it is asking about.**
+        // Every other row here is taken at whatever occupancy its own work makes
+        // and says so nowhere, which is the whole of what this measurement
+        // exists to fix — so the two levers are refused to the measurements that
+        // could only drop them, under the same rule as the numbers above.
+        if what != What::Clock && (idle.is_some() || prefill.is_some()) {
+            bail!("{what:?} takes no --idle or --prefill: it does not vary its own duty cycle");
+        }
+        // **A prefill's unit is its own prompt.** Its keys are the tokens
+        // `--prefill` names and there is no step behind a context, so a number
+        // given for one could only be dropped — the same rule as above.
+        if prefill.is_some() && context.is_some() {
+            bail!("a clock run over prefills takes no --context: its keys are its own prompt");
         }
         // **Only the batch sweep has a width to be swept.** Every other
         // measurement here decodes one sequence, so a widest batch handed to one
@@ -364,6 +438,7 @@ impl Job {
             tokens: tokens.unwrap_or(match what {
                 What::Prefill => PREFILLED,
                 What::Session => Session::OPENING,
+                What::Clock => TICKED,
                 _ => DECODED,
             }),
             context: context.unwrap_or(0),
@@ -371,6 +446,8 @@ impl Job {
             numerics: numerics.unwrap_or_default(),
             reuse: reuse.unwrap_or(DEFAULT_BOUND),
             widest: widest.unwrap_or(WIDEST),
+            idle: idle.unwrap_or_default(),
+            prefill: prefill.unwrap_or(0),
         })
     }
 
@@ -457,6 +534,8 @@ impl Job {
                 numerics,
                 reuse,
                 widest,
+                idle,
+                prefill,
             } => {
                 let asked = Asked {
                     tokens: *tokens,
@@ -465,6 +544,8 @@ impl Job {
                     numerics: *numerics,
                     reuse: *reuse,
                     widest: *widest,
+                    idle: *idle,
+                    prefill: *prefill,
                 };
                 for reading in measure(*what, checkpoint, asked)? {
                     println!("{}", reading.line());
@@ -662,6 +743,12 @@ struct Asked {
     reuse: usize,
     /// The widest batch the batch sweep runs, ignored by everything else.
     widest: usize,
+    /// Host time the clock measurement leaves between its units, ignored by
+    /// everything else.
+    idle: Duration,
+    /// The prompt each of the clock measurement's units prefills, and zero for
+    /// the decode step it charges otherwise.
+    prefill: usize,
 }
 
 fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
@@ -672,6 +759,8 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
         numerics,
         reuse,
         widest,
+        idle,
+        prefill,
     } = asked;
     let config = config::of_checkpoint(dir)?;
     let text = &config.text_config;
@@ -822,6 +911,30 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                         slots as f64 / run.step.as_secs_f64(),
                     );
                 }
+            }
+            // **The same work over and over, and what each of them cost the
+            // device.** Everything else here quotes a mean over a run and so
+            // cannot say whether the run held its speed; this quotes the run in
+            // parts, and the device column is what a clock is read off where the
+            // work is fixed — see [`Unit`] for which of the two arms that is
+            // true of, because the drift column means different things under
+            // them.
+            What::Clock => {
+                let unit = match prefill {
+                    0 => Unit::Step(behind_a_step(&prompt, context)),
+                    length => Unit::Prefill(tiled(&prompt, length)),
+                };
+                let ticks = ticked(&weights, text, &unit, tokens, idle);
+                eprintln!(
+                    "clock: {} {}, {} idle between them",
+                    ticks.len(),
+                    unit.over(ticks.len()),
+                    match idle.is_zero() {
+                        true => "no".to_string(),
+                        false => format!("{:.0?}", idle),
+                    },
+                );
+                taken.extend(clocked(&ticks));
             }
             What::Prefill => {
                 // A prefill is one step and its prompt is the measurement, so
@@ -1094,6 +1207,237 @@ fn batched(
     Amortised {
         step: wall / charged,
         gpu: profile::take().per_step(charged).gpu(),
+    }
+}
+
+/// The work a clock run repeats, which is one decode step behind a context or
+/// one prefill of a prompt.
+///
+/// **Two units rather than two measurements**, because the question is the same
+/// one either way and only the duty cycle differs: a decode step is milliseconds
+/// of device work with a host gap after it, and a prefill of thousands of tokens
+/// is a minute of it with nothing else in the way.
+///
+/// **Only a prefill's units are the same work**, and that decides what the drift
+/// column is worth under each of them:
+///
+/// - A prefill's unit is a prompt of a fixed length through a cache that starts
+///   empty every time, so every one of them is the same dispatches over the same
+///   shapes. A unit that took the device longer was run on a slower part, and
+///   nothing else can have moved.
+/// - A decode step's unit walks one more key than the one before it, because the
+///   steps are one generation and that is what a generation does. This repo has
+///   measured what those keys cost — a step at 8192 keys is 1.45× its 97-key
+///   figure — so a drift over a run of them is that slope plus whatever the
+///   clock did, and the two are not separated here. [`Unit::over`] prints the
+///   range so that a reader is told which figure they are holding.
+///
+/// **What the step arm is for is the pair rather than the drift**: two runs of
+/// it over the same keys, one with `--idle` and one without, have the same slope
+/// under both arms and differ only in occupancy.
+enum Unit {
+    Step(Vec<usize>),
+    Prefill(Vec<usize>),
+}
+
+impl Unit {
+    /// What a run of `units` of this was over, as a reader needs it stated: the
+    /// keys a decode run walked between its first timed step and its last, or
+    /// the one prompt length every prefill of a run shares.
+    ///
+    /// The first timed step is the one after the prompt's own prefill, so the
+    /// range opens one key past the prompt.
+    fn over(&self, units: usize) -> String {
+        match self {
+            Self::Step(ids) => format!(
+                "decode steps over {} to {} keys",
+                ids.len() + 1,
+                ids.len() + units
+            ),
+            Self::Prefill(ids) => format!("prefills of {} tokens", ids.len()),
+        }
+    }
+}
+
+/// One repetition of a clock run's unit, on the two clocks that can see it.
+///
+/// **The wall is the whole period and the device is the work inside it**, so
+/// their ratio is the duty cycle the unit was run at — which is what `--idle`
+/// moves and is the figure this measurement exists to put beside every other
+/// one. A gap left between two units belongs to the period and to neither
+/// unit's work.
+#[derive(Debug, Clone, Copy)]
+struct Tick {
+    wall: Duration,
+    gpu: Duration,
+}
+
+/// `count` repetitions of `unit`, back to back, with `idle` of host time
+/// deliberately left between them.
+///
+/// **One repetition is discarded before the ones that are timed**, for the
+/// reason the prefill measurement takes the second of two: the first unit of a
+/// length is the one that faults in the pages the rest of them read, and a page
+/// fault charged to the first unit is a drift this would report as the part
+/// warming up.
+fn ticked(
+    weights: &CheckpointWeights<'_>,
+    config: &TextConfig,
+    unit: &Unit,
+    count: usize,
+    idle: Duration,
+) -> Vec<Tick> {
+    profile::take();
+    let mut ticking = Ticking::new(idle, count + 1);
+    match unit {
+        // Every step of one generation rather than a generation apiece, so that
+        // the gap `--idle` leaves falls between two decode steps — which is the
+        // occupancy this arm exists to move. What it costs is the growing key
+        // count [`Unit`] describes.
+        Unit::Step(ids) => {
+            let generator = weights.generator();
+            let cache = &mut ModelCache::speculating(config, 0);
+            let ending = Ending {
+                budget: count + 1,
+                eos: None,
+            };
+            let mut sink = |_| {
+                ticking.tick(profile::take().gpu());
+                ControlFlow::Continue(())
+            };
+            generator.stream(cache, ids, ending, weights, &mut sink);
+        }
+        Unit::Prefill(ids) => {
+            for _ in 0..count + 1 {
+                let run = generate(weights, None, config, ids, 1, 0);
+                ticking.tick(run.gpu);
+            }
+        }
+    }
+    let mut ticks = ticking.ticks;
+    // For a generation, the prompt's own prefill; for a run of prefills, the
+    // repetition that faulted the pages in.
+    ticks.drain(..1.min(ticks.len()));
+    ticks
+}
+
+/// The clock a run of units is timed on, and the gap it leaves after each of
+/// them.
+///
+/// A type rather than a closure because both arms of [`ticked`] keep the same
+/// two pieces of state and one of them reaches it from inside a sink the
+/// generator drives.
+struct Ticking {
+    at: Instant,
+    idle: Duration,
+    ticks: Vec<Tick>,
+}
+
+impl Ticking {
+    fn new(idle: Duration, count: usize) -> Self {
+        Self {
+            at: Instant::now(),
+            idle,
+            ticks: Vec::with_capacity(count),
+        }
+    }
+
+    /// One unit finished for `gpu` of device time, the gap it is followed by,
+    /// and the period the two of them are.
+    ///
+    /// The sleep is behind a test so that a run asking for no gap makes no
+    /// syscall a run of any other measurement here would not: what this is
+    /// timing is a decode step, and a decode step's own host side is 8% of it.
+    fn tick(&mut self, gpu: Duration) {
+        if !self.idle.is_zero() {
+            std::thread::sleep(self.idle);
+        }
+        self.ticks.push(Tick {
+            wall: self.at.elapsed(),
+            gpu,
+        });
+        self.at = Instant::now();
+    }
+}
+
+/// What a run of identical units says about the clock underneath them.
+///
+/// The run in [`PARTS`] parts, each part's mean device time and duty cycle, and
+/// the last part against the first — which is the number that says whether the
+/// part held its speed, and in which direction it did not.
+fn clocked(ticks: &[Tick]) -> Vec<Reading> {
+    let mean = |part: &[Tick]| match part.is_empty() {
+        true => (Duration::ZERO, Duration::ZERO),
+        false => (
+            part.iter().map(|tick| tick.gpu).sum::<Duration>() / part.len() as u32,
+            part.iter().map(|tick| tick.wall).sum::<Duration>() / part.len() as u32,
+        ),
+    };
+    let (whole_gpu, whole_wall) = mean(ticks);
+    // **[`PARTS`] parts wherever there are units for them**, cut at the
+    // proportion rather than by a fixed chunk: a chunk wide enough for the last
+    // part to be short is one that leaves a run of eleven reporting four parts
+    // and a run of ten reporting five, so the shape a reader compares would
+    // depend on a count nobody chose for its divisibility.
+    let cuts = PARTS.min(ticks.len());
+    let parts: Vec<(Duration, Duration)> = (0..cuts)
+        .map(|at| mean(&ticks[at * ticks.len() / cuts..(at + 1) * ticks.len() / cuts]))
+        .collect();
+
+    eprintln!("  part      device       wall    duty    against the first");
+    let mut readings = Vec::new();
+    for (at, (gpu, wall)) in parts.iter().enumerate() {
+        eprintln!(
+            "  {:>4}   {:>9.4?}  {:>9.4?}  {:>5.1}%    {}",
+            at + 1,
+            gpu,
+            wall,
+            duty(*gpu, *wall),
+            match at {
+                0 => String::new(),
+                _ => format!("{:+.2}%", against(*gpu, parts[0].0)),
+            },
+        );
+        readings.push(Reading::new(
+            format!("part{}.device", at + 1),
+            millis(*gpu),
+            "ms",
+        ));
+    }
+    let drift = parts
+        .last()
+        .map_or(0.0, |(last, _)| against(*last, parts[0].0));
+    eprintln!(
+        "  whole: device {:.4?}, wall {:.4?}, duty {:.1}%, drift {:+.2}%",
+        whole_gpu,
+        whole_wall,
+        duty(whole_gpu, whole_wall),
+        drift,
+    );
+    readings.extend([
+        Reading::new("clock.device", millis(whole_gpu), "ms"),
+        Reading::new("clock.wall", millis(whole_wall), "ms"),
+        Reading::new("clock.duty", duty(whole_gpu, whole_wall), "%"),
+        Reading::new("clock.drift", drift, "%"),
+    ]);
+    readings
+}
+
+/// How much of the wall around a unit of work the device was busy for, which is
+/// the number a figure taken at an unstated occupancy is missing.
+fn duty(gpu: Duration, wall: Duration) -> f64 {
+    match wall.is_zero() {
+        true => 0.0,
+        false => 100.0 * gpu.as_secs_f64() / wall.as_secs_f64(),
+    }
+}
+
+/// One duration against another as a percentage, positive where the first is the
+/// longer — which for a fixed amount of work is the slower clock.
+fn against(taken: Duration, first: Duration) -> f64 {
+    match first.is_zero() {
+        true => 0.0,
+        false => 100.0 * (taken.as_secs_f64() / first.as_secs_f64() - 1.0),
     }
 }
 
@@ -1888,6 +2232,8 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: WIDEST,
+                idle: Duration::ZERO,
+                prefill: 0,
             }
         );
         assert_eq!(
@@ -1901,6 +2247,8 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: WIDEST,
+                idle: Duration::ZERO,
+                prefill: 0,
             }
         );
     }
@@ -1922,6 +2270,8 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: WIDEST,
+                idle: Duration::ZERO,
+                prefill: 0,
             }
         );
         assert_ne!(BEST, SWEPT);
@@ -1949,6 +2299,8 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: 0,
                 widest: WIDEST,
+                idle: Duration::ZERO,
+                prefill: 0,
             }
         );
         for what in ["decode", "prefill", "sweep", "engines"] {
@@ -1984,6 +2336,8 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: 8,
+                idle: Duration::ZERO,
+                prefill: 0,
             }
         );
         for what in ["decode", "prefill", "sweep", "engines", "session"] {
@@ -2001,6 +2355,235 @@ mod tests {
         assert_eq!(widths(1), vec![1]);
         assert_eq!(widths(8), vec![1, 2, 4, 8]);
         assert_eq!(widths(12), vec![1, 2, 4, 8, 12]);
+    }
+
+    /// **Only the clock measurement varies its own duty cycle**, which is the
+    /// rule the two levers no other measurement has anywhere to put are refused
+    /// under — and a run that silently dropped the gap it was told to leave
+    /// would report a figure about a duty cycle nobody asked for.
+    #[test]
+    fn only_a_clock_run_varies_its_own_duty_cycle() {
+        assert_eq!(
+            Job::parse(
+                ["clock", "models/small", "--idle", "40", "--context", "8192"].map(str::to_string)
+            )
+            .expect("parses"),
+            Job::Measure {
+                what: What::Clock,
+                checkpoint: PathBuf::from("models/small"),
+                tokens: TICKED,
+                context: 8192,
+                depth: SWEPT,
+                numerics: Numerics::default(),
+                reuse: DEFAULT_BOUND,
+                widest: WIDEST,
+                idle: Duration::from_millis(40),
+                prefill: 0,
+            }
+        );
+        for what in ["decode", "prefill", "sweep", "engines", "session", "batch"] {
+            for lever in [["--idle", "40"], ["--prefill", "2048"]] {
+                let given = [what, "models/small"].map(str::to_string);
+                assert!(
+                    Job::parse(given.into_iter().chain(lever.map(str::to_string))).is_err(),
+                    "{what} took {} it has no use for",
+                    lever[0]
+                );
+            }
+        }
+    }
+
+    /// **A prefill's keys are its own prompt**, so the two lengths cannot both
+    /// be given: a run told to prefill 2048 tokens behind a context of 8192 has
+    /// been given two answers to one question.
+    #[test]
+    fn a_clock_run_over_prefills_takes_no_context() {
+        assert_eq!(
+            Job::parse(["clock", "models/small", "--prefill", "2048"].map(str::to_string))
+                .expect("parses"),
+            Job::Measure {
+                what: What::Clock,
+                checkpoint: PathBuf::from("models/small"),
+                tokens: TICKED,
+                context: 0,
+                depth: SWEPT,
+                numerics: Numerics::default(),
+                reuse: DEFAULT_BOUND,
+                widest: WIDEST,
+                idle: Duration::ZERO,
+                prefill: 2048,
+            }
+        );
+        assert!(
+            Job::parse(
+                [
+                    "clock",
+                    "models/small",
+                    "--prefill",
+                    "2048",
+                    "--context",
+                    "8192"
+                ]
+                .map(str::to_string)
+            )
+            .is_err(),
+            "a run over prefills took a context as well as a prompt"
+        );
+        // Zero is the word for the other unit and cannot also be a prompt
+        // length, so it is refused rather than taken for either.
+        assert!(
+            Job::parse(["clock", "models/small", "--prefill", "0"].map(str::to_string)).is_err(),
+            "a prefill of no tokens was taken for a unit"
+        );
+    }
+
+    /// **A gap of nothing is a gap this measurement means something by** — it is
+    /// the arm every other measurement here runs at and the one the idled arm is
+    /// compared against — so `--idle 0` is a run rather than a refusal, unlike
+    /// every count in this parser.
+    #[test]
+    fn a_gap_of_no_milliseconds_is_the_arm_the_others_are_compared_against() {
+        let job = Job::parse(["clock", "models/small", "--idle", "0"].map(str::to_string))
+            .expect("a gap of nothing parses");
+        assert!(
+            matches!(job, Job::Measure { idle, .. } if idle.is_zero()),
+            "{job:?}"
+        );
+    }
+
+    fn ticks(gpu: &[u64], wall: &[u64]) -> Vec<Tick> {
+        gpu.iter()
+            .zip(wall)
+            .map(|(gpu, wall)| Tick {
+                gpu: Duration::from_micros(*gpu),
+                wall: Duration::from_micros(*wall),
+            })
+            .collect()
+    }
+
+    fn reading(readings: &[Reading], name: &str) -> f64 {
+        readings
+            .iter()
+            .find(|reading| reading.name == name)
+            .unwrap_or_else(|| panic!("{name} is among {:?}", names(readings)))
+            .value
+    }
+
+    fn names(readings: &[Reading]) -> Vec<&str> {
+        readings
+            .iter()
+            .map(|reading| reading.name.as_str())
+            .collect()
+    }
+
+    /// A reading against what it should be, to a tolerance far below anything
+    /// this measurement reports: the durations go through `f64` seconds and
+    /// back, so an exact comparison is asserting the rounding rather than the
+    /// arithmetic.
+    #[track_caller]
+    fn reads(readings: &[Reading], name: &str, want: f64) {
+        let got = reading(readings, name);
+        assert!(
+            (got - want).abs() < 1e-6,
+            "{name} reads {got} rather than {want}"
+        );
+    }
+
+    /// **A run is reported in parts because a drift is a shape**, and the parts
+    /// are what separates a part that ramped once from one that fell throughout
+    /// — two runs a mean cannot tell apart.
+    #[test]
+    fn a_clock_run_is_reported_in_parts_and_the_last_against_the_first() {
+        // Ten units at 10 ms rising to 12, which is a part-per-two run whose
+        // last part is 20% above its first.
+        let rising = ticks(
+            &[
+                10_000, 10_000, 10_500, 10_500, 11_000, 11_000, 11_500, 11_500, 12_000, 12_000,
+            ],
+            &[20_000; 10],
+        );
+        let readings = clocked(&rising);
+        assert_eq!(
+            names(&readings),
+            [
+                "part1.device",
+                "part2.device",
+                "part3.device",
+                "part4.device",
+                "part5.device",
+                "clock.device",
+                "clock.wall",
+                "clock.duty",
+                "clock.drift",
+            ]
+        );
+        reads(&readings, "part1.device", 10.0);
+        reads(&readings, "part5.device", 12.0);
+        reads(&readings, "clock.drift", 20.0);
+        reads(&readings, "clock.device", 11.0);
+    }
+
+    /// **The duty cycle is the device against the whole period**, which is what
+    /// makes a gap deliberately left between two units visible in the figure
+    /// rather than only in the flag that asked for it.
+    #[test]
+    fn the_duty_cycle_is_the_device_against_the_period_the_gap_is_inside() {
+        let busy = ticks(&[18_400; 4], &[20_000; 4]);
+        let idled = ticks(&[18_400; 4], &[60_000; 4]);
+        reads(&clocked(&busy), "clock.duty", 92.0);
+        reads(&clocked(&idled), "clock.duty", 100.0 * 18.4 / 60.0);
+        // And the device column is what says the two ran at the same clock,
+        // which is the whole of what the idle arm is for.
+        reads(&clocked(&idled), "clock.device", 18.4);
+        reads(&clocked(&busy), "clock.device", 18.4);
+    }
+
+    /// **The parts are cut at the proportion**, so a run reports as many of them
+    /// as it has units for and the shape a reader compares does not depend on
+    /// whether the count happened to divide.
+    #[test]
+    fn a_run_reports_as_many_parts_as_it_has_units_for() {
+        let parts = |units: usize| {
+            clocked(&ticks(&vec![1_000; units], &vec![2_000; units]))
+                .iter()
+                .filter(|reading| reading.name.starts_with("part"))
+                .count()
+        };
+        assert_eq!(parts(1), 1);
+        assert_eq!(parts(4), 4);
+        assert_eq!(parts(5), PARTS);
+        // The counts a fixed chunk width gets wrong: eleven over chunks of three
+        // is four parts, and sixteen over chunks of four is four.
+        assert_eq!(parts(11), PARTS);
+        assert_eq!(parts(16), PARTS);
+        assert_eq!(parts(600), PARTS);
+    }
+
+    /// Every unit lands in exactly one part, so what the parts are is a cut of
+    /// the run rather than a second sample of it — which is what makes a drift
+    /// between two of them a statement about the run that was taken.
+    #[test]
+    fn the_parts_are_a_cut_of_the_run_rather_than_a_sample_of_it() {
+        // Eleven units, which no chunk width divides, rising by a tenth of a
+        // millisecond each.
+        let gpu: Vec<u64> = (0..11).map(|at| 10_000 + at * 100).collect();
+        let readings = clocked(&ticks(&gpu, &[20_000; 11]));
+        reads(&readings, "clock.device", 10.5);
+        // Two units in the first part and three in the last, which is where
+        // cutting at the proportion puts them.
+        reads(&readings, "part1.device", 10.05);
+        reads(&readings, "part5.device", 10.9);
+        reads(&readings, "clock.drift", 100.0 * (10.9 / 10.05 - 1.0));
+    }
+
+    /// A run of nothing reports zeroes rather than dividing by them, which is
+    /// the shape every other reading here answers an empty run with.
+    #[test]
+    fn a_clock_run_over_no_units_divides_by_nothing() {
+        let readings = clocked(&[]);
+        reads(&readings, "clock.device", 0.0);
+        reads(&readings, "clock.duty", 0.0);
+        reads(&readings, "clock.drift", 0.0);
     }
 
     /// **The numerics are an arm's own word and every measurement takes it**,
@@ -2368,6 +2951,8 @@ mod tests {
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: WIDEST,
+                idle: Duration::ZERO,
+                prefill: 0,
             }
         );
         for what in ["prefill", "sweep", "engines", "session"] {

@@ -184,3 +184,111 @@ fn the_harness_alternates_the_real_arm_against_itself() {
     }
     assert!(report.contains("1 of 1"), "{report}");
 }
+
+/// **The clock measurement reports a part at a time and a whole beside them**,
+/// which is what a drift is read off — and the gap it was told to leave falls
+/// inside the period rather than beside it, or the duty cycle it reports is
+/// about a lever nobody pulled.
+///
+/// Four units, because what this asserts is the shape of the report rather than
+/// anything about the machine, and a short decode run reaches every reading a
+/// long one does.
+///
+/// **The gap is the one duration asserted here and it is asserted as a floor**,
+/// which is what keeps this inside the rule at the top of this file: a period
+/// holding a 200 ms sleep is at least 200 ms because `sleep` says so, on any
+/// machine and under any load. What the gap does to the *pair* of arms is a
+/// comparison of two durations and belongs where the arithmetic lives — see
+/// `the_duty_cycle_is_the_device_against_the_period_the_gap_is_inside`. This run
+/// decodes beside a whole suite, and the reading that failed here first was the
+/// unidled arm's wall at 510 ms against a device of 21.
+#[test]
+fn a_clock_run_reports_every_part_and_the_period_the_gap_is_inside() {
+    let Some(dir) = checkpoint_dir() else { return };
+    const GAP: f64 = 200.0;
+    let ran = bench(&[
+        "clock",
+        "--tokens",
+        "4",
+        "--idle",
+        "200",
+        &dir.display().to_string(),
+    ]);
+    let reported = readings(stdout(&ran));
+
+    assert_eq!(
+        named(stdout(&ran)),
+        [
+            "part1.device",
+            "part2.device",
+            "part3.device",
+            "part4.device",
+            "clock.device",
+            "clock.wall",
+            "clock.duty",
+            "clock.drift",
+        ]
+    );
+    let value = |name: &str| {
+        reported
+            .iter()
+            .find(|(had, ..)| had == name)
+            .unwrap_or_else(|| panic!("{name} is reported"))
+            .1
+    };
+    assert!(
+        value("clock.wall") > GAP,
+        "the gap is inside the period: {reported:?}"
+    );
+    // And the device time is the work rather than the period, so it is under the
+    // gap the period is over — which is the separation the whole measurement
+    // rests on.
+    assert!(
+        value("clock.device") < GAP && value("clock.device") > 0.0,
+        "the gap is beside the work rather than inside it: {reported:?}"
+    );
+}
+
+/// **The other unit is a whole prefill**, which is the arm whose repetitions are
+/// the same work every time and so the arm a drift means anything under — and
+/// nothing else in this file runs it.
+///
+/// A prompt of 32 tokens and two of them, because what this asserts is that the
+/// arm runs and reports rather than anything about how long it took.
+#[test]
+fn a_clock_run_over_prefills_reports_the_same_readings() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ran = bench(&[
+        "clock",
+        "--prefill",
+        "32",
+        "--tokens",
+        "2",
+        &dir.display().to_string(),
+    ]);
+
+    assert_eq!(
+        named(stdout(&ran)),
+        [
+            "part1.device",
+            "part2.device",
+            "clock.device",
+            "clock.wall",
+            "clock.duty",
+            "clock.drift"
+        ]
+    );
+    // The durations, and not the drift beside them: a part slower than the first
+    // is a positive drift and a part faster than it is a negative one, which is
+    // the whole of what that column is for.
+    for (name, value, unit) in readings(stdout(&ran)) {
+        if unit == "ms" {
+            assert!(value > 0.0, "{name} is {value}");
+        }
+    }
+    // The prompt is the unit, so the header says which length was repeated
+    // rather than a range of keys — the two arms report different things there
+    // and a reader has to be able to tell which one they are holding.
+    let said = String::from_utf8_lossy(&ran.stderr).to_string();
+    assert!(said.contains("prefills of 32 tokens"), "{said}");
+}
