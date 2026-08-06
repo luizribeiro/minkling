@@ -351,6 +351,12 @@ impl<'a> LayerProjections<'a> {
         self.v_sconv.resume(slot, v);
     }
 
+    /// What this layer's attention holds for the sequences in it: their spans,
+    /// and the two convolution windows either side of the key and the value.
+    pub fn held_bytes(&self) -> u64 {
+        self.attention.span_bytes() + self.k_sconv.window_bytes() + self.v_sconv.window_bytes()
+    }
+
     /// That the step being asked for is over the shape this layer was wrapped
     /// for.
     ///
@@ -1289,6 +1295,26 @@ impl<'a> ModelLayers<'a> {
     fn layer(&self, layer: usize) -> Option<&LayerDevice<'a>> {
         self.layers.get(layer)?.as_ref()
     }
+
+    /// **What a batch costs in memory, which is the whole of what it costs.**
+    ///
+    /// Every weight this holds is read once for every sequence in flight and is
+    /// not on this account; what a slot adds is one sequence's span and its four
+    /// convolution windows in every layer this holds. So this grows with the
+    /// slots and with the keys the sequences have seen, and with nothing else.
+    ///
+    /// **The spans are the term that moves.** A window is `taps - 1` timesteps
+    /// and never grows; a span grows by powers of two as a sequence sees keys,
+    /// and a windowed layer is charged the same as a global one — see
+    /// [`LayerAttention::span_bytes`](crate::LayerAttention::span_bytes), where
+    /// that is a finding rather than an interface.
+    pub fn held_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .flatten()
+            .map(LayerDevice::held_bytes)
+            .sum()
+    }
 }
 
 /// The seam [`inkling_core::weights`] names, so that a layer standing itself up
@@ -1296,6 +1322,10 @@ impl<'a> ModelLayers<'a> {
 impl LayerBackend for ModelLayers<'_> {
     fn attention(&self, layer: usize) -> Option<&dyn Projections> {
         Some(&self.layer(layer)?.attention as &dyn Projections)
+    }
+
+    fn held_bytes(&self) -> u64 {
+        ModelLayers::held_bytes(self)
     }
 
     fn dense_mlp(&self, layer: usize) -> Option<&dyn MlpProjections> {
@@ -1394,6 +1424,12 @@ impl LayerBackend for ModelLayers<'_> {
 }
 
 impl LayerDevice<'_> {
+    /// What this layer holds for the sequences in it, which is the whole of what
+    /// a slot costs: a span and four convolution windows.
+    pub(crate) fn held_bytes(&self) -> u64 {
+        self.attention.held_bytes() + self.attn_sconv.window_bytes() + self.mlp_sconv.window_bytes()
+    }
+
     /// Take back the last `rows` timesteps of everything this layer holds for
     /// the sequence in flight: its attention's keys and two windows, and the
     /// two convolutions on its residual paths.

@@ -73,18 +73,6 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// What this device has allocated and not given back.
-    ///
-    /// **What a batch costs in memory is read here rather than derived.** A slot
-    /// is one sequence's span and its four convolution windows in every layer,
-    /// and the spans grow with the context a sequence has seen — so the bound is
-    /// a measurement of a run at a length rather than an arithmetic from the
-    /// config alone. Nothing else this process holds is on this account: the
-    /// packed weights are mapped and never copied here.
-    pub fn allocated_bytes(&self) -> u64 {
-        self.device.allocated_bytes()
-    }
-
     fn open(numerics: Numerics) -> Result<Self> {
         let device = Device::open().context("opening a Metal device")?;
         let kernels =

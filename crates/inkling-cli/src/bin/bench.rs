@@ -790,9 +790,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 for slots in widths(widest) {
                     let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?;
                     let ids = behind_a_step(&prompt, context);
-                    let held = gpu.as_ref().map_or(0, backend::Gpu::allocated_bytes);
                     let run = batched(&weights, text, &ids, slots, tokens);
-                    let grew = gpu.as_ref().map_or(0, backend::Gpu::allocated_bytes) - held;
                     // A step is what the batch waits; a token is what one
                     // sequence in it waits, which is the step divided by the
                     // sequences that took a token out of it.
@@ -816,20 +814,12 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                         slots as f64 / run.step.as_secs_f64(),
                         "tok/s",
                     ));
-                    taken.push(Reading::new(
-                        format!("batch{slots}.held"),
-                        grew as f64 / (1u64 << 20) as f64,
-                        "MiB",
-                    ));
                     eprintln!(
-                        "batch {slots}: step {:.2?}, token {:.2?}, device {:.2?}, \
-                         {:.1} tok/s, {:.1} MiB of spans and windows ({:.1} a sequence)",
+                        "batch {slots}: step {:.2?}, token {:.2?}, device {:.2?}, {:.1} tok/s",
                         run.step,
                         run.step / slots as u32,
                         run.gpu,
                         slots as f64 / run.step.as_secs_f64(),
-                        grew as f64 / (1u64 << 20) as f64,
-                        grew as f64 / (1u64 << 20) as f64 / slots as f64,
                     );
                 }
             }

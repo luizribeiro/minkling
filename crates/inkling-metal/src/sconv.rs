@@ -273,6 +273,17 @@ impl<'a> LayerConv<'a> {
         self.channels
     }
 
+    /// What the windows this holds occupy on the device — two per slot, which
+    /// is what a sequence costs here and is the whole of what a slot adds
+    /// beside its span.
+    ///
+    /// The weight is not on this account: it is one tensor whatever the batch
+    /// is, which is what a batch is for.
+    pub fn window_bytes(&self) -> u64 {
+        let floats = self.slots.iter().map(|slot| 2 * slot.held.get().floats());
+        (floats.sum::<usize>() * size_of::<f32>()) as u64
+    }
+
     /// The window a sequence starts from, which is `taps - 1` zeroed timesteps —
     /// and is what makes the first output causal.
     ///

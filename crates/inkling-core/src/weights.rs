@@ -653,6 +653,19 @@ pub trait LayerBackend {
     /// which leaves the CPU path to decode them.
     fn experts(&self, layer: usize) -> Option<&dyn Experts>;
 
+    /// What this backend is holding for the sequences in flight, in bytes, and
+    /// zero from one that holds only weights.
+    ///
+    /// **This is what a batch costs and the whole of what it costs.** A weight
+    /// is read once for every sequence in flight and held once; what a slot
+    /// adds is one sequence's own state — a span and four convolution windows in
+    /// every layer — so N sequences hold N times what one does and nothing else
+    /// moves. See [`ModelLayers::held_bytes`](crate::ModelLayers), which is the
+    /// arithmetic.
+    fn held_bytes(&self) -> u64 {
+        0
+    }
+
     /// Take back the last `rows` timesteps of whatever state this backend holds
     /// for the sequence in flight — the keys it appended, and the convolution
     /// windows it advanced.
@@ -1007,6 +1020,12 @@ impl<'a> CheckpointWeights<'a> {
     /// different weights.
     pub fn final_norm(&self) -> &[f32] {
         &self.norm
+    }
+
+    /// What whatever runs the layers is holding for the sequences in flight —
+    /// see [`LayerBackend::held_bytes`], which is where what that is is said.
+    pub fn held_bytes(&self) -> u64 {
+        self.backend.as_deref().map_or(0, LayerBackend::held_bytes)
     }
 
     /// What the head multiplies against, which is the backend this was opened

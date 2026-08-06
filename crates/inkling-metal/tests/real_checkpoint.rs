@@ -3377,6 +3377,80 @@ fn a_generation_in_a_batch_produces_what_it_produces_alone_on_the_device() {
     }
 }
 
+/// **What a batch costs in memory, stated and bounded.**
+///
+/// N sequences means N KV caches, and that is the whole of what a slot adds: a
+/// span and four convolution windows in every layer, against weights that are
+/// read once for every sequence in flight and held once. So what this asserts is
+/// that the device's own accounting of that state is *linear* in the slots and
+/// that a slot costs what the checkpoint's shapes say it does.
+///
+/// The arithmetic, from the config alone and at a span holding its least
+/// capacity: a layer's keys and values are `2 * kv_heads * capacity * head_dim`
+/// floats, and its four windows are `2 * (taps - 1) * channels` floats apiece
+/// over the key's width twice and the hidden width twice.
+///
+/// **A windowed layer is charged the same as a global one**, which is a finding
+/// rather than an interface — see `LayerAttention::span_bytes`. It is what makes
+/// the bound below a bound on every layer rather than on seven of forty-two.
+#[test]
+fn a_slot_costs_a_span_and_four_windows_in_every_layer() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let config = fixture::config(&dir).text_config;
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+
+    let recorded = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+    let mut held = Vec::new();
+    for slots in [1, 2, 4] {
+        let weights = gpu.wrap_batch(&ckpt, &config, slots);
+        let generator = weights.generator();
+        let want = Tail {
+            block: 1,
+            chained: false,
+            logits: false,
+        };
+        for slot in 0..slots {
+            let mut cache = ModelCache::in_slot(&config, 0, slot);
+            generator.tailed(&mut cache, &recorded, want, &weights);
+        }
+        let bytes = weights.held_bytes();
+        eprintln!(
+            "batch {slots}: {:.1} MiB of spans and windows, {:.1} a sequence",
+            bytes as f64 / (1u64 << 20) as f64,
+            bytes as f64 / (1u64 << 20) as f64 / slots as f64,
+        );
+        held.push(bytes);
+    }
+
+    // A slot is a slot: two of them hold twice what one does, and four twice
+    // what two do. A layer that held its state anywhere but in the slots would
+    // break this before it broke a token.
+    assert_eq!(held[1], 2 * held[0], "two slots against one");
+    assert_eq!(held[2], 4 * held[0], "four slots against one");
+
+    // What one of them is, from the checkpoint's own shapes. The span is at the
+    // least capacity a span has, which the recorded prompt does not exceed.
+    let layers = config.num_hidden_layers as u64;
+    let kv = (config.num_key_value_heads * config.head_dim) as u64;
+    let taps = (config.sconv_kernel_size - 1) as u64;
+    let floats = |values: u64| values * size_of::<f32>() as u64;
+    let span = floats(2 * LEAST_SPAN * kv);
+    let windows = floats(2 * taps * (2 * kv + 2 * config.hidden_size as u64));
+    assert_eq!(
+        held[0],
+        layers * (span + windows),
+        "a slot against the shapes the checkpoint gives it"
+    );
+}
+
+/// Key slots a span has room for before a sequence makes it grow, which is
+/// `LEAST_KEYS` in `inkling_metal::attention` and is not public — spelled here
+/// so that the arithmetic above is checkable and a constant that moved would
+/// fail this rather than quietly widen a bound.
+const LEAST_SPAN: u64 = 64;
+
 /// **The derived and the encoded barrier counts still agree at batch > 1**, which
 /// is what makes contamination through a missing barrier a test failure rather
 /// than a paragraph.

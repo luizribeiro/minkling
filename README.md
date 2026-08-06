@@ -23,19 +23,20 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **692 of the 766 tests, no
+`just test` is the one to run while iterating: **713 of the 792 tests, no
 checkpoint, thirteen seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
-38 that need weights report a skip and pass. It runs through libtest, which puts
+41 that need weights report a skip and pass. It runs through libtest, which puts
 a crate's tests in one process: opening a Metal device costs a second, so the 256
 kernel tests are 13.6 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 766 against a
-real checkpoint, fifteen minutes.** The 692 the gated tier runs and the 74 the
-timing tier does. The 54 gated tests — the 38 above and fifteen
-of the measurements below, which need weights as well as a clock — are what
+`just test-full` is what has to pass at the ends of a series: **all 792 against a
+real checkpoint, twenty minutes and the measurements after it.** The 713 the
+gated tier runs and the 79 the timing tier does. The 57 gated tests — the 41
+above and sixteen of the measurements below, which need weights as well as a
+clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
 generates the oracle's own continuation, and that it generates the same
@@ -44,7 +45,7 @@ oracle they are measured against, at 9.0 s a decoded token, which is where most 
 minutes go. This tier runs a process a test, which is what keeps a test that
 bounds its resident set bounding only its own.
 
-`just test-timing` is the seventy-four tests whose result *is* a number — a duration
+`just test-timing` is the seventy-nine tests whose result *is* a number — a duration
 they assert on, a resident set they bound, the three decode-step tables quoted
 above, what a speculative round costs — run one at a time with nothing beside
 them. **A measurement taken while fifteen other tests ran is a measurement of
@@ -68,17 +69,19 @@ three; the pre-commit hooks already skip clippy on those by config.
     just bench HEAD~1 .    decode --context 8192
     just bench HEAD~1 .    prefill --tokens 769
     just bench v1 v2       sweep --depth 4
+    just bench . .         batch --batch 32   # what a token costs at each width
     just bench-engines                        # this engine against mlx-vlm
     just bench-session                        # a conversation, kept against not
 
-**A decode step is the one measurement here with a context to be taken at**, and
-until the occupancy turn wanted one it was always taken at the structured
-prompt's own 34 keys — which is the one length nobody has, on the one row of this
-file that grows with the context. `--context` tiles the prompt to the length
-asked for first. The other three refuse the flag rather than drop it: a prefill's
-context is its prompt and `--tokens` already says how long that is, and a sweep
-and a cross-engine table fix their own prompts because acceptance is the
-workload's.
+**A decode step is the one measurement here with a context to be taken at** —
+and the batch sweep with it, which is decode steps — and until the occupancy turn
+wanted one it was always taken at the structured prompt's own 34 keys, which is
+the one length nobody has, on the one row of this file that grows with the
+context. `--context` tiles the prompt to the length asked for first. The other
+three refuse the flag rather than drop it: a prefill's context is its prompt and
+`--tokens` already says how long that is, and a sweep and a cross-engine table
+fix their own prompts because acceptance is the workload's. `--batch` is refused
+the same way by everything but the sweep it belongs to.
 
 Every timed claim in this file is paired and alternating — build A, build B, run
 them in one sitting with the order flipped each pair, and report whether the
@@ -89,16 +92,19 @@ ref is built once into `target/bench/bin/<sha>` and kept, and the pairs are
 process launches against binaries that already exist. `.` is the working tree,
 which is the arm a change is measured from before it is a commit at all.
 
-**And one of them measures more than one request.** Everything else here is a
-call — a prefill, a decode step, a prompt and its answer — and a cache kept
-between requests is worth nothing on any of them, because none of them has a
-between. `just bench-session` is a conversation instead: several turns, each
-adding a question and each answered. See "What a conversation costs when its
-cache is kept".
+**And two of them measure more than one request, in the two ways there are.**
+`just bench-session` is a conversation — several turns, each adding a question
+and each answered — because a cache kept between requests is worth nothing on a
+measurement of one call, which has no between. See "What a conversation costs
+when its cache is kept". `bench batch` is several requests *at once* rather than
+one after another, which is the other thing a single call cannot say: what a
+token costs when the weights a step reads are read for N sequences instead of
+one. See "One weight read, many tokens".
 
-The four things it measures are the four this file quotes: a decode step, a
-prefill at a given length, the end-to-end `k` sweep with its acceptance and its
-speedups — the last of which are divided against *that run's* own `k = 0`,
+The five things it measures are the five this file quotes: a decode step, a
+prefill at a given length, what a token costs as more sequences are decoded
+through one set of weight reads, the end-to-end `k` sweep with its acceptance and
+its speedups — the last of which are divided against *that run's* own `k = 0`,
 because a sweep whose speedup row comes from another sitting carries the drift
 between the two — and what a prompt and its answer cost together. What comes back
 is the per-arm mean, both ranges, whether they overlap, and how many pairs moved
@@ -1203,6 +1209,187 @@ and 769 tokens cost 2.04, 5.45 and 10.1 s before the budget replaced the row
 count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
+
+## One weight read, many tokens — and what that turns out to be worth
+
+**A decode step reads 5.9 GB of weights to produce one token. At batch N the
+same read produces N, and nothing in a kernel touches that.** So the lever this
+milestone pulls is not arithmetic: N sequences advance through one set of weight
+reads, the state each of them carries becomes a *slot*, and the five projections,
+the two full-width norms, the MoE and the tail run once over every row of the
+call.
+
+**It works and it changes no token. What it is worth is 1.78×, and it stops
+paying at eight.**
+
+    N     step      a token   device    tokens/s   against N=1
+    1    16.22 ms   16.22 ms  15.25 ms     61.7      1.00x
+    2    27.45      13.72     26.27        72.9      1.18x
+    4    41.93      10.48     40.84        95.4      1.55x
+    8    78.49       9.81     76.80       101.9      1.65x
+   16   147.17       9.20    143.41       108.7      1.76x
+   32   291.21       9.10    278.81       109.9      1.78x
+
+Doubling from 8 to 16 buys 6% and from 16 to 32 buys 1%. **The curve is the
+result of this milestone**, and it says the premise it was pulled on is only
+partly true at these shapes — the section after next is what the rest of it is.
+
+`just bench . . batch --batch 32` is the sweep; it is one sitting warmed and
+settled two steps a width, and a null pair of it — the same binary on both arms —
+reads the device column to within 0.8% at N = 1 and 0.3% at every other width,
+which is the instrument the rows above are read against.
+
+### What it costs a single request, which is nothing
+
+**Batch 1 is a case of the batch path and not a path beside it**, which is the
+whole of what keeps ten milestones of shape-keyed tuning from being derived
+twice: `Reading::whole` and `Placed::alone` are the same call at row zero of a
+buffer of its own, and a batch of one encodes the same dispatches in the same
+order as the decode step that came before this milestone. Paired against the
+commit before it, seven pairs, alternating:
+
+    decode    16.272 -> 16.291 ms   +0.1%   ranges across, 4 of 7   no claim
+    device    15.195 -> 15.206 ms   +0.1%   ranges across, 6 of 7   no claim
+
+**No token moved under any word.** `just test-full` is green, the recorded
+continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what the engine
+generates, `--backend cpu` is unmoved, and `production` is still 448 of 448
+against `reference`.
+
+### The test this milestone lives or dies by
+
+**Every existing check here is blind to what a batch breaks.** If sequence A's
+span, convolution window or rows leak into B, both continuations are still
+coherent text, the recorded eight-token continuation still passes, and every
+tolerance in the tree is still met. So the test came before any timing claim, and
+it is one sentence:
+
+> The same sequence, run alone and run inside a batch, produces identical
+> tokens — in different batch positions, with neighbours of different lengths,
+> with neighbours feeding a different number of rows a step, and with a
+> neighbour that finishes early.
+
+It is asserted at four scales, exactly rather than within a tolerance, because
+the batched arm walks the same taps over the same window and the same keys in
+the same tiles and the only thing a batch changes is which row of a buffer each
+of them is at:
+
+- **The state**, in `inkling_metal::sconv` and `::attention`: two sequences
+  interleaved a step at a time through one convolution's two slots, and through
+  one layer's two spans, are the two sequences run alone. Interleaved rather than
+  run one after the other, because state shared between two slots is right on the
+  step that wrote it and wrong on the one after.
+- **The layer**, in `inkling_metal::projections`: three sequences through two
+  whole decoder layers, in every ordering of them, one feeding three rows a step
+  where another feeds one and a third stopping after one step.
+- **The stack and the loop**, in `inkling_core::model` and `::generate`, which is
+  where the bookkeeping around the calls lives.
+- **The checkpoint**, in `inkling-metal/tests/real_checkpoint.rs`: the oracle's
+  own prompt generated from *inside* a batch of three, against each of the three
+  generated alone on the same weights. Agreeing with the oracle is not the claim
+  — the claim is that the neighbours are unmoved too.
+
+The layer-level case was mutated to check it can fail: pinning the residual
+convolution to slot 0 fails it at the first sequence of the first ordering.
+
+**And the barriers.** D4's dependency graph is derived from each kernel's Metal
+source at compile time, and a batch adds edges it never saw — a convolution
+reading the run of the projections' rows that is its own, writing into a span the
+step after it binds, N of each. The derived and the encoded counts still agree at
+batch 1, 2 and 4: 617, 781 and 1111 barriers over 876, 1086 and 1546 dispatches.
+A missing barrier is a race that is correct most of the time, which is the one
+failure a batch cannot afford, so it is a test failure rather than a paragraph.
+
+**D5's dispatch-list differential needs nothing new**: a batch adds no kernel
+entry. Every dispatch a batched step makes is one of the entries a single
+sequence already made, more times — which is what the count says.
+
+### What a slot costs, which is where the sequences stop being free
+
+    30.8 MiB a sequence, exactly linear in the slots
+
+A slot is one sequence's span and its four convolution windows in every layer,
+and nothing else: the weights beside them are read once for every sequence in
+flight and held once. So `2 * kv_heads * capacity * head_dim` floats of keys and
+values, plus `2 * (taps - 1) * channels` floats for each of four windows, times
+42 layers — and `a_slot_costs_a_span_and_four_windows_in_every_layer` holds the
+device's own accounting to exactly that and to exactly `N` times one.
+
+**The capacity is what grows.** A span doubles as a sequence sees keys and a
+windowed layer is charged the same as a global one, so the figure above is the
+floor at a span's least capacity of 64 keys. At a context a user has it is the
+KV cost of the context times N, and that is the bound: **N sequences means N KV
+caches and means nothing else.**
+
+### Why it stops at eight, which is not the weights
+
+**About 6.7 ms of a decode step's 15.25 ms of device time is read once between
+the sequences, and about 8.5 ms is per sequence.** That is the line fitted
+through the device column at N = 1 and N = 32, and it predicts 40.8 ms at N = 4
+against 40.84 measured and 142.8 at N = 16 against 143.41.
+
+There are two things in the 8.5 and the measurement separates them. **A prefill
+of N rows is N rows through *one* sequence** — one span, one set of windows, one
+attention dispatch — so it pays whatever N rows cost the model and none of what N
+*sequences* cost the scheduler:
+
+    rows    N rows, one sequence    N rows, N sequences    batched / alone
+      1          14.17 ms                15.25 ms              1.08x
+      2          22.43                   26.27                 1.17x
+      4          33.03                   40.84                 1.24x
+      8          59.77                   76.80                 1.28x
+     16         108.40                  143.41                 1.32x
+     32         207.93                  278.81                 1.34x
+
+Two things follow, and they point in different directions.
+
+**The batch is within a third of the best any batching could do here**, and the
+gap is the dispatches a slot keeps to itself: five a layer — the convolution
+pair, the head-norm pair and the attention step — which is 210 more dispatches a
+slot, measured. The remedy is a step and a convolution that take a slot index per
+*row* rather than a call per slot, so that N sequences are one dispatch reading N
+spans. That is priced here and not built: it is a kernel change to the three
+entries whose bit-exactness every numerics claim in this file rests on, and the
+1.32× it is chasing is bounded by the column beside it.
+
+**And that column is the real ceiling, which is much lower than the lever
+assumed.** Sixteen rows through one sequence cost 108.40 ms where one row costs
+14.17 — 7.65× for 16× the rows, so the *model's own* per-row cost falls only
+2.09× from one row to sixteen. A decode step at these shapes is not
+weight-read-bound the way "one weight read, many tokens" supposes, and the
+arithmetic says why: **73% of the 5.9 GB a step reads is routed experts**, and
+sixteen tokens draw 96 experts from a bank of 256 — about 80 distinct — so the
+expert half of the read grows almost as fast as the batch does. Only the 27% that
+every token reads all of amortises at all. Covering the bank needs N well past
+`256 / 6`, and by then the shared half has been flat for two doublings.
+
+*The prefill column is a floor and not an equal comparison*: its sequence attends
+over its own 1 to 32 keys where a batched step's sequences attend over the
+structured prompt's 34 and the steps behind it. That biases against the batch, so
+1.32× is an upper bound on what a slot's own dispatches cost.
+
+### What this leaves
+
+**Static, and stopping there is a complete result.** Requests joining and leaving
+mid-flight is the fourth item of the scope and it is not here: what it needs is a
+scheduler and an admission policy, and what it would be worth is bounded above by
+the curve — a slot that fills sooner earns the same 1.78× sooner. The pieces it
+would be built on are here: a slot is addressed rather than positional, a
+sequence's cache names its own slot, and a sequence that stops feeding drops out
+of the batch and the rest go on without it, which
+`a_generation_in_a_batch_produces_what_it_produces_alone` drives.
+
+**A prefill is still one sequence at a time, deliberately.** A prompt of any
+length already fills the machine — that is the whole reason this milestone
+batched the other regime — and batching prefills would mean a tail that runs the
+200058-row head at every position of every prompt.
+
+**Speculation is batching and the layer already serves it**: a sequence of a batch
+may feed any number of rows a step, which is what a `k`-deep verify block is, and
+the contamination cases drive neighbours at different depths. What is not here is
+the *chain*: the MTP heads carry a decoder layer's state apiece, so a batch that
+speculates needs a chain's state per slot, which `ModelHeads::wrap` now takes and
+nothing yet asks for above one.
 
 ## What the skew costs, which is the blocks it makes and not the tail
 
