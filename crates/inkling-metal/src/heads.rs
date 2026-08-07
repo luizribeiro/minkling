@@ -30,8 +30,8 @@
 use inkling_core::attention::Projections;
 use inkling_core::head::Tail;
 use inkling_core::layer::Advancing;
-use inkling_core::layer::{DecoderCache, Passed};
-use inkling_core::mtp::{Guessed, HeadBackend, HeadDevice, HeadPacked, HeadStep, HeadWeight};
+use inkling_core::layer::Passed;
+use inkling_core::mtp::{Guessed, HeadBackend, HeadDevice, HeadPacked, HeadWeight};
 use inkling_core::ops::{MlpProjections, Projection};
 use inkling_core::profile::{self, Op};
 
@@ -94,6 +94,10 @@ struct WrappedHead<'a> {
 #[derive(Debug)]
 pub struct ModelHeads<'a> {
     heads: Vec<WrappedHead<'a>>,
+    /// How many sequences each head holds a span and four windows for, which is
+    /// what a chain built for more of them has to be refused by — see
+    /// [`HeadBackend::slots`].
+    slots: usize,
     /// The model's own final norm, muP divide and `lm_head`, where this holds
     /// them — which is the second half of a head's command buffer and half of
     /// a chain's submissions.
@@ -174,6 +178,7 @@ impl<'a> ModelHeads<'a> {
             .collect::<Result<Vec<_>, ProjectionError>>()?;
         Ok(Self {
             heads: wrapped,
+            slots,
             tail,
         })
     }
@@ -217,6 +222,10 @@ impl HeadBackend for ModelHeads<'_> {
             held.block.rewind(slot, rows);
         }
     }
+
+    fn slots(&self) -> Option<usize> {
+        Some(self.slots)
+    }
 }
 
 /// **One command buffer a head**, where the same eight multiplies asked for a
@@ -229,10 +238,10 @@ impl HeadBackend for ModelHeads<'_> {
 /// pair of normed rows it was handed and the `[rows, hidden]` and the four bytes
 /// of id it answers with.
 impl HeadDevice for ModelHeads<'_> {
-    fn run(&self, head: usize, cache: &mut DecoderCache, step: HeadStep<'_>) -> Option<Guessed> {
+    fn run(&self, head: usize, seats: &mut [Advancing<'_>], input: &[f32]) -> Option<Vec<Guessed>> {
         let held = self.heads.get(head)?;
         Some(
-            held.run(cache, step, self.tail.as_ref())
+            held.run(seats, input, self.tail.as_ref())
                 .unwrap_or_else(|err| panic!("the head did not run: {err}")),
         )
     }
@@ -240,7 +249,10 @@ impl HeadDevice for ModelHeads<'_> {
 
 impl WrappedHead<'_> {
     /// The projection and the block encoded into one command buffer, submitted
-    /// and waited for.
+    /// and waited for — **one buffer for the whole batch and not one a
+    /// sequence**, which is the same bargain the stack's own run of layers
+    /// makes: what N seats share is the eight weight reads and the nineteen
+    /// dispatches over them.
     ///
     /// Nothing between the `[rows, 2 * hidden]` this is handed and the `[rows,
     /// hidden]` it answers with is a value this process forms: what
@@ -248,36 +260,41 @@ impl WrappedHead<'_> {
     /// twenty dispatches behind that are a layer's own.
     fn run(
         &self,
-        cache: &mut DecoderCache,
-        step: HeadStep<'_>,
+        seats: &mut [Advancing<'_>],
+        input: &[f32],
         tail: Option<&ModelTail<'_>>,
-    ) -> Result<Guessed, ProjectionError> {
+    ) -> Result<Vec<Guessed>, ProjectionError> {
+        // Read before the block advances the caches it is handed, because
+        // `Advancing::queries` is this call's rows and the append past it is
+        // the next call's.
+        let counts: Vec<usize> = seats.iter().map(Advancing::queries).collect();
+        // The row a round takes each sequence's guess from: the last of that
+        // sequence's own run, which past one seat is not the last of the call.
+        let frontier: Vec<usize> = seats
+            .iter()
+            .map(|seat| seat.first + seat.queries() - 1)
+            .collect();
+
         let device = self.input_proj.device();
         let mut batch = device.batch()?;
-        let mut input = device.buffer(step.input)?;
+        let mut buffer = device.buffer(input)?;
         let mut x = self
             .input_proj
-            .encode_over(&mut batch, &mut input)?
+            .encode_over(&mut batch, &mut buffer)?
             .buffer();
-        let mut rows = self.block.encode_into(
-            &mut batch,
-            &mut [Advancing {
-                cache,
-                first: 0,
-                step: step.block,
-            }],
-            &mut x,
-        )?;
-        // The last row alone, and undivided rows nobody wants: what a head is
+        let mut rows = self.block.encode_into(&mut batch, seats, &mut x)?;
+        // One row a sequence, and undivided rows nobody wants: what a head is
         // chained from is its own state, which is these rows before any norm,
-        // and what the guess needs is the model's tail over the last of them.
+        // and what the guess needs is the model's tail over each sequence's
+        // last.
         let landed = tail
             .map(|tail| {
-                tail.encode_into(
+                tail.encode_rows(
                     &mut batch,
                     &mut rows,
+                    &frontier,
                     Tail {
-                        block: 1,
+                        block: frontier.len(),
                         chained: false,
                         logits: false,
                     },
@@ -285,10 +302,23 @@ impl WrappedHead<'_> {
             })
             .transpose()?;
         batch.wait()?;
-        Ok(Guessed {
-            hidden: Passed::Rows(profile::timed(Op::Readback, || rows.to_vec())),
-            guess: landed.as_ref().map(Landed::guess),
-        })
+
+        let produced = profile::timed(Op::Readback, || rows.to_vec());
+        let guesses = landed.as_ref().map(Landed::guesses);
+        let width = produced.len() / counts.iter().sum::<usize>().max(1);
+        let mut from = 0;
+        Ok(counts
+            .iter()
+            .enumerate()
+            .map(|(at, rows)| {
+                let own = produced[from..from + rows * width].to_vec();
+                from += rows * width;
+                Guessed {
+                    hidden: Passed::Rows(own),
+                    guess: guesses.as_ref().map(|guesses| guesses[at]),
+                }
+            })
+            .collect())
     }
 }
 

@@ -142,6 +142,51 @@ pub trait Proposer {
     fn propose(&mut self, round: Round<'_>) -> &[usize];
 }
 
+/// Where a batch's rounds come from.
+///
+/// **The mirror of [`Proposer`] one seat out, and a trait of its own rather than
+/// a default on that one**, for the reason a batch is not a loop over one
+/// sequence: a proposer carries state per sequence — the MTP heads carry a chain
+/// of caches apiece — so an implementation asked for N rounds has to know they
+/// are N sequences' and not one sequence's N times. A default that walked the
+/// rounds through [`Proposer::propose`] would give every sequence in the batch
+/// the state of the one before it, silently.
+///
+/// A guess is never load-bearing here either: [`Generator::speculate_batch`]
+/// verifies every one of them against the model's own answer, per sequence.
+pub trait BatchProposer {
+    /// How many tokens this can guess at most for any one sequence, which the
+    /// loop takes as the ceiling on a round's block.
+    fn depth(&self) -> usize;
+
+    /// Up to `round.depth` tokens after the last row of each round.
+    ///
+    /// One entry per round handed in, in the order they were handed in — which
+    /// is the sequences' slot order, since a batch's rows are laid that way.
+    fn propose_batch(&mut self, rounds: &[Seated<'_>]) -> Vec<Vec<usize>>;
+}
+
+/// One sequence's round inside a batch of them.
+///
+/// `at` is which of the proposer's sequences it belongs to, because a batch's
+/// live members are a subset: a sequence that has produced everything it was
+/// asked for drops out and the rest go on without it, so the `n`th round of a
+/// call is not the `n`th sequence.
+pub struct Seated<'a> {
+    pub at: usize,
+    pub round: Round<'a>,
+}
+
+impl BatchProposer for Alone {
+    fn depth(&self) -> usize {
+        0
+    }
+
+    fn propose_batch(&mut self, rounds: &[Seated<'_>]) -> Vec<Vec<usize>> {
+        rounds.iter().map(|_| Vec::new()).collect()
+    }
+}
+
 /// What a round hands its proposer: the rows it committed, and what follows
 /// each of them.
 ///
@@ -193,6 +238,30 @@ impl Picked {
     pub fn last(&self) -> usize {
         *self.picks.last().expect("a row per sequence of a batch")
     }
+}
+
+/// What a batched step answered: each sequence's ids, and — where the caller
+/// asked for them — the normed rows a proposer is chained from.
+///
+/// The rows are the whole call's, laid sequence by sequence in the order the
+/// batch names them, so [`Picked::first`] is what indexes into them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Verified {
+    pub picked: Vec<Picked>,
+    /// `[rows, hidden]` post-final-norm, and empty where nothing asked.
+    pub normed: Vec<f32>,
+}
+
+/// Where each sequence of a batched speculative run is: what it has produced,
+/// the token it owes the next call, and what its chain guessed after that.
+///
+/// One struct rather than three parallel vectors passed around, because they
+/// are indexed by the same thing and a caller holding two of them in step by
+/// hand is a caller that can stop.
+struct Running {
+    produced: Vec<Vec<usize>>,
+    pending: Vec<usize>,
+    guesses: Vec<Vec<usize>>,
 }
 
 /// The proposer of a generation that does not speculate, which guesses nothing
@@ -363,22 +432,57 @@ impl<'a> Generator<'a> {
         batch: &mut [Batched<'_>],
         weights: &impl ModelWeights,
     ) -> Vec<Picked> {
+        self.verify_batch(batch, false, weights).picked
+    }
+
+    /// The same batched step with the rows a proposer is chained from carried
+    /// back beside the ids.
+    ///
+    /// **The one call a batched speculative round makes.** Every row of the
+    /// call is a question — a sequence's rows are the token it owes plus the
+    /// guesses a chain made after it — and what the round then needs of the
+    /// rows it keeps is the *post*-final-norm hidden state each of them
+    /// produced, because that is what an MTP head is chained from. Asking for
+    /// the two separately would be the pass run twice.
+    ///
+    /// `chained` is what decides whether those rows cross back at all, for the
+    /// reason [`Tail::chained`](crate::Tail::chained) exists: a batch that will
+    /// not be asked for guesses does not pay a dispatch and a crossing to carry
+    /// them.
+    pub fn verify_batch(
+        &self,
+        batch: &mut [Batched<'_>],
+        chained: bool,
+        weights: &impl ModelWeights,
+    ) -> Verified {
         let counts: Vec<usize> = batch.iter().map(|sequence| sequence.ids.len()).collect();
         let rows: usize = counts.iter().sum();
-        let picks = self.asked_of(batch, rows, weights);
+        let tailed = self.asked_of(
+            batch,
+            Tail {
+                block: rows,
+                chained,
+                logits: false,
+            },
+            weights,
+        );
 
         let mut from = 0;
-        counts
+        let picked = counts
             .into_iter()
             .map(|queries| {
                 let picked = Picked {
                     first: from,
-                    picks: picks[from..from + queries].to_vec(),
+                    picks: tailed.picks[from..from + queries].to_vec(),
                 };
                 from += queries;
                 picked
             })
-            .collect()
+            .collect();
+        Verified {
+            picked,
+            normed: tailed.normed,
+        }
     }
 
     /// The same step over a batch whose **leading seats are feeding a prompt
@@ -434,7 +538,17 @@ impl<'a> Generator<'a> {
         // the smallest tail there is is the one [`Generator::prefill`] takes and
         // for the same reason. The id it names is a mid-prompt position's and is
         // dropped here.
-        let picks = self.asked_of(batch, decoding.max(1), weights);
+        let picks = self
+            .asked_of(
+                batch,
+                Tail {
+                    block: decoding.max(1),
+                    chained: false,
+                    logits: false,
+                },
+                weights,
+            )
+            .picks;
         picks[picks.len() - decoding..].to_vec()
     }
 
@@ -448,22 +562,17 @@ impl<'a> Generator<'a> {
     fn asked_of(
         &self,
         batch: &mut [Batched<'_>],
-        block: usize,
+        want: Tail,
         weights: &impl ModelWeights,
-    ) -> Vec<usize> {
-        let want = Tail {
-            block,
-            chained: false,
-            logits: false,
-        };
+    ) -> Tailed {
         let tailed = match self.model.forward_batch(batch, weights) {
             Passed::Carried(carried) => weights
                 .tail(carried, want)
                 .expect("a stack that carried its last layer's rows holds the tail behind them"),
             Passed::Rows(h) => self.on_this_side(&h, want),
         };
-        assert_eq!(tailed.picks.len(), block, "an id per row of the block");
-        tailed.picks
+        assert_eq!(tailed.picks.len(), want.block, "an id per row of the block");
+        tailed
     }
 
     /// `ids` into `cache`, with no token taken back out of it.
@@ -761,6 +870,218 @@ impl<'a> Generator<'a> {
             for (at, picked) in live.iter().zip(self.step_batch(&mut batch, weights)) {
                 produced[*at].push(picked.last());
             }
+        }
+    }
+
+    /// The same several generations, with `proposer` allowed to guess ahead for
+    /// every one of them at once.
+    ///
+    /// # The verify is one call and it is ragged
+    ///
+    /// Each live sequence feeds the token it owes plus the guesses its own
+    /// chain made after it, and all of those rows go through the stack
+    /// together — so the weights a round reads are read once for the whole
+    /// batch, as a decode step's already are, and the block a round verifies is
+    /// N sequences' blocks rather than one. **The rows are unequal by
+    /// construction**: a round accepts as many guesses as the model agreed
+    /// with, which is a different number per sequence, so the next call's seats
+    /// differ in length and each sequence rewinds its own cache by its own
+    /// amount.
+    ///
+    /// Everything a round does to one sequence is what
+    /// [`Generator::speculate`] does to it alone — the longest agreeing prefix
+    /// is kept, the first disagreeing answer is kept too, and the rows behind
+    /// that are taken back out of the cache *and* out of whatever backend holds
+    /// its span — and nothing about it is shared between two sequences of the
+    /// batch. That is what makes "speculation at batch changes no token" a
+    /// claim a caller can check by running the same sequence alone.
+    ///
+    /// `caches` is a cache a prompt, each built for its own slot — see
+    /// [`ModelCache::in_slot`] — and each with slack enough for the depth, since
+    /// a rejected token is taken back out of a window that had to have room for
+    /// it.
+    ///
+    /// A sequence whose count runs out drops out of the batch and the rest go
+    /// on without it, which is what the tail of any real batch looks like.
+    pub fn speculate_batch(
+        &self,
+        caches: &mut [ModelCache],
+        prompts: &[&[usize]],
+        counts: &[usize],
+        weights: &impl ModelWeights,
+        proposer: &mut impl BatchProposer,
+    ) -> Vec<Vec<usize>> {
+        assert_eq!(caches.len(), prompts.len(), "a cache a prompt");
+        assert_eq!(counts.len(), prompts.len(), "a budget a prompt");
+        let hidden = self.model.hidden();
+        let speculating = proposer.depth() > 0;
+
+        let mut run = Running {
+            produced: prompts.iter().map(|_| Vec::new()).collect(),
+            pending: vec![0; prompts.len()],
+            guesses: prompts.iter().map(|_| Vec::new()).collect(),
+        };
+
+        // **The prompts are prefilled a sequence at a time**, for
+        // [`Generator::generate_batch`]'s reason: a prefill of any length
+        // already fills the machine, and what a batch is for is the decode.
+        // The round each prompt opens is the prompt itself — every position of
+        // it, and the token that follows each — which is the round
+        // [`Generator::speculate`] asks for out of its own first pass.
+        let mut opened: Vec<(Vec<f32>, Vec<usize>)> = Vec::with_capacity(prompts.len());
+        for (at, (cache, prompt)) in caches.iter_mut().zip(prompts).enumerate() {
+            if counts[at] == 0 {
+                opened.push(Default::default());
+                continue;
+            }
+            let tailed = self.tailed(
+                cache,
+                prompt,
+                Tail {
+                    block: 1,
+                    chained: speculating,
+                    logits: false,
+                },
+                weights,
+            );
+            let first = *tailed
+                .picks
+                .first()
+                .expect("an id for the prompt's last row");
+            run.produced[at].push(first);
+            run.pending[at] = first;
+            let mut next = prompt[1..].to_vec();
+            next.push(first);
+            opened.push((tailed.normed, next));
+        }
+        let opening: Vec<(usize, &[f32], &[usize])> = opened
+            .iter()
+            .enumerate()
+            .map(|(at, (normed, next))| (at, normed.as_slice(), next.as_slice()))
+            .collect();
+        self.asking(&opening, counts, &mut run, proposer);
+
+        loop {
+            let live: Vec<usize> = (0..prompts.len())
+                .filter(|at| run.produced[*at].len() < counts[*at])
+                .collect();
+            if live.is_empty() {
+                return run.produced;
+            }
+
+            // The rows each live sequence feeds: the token it owes, and the
+            // guesses its own chain made after it.
+            let feeding: Vec<Vec<usize>> = live
+                .iter()
+                .map(|at| {
+                    std::iter::once(run.pending[*at])
+                        .chain(run.guesses[*at].iter().copied())
+                        .collect()
+                })
+                .collect();
+            let verified = {
+                let mut batch: Vec<Batched<'_>> = caches
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(at, _)| live.contains(at))
+                    .zip(&feeding)
+                    .map(|((_, cache), ids)| Batched { cache, ids })
+                    .collect();
+                self.verify_batch(&mut batch, speculating, weights)
+            };
+
+            // What each sequence's round produced, and what its cache has to
+            // give back — which is its own number and not the call's, because a
+            // round accepts what the model agreed with for that sequence alone.
+            let mut kept: Vec<(usize, Vec<usize>)> = Vec::with_capacity(live.len());
+            for ((at, ids), picked) in live.iter().zip(&feeding).zip(&verified.picked) {
+                let agreed = run.guesses[*at]
+                    .iter()
+                    .zip(&picked.picks)
+                    .take_while(|(guess, pick)| guess == pick)
+                    .count();
+                let mut round = run.guesses[*at][..agreed].to_vec();
+                round.push(picked.picks[agreed]);
+                round.truncate(counts[*at] - run.produced[*at].len());
+
+                let held = round.len();
+                run.produced[*at].extend(&round);
+                run.pending[*at] = *round.last().expect("a round commits a token");
+                // The rows this sequence keeps, and the token that follows each
+                // — which for the last is the one the model has just produced
+                // and this loop has yet to feed.
+                let mut next = ids[1..held].to_vec();
+                next.push(run.pending[*at]);
+                kept.push((held, next));
+                weights.rewind(&mut caches[*at], ids.len() - held);
+            }
+
+            let rounds: Vec<(usize, &[f32], &[usize])> = live
+                .iter()
+                .zip(&verified.picked)
+                .zip(&kept)
+                .map(|((at, picked), (held, next))| {
+                    // This sequence's own rows out of the call's, which is what
+                    // `Picked::first` is for: a seat's rows begin where the
+                    // seats in front of it end, and a round chained from the
+                    // call's first rows would chain every sequence from
+                    // whichever one came first.
+                    let rows = match speculating {
+                        true => {
+                            &verified.normed[picked.first * hidden..(picked.first + held) * hidden]
+                        }
+                        false => &[][..],
+                    };
+                    (*at, rows, next.as_slice())
+                })
+                .collect();
+            self.asking(&rounds, counts, &mut run, proposer);
+        }
+    }
+
+    /// The rounds that still have budget to guess into, handed to the proposer
+    /// in one call, and the guesses it answered with put where the next verify
+    /// reads them.
+    ///
+    /// **One call and not one per sequence**, which is the whole of what this
+    /// milestone is: a chain of heads over N sequences reads its eight weights
+    /// once for all of them.
+    ///
+    /// A sequence with nothing left to produce is not asked at all — its round
+    /// would be a chain run for guesses nobody will verify.
+    fn asking(
+        &self,
+        rounds: &[(usize, &[f32], &[usize])],
+        counts: &[usize],
+        run: &mut Running,
+        proposer: &mut impl BatchProposer,
+    ) {
+        for guesses in &mut run.guesses {
+            guesses.clear();
+        }
+        let speculating = proposer.depth() > 0;
+        let seated: Vec<Seated<'_>> = rounds
+            .iter()
+            .filter(|(at, _, _)| run.produced[*at].len() < counts[*at])
+            .map(|(at, hidden, next)| Seated {
+                at: *at,
+                round: Round {
+                    hidden: match speculating {
+                        true => hidden,
+                        false => &[],
+                    },
+                    next,
+                    depth: proposer
+                        .depth()
+                        .min((counts[*at] - run.produced[*at].len()).saturating_sub(1)),
+                },
+            })
+            .collect();
+        if seated.is_empty() {
+            return;
+        }
+        for (seated, proposed) in seated.iter().zip(proposer.propose_batch(&seated)) {
+            run.guesses[seated.at] = proposed;
         }
     }
 
@@ -1236,6 +1557,15 @@ mod tests {
         /// How many rounds it has been asked for, which is what says
         /// speculation banked anything at all.
         rounds: usize,
+        /// The rows every round handed this sequence to be chained from, which
+        /// a real proposer reads and this one only records.
+        ///
+        /// **Recorded because nothing else at this scale looks at them.** The
+        /// hidden state is what an MTP head is chained from, so a batched round
+        /// that handed a sequence its neighbour's rows would guess from the
+        /// wrong trajectory — and a proposer built to be deliberately wrong
+        /// cannot notice, because its guesses do not come from the rows at all.
+        chained: Vec<Vec<f32>>,
     }
 
     impl Guesser {
@@ -1246,6 +1576,7 @@ mod tests {
                 at: 0,
                 guesses: Vec::new(),
                 rounds: 0,
+                chained: Vec::new(),
             }
         }
     }
@@ -1259,10 +1590,11 @@ mod tests {
             self.rounds += 1;
             self.at += round.next.len();
             assert_eq!(
-                round.hidden.len() % 32,
-                0,
+                round.hidden.len(),
+                round.next.len() * HIDDEN,
                 "a hidden state per row the round kept"
             );
+            self.chained.push(round.hidden.to_vec());
             assert_eq!(
                 round.next.last().copied(),
                 self.truth.get(self.at).copied(),
@@ -1291,6 +1623,10 @@ mod tests {
     /// The synthetic stack's vocabulary, which a wrong guess has to stay inside
     /// of: an id past the head's rows is not a token the model could produce.
     const VOCAB: usize = 48;
+
+    /// The synthetic stack's hidden width, which a round's chained rows are
+    /// counted in.
+    const HIDDEN: usize = 32;
 
     /// Everything a generation is: the tokens, why it ended, and the logits the
     /// cache it left behind produces for the next token.
@@ -1443,5 +1779,260 @@ mod tests {
     fn a_forward_pass_over_no_tokens_is_refused() {
         let stack = Stack::load();
         logits(&stack, &mut ModelCache::new(&stack.config), &[]);
+    }
+
+    /// A chain a sequence, each guessing right up to its own depth, and the
+    /// rows each round handed every one of them.
+    ///
+    /// **One proposer per sequence rather than one shared**, which is what
+    /// [`BatchProposer`] exists to say: a chain carries state per sequence, and
+    /// a batch is N of them asked at once.
+    struct Guessers {
+        chains: Vec<Guesser>,
+        /// Per round: the rows each sequence fed, in the order they were
+        /// handed over. What the ragged case is checked *against*, since a
+        /// batch whose seats are all the same length is not the shape this
+        /// milestone is about — see
+        /// `a_batched_verify_is_ragged_and_the_seats_are_not_the_same_length`.
+        seats: Vec<Vec<usize>>,
+    }
+
+    impl Guessers {
+        fn new(right: &[usize]) -> Self {
+            Self {
+                chains: right
+                    .iter()
+                    .map(|right| Guesser::new(Vec::new(), *right))
+                    .collect(),
+                seats: Vec::new(),
+            }
+        }
+    }
+
+    impl BatchProposer for Guessers {
+        fn depth(&self) -> usize {
+            DEPTH
+        }
+
+        fn propose_batch(&mut self, rounds: &[Seated<'_>]) -> Vec<Vec<usize>> {
+            self.seats.push(
+                rounds
+                    .iter()
+                    .map(|seated| seated.round.next.len())
+                    .collect(),
+            );
+            rounds
+                .iter()
+                .map(|seated| self.chains[seated.at].propose(seated.round).to_vec())
+                .collect()
+        }
+    }
+
+    /// The same generation run alone, for the sequence a batched case is
+    /// checking one seat of: the tokens it produced, and the rows every round
+    /// handed it to be chained from.
+    fn alone(stack: &Stack, prompt: &[usize], count: usize, right: usize) -> (Vec<usize>, Guesser) {
+        let head = stack.head();
+        let truth = [
+            prompt.to_vec(),
+            generator(stack, &head).generate(
+                &mut ModelCache::new(&stack.config),
+                prompt,
+                count,
+                stack,
+            ),
+        ]
+        .concat();
+        let cache = &mut ModelCache::speculating(&stack.config, DEPTH);
+        let mut generated = Vec::new();
+        let mut guesser = Guesser::new(truth, right);
+        generator(stack, &head).speculate(
+            cache,
+            prompt,
+            Ending {
+                budget: count,
+                eos: None,
+            },
+            stack,
+            &mut guesser,
+            |id| {
+                generated.push(id);
+                ControlFlow::Continue(())
+            },
+        );
+        (generated, guesser)
+    }
+
+    /// The prompts a batched speculative case drives, which are three lengths
+    /// so that no two sequences' rows line up by accident.
+    fn prompts(stack: &Stack) -> Vec<Vec<usize>> {
+        let sequence = stack.sequence();
+        vec![
+            sequence[..3].to_vec(),
+            sequence[3..].to_vec(),
+            sequence[..1].to_vec(),
+        ]
+    }
+
+    /// How many of its round's guesses each of the three sequences gets right,
+    /// which is what makes the seats of one call unequal: at `DEPTH` the model
+    /// agrees with all three and the sequence banks four rows, at 1 it banks
+    /// two, and at 0 it banks one.
+    const RIGHT: [usize; 3] = [DEPTH, 0, 1];
+
+    /// How many tokens a batched speculative case asks each sequence for.
+    ///
+    /// **More than [`COUNT`], and the difference is load-bearing**: a round that
+    /// accepts everything banks the whole of a four-token budget in one go and
+    /// never rejects a guess, so a budget that short leaves the rewind — which
+    /// is the one thing a ragged verify does per sequence — unexercised.
+    const ROUNDS: usize = COUNT + 4;
+
+    /// Every sequence's round through a batched proposer, and every seat's own
+    /// chain beside it.
+    ///
+    /// Returns what each seat produced and what each seat's chain recorded,
+    /// which is the pair every case below reads: a token comparison says the
+    /// answer is the same and the chained rows say the *trajectory* was.
+    fn batched(
+        stack: &Stack,
+        prompts: &[Vec<usize>],
+        order: &[usize],
+        counts: &[usize],
+        truths: &[Vec<usize>],
+    ) -> (Vec<Vec<usize>>, Guessers) {
+        let head = stack.head();
+        let generator = generator(stack, &head);
+        let mut caches: Vec<ModelCache> = (0..order.len())
+            .map(|slot| ModelCache::in_slot(&stack.config, DEPTH, slot))
+            .collect();
+        let ids: Vec<&[usize]> = order.iter().map(|at| prompts[*at].as_slice()).collect();
+        let budgets: Vec<usize> = order.iter().map(|at| counts[*at]).collect();
+        let mut proposer = Guessers::new(&order.iter().map(|at| RIGHT[*at]).collect::<Vec<_>>());
+        for (chain, at) in proposer.chains.iter_mut().zip(order) {
+            chain.truth.clone_from(&truths[*at]);
+        }
+        let produced = generator.speculate_batch(&mut caches, &ids, &budgets, stack, &mut proposer);
+        (produced, proposer)
+    }
+
+    /// **A generation that speculates inside a batch produces what it produces
+    /// alone**, at every position of the batch and beside neighbours whose
+    /// rounds accept a different number of guesses from its own.
+    ///
+    /// This is the loop's half of the milestone's claim, and what it can fail
+    /// on is the bookkeeping a ragged verify needs: a sequence rewound by the
+    /// call's rows rather than by its own, a sequence chained from the rows of
+    /// whichever seat came first, or a sequence handed its neighbour's guesses.
+    ///
+    /// **Both halves of a round are checked and the second is not the tokens.**
+    /// The rows a round hands its proposer are what a real chain is chained
+    /// from, and a proposer built to be deliberately wrong guesses without
+    /// reading them — so a batch that handed a sequence its neighbour's rows
+    /// would produce the right tokens here and the wrong ones with the heads in
+    /// place. Asserting the recorded rows is what closes that.
+    ///
+    /// Exactly the tokens and not nearly: every arm multiplies the same numbers
+    /// in the same order, so a batch that has not leaked is a batch that agrees
+    /// bit for bit.
+    #[test]
+    fn a_speculating_generation_in_a_batch_produces_what_it_produces_alone() {
+        let stack = Stack::load();
+        let prompts = prompts(&stack);
+        // **The first finishes four tokens before the others**, which is what a
+        // batch's tail looks like: the sequences do not stop together. The
+        // *first* rather than the last, because a live set that only ever
+        // shrinks from its end is one whose members are still their own
+        // positions — and a round handed back by position rather than by slot
+        // would be right in every batch that drains that way.
+        let counts = [ROUNDS - 4, ROUNDS, ROUNDS];
+
+        let apart: Vec<(Vec<usize>, Guesser)> = (0..prompts.len())
+            .map(|at| alone(&stack, &prompts[at], counts[at], RIGHT[at]))
+            .collect();
+        assert_ne!(apart[0].0, apart[1].0, "two generations to tell apart");
+        let truths: Vec<Vec<usize>> = (0..prompts.len())
+            .map(|at| [prompts[at].clone(), apart[at].0.clone()].concat())
+            .collect();
+
+        for order in [vec![0, 1, 2], vec![2, 1, 0], vec![1, 2], vec![2, 0]] {
+            let (produced, proposer) = batched(&stack, &prompts, &order, &counts, &truths);
+            for (position, at) in order.iter().enumerate() {
+                assert_eq!(
+                    produced[position], apart[*at].0,
+                    "sequence {at} at position {position} of {order:?}: the tokens"
+                );
+                assert_eq!(
+                    proposer.chains[position].chained, apart[*at].1.chained,
+                    "sequence {at} at position {position} of {order:?}: the chained rows"
+                );
+            }
+        }
+    }
+
+    /// **And that the seats of one call are actually unequal**, which the case
+    /// above cannot say: a batch whose sequences all accept the same number of
+    /// guesses is the one shape a ragged verify is not being tested by, and it
+    /// would pass every assertion above.
+    ///
+    /// Stated on the rows the chain was handed rather than on the verify's,
+    /// because the two are the same rows — a round runs its heads over what it
+    /// committed — and this is the side a proposer can see.
+    #[test]
+    fn a_batched_verify_is_ragged_and_the_seats_are_not_the_same_length() {
+        let stack = Stack::load();
+        let prompts = prompts(&stack);
+        let counts = [ROUNDS; 3];
+        let order: Vec<usize> = (0..prompts.len()).collect();
+
+        let truths: Vec<Vec<usize>> = (0..prompts.len())
+            .map(|at| {
+                let (produced, _) = alone(&stack, &prompts[at], counts[at], RIGHT[at]);
+                [prompts[at].clone(), produced].concat()
+            })
+            .collect();
+        let (_, proposer) = batched(&stack, &prompts, &order, &counts, &truths);
+
+        let ragged = proposer
+            .seats
+            .iter()
+            // The prompts open the rounds and are three lengths of their own,
+            // so the round that says something about *acceptance* is one where
+            // every seat is feeding a block rather than a prompt.
+            .skip(1)
+            .filter(|seats| seats.len() > 1)
+            .filter(|seats| seats.iter().any(|rows| *rows != seats[0]))
+            .count();
+        assert!(
+            ragged > 0,
+            "every round's seats were the same length: {:?}",
+            proposer.seats
+        );
+    }
+
+    /// **A batch that speculates nothing is the batch that always ran.** The
+    /// loop above is [`Generator::generate_batch`] with a proposer in it, and
+    /// this is what says so: the same tokens, from the same prompts, at the
+    /// same budgets.
+    #[test]
+    fn a_batch_that_guesses_nothing_generates_what_a_plain_batch_generates() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let generator = generator(&stack, &head);
+        let prompts = prompts(&stack);
+        let counts = [COUNT, COUNT, COUNT - 2];
+        let ids: Vec<&[usize]> = prompts.iter().map(Vec::as_slice).collect();
+
+        let mut plain: Vec<ModelCache> = (0..prompts.len())
+            .map(|slot| ModelCache::in_slot(&stack.config, 0, slot))
+            .collect();
+        let mut speculating: Vec<ModelCache> = (0..prompts.len())
+            .map(|slot| ModelCache::in_slot(&stack.config, 0, slot))
+            .collect();
+
+        assert_eq!(
+            generator.speculate_batch(&mut speculating, &ids, &counts, &stack, &mut Alone),
+            generator.generate_batch(&mut plain, &ids, &counts, &stack)
+        );
     }
 }

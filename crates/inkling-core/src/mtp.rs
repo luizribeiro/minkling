@@ -60,9 +60,10 @@ use crate::attention::{
 };
 use crate::checkpoint::Checkpoint;
 use crate::config::{MtpConfig, TextConfig};
-use crate::generate::{Generator, Proposer, Round};
+use crate::generate::{BatchProposer, Generator, Proposer, Round, Seated};
 use crate::layer::{
-    DecoderCache, DecoderLayer, DecoderStep, DecoderWeights, Hidden, LayerMlp, NoExperts, Passed,
+    Advancing, DecoderCache, DecoderLayer, DecoderWeights, Hidden, LayerMlp, NoExperts, Passed,
+    Seat,
 };
 use crate::model::{ModelCache, ModelWeights};
 use crate::ops::{DenseMlp, DenseProjection, MlpProjections, Projection, rms_norm};
@@ -160,39 +161,108 @@ impl<'a> MtpHead<'a> {
         embed: &[f32],
         device: Option<&dyn HeadDevice>,
     ) -> Guessed {
-        assert_eq!(hidden.len(), embed.len(), "a hidden state per embedding");
-        let rows = Hidden::Rows(hidden).tokens(self.hidden());
-        let input = self.concatenated(hidden, embed);
+        let mut seats = [HeadSeat {
+            cache,
+            hidden,
+            embed,
+        }];
+        self.forward_batch(head, &mut seats, device)
+            .pop()
+            .expect("a head answers the one sequence it was handed")
+    }
+
+    /// The same head over several sequences advancing together, each with its
+    /// own rows, its own cache and its own slot.
+    ///
+    /// **A batch of one is this call and not a simpler one beside it**, for the
+    /// reason [`DecoderLayer::forward_batch`](crate::layer::DecoderLayer::forward_batch)
+    /// gives: what a batch buys is that the head's eight weights are read once
+    /// for every sequence in it, and a chain serving one request that took
+    /// another path would be a second copy of every shape-keyed decision.
+    ///
+    /// **The seats are ragged and that is the whole of why this exists.** A
+    /// round accepts as many guesses as the model agreed with, which is a
+    /// different number per sequence, so the rows a head is handed for one seat
+    /// are not the rows it is handed for its neighbour — see
+    /// [`MtpProposer::propose_batch`], where the raggedness comes from.
+    ///
+    /// The rows are laid seat by seat, each sequence's run following the last's,
+    /// which is what every dispatch reading one sequence's rows out of the call
+    /// indexes by.
+    pub fn forward_batch(
+        &self,
+        head: usize,
+        seats: &mut [HeadSeat<'_>],
+        device: Option<&dyn HeadDevice>,
+    ) -> Vec<Guessed> {
+        assert!(!seats.is_empty(), "a head over no sequences");
+        let width = self.hidden();
+        let mut input = Vec::new();
+        let mut counts = Vec::with_capacity(seats.len());
+        for seat in seats.iter() {
+            assert_eq!(
+                seat.hidden.len(),
+                seat.embed.len(),
+                "a hidden state per embedding"
+            );
+            counts.push(Hidden::Rows(seat.hidden).tokens(width));
+            input.extend(self.concatenated(seat.hidden, seat.embed));
+        }
+
         let guessed = device.and_then(|device| {
-            let seen = cache.attention().seen();
-            self.block
-                .described(seen, Hidden::Carried(rows), rows, |block| {
-                    device.run(
-                        head,
-                        cache,
-                        HeadStep {
-                            input: &input,
-                            block,
-                        },
-                    )
+            let mut advancing: Vec<Seat<'_>> = seats
+                .iter_mut()
+                .zip(&counts)
+                .map(|(seat, queries)| Seat {
+                    cache: seat.cache,
+                    queries: *queries,
                 })
+                .collect();
+            self.block
+                .advancing(&mut advancing, |batch| device.run(head, batch, &input))
         });
-        let guessed = match guessed {
-            Some(guessed) => guessed,
-            None => {
-                let x = self.input_proj.forward(&input);
+        let guessed = guessed.unwrap_or_else(|| self.severally(head, seats, &counts, &input));
+
+        assert_eq!(guessed.len(), seats.len(), "a guess per sequence");
+        for guessed in &guessed {
+            match guessed.hidden {
+                Passed::Rows(_) => {}
+                ref passed => panic!("a head's block answered with {passed:?}"),
+            }
+        }
+        guessed
+    }
+
+    /// Each sequence's rows through the head against its own cache, which is
+    /// what a batch means and what nothing but a backend can do in one pass.
+    fn severally(
+        &self,
+        head: usize,
+        seats: &mut [HeadSeat<'_>],
+        counts: &[usize],
+        input: &[f32],
+    ) -> Vec<Guessed> {
+        let pair = 2 * self.hidden();
+        let mut from = 0;
+        seats
+            .iter_mut()
+            .zip(counts)
+            .map(|(seat, rows)| {
+                let own = &input[from..from + rows * pair];
+                from += rows * pair;
+                let x = self.input_proj.forward(own);
                 Guessed {
-                    hidden: self
-                        .block
-                        .forward(head, cache, Hidden::Rows(&x), &NoExperts, None),
+                    hidden: self.block.forward(
+                        head,
+                        seat.cache,
+                        Hidden::Rows(&x),
+                        &NoExperts,
+                        None,
+                    ),
                     guess: None,
                 }
-            }
-        };
-        match guessed.hidden {
-            Passed::Rows(_) => guessed,
-            passed => panic!("a head's block answered with {passed:?}"),
-        }
+            })
+            .collect()
     }
 
     /// Each row's two normed halves laid end to end, which is what
@@ -230,8 +300,35 @@ pub struct HeadNorms<'a> {
 /// `input_proj` reads is the `[rows, 2 * hidden]` they are laid into, so the
 /// concatenation is on this side and the projection is the first thing past it.
 pub trait HeadDevice {
-    /// Head `head`, or `None` where this backend does not hold all of it.
-    fn run(&self, head: usize, cache: &mut DecoderCache, step: HeadStep<'_>) -> Option<Guessed>;
+    /// Head `head` over every sequence `seats` names, or `None` where this
+    /// backend does not hold all of it.
+    ///
+    /// `input` is the `[rows, 2 * hidden]` of the whole call — each sequence's
+    /// normed pairs following the last's, in the order the seats name them —
+    /// and what comes back is one [`Guessed`] per seat, in that same order.
+    ///
+    /// **A batch rather than a sequence, which is what
+    /// [`DecoderDevice::run`](crate::layer::DecoderDevice::run) already was.**
+    /// A head's block *is* a decoder layer, so a backend that can run the layer
+    /// for N seats can run the head for N — and the seats a round produces have
+    /// unequal row counts, because a round accepts a different number of guesses
+    /// per sequence.
+    fn run(&self, head: usize, seats: &mut [Advancing<'_>], input: &[f32]) -> Option<Vec<Guessed>>;
+}
+
+/// One sequence a caller is putting through a head: its state, the chained
+/// hidden state it is continuing from, and the embeddings beside it.
+///
+/// The head's own [`Seat`](crate::layer::Seat), one norm pair further out: what
+/// a layer's seat carries is a row count, and what a head's carries is the two
+/// vectors the row count is of — because the norms in front of a head are on
+/// this side and the concatenation between them is what `input_proj` reads.
+pub struct HeadSeat<'a> {
+    pub cache: &'a mut DecoderCache,
+    /// `[rows, hidden]` of chained hidden state.
+    pub hidden: &'a [f32],
+    /// `[rows, hidden]` of embeddings, one per row of `hidden`.
+    pub embed: &'a [f32],
 }
 
 /// What a head answers with: the state it produced, and — where the backend ran
@@ -261,20 +358,6 @@ pub struct Guessed {
     /// [`Generator::id_from_hidden`](crate::Generator::id_from_hidden) is the
     /// same tail and the same argmax back on this side.
     pub guess: Option<usize>,
-}
-
-/// Everything one head runs past the two norms in front of it, described rather
-/// than run.
-#[derive(Debug, Clone, Copy)]
-pub struct HeadStep<'a> {
-    /// `[rows, 2 * hidden]`: each row's two normed halves laid end to end,
-    /// which is what `input_proj` was trained to read — see
-    /// [`MtpHead::concatenated`].
-    pub input: &'a [f32],
-    /// The decoder layer behind that projection, whose own input is what the
-    /// projection produced and is therefore a value nobody on this side sees —
-    /// which is what [`Hidden::Carried`] says.
-    pub block: DecoderStep<'a>,
 }
 
 /// Where a head's multiplies run, when they are not here.
@@ -317,9 +400,23 @@ pub trait HeadBackend {
     /// leave them where the frontier row put them.
     ///
     /// Per head rather than over all of them, because a round runs the heads its
-    /// depth asked for and no others — see [`MtpProposer::propose`].
+    /// depth asked for and no others — see [`MtpProposer::propose_batch`].
     fn rewind(&self, head: usize, slot: usize, rows: usize) {
         let (_, _, _) = (head, slot, rows);
+    }
+
+    /// How many sequences this backend holds a head's state for, and `None`
+    /// from one that holds none.
+    ///
+    /// **Asked rather than assumed, because the two counts are decided in
+    /// different places and only one of them is checkable at the seam.** A
+    /// slot is a span and four convolution windows in every head, allocated
+    /// where the heads are wrapped; how many sequences a chain guesses for is
+    /// decided where the chain is built. A chain built for more than the wrap
+    /// holds would seat a sequence in a slot nothing allocated — see
+    /// [`MtpProposer::batched`], which refuses it.
+    fn slots(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -675,18 +772,13 @@ impl<'a> CheckpointHeads<'a> {
     }
 
     /// `[rows, hidden]` of chained hidden state and the same of embeddings
-    /// through head `head`.
+    /// through head `head`, for every sequence `seats` names.
     ///
     /// The head is stood up around whatever answers for its weights and dropped
     /// again, which is what lets the widened ones live in a buffer the next
-    /// head overwrites.
-    pub fn forward(
-        &self,
-        head: usize,
-        cache: &mut DecoderCache,
-        hidden: &[f32],
-        embed: &[f32],
-    ) -> Guessed {
+    /// head overwrites. See [`MtpHead::forward_batch`], which is what this
+    /// stands the head up around.
+    pub fn forward_batch(&self, head: usize, seats: &mut [HeadSeat<'_>]) -> Vec<Guessed> {
         let mut buffer = self.scratch.borrow_mut();
         if buffer.is_empty() && self.backend.is_none() {
             buffer.resize(self.scratch_floats(), 0.0);
@@ -722,13 +814,18 @@ impl<'a> CheckpointHeads<'a> {
             DecoderLayer::new(config, weights, mlp.view()),
             self.config.rms_norm_eps,
         )
-        .forward(
+        .forward_batch(
             head,
-            cache,
-            hidden,
-            embed,
+            seats,
             backend.and_then(|backend| backend.device(head)),
         )
+    }
+
+    /// How many sequences the backend holds a head's state for, and `None`
+    /// where the heads run here — this side keeps a sequence's state in the
+    /// caller's own [`DecoderCache`] and has no slot to run out of.
+    pub fn slots(&self) -> Option<usize> {
+        self.backend.as_deref().and_then(HeadBackend::slots)
     }
 
     /// Take back the last `rows` timesteps of head `head`'s own state, wherever
@@ -813,24 +910,41 @@ impl<'a> CheckpointHeads<'a> {
 ///
 /// Neither of those can cost a token: [`Proposer`] is asked for guesses and the
 /// loop above verifies them.
+/// # Every sequence of a batch through one chain
+///
+/// The eight weights a head reads are the same weights whichever sequence is
+/// guessing, so N sequences' rounds go down the chain together: head `d` is one
+/// command buffer over every sequence still guessing at that depth, each with
+/// its own rows, its own cache and its own slot. **What makes those rows
+/// unequal is acceptance** — a round banks as many guesses as the model agreed
+/// with, which is a different number per sequence — so a batched chain is a
+/// ragged call by construction and not by contrivance.
 pub struct MtpProposer<'a, W> {
     heads: &'a CheckpointHeads<'a>,
     generator: Generator<'a>,
     weights: &'a W,
-    /// One decoder cache per head, able to give the frontier row back.
-    caches: ModelCache,
+    /// One of these per sequence the batch serves, in slot order.
+    chains: Vec<Chain>,
     depth: usize,
-    /// The row the round before this one ran and took back: the hidden state
-    /// the stack produced there, and the token that follows it.
-    carried: Option<Carried>,
-    guesses: Vec<usize>,
     /// Rows accepted and rows guessed, which is acceptance as this run measures
-    /// it — see [`MtpProposer::accepted`].
+    /// it — see [`MtpProposer::accepted`]. Over every sequence together,
+    /// because acceptance is a property of the workload rather than of a slot.
     accepted: Vec<usize>,
     proposed: Vec<usize>,
     /// Rounds this has been asked for guesses by, which is every round of the
     /// generation but the one it ended in.
     rounds: usize,
+}
+
+/// One sequence's chain: the caches its heads stand on, and where the round
+/// before this one left it.
+struct Chain {
+    /// One decoder cache per head, able to give the frontier row back.
+    caches: ModelCache,
+    /// The row the round before this one ran and took back: the hidden state
+    /// the stack produced there, and the token that follows it.
+    carried: Option<Carried>,
+    guesses: Vec<usize>,
 }
 
 /// The frontier row of the round before this one, which is run again because
@@ -840,8 +954,24 @@ struct Carried {
     next: usize,
 }
 
+/// One sequence's round as the chain walks it down the heads: what head `d` is
+/// chained from, the tokens it embeds from, and what it has guessed so far.
+struct Walking {
+    /// Which of the proposer's sequences this round belongs to.
+    at: usize,
+    /// How many heads this round asked for, which the budget may have capped
+    /// below the chain's own depth.
+    depth: usize,
+    /// Rows this sequence feeds every head, which is what makes the call ragged.
+    rows: usize,
+    chained: Vec<f32>,
+    tokens: Vec<usize>,
+    guesses: Vec<usize>,
+}
+
 impl<'a, W: ModelWeights> MtpProposer<'a, W> {
-    /// The heads as a proposer of at most `depth` tokens a round.
+    /// The heads as a proposer of at most `depth` tokens a round, for one
+    /// sequence.
     ///
     /// `generator` is what turns a head's hidden state into a token — the
     /// model's own final norm and `lm_head`, which is what makes a head's guess
@@ -853,19 +983,48 @@ impl<'a, W: ModelWeights> MtpProposer<'a, W> {
         weights: &'a W,
         depth: usize,
     ) -> Self {
+        Self::batched(heads, generator, weights, depth, 1)
+    }
+
+    /// The same, for `slots` sequences guessing together.
+    ///
+    /// **A chain a sequence, and the slot is what says so on the device.** A
+    /// head's block is a decoder layer and carries a decoder layer's state, so
+    /// sequence `s`'s span and its four convolution windows in every head are
+    /// the backend's slot `s` — which is what
+    /// [`ModelHeads::wrap`](../../inkling_metal/struct.ModelHeads.html) has to
+    /// have been told before it wrapped them.
+    pub fn batched(
+        heads: &'a CheckpointHeads<'a>,
+        generator: Generator<'a>,
+        weights: &'a W,
+        depth: usize,
+        slots: usize,
+    ) -> Self {
         assert!(
             depth <= heads.heads(),
             "{depth} tokens a round from {} heads",
             heads.heads()
         );
+        assert!(slots > 0, "a chain over no sequences");
+        if let Some(held) = heads.slots() {
+            assert!(
+                slots <= held,
+                "a chain of {slots} sequences against heads wrapped for {held}"
+            );
+        }
         Self {
-            caches: ModelCache::speculating(heads.config(), FRONTIER),
+            chains: (0..slots)
+                .map(|slot| Chain {
+                    caches: ModelCache::in_slot(heads.config(), FRONTIER, slot),
+                    carried: None,
+                    guesses: Vec::new(),
+                })
+                .collect(),
             heads,
             generator,
             weights,
             depth,
-            carried: None,
-            guesses: Vec::new(),
             accepted: Vec::new(),
             proposed: Vec::new(),
             rounds: 0,
@@ -912,31 +1071,45 @@ impl<'a, W: ModelWeights> MtpProposer<'a, W> {
             .collect()
     }
 
-    /// What the round's rows are, once the row taken back at the end of the
-    /// last round is put in front of them.
-    fn rows(&self, round: &Round<'_>) -> (Vec<f32>, Vec<usize>) {
-        let mut hidden = Vec::with_capacity(round.hidden.len() + self.heads.config().hidden_size);
-        let mut next = Vec::with_capacity(round.next.len() + 1);
-        if let Some(carried) = &self.carried {
-            hidden.extend_from_slice(&carried.hidden);
-            next.push(carried.next);
-        }
-        hidden.extend_from_slice(round.hidden);
-        next.extend_from_slice(round.next);
-        (hidden, next)
-    }
-
     /// What the model went on to do with the guesses of the round before this
     /// one, read off the tokens it committed.
-    fn score(&mut self, next: &[usize]) {
+    fn score(&mut self, at: usize, next: &[usize]) {
         let banked = next.len().saturating_sub(1);
-        for (depth, guess) in self.guesses.iter().enumerate() {
+        for (depth, guess) in self.chains[at].guesses.iter().enumerate() {
             if self.proposed.len() <= depth {
                 self.proposed.push(0);
                 self.accepted.push(0);
             }
             self.proposed[depth] += 1;
             self.accepted[depth] += usize::from(depth < banked && next[depth + 1] == *guess);
+        }
+    }
+}
+
+impl Chain {
+    /// What this sequence's round runs, once the row the last round took back
+    /// is put in front of the rows it committed.
+    fn walking(&self, at: usize, round: &Round<'_>, width: usize) -> Walking {
+        let mut chained = Vec::with_capacity(round.hidden.len() + width);
+        let mut tokens = Vec::with_capacity(round.next.len() + 1);
+        if let Some(carried) = &self.carried {
+            chained.extend_from_slice(&carried.hidden);
+            tokens.push(carried.next);
+        }
+        chained.extend_from_slice(round.hidden);
+        tokens.extend_from_slice(round.next);
+        assert_eq!(
+            chained.len(),
+            tokens.len() * width,
+            "a hidden state per row"
+        );
+        Walking {
+            at,
+            depth: round.depth,
+            rows: tokens.len(),
+            chained,
+            tokens,
+            guesses: Vec::new(),
         }
     }
 }
@@ -955,6 +1128,25 @@ impl<W: ModelWeights> Proposer for MtpProposer<'_, W> {
         self.depth
     }
 
+    /// One sequence's round, which is [`BatchProposer::propose_batch`] over the
+    /// batch of one this was built with.
+    fn propose(&mut self, round: Round<'_>) -> &[usize] {
+        assert_eq!(
+            self.chains.len(),
+            1,
+            "a chain of {} sequences asked for one sequence's round",
+            self.chains.len()
+        );
+        self.propose_batch(&[Seated { at: 0, round }]);
+        &self.chains[0].guesses
+    }
+}
+
+impl<W: ModelWeights> BatchProposer for MtpProposer<'_, W> {
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
     /// **A round that asks for fewer than the last one leaves the heads past
     /// it where they are**, which is right for the one case that happens — a
     /// generation whose budget is running out, and which will not ask again —
@@ -962,7 +1154,12 @@ impl<W: ModelWeights> Proposer for MtpProposer<'_, W> {
     /// would be missing the rows the shallower rounds ran. Nothing chooses a
     /// depth adaptively yet; whatever does has to run the heads it skipped or
     /// start their caches over.
-    fn propose(&mut self, round: Round<'_>) -> &[usize] {
+    ///
+    /// **The sequences of a round need not all ask for the same depth**, and
+    /// one running out of budget is where they stop: head `d` is run over the
+    /// sequences whose depth reaches it and no others, so a call narrows as the
+    /// chain deepens rather than carrying rows nobody asked for.
+    fn propose_batch(&mut self, rounds: &[Seated<'_>]) -> Vec<Vec<usize>> {
         self.rounds += 1;
         // A chain of no heads is handed no hidden state to be chained from, and
         // there is nothing here that reading one would be for: no head to run,
@@ -970,50 +1167,109 @@ impl<W: ModelWeights> Proposer for MtpProposer<'_, W> {
         // ask the same nothing. See [`Tail::chained`](crate::Tail::chained),
         // where that absence is a dispatch and a crossing.
         if self.depth == 0 {
-            return &self.guesses;
+            for seated in rounds {
+                self.chains[seated.at].guesses.clear();
+            }
+            return rounds.iter().map(|_| Vec::new()).collect();
         }
-        let (mut chained, mut tokens) = self.rows(&round);
-        self.score(&tokens);
-        let hidden = self.heads.config().hidden_size;
-        let rows = tokens.len();
-        assert_eq!(chained.len(), rows * hidden, "a hidden state per row");
 
-        self.guesses.clear();
-        for head in 0..round.depth {
-            let embed = self
-                .generator
-                .model()
-                .embeddings(&tokens[head..head + rows], self.weights);
-            let guessed = self
-                .heads
-                .forward(head, self.caches.layer(head), &chained, &embed);
-            chained = guessed.hidden.rows();
-            // The tail where the head ran it, and where it did not: a guess is
-            // the same token either way, and what differs is whether reading it
-            // cost a second submission.
-            let guess = match guessed.guess {
-                Some(id) => id,
-                None => self
-                    .generator
-                    .id_from_hidden(&chained[(rows - 1) * hidden..]),
+        let width = self.heads.config().hidden_size;
+        let mut walking: Vec<Walking> = Vec::with_capacity(rounds.len());
+        let mut last = None;
+        for seated in rounds {
+            assert!(
+                last.is_none_or(|last| last < seated.at),
+                "a batch's rounds are its slots in order"
+            );
+            last = Some(seated.at);
+            walking.push(self.chains[seated.at].walking(seated.at, &seated.round, width));
+        }
+        for walk in &walking {
+            self.score(walk.at, &walk.tokens);
+        }
+
+        // Copied out of `self` so that the chains below can be borrowed a seat
+        // at a time: all three are references or plain copies of them.
+        let (heads, generator, weights) = (self.heads, self.generator, self.weights);
+        let chains = &mut self.chains;
+        let deepest = walking.iter().map(|walk| walk.depth).max().unwrap_or(0);
+        for head in 0..deepest {
+            // Which sequences reach this head, in the slot order the seats have
+            // to be laid in.
+            let running: Vec<usize> = (0..walking.len())
+                .filter(|walk| head < walking[*walk].depth)
+                .collect();
+            if running.is_empty() {
+                continue;
+            }
+            let embeds: Vec<Vec<f32>> = running
+                .iter()
+                .map(|walk| {
+                    let walk = &walking[*walk];
+                    generator
+                        .model()
+                        .embeddings(&walk.tokens[head..head + walk.rows], weights)
+                })
+                .collect();
+
+            let guessed = {
+                let mut running = running.iter().zip(&embeds).peekable();
+                let mut seats: Vec<HeadSeat<'_>> = Vec::with_capacity(embeds.len());
+                for (slot, chain) in chains.iter_mut().enumerate() {
+                    let Some((walk, embed)) = running.peek() else {
+                        break;
+                    };
+                    let walk = &walking[**walk];
+                    if walk.at != slot {
+                        continue;
+                    }
+                    seats.push(HeadSeat {
+                        cache: chain.caches.layer(head),
+                        hidden: &walk.chained,
+                        embed,
+                    });
+                    running.next();
+                }
+                assert_eq!(
+                    seats.len(),
+                    embeds.len(),
+                    "a seat per sequence at this head"
+                );
+                heads.forward_batch(head, &mut seats)
             };
-            self.guesses.push(guess);
-            tokens.push(guess);
+
+            for (walk, guessed) in running.iter().zip(guessed) {
+                let walk = &mut walking[*walk];
+                walk.chained = guessed.hidden.rows();
+                // The tail where the head ran it, and where it did not: a guess
+                // is the same token either way, and what differs is whether
+                // reading it cost a second submission.
+                let guess = match guessed.guess {
+                    Some(id) => id,
+                    None => generator.id_from_hidden(&walk.chained[(walk.rows - 1) * width..]),
+                };
+                walk.guesses.push(guess);
+                walk.tokens.push(guess);
+            }
         }
 
         // The frontier row again next time, against the token the model
         // produced rather than the one this chain guessed. Both sides of the
         // head's state, for the reason `CheckpointHeads::rewind` gives.
-        for head in 0..round.depth {
-            let slot = self.caches.layer(head).slot();
-            self.caches.layer(head).rewind(FRONTIER);
-            self.heads.rewind(head, slot, FRONTIER);
+        for (walk, seated) in walking.iter().zip(rounds) {
+            let chain = &mut chains[walk.at];
+            for head in 0..walk.depth {
+                let slot = chain.caches.layer(head).slot();
+                chain.caches.layer(head).rewind(FRONTIER);
+                heads.rewind(head, slot, FRONTIER);
+            }
+            chain.carried = Some(Carried {
+                hidden: chained_row(seated.round.hidden, width),
+                next: *seated.round.next.last().expect("a round commits a row"),
+            });
+            chain.guesses.clone_from(&walk.guesses);
         }
-        self.carried = Some(Carried {
-            hidden: chained_row(round.hidden, hidden),
-            next: *round.next.last().expect("a round commits a row"),
-        });
-        &self.guesses
+        walking.into_iter().map(|walk| walk.guesses).collect()
     }
 }
 
@@ -1113,7 +1369,6 @@ fn widen<'s>(weight: &HeadWeight<'_>, scratch: &mut Scratch<'s>) -> &'s [f32] {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
 
     use super::*;
     use crate::attention::LogScaling;
@@ -1323,19 +1578,36 @@ mod tests {
     #[derive(Default)]
     struct Recorded {
         input: RefCell<Vec<f32>>,
-        described: Cell<(usize, usize)>,
+        /// Per seat: the rows it was described over, and how many values of
+        /// them crossed the seam.
+        described: RefCell<Vec<(usize, usize)>>,
+        /// Where each seat's first row of the call is.
+        first: RefCell<Vec<usize>>,
         answer: Vec<f32>,
     }
 
     impl HeadDevice for Recorded {
-        fn run(&self, _: usize, _: &mut DecoderCache, step: HeadStep<'_>) -> Option<Guessed> {
-            *self.input.borrow_mut() = step.input.to_vec();
-            self.described
-                .set((step.block.queries, step.block.attention.x.len()));
-            Some(Guessed {
-                hidden: Passed::Rows(self.answer.clone()),
-                guess: None,
-            })
+        fn run(
+            &self,
+            _: usize,
+            seats: &mut [Advancing<'_>],
+            input: &[f32],
+        ) -> Option<Vec<Guessed>> {
+            *self.input.borrow_mut() = input.to_vec();
+            *self.described.borrow_mut() = seats
+                .iter()
+                .map(|seat| (seat.step.queries, seat.step.attention.x.len()))
+                .collect();
+            *self.first.borrow_mut() = seats.iter().map(|seat| seat.first).collect();
+            Some(
+                seats
+                    .iter()
+                    .map(|_| Guessed {
+                        hidden: Passed::Rows(self.answer.clone()),
+                        guess: None,
+                    })
+                    .collect(),
+            )
         }
     }
 
@@ -1344,7 +1616,7 @@ mod tests {
     struct Declined;
 
     impl HeadDevice for Declined {
-        fn run(&self, _: usize, _: &mut DecoderCache, _: HeadStep<'_>) -> Option<Guessed> {
+        fn run(&self, _: usize, _: &mut [Advancing<'_>], _: &[f32]) -> Option<Vec<Guessed>> {
             None
         }
     }
@@ -1386,8 +1658,8 @@ mod tests {
                 head.name
             );
             assert_eq!(
-                device.described.get(),
-                (rows, 0),
+                *device.described.borrow(),
+                vec![(rows, 0)],
                 "{}: the block was described over {rows} rows and no values",
                 head.name
             );
@@ -1690,7 +1962,15 @@ mod tests {
         for (index, head) in Head::all().iter().enumerate() {
             let cache = &mut DecoderCache::new(head.config, head.hidden(), 4);
             let got = heads
-                .forward(index, cache, &calls.hidden, &calls.embed)
+                .forward_batch(
+                    index,
+                    &mut [HeadSeat {
+                        cache,
+                        hidden: &calls.hidden,
+                        embed: &calls.embed,
+                    }],
+                )
+                .remove(0)
                 .hidden
                 .rows();
             let deviation = deviation(&got, &head.prefill_out);

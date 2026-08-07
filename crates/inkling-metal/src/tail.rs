@@ -160,12 +160,50 @@ impl<'a> ModelTail<'a> {
     ) -> Result<Landed, ProjectionError> {
         let rows = x.len() / self.hidden();
         assert!(want.block <= rows, "a block longer than the call");
+        self.encoding(batch, x, &[(rows - want.block, want.block)], want)
+    }
 
+    /// The same tail over the single rows `taking` names rather than over a
+    /// suffix of the call.
+    ///
+    /// **What a chain of heads over a batch asks for.** Each sequence's rows are
+    /// its own run of the call and the row a round guesses from is the last of
+    /// that run, so the rows the projection has to read are one per sequence and
+    /// scattered — which the last `block` of the call cannot name once there is
+    /// more than one sequence in it.
+    pub(crate) fn encode_rows(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        taking: &[usize],
+        want: Tail,
+    ) -> Result<Landed, ProjectionError> {
+        let rows = x.len() / self.hidden();
+        assert_eq!(want.block, taking.len(), "a block of the rows it names");
+        assert!(
+            taking.iter().all(|row| *row < rows),
+            "{taking:?} against a call of {rows} rows"
+        );
+        let runs: Vec<(usize, usize)> = taking.iter().map(|row| (*row, 1)).collect();
+        self.encoding(batch, x, &runs, want)
+    }
+
+    /// The tail over whichever runs of rows the two above worked out, which is
+    /// the whole of what they share: the undivided norm where a chain wants it,
+    /// the divided one over those runs, `lm_head` behind that and the argmax
+    /// behind that.
+    fn encoding(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        runs: &[(usize, usize)],
+        want: Tail,
+    ) -> Result<Landed, ProjectionError> {
         let chained = match want.chained {
             true => Some(self.norm.encode(batch, x)?),
             false => None,
         };
-        let mut block = self.divided.encode_last(batch, x, want.block)?;
+        let mut block = self.divided.encode_runs(batch, x, runs)?;
         let mut logits = self.head.encode_over(batch, &mut block)?.buffer();
         let picks = self.argmax.encode(batch, &mut logits, self.vocab)?;
         Ok(Landed {
@@ -210,17 +248,18 @@ impl Landed {
         })
     }
 
-    /// The id the block's last row names, for the caller that wants nothing
+    /// The id each row of the block names, for the caller that wants nothing
     /// else of the tail — a head is chained from its own state and not from the
     /// model's normed one, and nothing in a chain ever reads a head's logits.
     ///
-    /// **Four bytes where [`Landed::read`] crosses a row of 800 KB**, which is
-    /// what the argmax being on the device is worth to a chain: eight heads are
-    /// eight rows of the vocabulary that stay where the projection wrote them.
-    pub(crate) fn guess(&self) -> usize {
-        profile::timed(Op::Readback, || {
-            *self.picks.as_slice().last().expect("a block names an id") as usize
-        })
+    /// One per sequence of the batch, in the order the rows were gathered.
+    ///
+    /// **Four bytes a sequence where [`Landed::read`] crosses a row of 800 KB**,
+    /// which is what the argmax being on the device is worth to a chain: eight
+    /// heads are eight rows of the vocabulary a slot that stay where the
+    /// projection wrote them.
+    pub(crate) fn guesses(&self) -> Vec<usize> {
+        profile::timed(Op::Readback, || widened(&self.picks))
     }
 }
 
