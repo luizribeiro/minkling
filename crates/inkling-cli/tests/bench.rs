@@ -329,3 +329,71 @@ fn a_clock_run_over_prefills_reports_the_same_readings() {
     let said = String::from_utf8_lossy(&ran.stderr).to_string();
     assert!(said.contains("prefills of 32 tokens"), "{said}");
 }
+
+/// **The batch sweep's `executed` row is its `device` row accumulated a second
+/// way**, and this is what says so.
+///
+/// One is `profile`'s: every completed command buffer charges the GPU's own
+/// clock to an account, and the sweep divides that account by the rounds. The
+/// other is the device's record of round trips, summed and divided the same way.
+/// The two are charged from the same line of `Submitted::wait` and must therefore
+/// be one number — so a division of a round's wall that disagreed with the wall
+/// it is dividing would say here, which is the check the collapse C4 could not
+/// attribute needed and did not have.
+///
+/// Two sequences at one depth over two tokens, because what this asserts is an
+/// identity between two readings rather than anything about how long either took.
+#[test]
+fn a_batch_sweeps_executed_row_is_its_device_row_summed_the_other_way() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let ran = bench(&[
+        "batch",
+        "--batch",
+        "2",
+        "--depth",
+        "1",
+        "--tokens",
+        "2",
+        &dir.display().to_string(),
+    ]);
+    let reported = readings(stdout(&ran));
+
+    let value = |name: &str| {
+        reported
+            .iter()
+            .find(|(had, ..)| had == name)
+            .unwrap_or_else(|| panic!("{name} is reported, out of {reported:?}"))
+            .1
+    };
+    let mut checked = 0;
+    for width in [1, 2] {
+        for depth in [0, 1] {
+            let cell = format!("batch{width}.k{depth}");
+            let (device, executed) = (
+                value(&format!("{cell}.device")),
+                value(&format!("{cell}.executed")),
+            );
+            assert!(device > 0.0, "{cell} executed nothing");
+            assert!(
+                (device - executed).abs() < 0.001 * device,
+                "{cell}: device {device} against executed {executed}"
+            );
+            // And the executions and the gaps between them tile the round
+            // rather than double-count it, which is the whole claim the `idle`
+            // column makes and is checkable against a wall this same run
+            // reports: a round's is its token times the tokens it banked. The
+            // bound is one-sided because it is the direction the claim is in —
+            // one queue runs one buffer at a time, so the two cannot come to
+            // more than the round they are inside. A slow host makes both sides
+            // grow together, which is what lets this run beside a whole suite.
+            let round = value(&format!("{cell}.token")) * value(&format!("{cell}.round"));
+            let (idle, tiled) = (value(&format!("{cell}.idle")), device);
+            assert!(
+                tiled + idle < 1.05 * round,
+                "{cell}: executed {tiled} + idle {idle} against a round of {round}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 4, "every cell of the sweep");
+}

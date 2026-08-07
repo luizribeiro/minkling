@@ -1126,6 +1126,15 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
             // layer, and a stack wrapped for sixteen holds sixteen of them
             // whether or not sixteen sequences are in flight.
             What::Batch => {
+                // **Recording for the whole sweep rather than for the cell that
+                // needs it**, because which cell that is is what the sweep is
+                // being run to find out. What it costs is a record a submission
+                // — some tens of thousands over a sitting — and the timestamps
+                // behind it are read off buffers that have already completed.
+                let recording = gpu.as_ref().map(backend::Gpu::device);
+                if let Some(device) = recording {
+                    device.record_round_trips(true);
+                }
                 for slots in widths(widest.unwrap_or(WIDEST)) {
                     let weights = backend::weights(gpu.as_ref(), &ckpt, text, wrapped_at, slots)?;
                     let ids = behind_a_step(&prompt, context);
@@ -1138,7 +1147,18 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     // coming up from idle, and that is a bias in one direction
                     // rather than noise — which is the finding C3's occupancy
                     // loop had to correct, arriving here on a different axis.
-                    speculated(&weights, None, text, &ids, slots, 0, SETTLING);
+                    speculated(
+                        &weights,
+                        None,
+                        text,
+                        &ids,
+                        Speculating {
+                            slots,
+                            depth: 0,
+                            tokens: SETTLING,
+                            device: None,
+                        },
+                    );
                     let run = batched(&weights, text, &ids, slots, tokens);
                     taken.push(Reading::new(
                         format!("batch{slots}.step"),
@@ -1182,7 +1202,18 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                         backend::heads(gpu.as_ref(), &ckpt, &config, wrapped_at, &tail, slots)?;
                     for k in 0..=wrapped_at {
                         let held = (k > 0).then_some(heads.as_ref()).flatten();
-                        let run = speculated(&weights, held, text, &ids, slots, k, tokens);
+                        let run = speculated(
+                            &weights,
+                            held,
+                            text,
+                            &ids,
+                            Speculating {
+                                slots,
+                                depth: k,
+                                tokens,
+                                device: recording,
+                            },
+                        );
                         let rate = run.tokens as f64 / run.wall.as_secs_f64();
                         let name = format!("batch{slots}.k{k}");
                         taken.push(Reading::new(format!("{name}.rate"), rate, "tok/s"));
@@ -1213,6 +1244,29 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                             format!("{name}.device"),
                             millis(run.gpu) / run.rounds as f64,
                             "ms",
+                        ));
+                        // **The wait divided, which is the column a duty cycle
+                        // is the ratio of and cannot break up.** `executed` is
+                        // the row above accumulated a second way, so the two
+                        // are a check on each other; the rest are where a wall
+                        // that is neither encode nor execution went.
+                        for (row, taken_by) in [
+                            ("scheduled", run.divided.scheduled),
+                            ("queued", run.divided.queued),
+                            ("executed", run.divided.executed),
+                            ("idle", run.divided.idle),
+                            ("unattributed", run.divided.unattributed),
+                        ] {
+                            taken.push(Reading::new(
+                                format!("{name}.{row}"),
+                                millis(taken_by),
+                                "ms",
+                            ));
+                        }
+                        taken.push(Reading::new(
+                            format!("{name}.allocations"),
+                            run.allocations,
+                            "/round",
                         ));
                         for (at, rate) in run.rates.iter().enumerate() {
                             taken.push(Reading::new(
@@ -1259,7 +1313,21 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
+                        eprintln!(
+                            "    a round's submissions: executed {:.2?} + idle {:.2?} tile it; \
+                             scheduled {:.2?} and queued {:.2?} a buffer's own life, \
+                             unattributed {:.2?}, over {:.1} buffers allocated",
+                            run.divided.executed,
+                            run.divided.idle,
+                            run.divided.scheduled,
+                            run.divided.queued,
+                            run.divided.unattributed,
+                            run.allocations,
+                        );
                     }
+                }
+                if let Some(device) = recording {
+                    device.record_round_trips(false);
                 }
             }
             // **The same work over and over, and what each of them cost the
@@ -1829,10 +1897,71 @@ struct Speculated {
     submissions: f64,
     encode: Duration,
     waited: Duration,
+    /// The same wait divided into the things a submission does, per round.
+    divided: Divided,
+    /// Buffers a round asked the device for.
+    ///
+    /// **The one column that separates a driver charging for work from a driver
+    /// charging for memory.** Every buffer a command buffer names has to be
+    /// resident before the GPU can start on it, and a round that allocates is a
+    /// round handing the driver something it has never made resident before —
+    /// so a `scheduled` that moved without this moving is a driver doing more
+    /// with the same buffers.
+    allocations: f64,
     /// Every op the round was charged, heaviest first — which is what says
     /// *which* side of a round a wall went to when the duty column says only
     /// that one did.
     rows: Vec<(profile::Op, u64, Duration)>,
+}
+
+/// A round's submissions as the driver's own clock divides them.
+///
+/// **A duty cycle is a ratio and cannot be broken up**, and C4 quoted a cell at
+/// 44.6% of it — 1.63 s a round inside `submit and wait` against 755 ms of
+/// execution and 7.8 ms of encode — with nowhere to put the difference. These
+/// are the columns that say where it went.
+///
+/// **`executed` and `idle` tile the round and the other two do not.** One queue
+/// runs one buffer at a time, so the stretches it spends executing and the gaps
+/// between them account for the round's clock exactly once. `scheduled` and
+/// `queued` are each buffer's own life, and a caller that leaves three in flight
+/// has three of those covering one stretch — so they are read as per-submission
+/// costs and never summed against a wall.
+#[derive(Debug, Default, Clone, Copy)]
+struct Divided {
+    /// The driver turning a committed buffer into work, which grows with the
+    /// dispatches in it.
+    scheduled: Duration,
+    /// How long a buffer then sat before the GPU picked it up.
+    queued: Duration,
+    /// What the GPU was executing, summed over the round's buffers.
+    ///
+    /// **The same quantity [`Speculated::gpu`] holds, accumulated a second
+    /// way** — the profile sums it as each buffer completes and this sums the
+    /// records — so the two agreeing is a figure neither of them chooses.
+    executed: Duration,
+    /// What the GPU spent between one buffer of the round and the next, summed:
+    /// the device standing still with the round unfinished.
+    idle: Duration,
+    /// The commit reaching the driver and this thread being woken, which is
+    /// what none of the buffer's own three account for.
+    unattributed: Duration,
+}
+
+impl Divided {
+    /// Every round trip of a run, summed and charged to one round.
+    fn over(trips: &[inkling_metal::RoundTrip], rounds: u32) -> Self {
+        let summed = |of: fn(&inkling_metal::RoundTrip) -> Duration| {
+            trips.iter().map(of).sum::<Duration>() / rounds
+        };
+        Self {
+            scheduled: summed(|trip| trip.scheduled),
+            queued: summed(|trip| trip.queued),
+            executed: summed(|trip| trip.executed),
+            idle: summed(|trip| trip.idle),
+            unattributed: summed(inkling_metal::RoundTrip::unattributed),
+        }
+    }
 }
 
 /// A proposer that starts the clock the first time it is asked.
@@ -1852,14 +1981,25 @@ struct Opened<'p, P> {
     /// has no chain to count and its rounds are what make its device column
     /// comparable to the row above it.
     rounds: usize,
+    /// The device whose round trips the clock covers, where one is recording.
+    ///
+    /// Here rather than around the call for the reason the profile is: the
+    /// record has to be cleared where the clock starts, or a run's division of
+    /// its wait carries its own prefill's submissions.
+    device: Option<&'p inkling_metal::Device>,
+    /// Buffers the device had allocated when the clock started, which is what a
+    /// round's own are counted against.
+    allocated: u64,
 }
 
 impl<'p, P> Opened<'p, P> {
-    fn over(proposer: &'p mut P) -> Self {
+    fn over(proposer: &'p mut P, device: Option<&'p inkling_metal::Device>) -> Self {
         Self {
             proposer,
             began: None,
             rounds: 0,
+            device,
+            allocated: 0,
         }
     }
 }
@@ -1876,6 +2016,10 @@ impl<P: BatchProposer> BatchProposer for Opened<'_, P> {
     fn propose_batch(&mut self, rounds: &[SeatedRound<'_>]) -> Vec<Vec<usize>> {
         if self.began.is_none() {
             profile::take();
+            if let Some(device) = self.device {
+                device.round_trips();
+                self.allocated = device.allocations();
+            }
             self.began = Some(Instant::now());
         }
         self.rounds += 1;
@@ -1884,14 +2028,44 @@ impl<P: BatchProposer> BatchProposer for Opened<'_, P> {
 }
 
 impl<P> Opened<'_, P> {
-    /// The wall from the first round to now, and the device time inside it.
-    fn clock(&self) -> (Duration, profile::Profile) {
-        (self.began.expect("a round").elapsed(), profile::take())
+    /// The wall from the first round to now, the device time inside it, every
+    /// submission that made it up, and the buffers those submissions were
+    /// handed that the device had not seen before.
+    fn clock(
+        &self,
+    ) -> (
+        Duration,
+        profile::Profile,
+        Vec<inkling_metal::RoundTrip>,
+        u64,
+    ) {
+        (
+            self.began.expect("a round").elapsed(),
+            profile::take(),
+            self.device
+                .map(inkling_metal::Device::round_trips)
+                .unwrap_or_default(),
+            self.device
+                .map_or(0, |device| device.allocations() - self.allocated),
+        )
     }
 }
 
-/// `slots` sequences prefilled together and then decoded together at depth
-/// `depth`, timed over the rounds alone.
+/// What one speculative run is asked for: how wide, how deep, how many tokens
+/// each of its sequences wants, and whose submissions to divide.
+#[derive(Clone, Copy)]
+struct Speculating<'a> {
+    slots: usize,
+    depth: usize,
+    tokens: usize,
+    /// The device recording round trips, and `None` for a run nobody is
+    /// dividing — which is the settling, whose submissions are not the ones
+    /// being reported.
+    device: Option<&'a inkling_metal::Device>,
+}
+
+/// `run.slots` sequences prefilled together and then decoded together at depth
+/// `run.depth`, timed over the rounds alone.
 ///
 /// **The same harness at every depth including none**, which is what makes the
 /// `k = 0` column a check rather than a restatement: it is a different code
@@ -1902,10 +2076,14 @@ fn speculated(
     heads: Option<&CheckpointHeads<'_>>,
     config: &TextConfig,
     ids: &[usize],
-    slots: usize,
-    depth: usize,
-    tokens: usize,
+    run: Speculating<'_>,
 ) -> Speculated {
+    let Speculating {
+        slots,
+        depth,
+        tokens,
+        device,
+    } = run;
     let generator = weights.generator();
     // The prompts are made distinct rather than copied, for [`Seated`]'s
     // reason: a batch of identical sequences routes every row of every step to
@@ -1926,27 +2104,38 @@ fn speculated(
     let mut chain =
         heads.map(|heads| MtpProposer::batched(heads, generator, weights, depth, slots));
     let mut alone = Alone;
-    let (produced, wall, spent, rounds, rates, ragged) = match chain.as_mut() {
+    let (produced, wall, spent, trips, allocated, rounds, rates, ragged) = match chain.as_mut() {
         Some(chain) => {
-            let mut opened = Opened::over(chain);
+            let mut opened = Opened::over(chain, device);
             let produced =
                 generator.speculate_batch(&mut caches, &asked, &counts, weights, &mut opened);
-            let (wall, spent) = opened.clock();
+            let (wall, spent, trips, allocated) = opened.clock();
             (
                 produced,
                 wall,
                 spent,
+                trips,
+                allocated,
                 opened.rounds,
                 opened.proposer.rates(),
                 opened.proposer.ragged(),
             )
         }
         None => {
-            let mut opened = Opened::over(&mut alone);
+            let mut opened = Opened::over(&mut alone, device);
             let produced =
                 generator.speculate_batch(&mut caches, &asked, &counts, weights, &mut opened);
-            let (wall, spent) = opened.clock();
-            (produced, wall, spent, opened.rounds, Vec::new(), 0)
+            let (wall, spent, trips, allocated) = opened.clock();
+            (
+                produced,
+                wall,
+                spent,
+                trips,
+                allocated,
+                opened.rounds,
+                Vec::new(),
+                0,
+            )
         }
     };
 
@@ -1963,6 +2152,8 @@ fn speculated(
         submissions: spent.calls(profile::Op::Submit) as f64 / rounds as f64,
         encode: spent.elapsed(profile::Op::Encode) / rounds as u32,
         waited: spent.elapsed(profile::Op::Submit) / rounds as u32,
+        divided: Divided::over(&trips, u32::try_from(rounds).unwrap_or(1)),
+        allocations: allocated as f64 / rounds as f64,
         rows: spent.per_step(u32::try_from(rounds).unwrap_or(1)).rows(),
     }
 }

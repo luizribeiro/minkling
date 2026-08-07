@@ -95,6 +95,18 @@ impl Gpu {
         })
     }
 
+    /// The device itself, for a caller measuring what a submission through it
+    /// costs rather than running one.
+    ///
+    /// Everything else here hands out something wrapped, because a caller that
+    /// only wants to run the model never has to name the device. A caller that
+    /// wants the driver's own clock on a command buffer does — see
+    /// [`inkling_metal::Device::record_round_trips`], which is what a wait that
+    /// is neither encode nor execution has to be divided by.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Which arithmetic this device's innermost accumulation uses, read back off
     /// the kernel that was compiled rather than off the flag that asked for it.
     pub fn numerics(&self) -> Numerics {
