@@ -1244,11 +1244,12 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                         let row = format!("{}{held}", policy.named());
                         eprintln!(
                             "  {held} decoding, {}: first token in {:.0} ms over {} steps, \
-                             {:.2?} of device{}",
+                             {:.2?} of device at {:.1}% duty{}",
                             policy.named(),
                             millis(run.ttft),
                             run.steps,
                             run.gpu,
+                            duty(run.gpu, run.ttft),
                             match (run.settled, run.mixed) {
                                 (Some(settled), Some(mixed)) => format!(
                                     "; the batch's step {:.2?} against {:.2?} with the prompt \
