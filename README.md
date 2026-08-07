@@ -1586,7 +1586,7 @@ of it passed.
 **No kernel changed and no dispatch changed.** What this milestone added is one
 module in `inkling-core`, one batched step beside the one that was there, two
 measurements, and the cases beside all of them. `just test-full` is green —
-**763 gated and 81 timing**, which is the 748 C2 left plus the fifteen this
+**764 gated and 81 timing**, which is the 748 C2 left plus the sixteen this
 milestone brought — the recorded continuation
 `[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what the engine generates,
 `--backend cpu` is unmoved,
