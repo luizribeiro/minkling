@@ -78,6 +78,15 @@
 //! `p` waits for `p` slots to free and for nothing else. Both halves of that are
 //! asserted: no request waits while a slot is free, and a stream of requests
 //! through one slot comes back in the order it was submitted.
+//!
+//! # A request nobody is waiting for any more
+//!
+//! Every request here finishes by producing the tokens it asked for. A client
+//! does not: it hangs up, and the seat it left decodes a budget nobody will read
+//! while the request behind it waits for a slot. That is the same starvation the
+//! queue is careful about, arriving through the one door the queue does not
+//! watch — so [`Continuous::release`] is the other half of it, and a fleet is
+//! precisely the workload that produces abandoned requests.
 
 use std::collections::VecDeque;
 
@@ -169,6 +178,15 @@ pub struct Stepped {
     /// Tickets whose **first** token this step produced, which is what a
     /// time-to-first-token is measured to.
     pub first: Vec<usize>,
+    /// Every token this step decoded, against the ticket that owes it.
+    ///
+    /// **What a caller streaming its answers needs and a caller collecting them
+    /// does not.** [`Answered`] arrives once, on the step a request finishes, so
+    /// a server reading only that holds every token back until the last one —
+    /// which is the whole reply buffered behind a budget that is seconds long.
+    /// The same ids are in both: see
+    /// `every_token_is_reported_against_the_ticket_that_produced_it`.
+    pub produced: Vec<(usize, usize)>,
     /// Requests this step finished.
     pub done: Vec<Answered>,
 }
@@ -250,6 +268,40 @@ impl<'a> Continuous<'a> {
         self.tickets += 1;
         self.waiting.push_back((ticket, request));
         ticket
+    }
+
+    /// Give a request up, seated or still queued, and answer whether it was
+    /// there to give up.
+    ///
+    /// **The seat is free before the next step is built**, which is the property
+    /// a server needs and a benchmark never did. A benchmark's requests all want
+    /// their tokens; a fleet's client hangs up, and a slot held for one that
+    /// hung up decodes a whole budget nobody reads while the request behind it
+    /// waits. That is a leak that only appears under the load a scheduler exists
+    /// for, so it is answered here rather than left to a caller polling
+    /// [`Continuous::seated`].
+    ///
+    /// **A ticket released twice is not an error.** A request that finished on
+    /// the same step its client hung up is one request ending for two reasons,
+    /// and the second has nothing left to undo — so this reports rather than
+    /// asserts, and a caller that cares can read the answer.
+    ///
+    /// The slot is emptied and not merely marked, so the sequence admitted into
+    /// it next gets the fresh cache [`Continuous::step`] describes: a seat handed
+    /// on with the released sequence's keys still counted would have its
+    /// successor attending over them.
+    pub fn release(&mut self, ticket: usize) -> bool {
+        let seat = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|held| held.ticket == ticket));
+        if let Some(slot) = seat {
+            *slot = None;
+            return true;
+        }
+        let queued = self.waiting.len();
+        self.waiting.retain(|(waiting, _)| *waiting != ticket);
+        self.waiting.len() < queued
     }
 
     /// How many requests are queued and not yet in a slot.
@@ -363,6 +415,7 @@ impl<'a> Continuous<'a> {
                         stepped.first.push(held.ticket);
                     }
                     held.produced.push(id);
+                    stepped.produced.push((held.ticket, id));
                     if held.done() {
                         stepped.done.push(Answered {
                             ticket: held.ticket,
@@ -495,6 +548,15 @@ mod tests {
             self.answered.sort_by_key(|answer| answer.ticket);
             &self.answered
         }
+    }
+
+    /// The two of [`requests`] that differ in length, content and budget, which
+    /// is the pair every release case drives: one request abandoned and one
+    /// behind it, told apart by what they generate.
+    fn a_pair(stack: &Stack) -> Vec<Request> {
+        let mut asked = requests(stack);
+        asked.truncate(2);
+        asked
     }
 
     /// The same generation run alone, which is what every case below is held
@@ -946,6 +1008,182 @@ mod tests {
             alone(&stack, &sequence[..3], COUNT),
             "the request behind the empty one"
         );
+    }
+
+    /// **The ids a caller streams are the ids it would have collected.** A
+    /// server that sends tokens as they arrive reads [`Stepped::produced`] and
+    /// never sees an [`Answered`] until the last step, so the two have to carry
+    /// the same generation — and they are filled by two different lines, which
+    /// is exactly the pair that drifts.
+    ///
+    /// Held against `alone` as well, so this says the streamed ids are right and
+    /// not only that the two disagree about nothing.
+    ///
+    /// **A ticket must not be readable as a slot index here**, which is the one
+    /// way this could pass while the attribution is wrong: every other case in
+    /// this file hands out tickets into an engine wide enough to seat all of
+    /// them at once, so ticket `n` sits in slot `n` and an engine reporting the
+    /// slot would be right by accident. Two slots for three requests puts the
+    /// third in a slot it does not number, and the empty request in front —
+    /// which takes ticket 0 and no slot at all — is what makes slot 0 a ticket
+    /// nothing may be attributed to.
+    #[test]
+    fn every_token_is_reported_against_the_ticket_that_produced_it() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let generator = generator(&stack, &head);
+        let asked = requests(&stack);
+
+        let mut engine = Continuous::new(&stack.config, 2, 2);
+        let empty = engine.submit(Request {
+            prompt: stack.sequence(),
+            count: 0,
+        });
+        let tickets: Vec<usize> = asked
+            .iter()
+            .map(|request| engine.submit(request.clone()))
+            .collect();
+
+        let mut streamed: Vec<Vec<usize>> = vec![Vec::new(); tickets.len() + 1];
+        let mut collected: Vec<Answered> = Vec::new();
+        while !engine.idle() {
+            let stepped = engine.step(&generator, &stack);
+            for (ticket, id) in &stepped.produced {
+                streamed[*ticket].push(*id);
+            }
+            collected.extend(stepped.done);
+        }
+
+        assert!(
+            streamed[empty].is_empty(),
+            "a token was attributed to the request that took no slot: {:?}",
+            streamed[empty]
+        );
+        collected.sort_by_key(|answer| answer.ticket);
+        assert_eq!(collected.len(), asked.len());
+        for (at, answer) in collected.iter().enumerate() {
+            assert_eq!(answer.ticket, tickets[at]);
+            assert_eq!(
+                streamed[answer.ticket], answer.produced,
+                "ticket {} streamed",
+                answer.ticket
+            );
+            assert_eq!(
+                answer.produced,
+                alone(&stack, &asked[at].prompt, asked[at].count),
+                "ticket {} against the same generation alone",
+                answer.ticket
+            );
+        }
+    }
+
+    /// **A seat given up is a seat the request behind it takes.** One slot and
+    /// two requests: the first is released a step into its generation, and the
+    /// second is admitted into the slot it left — producing what it produces
+    /// alone, which is what says the released sequence's keys did not come with
+    /// the slot.
+    ///
+    /// The whole of what a client hanging up costs, stated as steps: the
+    /// released request's remaining budget is never decoded, so the run is
+    /// shorter than the two requests together asked for.
+    #[test]
+    fn a_released_seat_is_taken_by_the_request_behind_it() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let generator = generator(&stack, &head);
+        let asked = a_pair(&stack);
+        let want = alone(&stack, &asked[1].prompt, asked[1].count);
+
+        let mut engine = Continuous::new(&stack.config, 1, 2);
+        let abandoned = engine.submit(asked[0].clone());
+        let behind = engine.submit(asked[1].clone());
+
+        // Far enough in that the seat holds a prompt and a token of its own,
+        // which is the state an abandoned seat is actually abandoned in.
+        let mut decoded = 0;
+        while decoded == 0 {
+            decoded = engine.step(&generator, &stack).produced.len();
+        }
+        assert_eq!(engine.seated(), 1, "the first request is in the slot");
+        assert_eq!(engine.waiting(), 1, "the second is behind it");
+
+        assert!(engine.release(abandoned), "the seat was there to give up");
+        assert_eq!(engine.seated(), 0, "the slot is free in the same breath");
+
+        let mut streamed = Vec::new();
+        let mut answered = Vec::new();
+        while !engine.idle() {
+            let stepped = engine.step(&generator, &stack);
+            streamed.extend(stepped.produced);
+            answered.extend(stepped.done);
+        }
+
+        assert_eq!(answered.len(), 1, "the abandoned request is not answered");
+        assert_eq!(answered[0].ticket, behind);
+        assert_eq!(answered[0].produced, want, "the slot came with keys");
+        assert!(
+            streamed.iter().all(|(ticket, _)| *ticket == behind),
+            "the abandoned seat decoded after it was released: {streamed:?}"
+        );
+    }
+
+    /// A request released before it was ever seated never takes a slot at all,
+    /// and the one behind it does not wait for it.
+    ///
+    /// Which is the queue's half of the same property: a client that hangs up
+    /// while waiting is the commonest one there is — it hung up *because* it was
+    /// waiting.
+    #[test]
+    fn a_request_released_while_it_waits_is_never_admitted() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let asked = a_pair(&stack);
+
+        let mut engine = Continuous::new(&stack.config, 1, 2);
+        let served = engine.submit(asked[0].clone());
+        let abandoned = engine.submit(asked[1].clone());
+
+        let generator = generator(&stack, &head);
+        let mut ran = Ran::default();
+        // The one slot taken, which is what leaves the second request waiting —
+        // and waiting is why its client hung up.
+        ran.took(engine.step(&generator, &stack));
+        assert_eq!(engine.seated(), 1);
+        assert_eq!(engine.waiting(), 1);
+
+        assert!(engine.release(abandoned), "the queued request was there");
+        assert_eq!(engine.waiting(), 0);
+
+        ran.on(&mut engine, &stack, &head);
+        let answered = ran.against(&asked[..1]);
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0].ticket, served);
+    }
+
+    /// **Releasing a ticket that is not there is not an error.** A request that
+    /// finished on the step its client hung up is one request ending twice, and
+    /// a server that had to tell the two apart before it could clean up would
+    /// have to win that race.
+    #[test]
+    fn releasing_a_ticket_the_engine_does_not_hold_changes_nothing() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let sequence = stack.sequence();
+        let asked = [Request {
+            prompt: sequence[..3].to_vec(),
+            count: COUNT,
+        }];
+
+        let mut engine = Continuous::new(&stack.config, 2, 2);
+        let ticket = engine.submit(asked[0].clone());
+        assert!(!engine.release(ticket + 1), "a ticket never handed out");
+
+        let mut ran = Ran::default();
+        ran.on(&mut engine, &stack, &head);
+        assert_eq!(ran.against(&asked).len(), 1);
+
+        assert!(!engine.release(ticket), "a request already answered");
+        assert!(engine.idle());
     }
 
     #[test]
