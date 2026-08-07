@@ -17,9 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use inkling_cli::chat::{self, Message};
-use inkling_cli::kept::{DEFAULT_BOUND, Kept};
 use inkling_cli::wire::{calls, dechunked, delta, payloads};
-use inkling_core::Tokenizer;
+use inkling_core::{DEFAULT_BOUND, Kept, Tokenizer};
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";
 

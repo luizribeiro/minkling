@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use inkling_core::workload::Session;
 use inkling_core::{Ending, Generator, ModelWeights};
 
-use crate::kept::Kept;
+use inkling_core::Kept;
 
 /// What one turn of a session cost, and what it produced.
 #[derive(Debug, Clone)]

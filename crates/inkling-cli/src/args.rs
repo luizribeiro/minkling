@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use inkling_metal::Numerics;
 
-use crate::kept::DEFAULT_BOUND;
+use inkling_core::DEFAULT_BOUND;
 
 /// What to run, and what against.
 #[derive(Debug, PartialEq, Eq)]

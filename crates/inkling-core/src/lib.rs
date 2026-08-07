@@ -5,6 +5,7 @@ pub mod detokenize;
 pub mod embed;
 pub mod generate;
 pub mod head;
+pub mod keep;
 pub mod layer;
 pub mod mask;
 pub mod model;
@@ -33,6 +34,7 @@ pub use detokenize::{Utf8Stream, char_byte, piece_bytes};
 pub use embed::Embed;
 pub use generate::{Ending, Generator, Stop, greedy};
 pub use head::{LmHead, Tail, Tailed};
+pub use keep::{DEFAULT_BOUND, Kept, Served};
 pub use layer::{
     DecoderCache, DecoderLayer, DecoderWeights, Experts, LayerMark, LayerMlp, NoExperts,
 };

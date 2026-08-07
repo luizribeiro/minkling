@@ -25,10 +25,9 @@
 use std::path::PathBuf;
 
 use inkling_cli::args::Backend;
-use inkling_cli::kept::{DEFAULT_BOUND, Kept};
 use inkling_cli::{backend, config, session};
 use inkling_core::workload::{STRUCTURED_PROMPT, Session};
-use inkling_core::{Checkpoint, Tokenizer};
+use inkling_core::{Checkpoint, DEFAULT_BOUND, Kept, Tokenizer};
 use inkling_metal::Numerics;
 
 const CHECKPOINT_VAR: &str = "INKLINGRS_CHECKPOINT";

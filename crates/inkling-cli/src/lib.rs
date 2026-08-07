@@ -17,7 +17,6 @@ pub mod chat;
 pub mod config;
 pub mod generate;
 pub mod inspect;
-pub mod kept;
 pub mod openai;
 pub mod serve;
 pub mod session;

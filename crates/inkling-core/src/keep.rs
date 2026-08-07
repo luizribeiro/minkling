@@ -8,17 +8,20 @@
 //! cache it computed thirty seconds earlier and threw away. Keeping it and
 //! prefilling only what is new is worth more than any kernel in this tree.
 //!
-//! # One conversation, because the device holds one sequence
+//! # One conversation a slot, because a slot holds one sequence
 //!
-//! [`LayerAttention`](inkling_metal::LayerAttention) holds one span per layer
-//! and [`LayerConv`](inkling_metal::LayerConv) one window pair, so two
-//! conversations interleaved through the same layer would overwrite each other's
+//! A backend holds one span and one window pair per layer *per slot*, so two
+//! conversations interleaved through the same slot would overwrite each other's
 //! keys. That is not a policy decision here, it is the shape of the backend: a
-//! prompt that does not extend what is held replaces it, and there is no
-//! arrangement of this file that could keep both.
+//! prompt that does not extend what a slot holds replaces it, and there is no
+//! arrangement of this file that could keep both in one slot.
 //!
-//! So this is not a prefix-cache service and does not pretend to be one. It is
-//! one entry, and the entry is a conversation.
+//! So one of these is not a prefix-cache service and does not pretend to be one.
+//! It is one entry, and the entry is a conversation. A server answering one
+//! request at a time holds one, in slot zero; [`Continuous`](crate::Continuous)
+//! holds one per slot and decides which slot an arriving prompt is given — see
+//! its `admit`, where the matching below is what a returning conversation is
+//! recognised by.
 //!
 //! # The invariant, which is what makes the matching a comparison
 //!
@@ -49,7 +52,9 @@
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use inkling_core::{Ending, Generator, ModelCache, ModelWeights, Stop, TextConfig};
+use crate::config::TextConfig;
+use crate::generate::{Ending, Generator, Stop};
+use crate::model::{ModelCache, ModelWeights};
 
 /// What one turn came to, beside the reply it streamed.
 #[derive(Debug, Clone)]
@@ -72,6 +77,9 @@ pub struct Served {
 pub struct Kept<'a> {
     config: &'a TextConfig,
     bound: usize,
+    /// Which of a backend's slots the cache's keys and windows live in, which a
+    /// forgotten conversation is rebuilt into — see [`Kept::in_slot`].
+    slot: usize,
     /// The tokens the cache holds, and nothing where it holds none.
     ids: Vec<usize>,
     cache: ModelCache,
@@ -96,11 +104,25 @@ impl<'a> Kept<'a> {
     /// A server holding nothing yet. `bound` of zero keeps nothing at all, which
     /// is the arm every measurement of this is taken against.
     pub fn new(config: &'a TextConfig, bound: usize) -> Self {
+        Self::in_slot(config, bound, 0)
+    }
+
+    /// The same, for a conversation whose keys and windows are a backend's slot
+    /// `slot` rather than its first.
+    ///
+    /// **A slot is where the state actually is, so it has to survive
+    /// forgetting.** [`Kept::forget`] builds a cache that holds nothing, and one
+    /// built without the slot would name slot zero — which is another
+    /// conversation's span in a batch, and a sequence handed it would write its
+    /// keys over a neighbour's. See
+    /// [`ModelCache::in_slot`](crate::ModelCache::in_slot).
+    pub fn in_slot(config: &'a TextConfig, bound: usize, slot: usize) -> Self {
         Self {
             config,
             bound,
+            slot,
             ids: Vec::new(),
-            cache: ModelCache::new(config),
+            cache: ModelCache::in_slot(config, 0, slot),
         }
     }
 
@@ -220,7 +242,7 @@ impl<'a> Kept<'a> {
     /// say the position of.
     pub fn forget(&mut self) {
         self.ids.clear();
-        self.cache = ModelCache::new(self.config);
+        self.cache = ModelCache::in_slot(self.config, 0, self.slot);
     }
 
     /// Positions this is holding a conversation at.
@@ -232,7 +254,7 @@ impl<'a> Kept<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inkling_core::fixture::Stack;
+    use crate::fixture::Stack;
 
     /// A conversation and the turn after it: the same tokens, with more on the
     /// end. Realistic in the one way that matters here — the prefix is long and
@@ -318,6 +340,23 @@ mod tests {
         let mut kept = Kept::new(&stack.config, 0);
         kept.keep(&TURN[..1]);
         assert_eq!(kept.held(), 0);
+    }
+
+    /// **A conversation kept in a slot stays in that slot, forgotten or not.**
+    /// The keys and the windows are the slot's, so a cache rebuilt into slot
+    /// zero would have the next sequence writing over whoever is seated there —
+    /// which is the one way a per-slot conversation could reintroduce exactly
+    /// the contamination it exists to rule out.
+    #[test]
+    fn a_conversation_forgotten_in_a_slot_is_rebuilt_in_the_same_slot() {
+        let stack = Stack::load();
+        let mut kept = Kept::in_slot(&stack.config, DEFAULT_BOUND, 3);
+        assert_eq!(kept.opened(&TURN).0.slot(), 3);
+
+        kept.keep(&TURN[..4]);
+        kept.forget();
+        assert_eq!(kept.held(), 0);
+        assert_eq!(kept.opened(&TURN).0.slot(), 3, "forgetting moved the slot");
     }
 
     /// Forgetting is both of the ways a conversation ends here, and what it has

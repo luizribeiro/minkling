@@ -40,7 +40,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use inkling_cli::args::Backend;
-use inkling_cli::kept::{DEFAULT_BOUND, Kept};
 use inkling_cli::{backend, config, session};
 use inkling_core::generate::{
     Alone, BatchProposer, Generator, Picked, Proposer, Round, Seated as SeatedRound,
@@ -52,8 +51,8 @@ use inkling_core::workload::{
     BEST, CORPUS, DECODED, DIFFERENTIAL, REALISTIC, STRUCTURED_PROMPT, SWEPT, Session, tiled,
 };
 use inkling_core::{
-    Checkpoint, CheckpointWeights, Continuous, Ending, ModelCache, Request, TextConfig, Tokenizer,
-    profile,
+    Checkpoint, CheckpointWeights, Continuous, DEFAULT_BOUND, Ending, Kept, ModelCache, Request,
+    TextConfig, Tokenizer, profile,
 };
 use inkling_metal::trace;
 use inkling_metal::{FusedAttention, Numerics, PackedMatmul};

@@ -109,14 +109,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use inkling_core::schedule::Request as SeatRequest;
 use inkling_core::{
-    Checkpoint, CheckpointWeights, Continuous, Detokenizer, Ending, Generator, ModelWeights,
+    Checkpoint, CheckpointWeights, Continuous, Detokenizer, Ending, Generator, Kept, ModelWeights,
     Stepped, Stop, TextConfig, Tokenizer,
 };
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::args::Serve;
 use crate::chat::{self, Channel, Channels, MARKERS, Reading, Routed};
-use crate::kept::Kept;
 use crate::openai::{ChatRequest, Completion, Finish, RequestError};
 use crate::stop::Stops;
 use crate::{backend, config};
