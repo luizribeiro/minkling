@@ -103,6 +103,8 @@ const USAGE: &str = "usage:\n  \
 [--admit <n>]\n  \
     bench fleet   <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>] \
 [--admit <n>] [--agents <n>] [--every <ms>]\n  \
+    bench conversations <checkpoint> [--tokens <n>] [--batch <n>] [--agents <n>] \
+[--admit <n>] [--reuse-tokens <n>] [--numerics <which>]\n  \
     bench guesses <checkpoint> <checkpoint> [--tokens <n>] [--depth <k>]\n  \
     bench diverge <checkpoint> [--tokens <n>] [--against <which>]\n  \
     bench alternate [--pairs <n>] <a> <b> -- <arguments for both>";
@@ -4268,6 +4270,38 @@ mod tests {
                 .is_err(),
             "an engine of no slots was accepted"
         );
+    }
+
+    /// **Every word the parser takes is a word [`USAGE`] names.**
+    ///
+    /// Stated because `conversations` parsed, ran, and had a recipe of its own
+    /// for a whole milestone while the usage text stopped at `fleet` — so the
+    /// only ways to find the measurement were to read this file or to mistype a
+    /// word and read the refusal, and neither is a way to find it. The list of
+    /// words lives in three places here (the match arms, that refusal, and the
+    /// usage text) and nothing but this held them together.
+    #[test]
+    fn every_measurement_the_parser_takes_is_one_the_usage_names() {
+        for word in [
+            "decode",
+            "prefill",
+            "sweep",
+            "engines",
+            "session",
+            "batch",
+            "clock",
+            "joining",
+            "fleet",
+            "conversations",
+            "guesses",
+            "diverge",
+            "alternate",
+        ] {
+            assert!(
+                USAGE.contains(&format!("bench {word} ")),
+                "{word} is a measurement the parser takes and the usage text does not name"
+            );
+        }
     }
 
     /// **A depth given on the command line is the depth the measurement runs
