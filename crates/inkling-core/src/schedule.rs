@@ -789,6 +789,7 @@ mod tests {
     use crate::keep::DEFAULT_BOUND;
     use crate::model::ModelCache;
     use crate::ops::DenseProjection;
+    use crate::workload::{Turned, turned};
 
     /// The head the synthetic stack's generator reads, which is its embedding
     /// table — see `generate`'s own tests, where the same tie is spelled out.
@@ -1572,44 +1573,24 @@ mod tests {
         let mut taken: Vec<Vec<Turn>> = vec![Vec::new(); openings.len()];
 
         for turn in 0..TURNS {
-            let tickets: Vec<usize> = prompts
+            let asking: Vec<Request> = prompts
                 .iter()
-                .map(|prompt| {
-                    engine.submit(Request {
-                        prompt: prompt.clone(),
-                        count: COUNT,
-                    })
+                .map(|prompt| Request {
+                    prompt: prompt.clone(),
+                    count: COUNT,
                 })
                 .collect();
-            let at = |ticket: usize| {
-                tickets
-                    .iter()
-                    .position(|held| *held == ticket)
-                    .expect("a ticket of this turn")
-            };
-
-            let mut admitted: Vec<Option<Admitted>> = vec![None; tickets.len()];
-            let mut answered: Vec<Option<Vec<usize>>> = vec![None; tickets.len()];
-            while !engine.idle() {
-                let stepped = engine.step(&generator, stack);
-                for seat in stepped.admitted {
-                    admitted[at(seat.ticket)] = Some(seat);
-                }
-                for answer in stepped.done {
-                    answered[at(answer.ticket)] = Some(answer.produced);
-                }
-            }
+            let answered = turned(engine, &generator, stack, &asking, |_| {});
 
             for (which, prompt) in prompts.iter_mut().enumerate() {
-                let seat = admitted[which].expect("every request admitted");
-                let produced = answered[which].take().expect("every request answered");
+                let Turned { seat, produced } = &answered[which];
                 taken[which].push(Turn {
                     prompt: prompt.clone(),
                     produced: produced.clone(),
                     slot: seat.slot,
                     reused: seat.reused,
                 });
-                prompt.extend_from_slice(&produced);
+                prompt.extend_from_slice(produced);
                 prompt.extend(sequence.iter().copied().cycle().skip(turn).take(ADDED));
             }
         }

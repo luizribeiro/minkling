@@ -29,7 +29,7 @@ use inkling_core::mtp::{CheckpointHeads, MtpProposer};
 use inkling_core::ops::linear;
 use inkling_core::profile::{self, Op, Profile};
 use inkling_core::quant::{BITS, dequantize_blocks_into};
-use inkling_core::workload::{DECODED, STRUCTURED_PROMPT, SWEPT, tiled};
+use inkling_core::workload::{DECODED, STRUCTURED_PROMPT, SWEPT, Turned, tiled, turned};
 use inkling_core::{
     Answered, AttentionCache, AttentionStep, BandedMask, Bf16, Checkpoint, CheckpointWeights,
     Continuous, DEFAULT_BOUND, Dtype, Ending, LayerStep, ModelCache, Packed as CorePacked,
@@ -4097,45 +4097,26 @@ fn conversing(
     let mut taken: Vec<Vec<KeptTurn>> = vec![Vec::new(); openings.len()];
 
     for turn in 0..KEPT_TURNS {
-        let tickets: Vec<usize> = prompts
+        let asking: Vec<Request> = prompts
             .iter()
-            .map(|prompt| {
-                engine.submit(Request {
-                    prompt: prompt.clone(),
-                    count: BATCHED,
-                })
+            .map(|prompt| Request {
+                prompt: prompt.clone(),
+                count: BATCHED,
             })
             .collect();
-        let at = |ticket: usize| {
-            tickets
-                .iter()
-                .position(|held| *held == ticket)
-                .expect("a ticket of this turn")
-        };
-
-        let mut seated: Vec<Option<(usize, usize)>> = vec![None; tickets.len()];
-        let mut answered: Vec<Option<Vec<usize>>> = vec![None; tickets.len()];
-        while !engine.idle() {
-            let stepped = engine.step(&generator, weights);
+        let answered = turned(engine, &generator, weights, &asking, |stepped| {
             assert!(!stepped.empty(), "a step that carried no rows");
-            for admitted in stepped.admitted {
-                seated[at(admitted.ticket)] = Some((admitted.slot, admitted.reused));
-            }
-            for answer in stepped.done {
-                answered[at(answer.ticket)] = Some(answer.produced);
-            }
-        }
+        });
 
         for (which, prompt) in prompts.iter_mut().enumerate() {
-            let (slot, reused) = seated[which].expect("every turn seated");
-            let produced = answered[which].take().expect("every turn answered");
+            let Turned { seat, produced } = &answered[which];
             taken[which].push(KeptTurn {
                 prompt: prompt.clone(),
                 produced: produced.clone(),
-                slot,
-                reused,
+                slot: seat.slot,
+                reused: seat.reused,
             });
-            prompt.extend_from_slice(&produced);
+            prompt.extend_from_slice(produced);
             prompt.extend(added.iter().copied().cycle().skip(turn).take(KEPT_ADDED));
         }
     }

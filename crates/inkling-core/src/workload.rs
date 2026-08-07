@@ -10,7 +10,14 @@
 //!
 //! What is not here is anything a measurement *decides*: how many pairs, how the
 //! ranges are compared, what a table prints. Those belong to whoever is
-//! measuring. This is the input.
+//! measuring. This is the input — and [`turned`], which is the *driving* of one
+//! of these workloads rather than the shape of it, for the same reason: three
+//! callers joining a step's answers back onto the conversation that asked is
+//! three chances to get one mapping wrong.
+
+use crate::generate::Generator;
+use crate::model::ModelWeights;
+use crate::schedule::{Admitted, Continuous, Request, Stepped};
 
 /// The prompt every multi-token prediction figure in this repo is taken over.
 ///
@@ -762,4 +769,74 @@ mod tests {
             .collect();
         assert_eq!(prompts, [97, 385, 769]);
     }
+}
+
+/// One conversation's turn, as an engine answered it.
+#[derive(Debug, Clone)]
+pub struct Turned {
+    /// The slot it was given, and how many tokens of its prompt that slot
+    /// already held.
+    pub seat: Admitted,
+    pub produced: Vec<usize>,
+}
+
+/// One turn of several conversations through an engine, drained.
+///
+/// **What this shares is the half that has been wrong before.** A ticket is not
+/// a slot index and not a position in the list of prompts — the scheduler hands
+/// one out and answers against it out of order — so joining a step's
+/// [`Stepped::admitted`] and [`Stepped::done`] back onto the conversation that
+/// asked is a mapping every caller would otherwise write again, and a milestone
+/// has already shipped a case that passed because a ticket happened to equal its
+/// slot. One implementation, and the three callers that drive conversations —
+/// the scheduler's own cases, the checkpoint-gated contamination case, and
+/// `bench conversations` — read it rather than repeat it.
+///
+/// Every request is submitted before the first step, so a turn's conversations
+/// arrive together; spreading arrivals over a clock is what `bench fleet` does
+/// and would be a second variable here.
+///
+/// `watching` sees every step as it is taken, which is where a measurement reads
+/// its clock and its rows. A caller that only wants the answers passes a closure
+/// that does nothing.
+pub fn turned(
+    engine: &mut Continuous<'_>,
+    generator: &Generator<'_>,
+    weights: &impl ModelWeights,
+    asking: &[Request],
+    mut watching: impl FnMut(&Stepped),
+) -> Vec<Turned> {
+    let tickets: Vec<usize> = asking
+        .iter()
+        .map(|request| engine.submit(request.clone()))
+        .collect();
+    let at = |ticket: usize| {
+        tickets
+            .iter()
+            .position(|held| *held == ticket)
+            .expect("a ticket of this turn")
+    };
+
+    let mut seats: Vec<Option<Admitted>> = vec![None; tickets.len()];
+    let mut produced: Vec<Option<Vec<usize>>> = vec![None; tickets.len()];
+    while !engine.idle() {
+        let stepped = engine.step(generator, weights);
+        watching(&stepped);
+        for admitted in &stepped.admitted {
+            seats[at(admitted.ticket)] = Some(*admitted);
+        }
+        for answer in &stepped.done {
+            produced[at(answer.ticket)] = Some(answer.produced.clone());
+        }
+    }
+
+    seats
+        .into_iter()
+        .zip(produced)
+        .enumerate()
+        .map(|(which, (seat, produced))| Turned {
+            seat: seat.unwrap_or_else(|| panic!("conversation {which} was never seated")),
+            produced: produced.unwrap_or_else(|| panic!("conversation {which} was never answered")),
+        })
+        .collect()
 }

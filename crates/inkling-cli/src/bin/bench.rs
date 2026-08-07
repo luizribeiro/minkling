@@ -31,7 +31,7 @@
 //! one Metal device, which at a second apiece is the reason a run measures as
 //! much as it can once it has one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -49,6 +49,7 @@ use inkling_core::model::Batched;
 use inkling_core::mtp::{CheckpointHeads, MtpProposer};
 use inkling_core::workload::{
     BEST, CORPUS, DECODED, DIFFERENTIAL, REALISTIC, STRUCTURED_PROMPT, SWEPT, Session, tiled,
+    turned,
 };
 use inkling_core::{
     Checkpoint, CheckpointWeights, Continuous, DEFAULT_BOUND, Ending, Kept, ModelCache, Request,
@@ -2429,59 +2430,51 @@ fn talking(engine: &Engine<'_, '_>, plan: Session, agents: usize) -> Talked {
         let prompts: Vec<Vec<usize>> = (0..agents)
             .map(|at| plan.prompt(&pools[at], turn, &produced[at]))
             .collect();
-        let submitted = Instant::now();
-        let tickets: Vec<usize> = prompts
+        let asking: Vec<Request> = prompts
             .iter()
-            .map(|ids| {
-                seating.submit(Request {
-                    prompt: ids.clone(),
-                    count: plan.generated,
-                })
+            .map(|ids| Request {
+                prompt: ids.clone(),
+                count: plan.generated,
             })
             .collect();
-        let of = |ticket: usize| {
-            tickets
-                .iter()
-                .position(|held| *held == ticket)
-                .expect("a ticket of this turn")
-        };
 
-        let mut reused = vec![0; agents];
-        let mut first = vec![Duration::ZERO; agents];
-        let mut last = vec![Duration::ZERO; agents];
-        let mut reply: Vec<Vec<usize>> = vec![Vec::new(); agents];
-        while !seating.idle() {
-            let stepped = seating.step(&generator, weights);
+        // **The clock is read here rather than by the driver**, because when a
+        // ticket's first token landed is what this measures and the driving is
+        // what it shares — see [`turned`], which is one implementation of the
+        // ticket bookkeeping for the three callers that drive conversations.
+        let submitted = Instant::now();
+        let mut felt: HashMap<usize, (Duration, Duration)> = HashMap::new();
+        let answered = turned(&mut seating, &generator, weights, &asking, |stepped| {
             steps += 1;
             rows += stepped.rows();
             tokens += stepped.decoding;
             bookkeeping += stepped.bookkeeping;
             let now = submitted.elapsed();
-            for admitted in &stepped.admitted {
-                reused[of(admitted.ticket)] = admitted.reused;
-            }
             for ticket in &stepped.first {
-                first[of(*ticket)] = now;
+                felt.entry(*ticket).or_insert((now, now)).0 = now;
             }
             for answer in &stepped.done {
-                last[of(answer.ticket)] = now;
-                reply[of(answer.ticket)] = answer.produced.clone();
+                felt.entry(answer.ticket).or_insert((now, now)).1 = now;
             }
-        }
+        });
 
-        for at in 0..agents {
+        for (at, answer) in answered.into_iter().enumerate() {
             assert_eq!(
-                reply[at].len(),
+                answer.produced.len(),
                 plan.generated,
                 "conversation {at} was answered short on turn {turn}"
             );
+            let (first, last) = felt
+                .get(&answer.seat.ticket)
+                .copied()
+                .expect("a wait for every conversation answered");
             spoke[at].push(Spoke {
                 prompt: prompts[at].len(),
-                reused: reused[at],
-                first: first[at],
-                last: last[at],
+                reused: answer.seat.reused,
+                first,
+                last,
             });
-            produced[at].push(std::mem::take(&mut reply[at]));
+            produced[at].push(answer.produced);
         }
     }
 
