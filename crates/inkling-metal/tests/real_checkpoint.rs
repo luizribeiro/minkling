@@ -3774,6 +3774,164 @@ fn a_generation_in_a_batch_produces_what_it_produces_alone_on_the_device() {
     }
 }
 
+/// **The milestone's own case, on the real checkpoint: a batch whose every
+/// sequence is speculating.**
+///
+/// The case above is a batch that decodes a row per sequence, which is the one
+/// shape `generate_batch` produces and the only one anything drove. A batch
+/// that speculates feeds a *block* per sequence — the token it owes plus the
+/// guesses its own chain made — and the model agrees with a different number of
+/// them per sequence, so **the seats of the next call are different lengths and
+/// each sequence rewinds its span and its four convolution windows by its own
+/// amount.**
+///
+/// That is the path B3 built and named as unreached, and it is where one
+/// sequence's state can reach another's tokens in three new ways: a chain
+/// seating a sequence in its neighbour's slot, a rewind returning the wrong
+/// seat's window, and a tail taking every sequence's guess from the last row of
+/// the *call* rather than from the last row of each sequence's own run.
+///
+/// **The oracle is the same sequence run alone at the same depth**, token for
+/// token — and one of the prompts is the recorded activation capture's, so the
+/// oracle's own continuation is asserted from inside a speculating batch as
+/// well as beside one. A guess cannot move a token, so a chain that has leaked
+/// shows up as a *rejected* guess and not as wrong text: what says the batch is
+/// clean is that the tokens agree, and what says the chain is clean is that
+/// acceptance does.
+#[test]
+fn a_speculating_generation_in_a_batch_produces_what_it_produces_alone_on_the_device() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let config = fixture::config(&dir);
+    let text = &config.text_config;
+    let mtp = config.mtp_config.as_ref().expect("an mtp_config");
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+
+    let recorded = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+    let oracle = indices(&fixture::tensor(
+        &fixture::open(ACTIVATIONS),
+        "greedy_continuation",
+    ));
+    let tokenizer = Tokenizer::open(&dir, &config).expect("the tokenizer opens");
+    let structured: Vec<usize> = tokenizer
+        .encode(STRUCTURED_PROMPT)
+        .expect("the prompt encodes")
+        .into_iter()
+        .map(|id| id as usize)
+        .collect();
+    // Three prompts of three different lengths, the first of them the capture's
+    // own, so that no two sequences' rows line up by accident.
+    //
+    // **Two of the three are the workload every acceptance figure in this file
+    // is measured on**, and that is not decoration: the eight ids the capture
+    // recorded are a fragment the heads guess nothing right on, and a batch
+    // whose every round banks exactly one token is a batch whose seats are all
+    // one row. The case asserts both — that the seats went ragged, and that the
+    // chain banked something to be wrong about.
+    let prompts: Vec<Vec<usize>> = vec![
+        recorded.clone(),
+        structured[..structured.len() / 2].to_vec(),
+        structured.clone(),
+    ];
+    // The *first* stops early, which is a sequence leaving the batch from the
+    // middle of the live set rather than off its end — a round handed back by
+    // position rather than by slot is right in every batch that drains from the
+    // end.
+    let counts = [SPECULATED_TOKENS - 3, SPECULATED_TOKENS, SPECULATED_TOKENS];
+
+    // Alone at the same depth, which is the oracle every arm below is held
+    // against: the tokens, and how many of each round's guesses were banked.
+    let alone: Vec<(Vec<usize>, Vec<usize>)> = {
+        let weights = gpu.wrap_speculating(&ckpt, text, SPECULATED, 1);
+        let held = gpu.tail(&weights, text);
+        let heads = gpu.heads(&ckpt, text, mtp, held);
+        let generator = weights.generator();
+        prompts
+            .iter()
+            .zip(&counts)
+            .map(|(prompt, count)| {
+                let mut proposer = MtpProposer::new(&heads, generator, &weights, SPECULATED);
+                let mut produced = Vec::new();
+                generator.speculate(
+                    &mut ModelCache::speculating(text, SPECULATED),
+                    prompt,
+                    Ending {
+                        budget: *count,
+                        eos: None,
+                    },
+                    &weights,
+                    &mut proposer,
+                    |id| {
+                        produced.push(id);
+                        ControlFlow::Continue(())
+                    },
+                );
+                (produced, proposer.accepted().0.to_vec())
+            })
+            .collect()
+    };
+    // As far as the two reach: the capture records eight tokens and the
+    // sequence carrying it is asked for its own budget.
+    let recorded_tokens = counts[0].min(oracle.len());
+    assert_eq!(
+        alone[0].0[..recorded_tokens],
+        oracle[..recorded_tokens],
+        "the recorded continuation, speculating alone"
+    );
+    assert_ne!(alone[0].0, alone[1].0, "two generations to tell apart");
+
+    for order in [vec![0, 1, 2], vec![2, 1, 0], vec![1, 0]] {
+        let weights = gpu.wrap_speculating(&ckpt, text, SPECULATED, order.len());
+        let held = gpu.tail(&weights, text);
+        let heads = gpu.heads_for(&ckpt, text, mtp, held, order.len());
+        let generator = weights.generator();
+        let mut proposer =
+            MtpProposer::batched(&heads, generator, &weights, SPECULATED, order.len());
+        let mut caches: Vec<ModelCache> = (0..order.len())
+            .map(|slot| ModelCache::in_slot(text, SPECULATED, slot))
+            .collect();
+        let ids: Vec<&[usize]> = order.iter().map(|at| prompts[*at].as_slice()).collect();
+        let budgets: Vec<usize> = order.iter().map(|at| counts[*at]).collect();
+        let batched =
+            generator.speculate_batch(&mut caches, &ids, &budgets, &weights, &mut proposer);
+
+        for (at, seq) in order.iter().enumerate() {
+            assert_eq!(
+                batched[at], alone[*seq].0,
+                "sequence {seq} at position {at} of {order:?}"
+            );
+        }
+        // **And that the chain banked what the same chains banked apart.** The
+        // tokens are the model's whatever the heads guessed, so a chain reading
+        // its neighbour's rows loses acceptance and moves no token — which is
+        // the one way this milestone can go wrong that a continuation cannot
+        // see.
+        let apart: Vec<usize> = order
+            .iter()
+            .map(|at| alone[*at].1.iter().sum::<usize>())
+            .collect();
+        let banked: usize = apart.iter().sum();
+        assert!(
+            banked > 0,
+            "the chains apart banked nothing at {order:?}, so this compares two zeroes"
+        );
+        assert_eq!(
+            proposer.accepted().0.iter().sum::<usize>(),
+            banked,
+            "the batch banked a different number of guesses from the same chains apart, \
+             at {order:?}"
+        );
+        // **And that the seats were actually unequal**, which nothing above
+        // says: a batch whose sequences all accept the same number of guesses
+        // passes every assertion here and drives none of the path.
+        assert!(
+            proposer.ragged() > 0,
+            "every round's seats were the same length at {order:?}"
+        );
+    }
+}
+
 /// **The same claim about the two things a continuous engine does that a static
 /// batch does not, on the real checkpoint**: a request admitted into a batch
 /// already decoding, and a request given the slot a finished one left.
@@ -4140,6 +4298,23 @@ const PER_CALL: &[(&str, usize)] = &[
 /// three inputs deep.
 const BATCHED: usize = 4;
 
+/// How far ahead each sequence of the speculating batched case guesses.
+///
+/// Three, which is the depth the sweep says pays best and the depth whose
+/// verify is four rows a sequence — so a batch of three is a twelve-row call
+/// where the same three sequences apart are three calls of four.
+const SPECULATED: usize = 3;
+
+/// How many tokens each sequence of that case generates.
+///
+/// **Longer than [`BATCHED`], and the difference is what makes the call
+/// ragged.** A round banks everything the model agreed with, so at a budget of
+/// four a chain that guesses well can take the whole budget in one round and
+/// never reject anything — and a batch whose seats are all one row is not the
+/// shape this milestone is about. The case asserts the raggedness it got rather
+/// than assuming this is enough.
+const SPECULATED_TOKENS: usize = 12;
+
 /// The kernels a speculative run compiles, held so that the weights wrapped
 /// against them can be built once per depth.
 struct Kernels<'d> {
@@ -4197,6 +4372,22 @@ impl<'d> Kernels<'d> {
         'd: 'a,
     {
         self.wrapping(ckpt, config, 0, true, slots)
+    }
+
+    /// The same, holding `slots` sequences that are each able to give back
+    /// `slack` timesteps — which is a batch that speculates: every seat's
+    /// rejected guesses come out of its own windows.
+    fn wrap_speculating<'a>(
+        &'a self,
+        ckpt: &'a Checkpoint,
+        config: &'a inkling_core::TextConfig,
+        slack: usize,
+        slots: usize,
+    ) -> CheckpointWeights<'a>
+    where
+        'd: 'a,
+    {
+        self.wrapping(ckpt, config, slack, true, slots)
     }
 
     /// The same, with the final norm and the muP divide left on the CPU and
@@ -4284,6 +4475,20 @@ impl<'d> Kernels<'d> {
         mtp: &inkling_core::config::MtpConfig,
         tail: Option<ModelTail<'a>>,
     ) -> CheckpointHeads<'a> {
+        self.heads_for(ckpt, config, mtp, tail, 1)
+    }
+
+    /// The same eight heads, holding a chain's state for `slots` sequences —
+    /// which is what a batch that speculates needs, a head's block being a
+    /// decoder layer and carrying a decoder layer's state.
+    fn heads_for<'a>(
+        &'a self,
+        ckpt: &'a Checkpoint,
+        config: &inkling_core::TextConfig,
+        mtp: &inkling_core::config::MtpConfig,
+        tail: Option<ModelTail<'a>>,
+        slots: usize,
+    ) -> CheckpointHeads<'a> {
         let heads = CheckpointHeads::open(ckpt, config, mtp).expect("the heads open");
         let held = heads.head_projections();
         let wrapped = ModelHeads::wrap(
@@ -4294,7 +4499,7 @@ impl<'d> Kernels<'d> {
             &held,
             tail,
             inkling_core::mtp::FRONTIER,
-            1,
+            slots,
         )
         .expect("the heads wrap");
         heads.with_backend(Box::new(wrapped))

@@ -934,6 +934,14 @@ pub struct MtpProposer<'a, W> {
     /// Rounds this has been asked for guesses by, which is every round of the
     /// generation but the one it ended in.
     rounds: usize,
+    /// Rounds whose seats were not all the same length, which is what says a
+    /// batched chain was actually driven ragged.
+    ///
+    /// **Kept because a batch whose sequences all accept the same number of
+    /// guesses is a null fixture for this path**, and it would pass every
+    /// token comparison a contamination case can make. A case reports it;
+    /// nothing here reads it.
+    ragged: usize,
 }
 
 /// One sequence's chain: the caches its heads stand on, and where the round
@@ -1028,6 +1036,7 @@ impl<'a, W: ModelWeights> MtpProposer<'a, W> {
             accepted: Vec::new(),
             proposed: Vec::new(),
             rounds: 0,
+            ragged: 0,
         }
     }
 
@@ -1049,6 +1058,12 @@ impl<'a, W: ModelWeights> MtpProposer<'a, W> {
     /// reports it; nothing here reads it.
     pub fn accepted(&self) -> (&[usize], &[usize]) {
         (&self.accepted, &self.proposed)
+    }
+
+    /// How many rounds ran seats of more than one length, which is the shape
+    /// this chain is batched for — see [`MtpProposer::ragged`]'s field.
+    pub fn ragged(&self) -> usize {
+        self.ragged
     }
 
     /// The same as a rate per depth, which is what a report prints and what a
@@ -1186,6 +1201,9 @@ impl<W: ModelWeights> BatchProposer for MtpProposer<'_, W> {
         }
         for walk in &walking {
             self.score(walk.at, &walk.tokens);
+        }
+        if walking.iter().any(|walk| walk.rows != walking[0].rows) {
+            self.ragged += 1;
         }
 
         // Copied out of `self` so that the chains below can be borrowed a seat
