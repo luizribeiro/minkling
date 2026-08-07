@@ -47,6 +47,7 @@
 use serde::Deserialize;
 
 use crate::chat::{Call, Channel, ChatError, Message, Routed};
+use crate::stop::MOST_SEQUENCES;
 
 /// What a client asked for.
 ///
@@ -82,6 +83,20 @@ pub struct ChatRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// Where to cut the reply, as a string or a list of them. Held as it
+    /// arrived because OpenAI spells it both ways and the two mean the same
+    /// thing; see [`crate::stop`] for what it is matched against.
+    #[serde(default)]
+    pub stop: Option<serde_json::Value>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// What a client wants of the stream beyond the reply itself.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 /// Which of OpenAI's `tool_choice` values this implements.
@@ -118,6 +133,43 @@ impl Choice {
     }
 }
 
+/// The sequences a `stop` names, or which value it is that cannot be one.
+///
+/// **An empty sequence is refused rather than dropped.** It matches before the
+/// first token of every reply, so a request carrying one would be answered with
+/// nothing at all — which a client reads as a model that had nothing to say
+/// rather than as a `stop` it should not have sent.
+///
+/// The count is OpenAI's own limit and is refused rather than truncated, for
+/// the reason a `tool_choice` this cannot honour is refused: a client whose
+/// fifth sequence was quietly dropped gets a reply running past a stop it asked
+/// for, which is the failure `stop` exists to prevent.
+fn sequences(asked: Option<&serde_json::Value>) -> Result<Vec<String>, RequestError> {
+    let Some(asked) = asked else {
+        return Ok(Vec::new());
+    };
+    let named: Vec<String> = match asked {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::String(one) => vec![one.clone()],
+        serde_json::Value::Array(many) => many
+            .iter()
+            .map(|one| match one.as_str() {
+                Some(sequence) => Ok(sequence.to_string()),
+                None => Err(RequestError::Stop(asked.to_string())),
+            })
+            .collect::<Result<_, _>>()?,
+        _ => return Err(RequestError::Stop(asked.to_string())),
+    };
+
+    if named.len() > MOST_SEQUENCES {
+        return Err(RequestError::Stop(asked.to_string()));
+    }
+    if named.iter().any(String::is_empty) {
+        return Err(RequestError::EmptyStop);
+    }
+    Ok(named)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RequestError {
     #[error("the request body is not the JSON this takes: {0}")]
@@ -132,6 +184,12 @@ pub enum RequestError {
     #[error("max_tokens must be a count of at least one")]
     NotACount,
 
+    #[error("stop takes a string or a list of at most {MOST_SEQUENCES} strings, not {0}")]
+    Stop(String),
+
+    #[error("a stop sequence must not be empty: it would match before the first token")]
+    EmptyStop,
+
     #[error(transparent)]
     Chat(#[from] ChatError),
 }
@@ -141,6 +199,7 @@ impl ChatRequest {
         let request: Self =
             serde_json::from_str(body).map_err(|err| RequestError::Malformed(err.to_string()))?;
         Choice::parse(request.tool_choice.as_ref())?;
+        sequences(request.stop.as_ref())?;
         if request.n.is_some_and(|choices| choices != 1) {
             return Err(RequestError::Choices);
         }
@@ -148,6 +207,23 @@ impl ChatRequest {
             return Err(RequestError::NotACount);
         }
         Ok(request)
+    }
+
+    /// Where this request's reply is cut, which is nothing for a request that
+    /// named no `stop`.
+    ///
+    /// `stop` was checked when the request was parsed, so a value that is not
+    /// sequences never reaches here.
+    pub fn stopping(&self) -> Vec<String> {
+        sequences(self.stop.as_ref()).unwrap_or_default()
+    }
+
+    /// Whether the client asked for token counts on the stream, which is a
+    /// question only a stream has.
+    pub fn wants_usage(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .is_some_and(|options| options.include_usage)
     }
 
     /// The specs the prompt declares, which is none of them where the caller
@@ -883,6 +959,62 @@ mod tests {
             5
         );
         assert_eq!(budget(serde_json::json!({})), DEFAULT);
+    }
+
+    /// OpenAI spells `stop` both ways and means the same thing by them, so both
+    /// reach the matching as the same list.
+    #[test]
+    fn stop_is_read_from_a_string_and_from_a_list_alike() {
+        let stopping = |extra| request(asking(extra)).expect("parses").stopping();
+
+        assert_eq!(
+            stopping(serde_json::json!({"stop": "\nUser:"})),
+            ["\nUser:"]
+        );
+        assert_eq!(
+            stopping(serde_json::json!({"stop": ["\nUser:", "###"]})),
+            ["\nUser:", "###"]
+        );
+        assert!(stopping(serde_json::json!({})).is_empty());
+        assert!(stopping(serde_json::json!({"stop": null})).is_empty());
+    }
+
+    /// **An empty sequence matches before the first token of every reply**, so a
+    /// request carrying one would be answered with nothing at all — which a
+    /// client reads as a model that had nothing to say rather than as a `stop`
+    /// it should not have sent.
+    #[test]
+    fn an_empty_stop_sequence_is_refused() {
+        assert_eq!(
+            refused(serde_json::json!({"stop": ""})),
+            RequestError::EmptyStop
+        );
+        assert_eq!(
+            refused(serde_json::json!({"stop": ["fine", ""]})),
+            RequestError::EmptyStop
+        );
+    }
+
+    /// A `stop` this cannot read is named back rather than ignored, for the
+    /// reason a `tool_choice` this cannot honour is: a client whose sequence was
+    /// quietly dropped gets a reply running past a stop it asked for, which is
+    /// the failure `stop` exists to prevent.
+    #[test]
+    fn a_stop_that_is_not_sequences_is_refused_rather_than_ignored() {
+        for asked in [
+            serde_json::json!(7),
+            serde_json::json!(["fine", 7]),
+            serde_json::json!({"where": "here"}),
+            // OpenAI's own limit, and one past it.
+            serde_json::json!(["a", "b", "c", "d", "e"]),
+        ] {
+            assert_eq!(
+                refused(serde_json::json!({"stop": asked})),
+                RequestError::Stop(asked.to_string()),
+                "{asked}"
+            );
+        }
+        assert!(request(asking(serde_json::json!({"stop": ["a", "b", "c", "d"]}))).is_ok());
     }
 
     #[test]

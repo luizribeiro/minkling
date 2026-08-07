@@ -74,6 +74,7 @@ use crate::args::Serve;
 use crate::chat::{self, Channel, Channels, MARKERS, Reading, Routed};
 use crate::kept::Kept;
 use crate::openai::{ChatRequest, Completion, Finish, RequestError};
+use crate::stop::Stops;
 use crate::{backend, config};
 
 const COMPLETIONS: &str = "/v1/chat/completions";
@@ -202,6 +203,19 @@ struct Body<W: Write> {
     out: W,
     completion: Completion,
     streaming: bool,
+    /// Where the client asked the reply to be cut, and the text held back until
+    /// it is known whether it begins a cut. See [`crate::stop`] for what it is
+    /// matched against and why nothing goes out that a match would retract.
+    stops: Stops,
+    /// Whether a stop sequence matched.
+    ///
+    /// An ending of its own, and one [`Stop`] has no word for: the model did not
+    /// end its turn and the budget did not run out. It reaches the generation as
+    /// [`Stop::Sink`] — the same `Break` a client that hung up produces, because
+    /// there is one way to say "no more tokens" — and that is precisely why it
+    /// has to be remembered here. `Sink` maps onto `length`, and a reply cut
+    /// where the client asked is not a reply that was cut short.
+    struck: bool,
     failed: Option<anyhow::Error>,
     /// Whether the failure was the socket's own.
     ///
@@ -216,7 +230,7 @@ struct Body<W: Write> {
 impl<W: Write> Body<W> {
     /// The head, for a stream, and nothing at all for a collected body — whose
     /// `Content-Length` is not known until the last token.
-    fn open(mut out: W, completion: Completion, streaming: bool) -> Result<Self> {
+    fn open(mut out: W, completion: Completion, streaming: bool, stops: Stops) -> Result<Self> {
         if streaming {
             out.write_all(EVENT_STREAM.as_bytes())
                 .context("writing the response head")?;
@@ -225,6 +239,8 @@ impl<W: Write> Body<W> {
             out,
             completion,
             streaming,
+            stops,
+            struck: false,
             failed: None,
             disconnected: false,
         };
@@ -266,8 +282,44 @@ impl<W: Write> Body<W> {
     /// [`Stop::Sink`], and it is why a client that hung up costs one more decode
     /// step rather than the whole budget.
     fn push(&mut self, routed: Routed) -> ControlFlow<()> {
+        let routed = self.cut(routed);
         let frame = self.completion.push(routed);
-        self.emit(frame)
+        let wrote = self.emit(frame);
+        match self.struck {
+            true => ControlFlow::Break(()),
+            false => wrote,
+        }
+    }
+
+    /// `routed` with anything past a stop sequence cut off, and anything that
+    /// might yet begin one held back.
+    ///
+    /// **Only content is matched, and everything else passes through
+    /// untouched** — which is what keeps a client's `content` one string across
+    /// a thinking channel the model opened in the middle of it. See
+    /// [`crate::stop`] for why `content` is the field a `stop` is written
+    /// against.
+    fn cut(&mut self, routed: Routed) -> Routed {
+        if self.struck {
+            return Routed::Nothing;
+        }
+        let Routed::Text(Channel::Content, text) = &routed else {
+            return routed;
+        };
+        let taken = self.stops.take(text);
+        self.struck = taken.struck;
+        Routed::Text(Channel::Content, taken.shown)
+    }
+
+    /// Which of OpenAI's endings this reply had.
+    ///
+    /// A stop sequence outranks whatever the generation reported, because what
+    /// the generation reported is the `Break` this handed it.
+    fn ending(&self, stop: Stop) -> Finish {
+        match self.struck {
+            true => Finish::Stop,
+            false => finish(stop, self.completion.called()),
+        }
     }
 
     /// A delta on its way out, which is a frame only for a stream: a collected
@@ -312,11 +364,25 @@ impl<W: Write> Body<W> {
                 )
             }
             false => {
-                // The `Break` this can return says the write failed, and
+                // The tail is text like any other and can be the second half of
+                // a sequence, so it goes through the matching rather than round
+                // it. The `Break` this can return says the write failed, and
                 // `self.failed` is where that is read off below.
-                let leftover = self.completion.tail(tail);
+                let cut = self.cut(tail);
+                let leftover = self.completion.tail(cut);
                 let _ = self.emit(leftover);
-                let finish = finish(stop, self.completion.called());
+
+                // Text held against a sequence that never matched was text all
+                // along, and there is nothing left to resolve it. A generation a
+                // sequence *did* match holds nothing: everything behind the
+                // match was cut where the match was found.
+                let held = self.stops.finish();
+                if !held.is_empty() {
+                    let frame = self.completion.tail(Routed::Text(Channel::Content, held));
+                    let _ = self.emit(frame);
+                }
+
+                let finish = self.ending(stop);
                 match self.streaming {
                     true => format!("{}{LAST_CHUNK}", chunked(&self.completion.closing(finish))),
                     false => {
@@ -411,10 +477,11 @@ impl Engine<'_> {
             self.model.clone(),
             ids.len(),
         );
+        let stops = Stops::new(asked.stopping());
         self.generate(
             &asked,
             &ids,
-            Body::open(request.into_writer(), completion, asked.stream)?,
+            Body::open(request.into_writer(), completion, asked.stream, stops)?,
         )
     }
 
@@ -545,7 +612,7 @@ pub fn run(args: &Serve) -> Result<()> {
 mod tests {
     use super::*;
     use crate::chat::text;
-    use crate::wire::{dechunked, frames, payload};
+    use crate::wire::{dechunked, delta, frames, payload, payloads};
 
     /// A socket that remembers what reached it, and can close under the writer
     /// the way a client that hung up does.
@@ -584,9 +651,21 @@ mod tests {
         )
     }
 
+    /// A body over a socket, for the cases whose subject is not the stop
+    /// sequences — which is every one that was here before them.
+    fn opened<W: Write>(out: W, streaming: bool) -> Result<Body<W>> {
+        Body::open(out, completion(), streaming, Stops::default())
+    }
+
+    /// A body that cuts its reply where a client asked it to.
+    fn cutting<W: Write>(out: W, streaming: bool, at: &[&str]) -> Body<W> {
+        let stops = Stops::new(at.iter().map(|word| word.to_string()).collect());
+        Body::open(out, completion(), streaming, stops).expect("the head goes out")
+    }
+
     /// A whole reply written to a socket, the way `generate` drives one.
     fn served(socket: &mut Socket, streaming: bool, reply: &[Routed]) -> Result<()> {
-        let mut body = Body::open(socket, completion(), streaming).expect("the head goes out");
+        let mut body = opened(socket, streaming).expect("the head goes out");
         for routed in reply {
             assert_eq!(body.push(routed.clone()), ControlFlow::Continue(()));
         }
@@ -656,7 +735,7 @@ mod tests {
     #[test]
     fn every_frame_is_written_as_its_token_arrives() {
         let mut socket = Socket::default();
-        let mut body = Body::open(&mut socket, completion(), true).expect("the head goes out");
+        let mut body = opened(&mut socket, true).expect("the head goes out");
 
         // The head and the opening role frame.
         let opened = body.out.writes;
@@ -700,7 +779,7 @@ mod tests {
     #[test]
     fn a_collected_completion_writes_nothing_until_it_is_whole() {
         let mut socket = Socket::default();
-        let mut body = Body::open(&mut socket, completion(), false).expect("nothing goes out");
+        let mut body = opened(&mut socket, false).expect("nothing goes out");
         for routed in reply() {
             assert_eq!(body.push(routed), ControlFlow::Continue(()));
         }
@@ -722,7 +801,7 @@ mod tests {
             breaks_at: Some(4),
             ..Socket::default()
         };
-        let mut body = Body::open(&mut socket, completion(), true).expect("the head goes out");
+        let mut body = opened(&mut socket, true).expect("the head goes out");
 
         assert_eq!(
             body.push(text(Channel::Content, "Hello")),
@@ -757,7 +836,7 @@ mod tests {
     #[test]
     fn a_token_that_cannot_be_spelled_still_ends_the_stream_it_opened() {
         let mut socket = Socket::default();
-        let mut body = Body::open(&mut socket, completion(), true).expect("the head goes out");
+        let mut body = opened(&mut socket, true).expect("the head goes out");
 
         let unspellable = anyhow!("no token with id 4096 in this vocabulary");
         assert_eq!(body.fail(unspellable), ControlFlow::Break(()));
@@ -786,7 +865,7 @@ mod tests {
     #[test]
     fn a_collected_completion_that_failed_answers_with_the_failure() {
         let mut socket = Socket::default();
-        let mut body = Body::open(&mut socket, completion(), false).expect("nothing goes out");
+        let mut body = opened(&mut socket, false).expect("nothing goes out");
         assert_eq!(
             body.push(text(Channel::Content, "The")),
             ControlFlow::Continue(())
@@ -824,7 +903,7 @@ mod tests {
             breaks_at: Some(3),
             ..Socket::default()
         };
-        let mut body = Body::open(&mut socket, completion(), true).expect("the head goes out");
+        let mut body = opened(&mut socket, true).expect("the head goes out");
         assert_eq!(
             body.push(text(Channel::Content, "Hello")),
             ControlFlow::Break(())
@@ -840,7 +919,7 @@ mod tests {
     #[test]
     fn the_text_left_over_at_the_end_reaches_the_client() {
         let mut socket = Socket::default();
-        let mut body = Body::open(&mut socket, completion(), false).expect("nothing goes out");
+        let mut body = opened(&mut socket, false).expect("nothing goes out");
         assert_eq!(
             body.push(text(Channel::Content, "The")),
             ControlFlow::Continue(())
@@ -852,6 +931,206 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(written).expect("a json body");
         assert_eq!(parsed["choices"][0]["message"]["content"], "The\u{fffd}");
         assert_eq!(parsed["choices"][0]["finish_reason"], "length");
+    }
+
+    /// **A stop sequence ends the turn and says `stop`.** The trap this is
+    /// about: a match reaches the generation as the same `Break` a client that
+    /// hung up produces, which is [`Stop::Sink`], and `Sink` maps onto `length`
+    /// — so a reply cut exactly where the client asked would be reported as one
+    /// the budget cut short, and a client would resume a message that is
+    /// finished.
+    #[test]
+    fn a_stop_sequence_ends_the_reply_and_reports_that_it_ended() {
+        let mut socket = Socket::default();
+        let mut body = cutting(&mut socket, false, &["\nUser:"]);
+
+        assert_eq!(
+            body.push(text(Channel::Content, "The answer.")),
+            ControlFlow::Continue(())
+        );
+        assert_eq!(
+            body.push(text(Channel::Content, "\nUser:")),
+            ControlFlow::Break(()),
+            "the generation was allowed to run on past the sequence"
+        );
+        // The budget is what the generation reports once the sink has broken,
+        // and it is not what the client is told.
+        body.close(Routed::Nothing, Stop::Sink)
+            .expect("it is written");
+
+        let (_, written) = socket.written.split_once("\r\n\r\n").expect("a body");
+        let parsed: serde_json::Value = serde_json::from_str(written).expect("a json body");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+        assert_eq!(parsed["choices"][0]["message"]["content"], "The answer.");
+    }
+
+    /// The stop text is not in the output, and neither is anything the model
+    /// produced behind it — including the bytes a detokenizer was still holding,
+    /// which reach [`Body::close`] after the match and are past it.
+    #[test]
+    fn the_stop_text_and_everything_behind_it_is_cut() {
+        let mut socket = Socket::default();
+        let mut body = cutting(&mut socket, false, &["END"]);
+
+        assert_eq!(
+            body.push(text(Channel::Content, "Done. ")),
+            ControlFlow::Continue(())
+        );
+        assert_eq!(
+            body.push(text(Channel::Content, "END and more")),
+            ControlFlow::Break(())
+        );
+        body.close(text(Channel::Content, " a tail"), Stop::Sink)
+            .expect("it is written");
+
+        let (_, written) = socket.written.split_once("\r\n\r\n").expect("a body");
+        let parsed: serde_json::Value = serde_json::from_str(written).expect("a json body");
+        assert_eq!(parsed["choices"][0]["message"]["content"], "Done. ");
+        assert!(!written.contains("END"), "{written}");
+        assert!(!written.contains("a tail"), "{written}");
+    }
+
+    /// **Nothing is framed that a match would have to take back.** A frame is
+    /// gone the moment it is flushed, so the tokens that could still be the
+    /// first half of a sequence must reach the socket as no write at all —
+    /// which is the claim, and the reply adding up correctly afterwards is not
+    /// enough to make it.
+    #[test]
+    fn a_stream_frames_nothing_a_stop_sequence_would_have_to_retract() {
+        let mut socket = Socket::default();
+        let mut body = cutting(&mut socket, true, &["\nUser:"]);
+
+        let before = body.out.writes;
+        assert_eq!(
+            body.push(text(Channel::Content, "The answer.")),
+            ControlFlow::Continue(())
+        );
+        assert_eq!(body.out.writes, before + 1, "the plain text was held");
+
+        // Each of these could still turn into the sequence, so none of them may
+        // reach the socket.
+        let held = body.out.writes;
+        for token in ["\n", "Us", "er"] {
+            assert_eq!(
+                body.push(text(Channel::Content, token)),
+                ControlFlow::Continue(())
+            );
+            assert_eq!(body.out.writes, held, "{token:?} was framed too early");
+        }
+        assert_eq!(
+            body.push(text(Channel::Content, ":")),
+            ControlFlow::Break(())
+        );
+
+        body.close(Routed::Nothing, Stop::Sink)
+            .expect("it is written");
+        let (_, written) = socket.written.split_once("\r\n\r\n").expect("a body");
+        let sent = dechunked(written);
+        let content: String = payloads(&sent)
+            .iter()
+            .filter_map(delta)
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(content, "The answer.");
+    }
+
+    /// Text that only looked like a sequence is released, and a generation that
+    /// ends with the ambiguity outstanding still owes the client the text. A
+    /// reply quietly missing its last few bytes is worse than a stop that did
+    /// not fire.
+    #[test]
+    fn text_held_against_a_sequence_that_never_matched_still_reaches_the_client() {
+        let mut socket = Socket::default();
+        let mut body = cutting(&mut socket, false, &["\nUser:"]);
+
+        for token in ["Answer.", "\nUse", "r"] {
+            assert_eq!(
+                body.push(text(Channel::Content, token)),
+                ControlFlow::Continue(())
+            );
+        }
+        body.close(Routed::Nothing, Stop::EndOfSequence)
+            .expect("it is written");
+
+        let (_, written) = socket.written.split_once("\r\n\r\n").expect("a body");
+        let parsed: serde_json::Value = serde_json::from_str(written).expect("a json body");
+        assert_eq!(parsed["choices"][0]["message"]["content"], "Answer.\nUser");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// **The decision, asserted: a sequence is matched against what the client
+    /// sees.** The model reasons in the client's own words, so a `stop` of
+    /// `"\nUser:"` would fire inside the thinking of half the requests carrying
+    /// one — cutting the turn off before the answer had started. `content` is
+    /// the field the rule was written against, and `reasoning_content` is not
+    /// it.
+    #[test]
+    fn a_stop_sequence_is_not_matched_against_the_thinking_channel() {
+        let mut socket = Socket::default();
+        let mut body = cutting(&mut socket, false, &["\nUser:"]);
+
+        for routed in [
+            text(Channel::Thinking, "They will say \nUser: next."),
+            text(Channel::Content, "The answer."),
+        ] {
+            assert_eq!(
+                body.push(routed.clone()),
+                ControlFlow::Continue(()),
+                "{routed:?} ended the turn"
+            );
+        }
+        body.close(Routed::Nothing, Stop::EndOfSequence)
+            .expect("it is written");
+
+        let (_, written) = socket.written.split_once("\r\n\r\n").expect("a body");
+        let parsed: serde_json::Value = serde_json::from_str(written).expect("a json body");
+        let message = &parsed["choices"][0]["message"];
+        assert_eq!(message["content"], "The answer.");
+        assert_eq!(message["reasoning_content"], "They will say \nUser: next.");
+    }
+
+    /// The other half of that decision. The model can open a thinking channel in
+    /// the middle of its content, and what the client's `content` holds is the
+    /// two pieces joined — so the join is where a sequence spanning it exists,
+    /// and holding back across the interruption is what finds it.
+    #[test]
+    fn a_stop_sequence_spanning_a_thinking_interruption_is_matched_in_the_join() {
+        let mut socket = Socket::default();
+        let mut body = cutting(&mut socket, false, &["\nUser:"]);
+
+        assert_eq!(
+            body.push(text(Channel::Content, "Answer.\nUs")),
+            ControlFlow::Continue(())
+        );
+        assert_eq!(
+            body.push(text(Channel::Thinking, "Second thoughts.")),
+            ControlFlow::Continue(()),
+            "the interruption ended the turn"
+        );
+        assert_eq!(
+            body.push(text(Channel::Content, "er: again")),
+            ControlFlow::Break(())
+        );
+        body.close(Routed::Nothing, Stop::Sink)
+            .expect("it is written");
+
+        let (_, written) = socket.written.split_once("\r\n\r\n").expect("a body");
+        let parsed: serde_json::Value = serde_json::from_str(written).expect("a json body");
+        assert_eq!(parsed["choices"][0]["message"]["content"], "Answer.");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// A request that named no `stop` is answered exactly as it was before there
+    /// were any: nothing held, nothing cut, and the reason the generation's own.
+    #[test]
+    fn a_request_that_named_no_stop_is_answered_as_it_always_was() {
+        let mut socket = Socket::default();
+        served(&mut socket, false, &reply()).expect("it is written");
+
+        let (_, written) = socket.written.split_once("\r\n\r\n").expect("a body");
+        let parsed: serde_json::Value = serde_json::from_str(written).expect("a json body");
+        assert_eq!(parsed["choices"][0]["message"]["content"], "Hello.");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
     }
 
     /// A client that hung up is not a turn the model ended, and the difference

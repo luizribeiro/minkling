@@ -21,6 +21,7 @@ pub mod kept;
 pub mod openai;
 pub mod serve;
 pub mod session;
+pub mod stop;
 
 /// The width a report's labels are padded to.
 ///
