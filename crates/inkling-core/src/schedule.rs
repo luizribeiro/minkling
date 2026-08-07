@@ -132,6 +132,7 @@
 //! is a figure about seats.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::config::TextConfig;
 use crate::generate::Generator;
@@ -270,6 +271,17 @@ pub struct Stepped {
     pub produced: Vec<(usize, usize)>,
     /// Requests this step finished.
     pub done: Vec<Answered>,
+    /// **What keeping conversations costs this step whether anything matched or
+    /// not**, which is the question a feature like this owes about its own bad
+    /// case: the matching against every free slot, the mark a seat takes when
+    /// its prompt goes in, and the resume and the recording a departure pays.
+    ///
+    /// It does not include the forward pass, and it does include the fresh cache
+    /// a miss builds — which is what this engine allocated at every admission
+    /// before there was a conversation to keep. The mirror of
+    /// [`Served::bookkeeping`](crate::keep::Served::bookkeeping) at the other
+    /// width.
+    pub bookkeeping: Duration,
 }
 
 impl Stepped {
@@ -496,7 +508,9 @@ impl<'a> Continuous<'a> {
     /// quietly. See [`Continuous::seat_for`], which is the whole of the choice.
     pub fn step(&mut self, generator: &Generator<'_>, weights: &impl ModelWeights) -> Stepped {
         let mut stepped = Stepped::default();
+        let at = Instant::now();
         self.admit(&mut stepped);
+        stepped.bookkeeping = at.elapsed();
         // **Starvation, asserted where it can be seen.** A scheduler that never
         // admits a waiting request is wrong however fast its steps are, and the
         // shape that would be is a queue with a slot standing empty in front of
@@ -536,6 +550,7 @@ impl<'a> Continuous<'a> {
         //
         // Between runs, which is what a mark needs of its caller on a device:
         // nothing of this step has been encoded yet.
+        let at = Instant::now();
         for slot in seated.iter_mut() {
             let Slot { kept, held, .. } = &mut **slot;
             let held = held.as_mut().expect("a seated slot");
@@ -543,6 +558,7 @@ impl<'a> Continuous<'a> {
                 held.mark = Some(weights.mark(kept.cache()));
             }
         }
+        stepped.bookkeeping += at.elapsed();
 
         // The step's prompt budget, split over the seats that are filling — see
         // [`Continuous::new`] for why the number is the call's and not the
@@ -607,11 +623,13 @@ impl<'a> Continuous<'a> {
             }
         }
 
+        let took = Instant::now();
         for at in 0..self.slots.len() {
             if self.slots[at].held.as_ref().is_some_and(Resident::done) {
                 self.vacate(at, weights);
             }
         }
+        stepped.bookkeeping += took.elapsed();
         stepped
     }
 

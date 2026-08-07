@@ -241,6 +241,50 @@ bench-session a="cold" b="kept" *measurement:
     "$root/target/debug/bench" alternate --pairs "${BENCH_PAIRS:-3}" \
         "$(arm '{{ a }}')" "$(arm '{{ b }}')" -- session {{ measurement }}
 
+# A fleet of conversations at width greater than one, two arms in one sitting:
+#
+#   just bench-conversations                                   # kept against not
+#   just bench-conversations cold kept --agents 1 --batch 4 --tokens 2048
+#   just bench-conversations cold kept --agents 4 --batch 4
+#
+# **`bench-session` at width one, and this at width N.** A slot's cache used to
+# belong to the slot, so a scheduled server re-prefilled every turn and the two
+# recipes measured two different servers; a slot now keeps the conversation it
+# last held, so what these arms differ in is the same one thing `bench-session`'s
+# do — how many positions a slot keeps — and the width is held.
+#
+# `--agents 1 --batch 4` is a coding session through an engine wide enough for a
+# fleet, which is the figure read against `bench-session`'s own. More agents than
+# that is the fleet nobody had measured, and more agents than `--batch` is the
+# eviction, which is a third measurement.
+#
+# **Three pairs rather than seven**, for the reason `bench-session` gives: a cold
+# arm is minutes a run, and the effect is the kind three pairs are enough for.
+#
+# A fleet of conversations at width greater than one, kept against not
+bench-conversations a="cold" b="kept" *measurement:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    cargo build --quiet --bin bench
+    bin="$root/target/bench/bin/working-tree"
+    mkdir -p "$(dirname "$bin")"
+    cp "$root/target/debug/bench" "$bin"
+
+    # A word, as the command line that measures it — the same three words
+    # `bench-session` takes, because they name the same lever.
+    arm() {
+        case "$1" in
+            cold)   echo "$bin --reuse-tokens 0 {{ absolute_path(checkpoint) }}" ;;
+            kept)   echo "$bin {{ absolute_path(checkpoint) }}" ;;
+            kept-*) echo "$bin --numerics ${1#kept-} {{ absolute_path(checkpoint) }}" ;;
+            *) echo "$1 is not one of cold, kept, kept-<numerics>" >&2; exit 2 ;;
+        esac
+    }
+
+    "$root/target/debug/bench" alternate --pairs "${BENCH_PAIRS:-3}" \
+        "$(arm '{{ a }}')" "$(arm '{{ b }}')" -- conversations {{ measurement }}
+
 # Two of the flag's words against each other in one sitting, out of one build:
 #
 #   just bench-numerics reference production prefill --tokens 2048

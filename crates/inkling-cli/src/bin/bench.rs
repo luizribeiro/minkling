@@ -236,6 +236,20 @@ enum What {
     /// between admitting continuously and admitting in batches, and only the
     /// tail says it.
     Fleet,
+    /// Several conversations, each taking several turns, through one engine.
+    ///
+    /// **The one measurement here whose subject is what happens between two
+    /// requests at width greater than one**, which is the join of the two
+    /// measurements either side of it and was not a workload this engine could
+    /// run at all. [`What::Session`] is one conversation through one slot;
+    /// [`What::Fleet`] is many requests that are each a single turn. A fleet of
+    /// coding agents is neither: it is several conversations, each coming back
+    /// with the last turn and a little more, and what a slot has already
+    /// prefilled for one of them is the whole of what it is worth.
+    ///
+    /// `--agents 1` is a session at width N and is what K1's width-one figures
+    /// are read against; `--agents k` is the fleet nobody had measured.
+    Conversations,
 }
 
 /// How a request reaches a slot, which is the one thing the two arms of the two
@@ -371,12 +385,13 @@ impl Job {
             Some("clock") => Some(What::Clock),
             Some("joining") => Some(What::Joining),
             Some("fleet") => Some(What::Fleet),
+            Some("conversations") => Some(What::Conversations),
             Some("alternate") => return Self::alternating(args),
             Some("diverge") => return Self::diverging(args),
             Some("guesses") => None,
             Some(word) => bail!(
                 "{word} is not one of decode, prefill, sweep, engines, session, batch, \
-                 clock, joining, fleet, guesses, diverge or alternate"
+                 clock, joining, fleet, conversations, guesses, diverge or alternate"
             ),
             None => bail!("no measurement given"),
         };
@@ -577,7 +592,7 @@ impl Job {
         // be dropped — the same rule the numbers above are refused under.
         if !matches!(
             what,
-            What::Batch | What::Clock | What::Joining | What::Fleet
+            What::Batch | What::Clock | What::Joining | What::Fleet | What::Conversations
         ) && widest.is_some()
         {
             bail!("{what:?} takes no --batch: it decodes one sequence");
@@ -588,11 +603,19 @@ impl Job {
         // could only be dropped — the same rule the numbers above are refused
         // under. `--agents` is a fleet's alone for the same reason: everything
         // else makes one request.
-        if !matches!(what, What::Joining | What::Fleet) && admit.is_some() {
+        if !matches!(what, What::Joining | What::Fleet | What::Conversations) && admit.is_some() {
             bail!("{what:?} takes no --admit: nothing joins a batch it is running");
         }
-        if what != What::Fleet && agents.is_some() {
+        if !matches!(what, What::Fleet | What::Conversations) && agents.is_some() {
             bail!("{what:?} takes no --agents: it makes one request");
+        }
+        // **An engine of no slots seats nobody**, refused here rather than in
+        // the panic one layer down, for the reason a fleet's own width is.
+        if what == What::Conversations && widest == Some(0) {
+            bail!(
+                "conversations takes a --batch of at least one: an engine with no slots seats \
+                 nobody"
+            );
         }
         // **A slot free for the joiner is what a joining measurement needs.** An
         // engine of one slot has none, so the request would be measuring a queue
@@ -642,11 +665,11 @@ impl Job {
         if !matches!(what, What::Batch | What::Sweep | What::Engines) && asked_depth {
             bail!("{what:?} takes no --depth: it decodes a token at a time");
         }
-        // **Only a session has a between-requests to keep anything across.**
-        // Every other measurement here is one call or a series of them against
-        // caches of its own, so a number of positions to keep could only be
-        // dropped — the same rule the two above are refused under.
-        if what != What::Session && reuse.is_some() {
+        // **Only the two measurements with a between-requests keep anything
+        // across one.** Every other measurement here is one call or a series of
+        // them against caches of its own, so a number of positions to keep could
+        // only be dropped — the same rule the two above are refused under.
+        if !matches!(what, What::Session | What::Conversations) && reuse.is_some() {
             bail!("{what:?} takes no --reuse-tokens: it makes one request");
         }
         Ok(Self::Measure {
@@ -654,7 +677,7 @@ impl Job {
             checkpoint,
             tokens: tokens.unwrap_or(match what {
                 What::Prefill => PREFILLED,
-                What::Session => Session::OPENING,
+                What::Session | What::Conversations => Session::OPENING,
                 What::Clock => TICKED,
                 What::Fleet | What::Joining => ASKED,
                 _ => DECODED,
@@ -674,7 +697,10 @@ impl Job {
             },
             prefill: prefill.unwrap_or(0),
             admit: admit.unwrap_or(ADMITTED),
-            agents: agents.unwrap_or(AGENTS),
+            agents: agents.unwrap_or(match what {
+                What::Conversations => CONVERSATIONS,
+                _ => AGENTS,
+            }),
         })
     }
 
@@ -1416,6 +1442,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     slots,
                     admit,
                     tokens,
+                    reuse: 0,
                 };
                 // **[`WARM`] runs thrown away.** A wall this reports is what a
                 // request waits, so it is the one figure here that cannot be
@@ -1497,6 +1524,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     slots,
                     admit,
                     tokens,
+                    reuse: 0,
                 };
                 let asked: usize = (0..agents).map(|at| engine.asking_at(at).count).sum();
                 eprintln!(
@@ -1550,6 +1578,92 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     taken.push(Reading::new(format!("{name}.rows"), run.rows as f64, "n"));
                     taken.push(Reading::new(format!("{name}.duty"), run.duty(), "%"));
                 }
+            }
+            // **The join of the two measurements either side of this one**: a
+            // conversation coming back turn after turn, several of them at once,
+            // through the engine that seats several. Neither figure existed —
+            // `session` keeps a conversation through one slot and `fleet` runs
+            // many requests that are each one turn.
+            //
+            // Every turn is a row, because the shape is the finding: turn one is
+            // cold in both arms and every turn after it is where they part.
+            What::Conversations => {
+                let plan = Session::new(tokens);
+                let slots = widest.unwrap_or(agents);
+                let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?;
+                let engine = Engine {
+                    weights: &weights,
+                    config: text,
+                    prompt: &prompt,
+                    slots,
+                    admit,
+                    tokens,
+                    reuse,
+                };
+                let run = talking(&engine, plan, agents);
+                eprintln!(
+                    "conversations: {agents} conversations of {} turns, {slots} slots, opening \
+                     {tokens}, keeping {reuse}, {admit} prompt rows a step",
+                    plan.turns,
+                );
+                for at in 0..run.turns() {
+                    let (wall, first) = (
+                        run.waits(at, |had| had.last),
+                        run.waits(at, |had| had.first),
+                    );
+                    eprintln!(
+                        "  turn {at}: {} tokens prefilled over {agents}, p50 {:.2} s wall, \
+                         worst {:.2} s, p50 {:.2} s to first",
+                        run.prefilled(at),
+                        percentile(&wall, 0.5).as_secs_f64(),
+                        percentile(&wall, 1.0).as_secs_f64(),
+                        percentile(&first, 0.5).as_secs_f64(),
+                    );
+                    taken.push(Reading::new(
+                        format!("turn{at}.wall"),
+                        millis(percentile(&wall, 0.5)),
+                        "ms",
+                    ));
+                    taken.push(Reading::new(
+                        format!("turn{at}.worst"),
+                        millis(percentile(&wall, 1.0)),
+                        "ms",
+                    ));
+                    taken.push(Reading::new(
+                        format!("turn{at}.first"),
+                        millis(percentile(&first, 0.5)),
+                        "ms",
+                    ));
+                    taken.push(Reading::new(
+                        format!("turn{at}.prefilled"),
+                        run.prefilled(at) as f64,
+                        "tokens",
+                    ));
+                }
+                eprintln!(
+                    "  whole: {:.1?}, {:.1} tok/s, {} steps carrying {} rows, {:.1}% duty, \
+                     {:.2} ms a turn of bookkeeping",
+                    run.wall,
+                    run.rate(),
+                    run.steps,
+                    run.rows,
+                    run.duty(),
+                    millis(run.bookkeeping) / (run.turns() * agents).max(1) as f64,
+                );
+                // The figure a fleet of users feels, which is the one nobody
+                // here has ever produced: every conversation, end to end.
+                taken.push(Reading::new("whole", millis(run.wall), "ms"));
+                taken.push(Reading::new("device", millis(run.gpu), "ms"));
+                taken.push(Reading::new("duty", run.duty(), "%"));
+                taken.push(Reading::new("rate", run.rate(), "tok/s"));
+                // Per turn rather than for the run, because it is a per-request
+                // cost and the number a server is judged on is what one request
+                // pays — the same reading `session` takes at width one.
+                taken.push(Reading::new(
+                    "bookkeeping",
+                    millis(run.bookkeeping) / (run.turns() * agents).max(1) as f64,
+                    "ms",
+                ));
             }
             What::Prefill => {
                 // A prefill is one step and its prompt is the measurement, so
@@ -2208,6 +2322,180 @@ const AGENTS: usize = 16;
 /// wake toll amortises to nothing over it.
 const ASKED: usize = 200;
 
+/// Conversations a fleet of them takes, when nobody says.
+///
+/// Four, against a width that seats all of them at once — what the arm is for is
+/// a conversation coming back to its own slot, and more conversations than slots
+/// would be measuring the eviction instead. `--agents 8 --batch 4` is that
+/// measurement and it is a different one.
+const CONVERSATIONS: usize = 4;
+
+/// What one turn of one conversation cost the client that asked for it.
+#[derive(Debug, Clone, Copy)]
+struct Spoke {
+    /// Tokens the turn sent, which grows every turn.
+    prompt: usize,
+    /// Tokens of it the slot already held, and zero on a cold turn.
+    reused: usize,
+    /// What the client waited for its first token, from submitting the turn.
+    first: Duration,
+    /// What it waited for its last.
+    last: Duration,
+}
+
+/// A fleet of conversations, each taking several turns through one engine.
+struct Talked {
+    /// Per conversation, per turn.
+    spoke: Vec<Vec<Spoke>>,
+    wall: Duration,
+    gpu: Duration,
+    steps: usize,
+    rows: usize,
+    tokens: usize,
+    /// What keeping the conversations cost over the whole run, hit or miss —
+    /// see [`Stepped::bookkeeping`](inkling_core::Stepped::bookkeeping).
+    bookkeeping: Duration,
+}
+
+impl Talked {
+    /// What every conversation waited on turn `at`, sorted — which is the
+    /// distribution, and a mean over a fleet describes none of it.
+    fn waits(&self, at: usize, of: impl Fn(&Spoke) -> Duration) -> Vec<Duration> {
+        let mut waits: Vec<Duration> = self.spoke.iter().map(|spoke| of(&spoke[at])).collect();
+        waits.sort_unstable();
+        waits
+    }
+
+    /// One turn's rows over every conversation, which is what the two arms part
+    /// company on: a cold turn prefills its whole prompt and a kept one prefills
+    /// what was added to it.
+    fn prefilled(&self, at: usize) -> usize {
+        self.spoke
+            .iter()
+            .map(|spoke| spoke[at].prompt - spoke[at].reused)
+            .sum()
+    }
+
+    fn turns(&self) -> usize {
+        self.spoke.first().map_or(0, Vec::len)
+    }
+
+    fn rate(&self) -> f64 {
+        self.tokens as f64 / self.wall.as_secs_f64()
+    }
+
+    fn duty(&self) -> f64 {
+        duty(self.gpu, self.wall)
+    }
+}
+
+/// A fleet of conversations through one engine, turn by turn.
+///
+/// **A turn of every conversation is submitted together and the engine drained
+/// before the next**, which is what makes the per-turn rows comparable across
+/// the two arms: the same prompts in the same order, and the only thing that
+/// differs between the arms is what the slots had already prefilled. Arrivals
+/// spread over a clock are [`fleeted`]'s subject and would put a second variable
+/// in this one.
+///
+/// Each conversation opens on its own rotation of the pool, so no two of them
+/// share a prefix and a slot matched is a slot matched on its own conversation's
+/// tokens rather than on an opening they happen to have in common.
+fn talking(engine: &Engine<'_, '_>, plan: Session, agents: usize) -> Talked {
+    let Engine {
+        weights, prompt, ..
+    } = *engine;
+    let generator = weights.generator();
+    let mut seating = engine.seating();
+    let pools: Vec<Vec<usize>> = (0..agents)
+        .map(|at| {
+            prompt
+                .iter()
+                .copied()
+                .cycle()
+                .skip(at * plan.added)
+                .take(prompt.len())
+                .collect()
+        })
+        .collect();
+
+    let mut produced: Vec<Vec<Vec<usize>>> = vec![Vec::new(); agents];
+    let mut spoke: Vec<Vec<Spoke>> = vec![Vec::new(); agents];
+    let (mut steps, mut rows, mut tokens, mut bookkeeping) = (0, 0, 0, Duration::ZERO);
+
+    profile::take();
+    let started = Instant::now();
+    for turn in 0..plan.turns {
+        let prompts: Vec<Vec<usize>> = (0..agents)
+            .map(|at| plan.prompt(&pools[at], turn, &produced[at]))
+            .collect();
+        let submitted = Instant::now();
+        let tickets: Vec<usize> = prompts
+            .iter()
+            .map(|ids| {
+                seating.submit(Request {
+                    prompt: ids.clone(),
+                    count: plan.generated,
+                })
+            })
+            .collect();
+        let of = |ticket: usize| {
+            tickets
+                .iter()
+                .position(|held| *held == ticket)
+                .expect("a ticket of this turn")
+        };
+
+        let mut reused = vec![0; agents];
+        let mut first = vec![Duration::ZERO; agents];
+        let mut last = vec![Duration::ZERO; agents];
+        let mut reply: Vec<Vec<usize>> = vec![Vec::new(); agents];
+        while !seating.idle() {
+            let stepped = seating.step(&generator, weights);
+            steps += 1;
+            rows += stepped.rows();
+            tokens += stepped.decoding;
+            bookkeeping += stepped.bookkeeping;
+            let now = submitted.elapsed();
+            for admitted in &stepped.admitted {
+                reused[of(admitted.ticket)] = admitted.reused;
+            }
+            for ticket in &stepped.first {
+                first[of(*ticket)] = now;
+            }
+            for answer in &stepped.done {
+                last[of(answer.ticket)] = now;
+                reply[of(answer.ticket)] = answer.produced.clone();
+            }
+        }
+
+        for at in 0..agents {
+            assert_eq!(
+                reply[at].len(),
+                plan.generated,
+                "conversation {at} was answered short on turn {turn}"
+            );
+            spoke[at].push(Spoke {
+                prompt: prompts[at].len(),
+                reused: reused[at],
+                first: first[at],
+                last: last[at],
+            });
+            produced[at].push(std::mem::take(&mut reply[at]));
+        }
+    }
+
+    Talked {
+        spoke,
+        wall: started.elapsed(),
+        gpu: profile::take().gpu(),
+        steps,
+        rows,
+        tokens,
+        bookkeeping,
+    }
+}
+
 /// How long a fleet leaves between two arrivals, when nobody says.
 const ARRIVAL: Duration = Duration::from_millis(200);
 
@@ -2285,11 +2573,17 @@ struct Engine<'a, 'w> {
     slots: usize,
     admit: usize,
     tokens: usize,
+    /// Positions a slot keeps its conversation at once the sequence holding it
+    /// leaves, and zero for an engine that keeps none — which is what both
+    /// latency measurements run at, because their requests are one turn each
+    /// and a conversation kept between them would be a conversation nobody
+    /// comes back for.
+    reuse: usize,
 }
 
 impl Engine<'_, '_> {
     fn seating(&self) -> Continuous<'_> {
-        Continuous::new(self.config, self.slots, self.admit)
+        Continuous::keeping(self.config, self.slots, self.admit, self.reuse)
     }
 
     /// What every request of the joining measurement asks for, which is one
@@ -3909,6 +4203,78 @@ mod tests {
                 "{what} took a count of positions to keep"
             );
         }
+    }
+
+    /// **A fleet of conversations takes both of the flags its two parents take**,
+    /// which is the whole of what it is: a width and a number of agents from the
+    /// fleet, a count of positions to keep from the session.
+    ///
+    /// Stated because the refusals above are written as a list of measurements
+    /// rather than as a property, so a measurement added to the list of one flag
+    /// and not the others is refused a flag it needs — and the refusal reads
+    /// exactly like the flag being wrong.
+    #[test]
+    fn a_fleet_of_conversations_takes_a_width_a_count_of_agents_and_a_bound() {
+        let parsed = Job::parse(
+            [
+                "conversations",
+                "models/small",
+                "--reuse-tokens",
+                "0",
+                "--batch",
+                "4",
+                "--agents",
+                "3",
+                "--admit",
+                "64",
+                "--tokens",
+                "2048",
+            ]
+            .map(str::to_string),
+        )
+        .expect("parses");
+        let Job::Measure {
+            what,
+            tokens,
+            reuse,
+            widest,
+            admit,
+            agents,
+            ..
+        } = parsed
+        else {
+            panic!("a measurement")
+        };
+        assert_eq!(what, What::Conversations);
+        assert_eq!(
+            (tokens, reuse, widest, admit, agents),
+            (2048, 0, Some(4), 64, 3)
+        );
+
+        // And the defaults are the workload's: a session's opening, a slot per
+        // conversation, and a conversation kept.
+        let Ok(Job::Measure {
+            tokens,
+            reuse,
+            agents,
+            widest,
+            ..
+        }) = Job::parse(["conversations", "models/small"].map(str::to_string))
+        else {
+            panic!("a measurement")
+        };
+        assert_eq!(
+            (tokens, reuse, agents, widest),
+            (Session::OPENING, DEFAULT_BOUND, CONVERSATIONS, None)
+        );
+
+        // An engine with no slots seats nobody, refused here rather than in the
+        // panic one layer down.
+        assert!(
+            Job::parse(["conversations", "models/small", "--batch", "0"].map(str::to_string))
+                .is_err(),
+            "an engine of no slots was accepted"
+        );
     }
 
     /// **A depth given on the command line is the depth the measurement runs
