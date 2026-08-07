@@ -273,6 +273,7 @@ impl<'a> Kept<'a> {
 mod tests {
     use super::*;
     use crate::fixture::Stack;
+    use crate::head::LmHead;
 
     /// A conversation and the turn after it: the same tokens, with more on the
     /// end. Realistic in the one way that matters here — the prefix is long and
@@ -389,5 +390,86 @@ mod tests {
 
         assert_eq!(kept.held(), 0);
         assert_eq!(kept.opened(&TURN).1, 0);
+    }
+
+    /// **A turn resumed onto its own keys is answered what the same prompt is
+    /// answered from a cache holding none of it** — the whole claim of the
+    /// serial path, driven through [`Kept::turn`] itself.
+    ///
+    /// Every case above reaches [`Kept::matching`], [`Kept::opened`] and
+    /// [`Kept::keep`] one at a time. The function that puts them in order is
+    /// where the three things a turn has to get right actually live — prefill
+    /// stops one short so the last prompt token is fed by the decode that owes
+    /// a reply, the mark is taken at the prompt's end rather than after the
+    /// reply has moved the cache past it, and what is recorded is exactly what
+    /// was resumed to — and it had no case here at all. Its only callers are
+    /// the server and the serial session, whose tests are gated on a
+    /// checkpoint, so a bare `cargo test` drove this function zero times while
+    /// the milestone above built a second copy of the same invariant for the
+    /// slots.
+    ///
+    /// The second turn is the one that carries the claim: it resumes, and it is
+    /// held against the identical prompt run through a `Kept` that has nothing.
+    #[test]
+    fn a_turn_resumed_onto_its_own_keys_is_answered_what_it_is_answered_cold() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let generator = Generator::new(stack.model(), LmHead::for_config(&stack.config), &head);
+        let ending = Ending {
+            budget: 4,
+            eos: None,
+        };
+        // The fixture's own ids rather than [`TURN`], which is a list of numbers
+        // chosen to read as a prefix and never asked to be a token.
+        let sequence = stack.sequence();
+        let opening = sequence[..3].to_vec();
+
+        let mut warm = kept(&stack.config);
+        let mut first = Vec::new();
+        let served = warm.turn(&generator, &stack, &opening, ending, |id| {
+            first.push(id);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(
+            served.reused, 0,
+            "a server holding nothing resumed something"
+        );
+        assert_eq!(
+            warm.held(),
+            opening.len() - 1,
+            "the mark was not taken where the prompt ended"
+        );
+
+        // The turn after it: what it sent, what it was answered, and a little
+        // more of its own — which is the only shape a match can serve.
+        let mut returning = opening.clone();
+        returning.extend_from_slice(&first);
+        returning.extend_from_slice(&sequence[3..5]);
+
+        let mut resumed = Vec::new();
+        let served = warm.turn(&generator, &stack, &returning, ending, |id| {
+            resumed.push(id);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(
+            served.reused,
+            opening.len() - 1,
+            "the turn did not resume to exactly what the one before it recorded"
+        );
+        assert_eq!(
+            warm.held(),
+            returning.len() - 1,
+            "the record is not what this turn was resumed to"
+        );
+
+        let mut cold = Vec::new();
+        kept(&stack.config).turn(&generator, &stack, &returning, ending, |id| {
+            cold.push(id);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(
+            resumed, cold,
+            "the resumed turn and the same prompt from nothing parted company"
+        );
     }
 }
