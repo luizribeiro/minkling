@@ -249,6 +249,24 @@ impl<'a> Kept<'a> {
     pub fn held(&self) -> usize {
         self.ids.len()
     }
+
+    /// The cache itself, for a caller that has already decided this is the
+    /// conversation it is serving — which [`Kept::opened`] is the deciding of.
+    ///
+    /// **Not a way round the matching.** A caller that fed rows through here
+    /// without opening first would be feeding them into whatever the last
+    /// conversation left, which is precisely the contamination the ids exist to
+    /// rule out. What it is for is a scheduler, which opens a slot once when a
+    /// sequence is admitted and then advances it a step at a time for as long as
+    /// that sequence is seated.
+    pub fn cache(&self) -> &ModelCache {
+        &self.cache
+    }
+
+    /// The same, to feed rows through. See [`Kept::cache`].
+    pub fn cache_mut(&mut self) -> &mut ModelCache {
+        &mut self.cache
+    }
 }
 
 #[cfg(test)]

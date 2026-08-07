@@ -50,7 +50,7 @@ pub use ops::{
 };
 pub use profile::{Op, Profile};
 pub use quant::{Dequantized, QuantError, Scratch};
-pub use schedule::{Answered, Continuous, Request, Stepped};
+pub use schedule::{Admitted, Answered, Continuous, Request, Stepped};
 pub use sconv::{ConvMark, ConvState, Held, ShortConv};
 pub use tokenizer::{Detokenizer, Tokenizer, TokenizerError};
 pub use weights::{

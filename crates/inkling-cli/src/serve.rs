@@ -842,14 +842,14 @@ fn stepping(
         // request already running would stall until the next one arrived.
         if engine.idle() {
             match asked.recv() {
-                Ok(wanted) => take(&mut engine, &mut live, wanted),
+                Ok(wanted) => take(&mut engine, &mut live, weights, wanted),
                 // Every connection thread has gone and nothing is seated, which
                 // is the only arrangement this can stop in.
                 Err(_) => return Ok(()),
             }
         }
         for wanted in asked.try_iter() {
-            take(&mut engine, &mut live, wanted);
+            take(&mut engine, &mut live, weights, wanted);
         }
         // Everything that arrived may have been a release, and a step over no
         // seats is a forward pass over no rows.
@@ -857,12 +857,17 @@ fn stepping(
             continue;
         }
         let stepped = engine.step(generator, weights);
-        dispatch(&mut engine, &mut live, stepped, eos);
+        dispatch(&mut engine, &mut live, weights, stepped, eos);
     }
 }
 
 /// One thing a connection thread asked for, done.
-fn take(engine: &mut Continuous<'_>, live: &mut HashMap<usize, Sender<Dispatch>>, wanted: Wanted) {
+fn take(
+    engine: &mut Continuous<'_>,
+    live: &mut HashMap<usize, Sender<Dispatch>>,
+    weights: &impl ModelWeights,
+    wanted: Wanted,
+) {
     match wanted {
         Wanted::Seat(seating) => {
             let ticket = engine.submit(SeatRequest {
@@ -876,12 +881,12 @@ fn take(engine: &mut Continuous<'_>, live: &mut HashMap<usize, Sender<Dispatch>>
                 // Gone before it was ever seated, so nothing will read its
                 // tokens and the slot should not be spent producing them.
                 Err(_) => {
-                    engine.release(ticket);
+                    engine.release(ticket, weights);
                 }
             }
         }
         Wanted::Release(ticket) => {
-            engine.release(ticket);
+            engine.release(ticket, weights);
             live.remove(&ticket);
         }
     }
@@ -898,6 +903,7 @@ fn take(engine: &mut Continuous<'_>, live: &mut HashMap<usize, Sender<Dispatch>>
 fn dispatch(
     engine: &mut Continuous<'_>,
     live: &mut HashMap<usize, Sender<Dispatch>>,
+    weights: &impl ModelWeights,
     stepped: Stepped,
     eos: usize,
 ) {
@@ -917,7 +923,7 @@ fn dispatch(
         // A send that failed is a connection thread already gone; its own
         // release is on its way and this only frees the seat a step sooner.
         if ended || gone {
-            engine.release(*ticket);
+            engine.release(*ticket, weights);
             live.remove(ticket);
         }
     }
@@ -1638,7 +1644,12 @@ mod tests {
                 budget,
                 reply,
             };
-            take(&mut self.engine, &mut self.live, Wanted::Seat(seating));
+            take(
+                &mut self.engine,
+                &mut self.live,
+                self.stack,
+                Wanted::Seat(seating),
+            );
             match dispatched.recv() {
                 Ok(Dispatch::Seated(ticket)) => (ticket, dispatched),
                 other => panic!("the engine seated nothing: {:?}", other.is_ok()),
@@ -1649,7 +1660,7 @@ mod tests {
         fn step(&mut self, eos: usize) {
             let generator = self.generator();
             let stepped = self.engine.step(&generator, self.stack);
-            dispatch(&mut self.engine, &mut self.live, stepped, eos);
+            dispatch(&mut self.engine, &mut self.live, self.stack, stepped, eos);
         }
 
         /// The engine run until it has nothing left.
