@@ -42,7 +42,9 @@ use anyhow::{Context, Result, bail};
 use inkling_cli::args::Backend;
 use inkling_cli::kept::{DEFAULT_BOUND, Kept};
 use inkling_cli::{backend, config, session};
-use inkling_core::generate::{Generator, Picked, Proposer, Round};
+use inkling_core::generate::{
+    Alone, BatchProposer, Generator, Picked, Proposer, Round, Seated as SeatedRound,
+};
 use inkling_core::head::Tail;
 use inkling_core::model::Batched;
 use inkling_core::mtp::{CheckpointHeads, MtpProposer};
@@ -410,13 +412,22 @@ impl Job {
         // means to the measurement asking for it.
         let mut depth = match what {
             Some(What::Engines) => BEST,
+            // **A batch sweep's default depth is none, and that is a number
+            // rather than an absence**: `k = 0` is the column every other one
+            // is read against, and it is the column `bench batch` itself
+            // reports. See [`What::Batch`] in [`measure`].
+            Some(What::Batch) => 0,
             _ => SWEPT,
         };
+        let mut asked_depth = false;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--tokens" | "-n" => tokens = Some(count(&arg, &mut args)?),
                 "--context" | "-c" => context = Some(count(&arg, &mut args)?),
-                "--depth" | "-k" => depth = count(&arg, &mut args)?,
+                "--depth" | "-k" => {
+                    depth = count(&arg, &mut args)?;
+                    asked_depth = true;
+                }
                 "--numerics" => numerics = Some(which(&arg, &mut args)?),
                 "--reuse-tokens" => reuse = Some(positions(&arg, &mut args)?),
                 "--batch" | "-b" => widest = Some(count(&arg, &mut args)?),
@@ -620,6 +631,17 @@ impl Job {
         // unit is a prompt would be a width nothing could do anything with.
         if prefill.is_some() && widest.is_some() {
             bail!("a clock run over prefills takes no --batch: a prefill fills the machine alone");
+        }
+        // **Only the three measurements that speculate take a depth.** A batch
+        // sweep runs the chain at the depth it is given, a sweep walks up to it
+        // and a cross-engine table quotes one beside `k = 0`; everything else
+        // here decodes a token at a time, so a depth handed to it could only be
+        // dropped — the same rule the numbers above are refused under.
+        //
+        // Asked of the flag rather than of the value, because the default is a
+        // number too and a run that gave one explicitly meant it.
+        if !matches!(what, What::Batch | What::Sweep | What::Engines) && asked_depth {
+            bail!("{what:?} takes no --depth: it decodes a token at a time");
         }
         // **Only a session has a between-requests to keep anything across.**
         // Every other measurement here is one call or a series of them against
@@ -994,10 +1016,19 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
 
     // Which depths this wants weights wrapped at: a sweep every one up to its
     // own, a cross-engine table `k = 0` and the depth that pays best beside it,
-    // and everything else nothing but zero.
+    // a batch sweep the one it was asked for, and everything else nothing but
+    // zero.
+    //
+    // **The binding below is named for what it is rather than shadowing the
+    // flag**, because the two are not the same number at every measurement and
+    // a row that read the wrong one would be a table of a depth nobody asked
+    // for — which is exactly what a batch sweep did until the missing row said
+    // so. See "The one the review could not have found" for the first time this
+    // file paid for a number being a number of the wrong thing.
     let depths: Vec<usize> = match what {
         What::Sweep => (0..=depth).collect(),
         What::Engines if depth > 0 => vec![0, depth],
+        What::Batch => vec![depth],
         _ => vec![0],
     };
     // Thrown away, because the first generation of a process faults in the
@@ -1008,15 +1039,16 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
 
     let mut taken = Vec::new();
     let mut unspeculated = None;
-    for depth in depths {
+    for wrapped_at in depths {
         // Wrapped at the depth being measured rather than at the deepest one:
         // the windows a rejected token is taken back out of are wider by the
         // depth, so this is the configuration a run of that depth actually has.
-        let weights = backend::weights(gpu.as_ref(), &ckpt, text, depth, 1)?;
+        let weights = backend::weights(gpu.as_ref(), &ckpt, text, wrapped_at, 1)?;
         let tail = backend::tail_weights(&weights, text);
-        let heads = backend::heads(gpu.as_ref(), &ckpt, &config, depth, &tail, 1)?;
-        let timed =
-            |ids: &[usize], budget| generate(&weights, heads.as_ref(), text, ids, budget, depth);
+        let heads = backend::heads(gpu.as_ref(), &ckpt, &config, wrapped_at, &tail, 1)?;
+        let timed = |ids: &[usize], budget| {
+            generate(&weights, heads.as_ref(), text, ids, budget, wrapped_at)
+        };
 
         timed(&warm, 2);
 
@@ -1040,7 +1072,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                         if !measured {
                             continue;
                         }
-                        let pair = format!("{prompted}x{generated}.k{depth}");
+                        let pair = format!("{prompted}x{generated}.k{wrapped_at}");
                         // The spread only where a step is a step. A round of
                         // depth `k` banks what it accepted all at once, so most
                         // of a speculating run's steps are nothing and the
@@ -1052,7 +1084,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                         eprintln!(
                             "{pair}: {} tokens, {}first eight {:?}",
                             felt.tokens,
-                            match depth {
+                            match wrapped_at {
                                 0 => format!(
                                     "steps p50 {:.2?}, longest {:.2?} at step {worst}, ",
                                     felt.median(),
@@ -1095,12 +1127,19 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
             // whether or not sixteen sequences are in flight.
             What::Batch => {
                 for slots in widths(widest.unwrap_or(WIDEST)) {
-                    let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?;
+                    let weights = backend::weights(gpu.as_ref(), &ckpt, text, wrapped_at, slots)?;
                     let ids = behind_a_step(&prompt, context);
+                    // **The batch's own row, at every width and at every
+                    // depth.** A step is what the batch waits; a token is what
+                    // one sequence in it waits, which is the step divided by
+                    // the sequences that took a token out of it.
+                    // **Settled before either arm is timed.** Whichever ran
+                    // first at a width would otherwise pay for the device
+                    // coming up from idle, and that is a bias in one direction
+                    // rather than noise — which is the finding C3's occupancy
+                    // loop had to correct, arriving here on a different axis.
+                    speculated(&weights, None, text, &ids, slots, 0, SETTLING);
                     let run = batched(&weights, text, &ids, slots, tokens);
-                    // A step is what the batch waits; a token is what one
-                    // sequence in it waits, which is the step divided by the
-                    // sequences that took a token out of it.
                     taken.push(Reading::new(
                         format!("batch{slots}.step"),
                         millis(run.step),
@@ -1122,12 +1161,105 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                         "tok/s",
                     ));
                     eprintln!(
-                        "batch {slots}: step {:.2?}, token {:.2?}, device {:.2?}, {:.1} tok/s",
+                        "batch {slots}: step {:.2?}, token {:.2?}, device {:.2?}, duty {:.1}%, \
+                         {:.1} tok/s",
                         run.step,
                         run.step / slots as u32,
                         run.gpu,
+                        duty(run.gpu, run.step),
                         slots as f64 / run.step.as_secs_f64(),
                     );
+
+                    // **And the same width through the speculative loop, at
+                    // `k = 0` as well as at the depth asked for.** The `k = 0`
+                    // arm is the same work through a different code path, so
+                    // its rate is a figure this measurement does not get to
+                    // choose: the two rows above and below have to agree, and a
+                    // milestone that only printed the speculating one would
+                    // have nothing to notice a wrong denominator with.
+                    let tail = backend::tail_weights(&weights, text);
+                    let heads =
+                        backend::heads(gpu.as_ref(), &ckpt, &config, wrapped_at, &tail, slots)?;
+                    for k in 0..=wrapped_at {
+                        let held = (k > 0).then_some(heads.as_ref()).flatten();
+                        let run = speculated(&weights, held, text, &ids, slots, k, tokens);
+                        let rate = run.tokens as f64 / run.wall.as_secs_f64();
+                        let name = format!("batch{slots}.k{k}");
+                        taken.push(Reading::new(format!("{name}.rate"), rate, "tok/s"));
+                        taken.push(Reading::new(
+                            format!("{name}.token"),
+                            millis(run.wall) / run.tokens.max(1) as f64,
+                            "ms",
+                        ));
+                        taken.push(Reading::new(
+                            format!("{name}.duty"),
+                            duty(run.gpu, run.wall),
+                            "%",
+                        ));
+                        taken.push(Reading::new(
+                            format!("{name}.submissions"),
+                            run.submissions,
+                            "/round",
+                        ));
+                        taken.push(Reading::new(
+                            format!("{name}.round"),
+                            run.tokens as f64 / run.rounds as f64,
+                            "/round",
+                        ));
+                        // Per round rather than over the run, which is what
+                        // makes it the same reading as the row above: at
+                        // `k = 0` a round is a step.
+                        taken.push(Reading::new(
+                            format!("{name}.device"),
+                            millis(run.gpu) / run.rounds as f64,
+                            "ms",
+                        ));
+                        for (at, rate) in run.rates.iter().enumerate() {
+                            taken.push(Reading::new(
+                                format!("{name}.accept{}", at + 1),
+                                100.0 * rate,
+                                "%",
+                            ));
+                        }
+                        eprintln!(
+                            "batch {slots} k{k}: {:.1} tok/s, token {:.2?}, device {:.2?}, \
+                             duty {:.1}%, {:.1} submissions a round — waited {:.2?}, encoded \
+                             {:.2?} — {} tokens over {} rounds ({:.2}/round), {} ragged, \
+                             acceptance {}",
+                            rate,
+                            run.wall / run.tokens.max(1) as u32,
+                            run.gpu / run.rounds as u32,
+                            duty(run.gpu, run.wall),
+                            run.submissions,
+                            run.waited,
+                            run.encode,
+                            run.tokens,
+                            run.rounds,
+                            run.tokens as f64 / run.rounds as f64,
+                            run.ragged,
+                            run.rates
+                                .iter()
+                                .map(|rate| format!("{:.0}%", 100.0 * rate))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        );
+                        eprintln!(
+                            "    sampled here {:.1}x a round; {}",
+                            run.rows
+                                .iter()
+                                .find(|(op, _, _)| matches!(op, profile::Op::Sample))
+                                .map_or(0, |(_, calls, _)| *calls),
+                            run.rows
+                                .iter()
+                                .take(6)
+                                .map(|(op, calls, took)| format!(
+                                    "{} {calls}x {took:.2?}",
+                                    op.name()
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
                 }
             }
             // **The same work over and over, and what each of them cost the
@@ -1433,9 +1565,9 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 let run = timed(&prompt, tokens);
                 let step = run.step();
                 let unspeculated = *unspeculated.get_or_insert(step);
-                taken.push(Reading::new(format!("k{depth}"), millis(step), "ms"));
+                taken.push(Reading::new(format!("k{wrapped_at}"), millis(step), "ms"));
                 taken.push(Reading::new(
-                    format!("k{depth}.device"),
+                    format!("k{wrapped_at}.device"),
                     millis(run.gpu),
                     "ms",
                 ));
@@ -1443,18 +1575,18 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 // sitting's: a sweep whose speedup row is divided by a figure
                 // taken an hour earlier carries the drift between the two.
                 taken.push(Reading::new(
-                    format!("k{depth}.speedup"),
+                    format!("k{wrapped_at}.speedup"),
                     unspeculated.as_secs_f64() / step.as_secs_f64(),
                     "x",
                 ));
                 taken.push(Reading::new(
-                    format!("k{depth}.tokens"),
+                    format!("k{wrapped_at}.tokens"),
                     run.per_round(),
                     "/round",
                 ));
                 for (at, rate) in run.rates.iter().enumerate() {
                     taken.push(Reading::new(
-                        format!("k{depth}.accept{}", at + 1),
+                        format!("k{wrapped_at}.accept{}", at + 1),
                         100.0 * rate,
                         "%",
                     ));
@@ -1669,6 +1801,182 @@ fn batched(
         gpu: profile::take().per_step(charged).gpu(),
     }
 }
+
+/// What a batch of speculating sequences came to, over the rounds after its
+/// prompts were in the caches.
+struct Speculated {
+    /// The wall from the first round to the last.
+    wall: Duration,
+    gpu: Duration,
+    /// Tokens the run produced inside that wall, which is every token but the
+    /// one each prompt's own pass produced.
+    tokens: usize,
+    /// Rounds the whole batch took, which is what a token divides by to say
+    /// what a round banked.
+    rounds: usize,
+    /// Acceptance per depth, over every sequence together.
+    rates: Vec<f64>,
+    /// Rounds whose seats were not all the same length, which is what says the
+    /// ragged path was driven at all.
+    ragged: usize,
+    /// Submissions a round made, and the wall this process spent inside them
+    /// against the encode ahead of them.
+    ///
+    /// **What a duty column cannot say on its own is which side of a round is
+    /// waiting**, and a chain's rounds have two kinds of submission in them:
+    /// the verify's run of layers, and one a head. So the three are here beside
+    /// the device's own clock.
+    submissions: f64,
+    encode: Duration,
+    waited: Duration,
+    /// Every op the round was charged, heaviest first — which is what says
+    /// *which* side of a round a wall went to when the duty column says only
+    /// that one did.
+    rows: Vec<(profile::Op, u64, Duration)>,
+}
+
+/// A proposer that starts the clock the first time it is asked.
+///
+/// **A batched speculative run prefills inside its own loop**, so a wall taken
+/// around the call is a prefill's and the rounds' summed — and the prompts here
+/// are 34 keys apiece, which is a prefill worth more than the rounds it opens.
+/// The proposer is asked once the prompts are in the caches and once a round
+/// after that, which is exactly where `bench sweep`'s own clock starts and what
+/// makes this figure a decode figure.
+struct Opened<'p, P> {
+    proposer: &'p mut P,
+    began: Option<Instant>,
+    /// Rounds the clock covers, which is what it is asked once for.
+    ///
+    /// Counted here rather than taken from the chain, because the `k = 0` arm
+    /// has no chain to count and its rounds are what make its device column
+    /// comparable to the row above it.
+    rounds: usize,
+}
+
+impl<'p, P> Opened<'p, P> {
+    fn over(proposer: &'p mut P) -> Self {
+        Self {
+            proposer,
+            began: None,
+            rounds: 0,
+        }
+    }
+}
+
+impl<P: BatchProposer> BatchProposer for Opened<'_, P> {
+    fn depth(&self) -> usize {
+        self.proposer.depth()
+    }
+
+    /// **Asked once the prompts are in the caches, and once a round after
+    /// that**, so counting the calls counts the rounds the clock covers: every
+    /// call but the last is followed by a verify, and so is the last, since the
+    /// loop stops on a verify that leaves nobody to ask.
+    fn propose_batch(&mut self, rounds: &[SeatedRound<'_>]) -> Vec<Vec<usize>> {
+        if self.began.is_none() {
+            profile::take();
+            self.began = Some(Instant::now());
+        }
+        self.rounds += 1;
+        self.proposer.propose_batch(rounds)
+    }
+}
+
+impl<P> Opened<'_, P> {
+    /// The wall from the first round to now, and the device time inside it.
+    fn clock(&self) -> (Duration, profile::Profile) {
+        (self.began.expect("a round").elapsed(), profile::take())
+    }
+}
+
+/// `slots` sequences prefilled together and then decoded together at depth
+/// `depth`, timed over the rounds alone.
+///
+/// **The same harness at every depth including none**, which is what makes the
+/// `k = 0` column a check rather than a restatement: it is a different code
+/// path from [`batched`] over the same work, so the two agreeing is a figure
+/// this measurement does not get to choose and the two disagreeing is a defect.
+fn speculated(
+    weights: &CheckpointWeights<'_>,
+    heads: Option<&CheckpointHeads<'_>>,
+    config: &TextConfig,
+    ids: &[usize],
+    slots: usize,
+    depth: usize,
+    tokens: usize,
+) -> Speculated {
+    let generator = weights.generator();
+    // The prompts are made distinct rather than copied, for [`Seated`]'s
+    // reason: a batch of identical sequences routes every row of every step to
+    // the same six experts.
+    let prompts: Vec<Vec<usize>> = (0..slots)
+        .map(|slot| {
+            let mut own = ids.to_vec();
+            own.rotate_left(slot % ids.len());
+            own
+        })
+        .collect();
+    let asked: Vec<&[usize]> = prompts.iter().map(Vec::as_slice).collect();
+    let counts = vec![tokens; slots];
+    let mut caches: Vec<ModelCache> = (0..slots)
+        .map(|slot| ModelCache::in_slot(config, depth, slot))
+        .collect();
+
+    let mut chain =
+        heads.map(|heads| MtpProposer::batched(heads, generator, weights, depth, slots));
+    let mut alone = Alone;
+    let (produced, wall, spent, rounds, rates, ragged) = match chain.as_mut() {
+        Some(chain) => {
+            let mut opened = Opened::over(chain);
+            let produced =
+                generator.speculate_batch(&mut caches, &asked, &counts, weights, &mut opened);
+            let (wall, spent) = opened.clock();
+            (
+                produced,
+                wall,
+                spent,
+                opened.rounds,
+                opened.proposer.rates(),
+                opened.proposer.ragged(),
+            )
+        }
+        None => {
+            let mut opened = Opened::over(&mut alone);
+            let produced =
+                generator.speculate_batch(&mut caches, &asked, &counts, weights, &mut opened);
+            let (wall, spent) = opened.clock();
+            (produced, wall, spent, opened.rounds, Vec::new(), 0)
+        }
+    };
+
+    let rounds = rounds.max(1);
+    Speculated {
+        wall,
+        gpu: spent.gpu(),
+        // Every token but the one each prompt's own pass produced, which landed
+        // before the clock started.
+        tokens: produced.iter().map(Vec::len).sum::<usize>() - slots,
+        rounds,
+        rates,
+        ragged,
+        submissions: spent.calls(profile::Op::Submit) as f64 / rounds as f64,
+        encode: spent.elapsed(profile::Op::Encode) / rounds as u32,
+        waited: spent.elapsed(profile::Op::Submit) / rounds as u32,
+        rows: spent.per_step(u32::try_from(rounds).unwrap_or(1)).rows(),
+    }
+}
+
+/// Tokens a width is settled over before either of the batch sweep's two arms
+/// is timed.
+///
+/// **A wall is what one of the two reports and a wall takes settling**, which
+/// this file already had the figure for at another shape: an unsettled batch of
+/// one read 25.9 ms against its own 16.4, and a width whose first arm pays that
+/// is a width whose two arms are not the same measurement. Eight, which is past
+/// the first dispatch after a gap that C2 priced the toll on and short beside
+/// the sixty-four either arm then runs.
+const SETTLING: usize = 8;
 
 /// Runs of the idle arm the two latency measurements throw away before they
 /// report anything.

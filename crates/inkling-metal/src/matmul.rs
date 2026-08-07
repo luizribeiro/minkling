@@ -6142,6 +6142,88 @@ kernel void mma_lane_probe___T__(
         assert!(tokens(2048) && tokens(16384));
     }
 
+    /// **What a verify reaches at each width and each depth, off the shipped
+    /// predicates rather than off arithmetic in a paragraph.**
+    ///
+    /// The case above says an *unbatched* round reaches no block. At batch the
+    /// same round's rows are the width times the depth plus one, so the shapes
+    /// move — and which lines they cross is the whole of what says whether
+    /// batching a chain puts its verify on a path speculation alone has been
+    /// missing. Three lines, and they are not the same line:
+    ///
+    /// - **[`ROWS_A_TILE`], which is four**, is where the shipped word's tiled
+    ///   entry begins reading one weight for several rows. A projection's rows
+    ///   all name expert zero, so a call of four crosses it — which an
+    ///   *unbatched* `k = 3` already does.
+    /// - **[`RUNS_A_GROUPING`] against 256 experts**, which is 512 rows of a
+    ///   routed bank and so 86 tokens in the call, is where the bank that is
+    ///   most of a step's bytes stops being one row an expert. **This is the
+    ///   line batching moves and depth alone cannot reach.**
+    /// - **[`PackedMatmul::SHORTEST_BLOCKED_CALL`], which is 64 rows and not
+    ///   32**, is where the production entries take a tiled call. `MMA_ROWS_A_BLOCK`
+    ///   is a block's *height*; the sweep behind [`PackedMatmul::blocks`] put
+    ///   the line at twice it because the block is behind the reference tile at
+    ///   40 and 48 rows. It is also behind `--numerics production`, which
+    ///   nothing this engine measures a decode step under.
+    #[test]
+    fn what_a_batched_verify_reaches_at_each_width_and_depth() {
+        let Some(device) = device() else { return };
+        let matmul = PackedMatmul::under(&device, Numerics::Production).expect("compiles");
+        let grouped = Layout::Grouped {
+            order: Arg::Inline(&[]),
+            plan: Arg::Inline(&[]),
+            blocks: 0,
+            through: Through::Gathered,
+        };
+        // A projection's rows are the call's tokens and all name expert zero; a
+        // shared bank is its input laid end to end once per expert; a routed
+        // bank is each token's six experts one after another.
+        let projection = |tokens: usize| vec![0u32; tokens];
+
+        for width in [1usize, 2, 4, 8, 16, 32] {
+            for depth in 0..=SWEPT {
+                let tokens = width * (depth + 1);
+                assert_eq!(
+                    tiles(&projection(tokens), matmul.rows_a_tile),
+                    tokens >= ROWS_A_TILE,
+                    "a projection of {tokens} rows against the tile"
+                );
+                assert_eq!(
+                    matmul.groups(tokens * 6, 256),
+                    tokens * 6 >= 256 * RUNS_A_GROUPING,
+                    "a routed bank of {tokens} tokens against the grouping"
+                );
+                assert_eq!(
+                    matmul.blocks(&Layout::Tiled, tokens, 1).is_some(),
+                    tokens >= PackedMatmul::SHORTEST_BLOCKED_CALL,
+                    "a projection of {tokens} rows against the block"
+                );
+                assert!(
+                    matmul.blocks(&grouped, tokens * 6, 256).is_none(),
+                    "a routed bank of {tokens} tokens reached a block"
+                );
+            }
+        }
+
+        // **The arithmetic this milestone's brief carried, stated against the
+        // predicate rather than against the constant it was read off.** A
+        // `k = 3` verify at batch 8 is 32 rows, which is a block's height and
+        // half the height a call has to bring before it is given one.
+        assert_eq!(8 * (3 + 1), MMA_ROWS_A_BLOCK);
+        assert!(matmul.blocks(&Layout::Tiled, 8 * (3 + 1), 1).is_none());
+        assert_eq!(MMA_ROWS_A_BLOCK * 2, PackedMatmul::SHORTEST_BLOCKED_CALL);
+
+        // **And the line batching does move**, which is the routed bank's: the
+        // widest a round can be at the sweep's own depth crosses it and the
+        // widest an unbatched round can be is nowhere near.
+        assert!(matmul.groups(32 * (2 + 1) * 6, 256), "batch 32 at k = 2");
+        assert!(
+            !matmul.groups(16 * (SWEPT + 1) * 6, 256),
+            "batch 16 at k = 4"
+        );
+        assert!(!matmul.groups(1 * (SWEPT + 1) * 6, 256), "alone at k = 4");
+    }
+
     /// **The two grouped entries answer the same bits**, which is what makes the
     /// line between them a rate and never an answer.
     ///
