@@ -17,8 +17,8 @@
 //! A seated request is in one of two states, and the difference is which rows
 //! the call it rides in asks a question about:
 //!
-//! - **Filling.** Its prompt is going into its cache, [`Continuous::chunk`]
-//!   tokens of it a step, in the same forward pass the sequences already in
+//! - **Filling.** Its prompt is going into its cache, a share of the step's
+//!   prompt budget at a time, in the same forward pass the sequences already in
 //!   flight take their next token out of. None of those rows is a question.
 //! - **Decoding.** It feeds one row a step — the token it owes — and the tail is
 //!   asked what follows it.
@@ -35,20 +35,30 @@
 //! # What the chunk buys and what it costs
 //!
 //! A joining prompt fed whole is one call of `n + d` rows, and the `d`
-//! sequences already decoding wait the whole of it — a 385-token prompt is about
-//! a second on this part against a 15 ms decode step, so one arrival stalls
-//! every sequence in flight for sixty steps' worth of time. Fed
-//! [`Continuous::chunk`] rows a step, the same prompt is spread over
-//! `ceil((n-1)/chunk)` steps and what any one of them costs the sequences in
-//! flight is bounded by the chunk.
+//! sequences already decoding wait the whole of it — a 385-token prompt riding
+//! with seven decoders is a **2.65 s** step against their own **73.8 ms**, so
+//! one arrival costs every sequence in flight thirty-six steps' worth of jitter
+//! on a single token. Given a budget of `b` prompt rows a step, the same prompt
+//! is spread over `ceil((n-1)/b)` steps and the worst any one of them costs them
+//! is bounded by that budget: 727 ms at 128 rows, 199 at 16.
 //!
-//! **What it costs is that the joiner's rows lose the query block.**
-//! `FusedAttention::blocked` refuses a call carrying more than one sequence —
-//! a block stages one tile of keys for the 64 query rows sharing it, and rows
-//! attending over different spans cannot share one — so a chunk riding beside
-//! decoders walks its keys a query row at a time where a prefill of its own
-//! would have blocked them. That is a real price and it is measured rather than
-//! assumed; see the README.
+//! **The budget is the call's and not the seat's** — see [`Continuous::new`],
+//! where the measurement that decided it is. A per-seat number bounds nothing:
+//! eight slots filling 128 rows apiece is a call of 1024 rows.
+//!
+//! **What the chunk does not buy is the total.** Summed over the decoders the
+//! delay is 2.0 to 3.0 s whatever the chunk, because it is the prefill's own
+//! work and somebody has to do it. The chunk is a bound on the jitter of one
+//! token and not a reduction in what the prompt costs.
+//!
+//! **And a chunk is not free either, for two reasons.** It pays a call's
+//! overhead once per chunk rather than once per prompt; and the joiner's rows
+//! lose the query block — `FusedAttention::blocked` refuses a call carrying more
+//! than one sequence, because a block stages one tile of keys for the 64 query
+//! rows sharing it and rows attending over different spans cannot share one. So
+//! a prompt in 24 chunks of 16 costs 4.53 s of device where the same prompt
+//! whole costs 1.79. Both prices are measured rather than assumed; the README
+//! has the sweep.
 //!
 //! # Starvation is a correctness property
 //!
@@ -72,8 +82,14 @@ pub struct Request {
     /// refused below this line and the refusal would land a step later, on a
     /// batch that has nothing to do with it.
     pub prompt: Vec<usize>,
-    /// How many tokens to decode. A request that wants none is answered
-    /// immediately and never takes a slot.
+    /// How many tokens to decode.
+    ///
+    /// **A request that wants none is dropped from the queue and never
+    /// answered**, which is worth stating rather than leaving to be discovered:
+    /// its ticket produces no [`Answered`] and a caller waiting on one waits
+    /// forever. What it must not do is take a slot, because a slot held by a
+    /// request that is already finished is a slot standing empty in front of the
+    /// one behind it.
     pub count: usize,
 }
 
@@ -103,9 +119,12 @@ impl Resident {
         self.filled + 1 < self.prompt.len()
     }
 
-    /// The prompt rows it feeds next, which is never empty while it is filling.
-    fn chunk(&self, chunk: usize) -> &[usize] {
-        &self.prompt[self.filled..(self.filled + chunk).min(self.prompt.len() - 1)]
+    /// The prompt rows it feeds next, given the `share` of the step's budget it
+    /// was allowed — which is never empty while it is filling, because a seat
+    /// allowed no rows would sit in a slot making no progress and never leave
+    /// it.
+    fn chunk(&self, share: usize) -> &[usize] {
+        &self.prompt[self.filled..(self.filled + share.max(1)).min(self.prompt.len() - 1)]
     }
 
     /// The one row it feeds when it is decoding: the last token of its prompt
@@ -164,14 +183,28 @@ pub struct Continuous<'a> {
     config: &'a TextConfig,
     slots: Vec<Option<Resident>>,
     waiting: VecDeque<(usize, Request)>,
-    /// Prompt rows one filling seat feeds in one step.
+    /// Prompt rows one step carries at most, **over every seat that is
+    /// filling** — see [`Continuous::new`].
     chunk: usize,
     tickets: usize,
 }
 
 impl<'a> Continuous<'a> {
-    /// `slots` sequences in flight at once, a joining prompt entering `chunk`
-    /// rows a step.
+    /// `slots` sequences in flight at once, and a step carrying at most `chunk`
+    /// rows of prompt between all of them.
+    ///
+    /// **A budget on the call and not on the seat**, which is the only reading
+    /// under which the number bounds anything. Eight slots filling 128 rows
+    /// apiece is a call of 1024 rows — measured at 46 tokens a second against
+    /// the 119 the same width decodes at — so a per-seat chunk names a figure
+    /// that is not the cost of a step and cannot be read as one. Split, it is
+    /// what a step's prompt rows are capped at, and that is the sentence a
+    /// scheduler needs.
+    ///
+    /// A seat always takes at least one row, so a budget smaller than the seats
+    /// filling is exceeded rather than starving one of them; and a seat with
+    /// less prompt left than its share takes what it has, so a call comes in
+    /// under the budget as often as at it.
     ///
     /// `slots` is the width the backend was wrapped for and not a number this
     /// picks: a slot is a span and four convolution windows in every layer,
@@ -270,15 +303,21 @@ impl<'a> Continuous<'a> {
             return stepped;
         }
 
+        // The step's prompt budget, split evenly over the seats that are
+        // filling — see [`Continuous::new`] for why the number is the call's and
+        // not the seat's.
+        let filling = seated.iter().filter(|held| held.filling()).count();
+        let share = self.chunk / filling.max(1);
+
         let fed: Vec<Vec<usize>> = seated
             .iter()
             .map(|held| match held.filling() {
-                true => held.chunk(self.chunk).to_vec(),
+                true => held.chunk(share).to_vec(),
                 false => vec![held.owed()],
             })
             .collect();
         stepped.seats = seated.len();
-        stepped.decoding = seated.iter().filter(|held| !held.filling()).count();
+        stepped.decoding = seated.len() - filling;
         stepped.filling = fed.iter().map(Vec::len).sum::<usize>() - stepped.decoding;
 
         let mut batch: Vec<Batched<'_>> = seated
@@ -390,6 +429,9 @@ mod tests {
         /// each prompt in one step would leave the engine alternating between
         /// prefills and decode steps and never reach it.
         mixed: usize,
+        /// The most prompt rows any one step of the run carried, which is what
+        /// the budget is a budget on.
+        widest: usize,
     }
 
     impl Ran {
@@ -398,6 +440,7 @@ mod tests {
             self.filling += stepped.filling;
             self.decoding += stepped.decoding;
             self.mixed += usize::from(stepped.filling > 0 && stepped.decoding > 0);
+            self.widest = self.widest.max(stepped.filling);
             self.answered.extend(stepped.done);
         }
 
@@ -698,6 +741,103 @@ mod tests {
             served, order,
             "answered out of the order they were admitted"
         );
+    }
+
+    /// **A step's prompt rows are the call's budget and not the seat's.** Three
+    /// prompts filling at once through a budget of six is six rows a step and
+    /// not eighteen, which is the only reading under which the number bounds
+    /// what a call costs — and a call is what the sequences already decoding
+    /// wait for.
+    ///
+    /// The two ends are asserted as well as the middle: a budget smaller than
+    /// the seats filling gives each of them one row rather than starving one,
+    /// and a budget wider than the prompts have left comes in under itself.
+    #[test]
+    fn a_steps_prompt_rows_are_the_calls_budget_and_not_a_seats() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let sequence = stack.sequence();
+        let seats = 3;
+        let asked: Vec<Request> = (0..seats)
+            .map(|_| Request {
+                prompt: sequence.clone(),
+                count: COUNT,
+            })
+            .collect();
+
+        for (chunk, widest) in [
+            // Met exactly: two rows to each of three seats.
+            (6, 6),
+            (3, 3),
+            // Over the budget rather than starving a seat, which is the one
+            // direction it may be missed in and is bounded by the seats.
+            (2, 3),
+            (1, 3),
+            // Under it, the other way: the three prompts have eight rows left
+            // apiece and there is nothing else to fill the budget with.
+            (60, seats * (sequence.len() - 1)),
+        ] {
+            let mut engine = Continuous::new(&stack.config, seats, chunk);
+            for request in &asked {
+                engine.submit(request.clone());
+            }
+            let mut ran = Ran::default();
+            ran.on(&mut engine, &stack, &head);
+            ran.against(&asked);
+            assert_eq!(ran.widest, widest, "{chunk} rows a step over {seats} seats");
+            assert!(
+                ran.widest <= chunk.max(seats),
+                "{} rows in one call against a budget of {chunk}",
+                ran.widest
+            );
+        }
+    }
+
+    /// **A request whose prompt is one token never fills at all.** Its whole
+    /// prompt is the row that is a question, so it goes straight to decoding on
+    /// the step it is admitted — which is a branch of [`Resident::filling`] that
+    /// no other case here reaches, and the one where an engine that filled
+    /// `prompt[..n-1]` unconditionally would ask a call for zero rows.
+    ///
+    /// Driven beside a neighbour that *is* filling, so the step it is admitted
+    /// on is a mixed call with a decoding seat that has produced nothing yet.
+    #[test]
+    fn a_request_whose_prompt_is_one_token_is_decoding_from_the_step_it_arrives_on() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let generator = generator(&stack, &head);
+        let sequence = stack.sequence();
+        let asked = [
+            Request {
+                prompt: sequence.clone(),
+                count: COUNT,
+            },
+            Request {
+                prompt: sequence[..1].to_vec(),
+                count: COUNT,
+            },
+        ];
+        let want: Vec<Vec<usize>> = asked
+            .iter()
+            .map(|request| alone(&stack, &request.prompt, request.count))
+            .collect();
+        assert_ne!(want[0], want[1], "two generations to tell apart");
+
+        let mut engine = Continuous::new(&stack.config, 2, 2);
+        for request in &asked {
+            engine.submit(request.clone());
+        }
+        let mut ran = Ran::default();
+        let first = engine.step(&generator, &stack);
+        assert_eq!(first.decoding, 1, "the one-token prompt fed a question");
+        assert!(first.filling > 0, "its neighbour was still filling");
+        ran.took(first);
+        ran.on(&mut engine, &stack, &head);
+
+        let answered = ran.against(&asked);
+        for (at, answer) in answered.iter().enumerate() {
+            assert_eq!(answer.produced, want[at], "request {at}");
+        }
     }
 
     /// A request that wants no tokens never takes a slot, and does not hold up

@@ -244,10 +244,18 @@ enum Admitting {
     /// Into a free slot as soon as there is one, which is what
     /// [`Continuous`](inkling_core::Continuous) does.
     Continuously,
-    /// Only into an engine that has drained — N prompts prefilled, all of them
-    /// decoded together, and the next request admitted when the last of them
-    /// finishes, which is what `generate_batch` does and what every batching
-    /// figure in this repo was taken at.
+    /// Only into an engine that has drained: up to `slots` requests admitted
+    /// together, decoded together, and the next of them admitted when the last
+    /// of the batch finishes.
+    ///
+    /// **This is `generate_batch`'s admission rule and not its prefill.** There
+    /// the prompts enter one sequence at a time and no sequence decodes until
+    /// all of them are in; here a batch's prompts fill together, in the same
+    /// calls, because that is what this engine does with several sequences
+    /// admitted at once. What the difference reaches is the prefill phase of a
+    /// batch and nothing after it — one call's worth of shape per batch, against
+    /// a wait this measures in hundreds of decode steps — so it is named here
+    /// rather than corrected, and the README says what it is worth.
     InBatches,
 }
 
@@ -302,11 +310,11 @@ enum Job {
         /// The prompt each of the clock measurement's units prefills, and zero
         /// for the decode step it charges otherwise.
         prefill: usize,
-        /// Prompt rows a joining request feeds in one step.
+        /// Prompt rows one step carries, over every request filling in it.
         ///
         /// **The knob the two latency measurements trade on.** A prompt fed
         /// whole is one call the sequences already in flight wait the whole of;
-        /// fed this many rows a step it is spread over as many steps, and what
+        /// spread over this many rows a step it takes as many steps, and what
         /// any one of them costs those sequences is bounded by this.
         admit: usize,
         /// How many requests a fleet makes, and nothing at all for the
@@ -439,8 +447,8 @@ impl Job {
                     warm = Some(Duration::from_millis(count(&arg, &mut args)? as u64));
                 }
                 "--prefill" => prefill = Some(count(&arg, &mut args)?),
-                // A prompt entering no rows a step never enters a cache at all,
-                // which is a joining request that is never answered.
+                // A step carrying no prompt rows never enters a prompt into a
+                // cache at all, which is a joining request nobody answers.
                 "--admit" => admit = Some(count(&arg, &mut args)?),
                 "--agents" => agents = Some(count(&arg, &mut args)?),
                 _ if arg.starts_with('-') => bail!("unexpected argument {arg}"),
@@ -582,6 +590,25 @@ impl Job {
         // the one this already runs beside it.
         if what == What::Joining && widest.is_some_and(|slots| slots < 2) {
             bail!("joining takes a --batch of at least two: one of the slots is the joiner's");
+        }
+        // An engine of no slots is refused below this line rather than here, and
+        // a measurement should say what it takes rather than panic inside the
+        // thing it is measuring.
+        if what == What::Fleet && widest == Some(0) {
+            bail!("fleet takes a --batch of at least one: an engine with no slots seats nobody");
+        }
+        // **A batch that finishes inside its own settling is not a batch this
+        // can take a step of.** The two latency measurements settle the
+        // sequences already in flight over [`SETTLED`] steps and quote what one
+        // of those cost, so a budget that runs out inside them would have the
+        // row named "the batch's step" be a mean over calls to an empty engine.
+        if matches!(what, What::Joining | What::Fleet)
+            && tokens.is_some_and(|tokens| tokens <= SETTLED)
+        {
+            bail!(
+                "{what:?} takes more than {SETTLED} tokens a request: the sequences it holds in \
+                 flight are settled over {SETTLED} steps"
+            );
         }
         // A prompt entering no rows a step never enters a cache at all, which is
         // a request nothing here would ever answer.
@@ -1179,8 +1206,8 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 let slots = widest.unwrap_or(WIDEST);
                 let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?;
                 eprintln!(
-                    "joining: {slots} slots, a {}-token prompt entering {admit} rows a step, \
-                     {tokens} tokens a request",
+                    "joining: {slots} slots, a {}-token prompt over {admit} prompt rows a \
+                     step, {tokens} tokens a request",
                     ids.len(),
                 );
                 let engine = Engine {
@@ -1199,6 +1226,13 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     joined(&engine, 0, Admitting::Continuously);
                 }
                 for held in occupancies(slots) {
+                    // **And one throwaway at every occupancy.** The loop below
+                    // runs `Continuously` first at each of them, so without this
+                    // the first call of every "joiner beside `held` decoders"
+                    // shape lands inside a timed run — and inside the same one
+                    // every time, which is a bias in one direction rather than
+                    // noise.
+                    joined(&engine, held, Admitting::Continuously);
                     for policy in [Admitting::Continuously, Admitting::InBatches] {
                         // At an idle engine the two policies are the same run,
                         // and a second one of it would be a row saying the same
@@ -1249,7 +1283,7 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 let arrivals: Vec<Duration> = (0..agents).map(|at| every * at as u32).collect();
                 eprintln!(
                     "fleet: {agents} requests one every {:.0?}, {tokens} tokens each, \
-                     {slots} slots, a {}-token prompt entering {admit} rows a step",
+                     {slots} slots, {}-token prompts over {admit} prompt rows a step",
                     every,
                     ids.len(),
                 );
@@ -1637,14 +1671,23 @@ fn batched(
 /// 237.6 and 237.6, which had settled by the third and moved 0.1% after it.
 const WARM: usize = 3;
 
-/// Prompt rows a joining request feeds in one step, when nobody says.
+/// Prompt rows one step carries, over every request filling in it, when nobody
+/// says.
 ///
-/// **The knob the latency of a joining request trades against the latency of
-/// the sequences it joins**, and 64 is the smaller of the two prices at this
-/// checkpoint's shapes: a decode step of eight sequences is 64 ms of device, so
-/// 64 prompt rows riding with it is a step of the same order rather than the
-/// second the whole prompt would be.
-const ADMITTED: usize = 64;
+/// **The knob a joining request's own wait trades against the wait it puts on
+/// the sequences it joins**, and 128 is where both are least at this
+/// checkpoint's shapes. A 385-token prompt joining seven decoders reads, at 16,
+/// 32, 64, 128 and 384 rows a chunk: **4866, 3843, 3311, 2259 and 3571 ms to
+/// its own first token**, and **199, 314, 539, 727 and 2650 ms on each step the
+/// seven decoders take while it is filling**, against their own 73.8 ms.
+///
+/// The two ends are two different prices. A narrow chunk pays call overhead
+/// once per chunk — 25 calls where 4 would do — and a whole prompt makes one
+/// call the decoders wait 36 of their own steps inside. What the chunk does
+/// *not* buy is the total: the delay summed over the decoders is 2.0 to 3.0 s
+/// whatever it is, which is the prefill's own work and has to be paid. **It is
+/// a bound on the jitter of one token, and it is worth about 4.4× of that.**
+const ADMITTED: usize = 128;
 
 /// Requests a fleet makes, when nobody says. Two per slot at the default width,
 /// so that a request waits for one to finish as well as arriving into a free
@@ -3550,6 +3593,25 @@ mod tests {
         // entering no rows a step never enters a cache at all.
         assert!(parsed(&["joining", "models/small", "--batch", "1"]).is_err());
         assert!(parsed(&["joining", "models/small", "--admit", "0"]).is_err());
+        // A fleet has no joiner to leave a slot for, so one slot is a width it
+        // means something by — and no slots is an engine that seats nobody.
+        assert!(parsed(&["fleet", "models/small", "--batch", "1"]).is_ok());
+        assert!(parsed(&["fleet", "models/small", "--batch", "0"]).is_err());
+        // **A budget that runs out inside the settling is a batch whose step
+        // these would report as a mean over calls to an empty engine.**
+        assert!(
+            parsed(&["fleet", "models/small", "--tokens", &SETTLED.to_string()]).is_err(),
+            "a request that finishes inside the settling was taken"
+        );
+        assert!(
+            parsed(&[
+                "joining",
+                "models/small",
+                "--tokens",
+                &(SETTLED + 1).to_string()
+            ])
+            .is_ok()
+        );
     }
 
     /// **A rate is a gap the work is taken out of**, which is the shape a server
