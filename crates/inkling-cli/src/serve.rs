@@ -18,33 +18,40 @@
 //! is 33 s of prefill not paid again, and is worth more than any kernel in this
 //! tree. A second client waits rather than fails.
 //!
-//! **`--slots N`: the scheduler, and the conversation is not kept.** This is
+//! **`--slots N`: the scheduler, and a conversation kept per slot.** This is
 //! [`Continuous`], the engine the batching figures were taken on, with the
 //! socket in front of it: N requests advance together, a request that arrives
 //! mid-generation joins the batch it found rather than waiting for it to drain,
 //! and a slot a request vacates is filled from the front of the queue in the
 //! very next step.
 //!
-//! **What the second gives up is [`Kept`](crate::kept::Kept), and that is not a
-//! decision made here.** A slot's cache is the *slot's* — the device holds one
-//! span and one window pair per layer per slot, and [`Continuous`] hands every
-//! joining sequence a fresh one precisely so that it does not attend over the
-//! keys of whoever sat there before. There is no position in that arrangement
-//! for a conversation to be resumed to. So a scheduled server re-prefills every
-//! turn, and a single-slot one does not, and which of those a workload wants is
-//! the question `--slots` asks. A fleet of agents at irregular times wants the
-//! scheduler; one coding session sending its context back turn after turn wants
-//! the cache.
+//! **The second used to give up [`Kept`] and no longer does.** A slot's cache is
+//! the *slot's* — the device holds one span and one window pair per layer per
+//! slot — and [`Continuous`] handed every joining sequence a fresh one precisely
+//! so that it did not attend over the keys of whoever sat there before. What
+//! that ruled out was a sequence reading a *stranger's* keys, and it ruled out a
+//! conversation reading its own along with it. So a slot now records the ids its
+//! cache sits at the end of and a returning prompt is given that slot only where
+//! it starts with those ids — see `Continuous::seat_for`, which is the whole of
+//! the choice, and `Continuous::keeping`, which is where why the tokens are the
+//! identity is written down.
 //!
-//! # A request prefills what the last one did not, on the serial path
+//! So the two paths trade what they always traded, minus the cache: one request
+//! at a time against N, and a conversation kept either way. `--slots 1` is still
+//! the default, because a server answering one client is a server whose second
+//! slot is a slot nobody sits in — see `a_slot_costs_a_span_and_four_windows_in
+//! _every_layer`, which is 30.8 MiB of it.
+//!
+//! # A request prefills what the last one did not
 //!
 //! A conversation comes back turn after turn with a little added each time, so a
 //! server that keeps nothing re-prefills the whole of it every turn. Whether the
-//! conversation a client sent is the one the cache holds is
-//! [`Kept`](crate::kept::Kept)'s decision — one conversation, and an exact
-//! extension of it — and this loop is what follows from it: prefill the part
-//! that is new, mark the cache where the prompt ends, generate, and put the
-//! cache back at the mark.
+//! conversation a client sent is the one a cache holds is [`Kept`]'s decision —
+//! one conversation an entry, and an exact extension of it — and the serial
+//! path's loop is what follows from it: prefill the part that is new, mark the
+//! cache where the prompt ends, generate, and put the cache back at the mark.
+//! The scheduled path does the same thing a slot at a time, which is why the
+//! deciding is one type and not two.
 //!
 //! **The mark is what keeps that decision honest.** A generation moves the cache
 //! past the prompt, and the reply cannot be recorded in its place: what a client
@@ -791,6 +798,7 @@ fn schedule(
     generator: &Generator<'_>,
     server: Arc<Server>,
     slots: usize,
+    reuse: usize,
 ) -> Result<()> {
     let (asking, asked) = mpsc::channel::<Wanted>();
     for _ in 0..slots * READERS_A_SLOT {
@@ -813,6 +821,7 @@ fn schedule(
         asked,
         shared.tokenizer.eos() as usize,
         slots,
+        reuse,
     )
 }
 
@@ -831,8 +840,9 @@ fn stepping(
     asked: Receiver<Wanted>,
     eos: usize,
     slots: usize,
+    reuse: usize,
 ) -> Result<()> {
-    let mut engine = Continuous::new(config, slots, ADMIT);
+    let mut engine = Continuous::keeping(config, slots, ADMIT, reuse);
     let mut live: HashMap<usize, Sender<Dispatch>> = HashMap::new();
 
     loop {
@@ -1025,9 +1035,12 @@ pub fn run(args: &Serve) -> Result<()> {
         "serving {} on http://{}, {}",
         shared.model,
         server.server_addr(),
-        match args.slots {
-            1 => "one request at a time, keeping the conversation between them".to_string(),
-            slots => format!("{slots} requests at a time, keeping no conversation"),
+        match (args.slots, args.reuse_tokens) {
+            (slots, 0) => format!("{slots} at a time, keeping no conversation"),
+            (1, bound) => format!("one request at a time, keeping a conversation to {bound}"),
+            (slots, bound) => {
+                format!("{slots} at a time, keeping a conversation a slot to {bound}")
+            }
         }
     );
 
@@ -1039,6 +1052,7 @@ pub fn run(args: &Serve) -> Result<()> {
             &generator,
             Arc::new(server),
             args.slots,
+            args.reuse_tokens,
         );
     }
 
@@ -1059,6 +1073,7 @@ mod tests {
     use inkling_core::fixture::Stack;
     use inkling_core::head::LmHead;
     use inkling_core::ops::DenseProjection;
+    use inkling_core::{Admitted, DEFAULT_BOUND};
 
     use super::*;
     use crate::chat::text;
@@ -1618,9 +1633,20 @@ mod tests {
     const COUNT: usize = 4;
 
     impl<'a> Seated<'a> {
+        /// An engine that keeps nothing, which is every case here whose
+        /// subject is a seat rather than a conversation.
         fn new(stack: &'a Stack, head: &'a DenseProjection<'a>, slots: usize) -> Self {
+            Self::keeping(stack, head, slots, 0)
+        }
+
+        fn keeping(
+            stack: &'a Stack,
+            head: &'a DenseProjection<'a>,
+            slots: usize,
+            keeping: usize,
+        ) -> Self {
             Self {
-                engine: Continuous::new(&stack.config, slots, 2),
+                engine: Continuous::keeping(&stack.config, slots, 2, keeping),
                 live: HashMap::new(),
                 stack,
                 head,
@@ -1656,18 +1682,24 @@ mod tests {
             }
         }
 
-        /// One step, and everything it produced sent on.
-        fn step(&mut self, eos: usize) {
+        /// One step, and everything it produced sent on — answering with the
+        /// requests it seated, which is where a case reads what a returning
+        /// client's slot already held.
+        fn step(&mut self, eos: usize) -> Vec<Admitted> {
             let generator = self.generator();
             let stepped = self.engine.step(&generator, self.stack);
+            let admitted = stepped.admitted.clone();
             dispatch(&mut self.engine, &mut self.live, self.stack, stepped, eos);
+            admitted
         }
 
         /// The engine run until it has nothing left.
-        fn drain(&mut self, eos: usize) {
+        fn drain(&mut self, eos: usize) -> Vec<Admitted> {
+            let mut admitted = Vec::new();
             while !self.engine.idle() {
-                self.step(eos);
+                admitted.extend(self.step(eos));
             }
+            admitted
         }
     }
 
@@ -1725,12 +1757,84 @@ mod tests {
 
         // An id the synthetic stack cannot produce, so nothing here ends on a
         // terminator and every request ends on its budget.
-        seated.drain(usize::MAX);
+        let _ = seated.drain(usize::MAX);
         drop(seated);
 
         for (at, (_, dispatched)) in clients.iter().enumerate() {
             let (tokens, stop) = received(dispatched);
             assert_eq!(tokens, want[at], "client {at}");
+            assert_eq!(stop, Some(Stop::Budget), "client {at}");
+        }
+    }
+
+    /// **A client that comes back with its own conversation is served out of the
+    /// slot holding its own keys**, which is what `--slots N` gives up nothing
+    /// for any more.
+    ///
+    /// Two clients, a turn each, and then each of them back with what it sent,
+    /// the reply it was given and a token more — which is the shape an OpenAI
+    /// client's second turn has, since it sends the whole conversation every
+    /// time. Both halves are asserted and the second is the one that matters:
+    /// each resumed the position its own last prompt ended at, **and** was sent
+    /// the ids its whole prompt produces alone, so what it resumed onto was its
+    /// own keys and not its neighbour's.
+    #[test]
+    fn a_client_that_comes_back_is_served_from_the_slot_holding_its_conversation() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let sequence = stack.sequence();
+        let opened = [sequence[..3].to_vec(), sequence[3..].to_vec()];
+
+        let mut seated = Seated::keeping(&stack, &head, 2, DEFAULT_BOUND);
+        let opening: Vec<(usize, Receiver<Dispatch>)> =
+            opened.iter().map(|ids| seated.seat(ids, COUNT)).collect();
+        let admitted = seated.drain(usize::MAX);
+        assert!(
+            admitted.iter().all(|seat| seat.reused == 0),
+            "an opening turn resumed something"
+        );
+
+        // What each client sends next: its own prompt, the reply it was given,
+        // and a token more.
+        let replies: Vec<Vec<usize>> = opening
+            .iter()
+            .map(|(_, dispatched)| received(dispatched).0)
+            .collect();
+        let returning: Vec<Vec<usize>> = opened
+            .iter()
+            .zip(&replies)
+            .map(|(ids, reply)| {
+                let mut next = ids.clone();
+                next.extend_from_slice(reply);
+                next.push(sequence[0]);
+                next
+            })
+            .collect();
+        let want: Vec<Vec<usize>> = returning
+            .iter()
+            .map(|ids| alone(&stack, ids, COUNT))
+            .collect();
+        assert_ne!(want[0], want[1], "two conversations to tell apart");
+
+        let clients: Vec<(usize, Receiver<Dispatch>)> = returning
+            .iter()
+            .map(|ids| seated.seat(ids, COUNT))
+            .collect();
+        let admitted = seated.drain(usize::MAX);
+        drop(seated);
+
+        for (at, (ticket, dispatched)) in clients.iter().enumerate() {
+            let seat = admitted
+                .iter()
+                .find(|seat| seat.ticket == *ticket)
+                .unwrap_or_else(|| panic!("client {at} was never seated"));
+            assert_eq!(
+                seat.reused,
+                opened[at].len() - 1,
+                "client {at} resumed to the wrong position"
+            );
+            let (tokens, stop) = received(dispatched);
+            assert_eq!(tokens, want[at], "client {at} read the wrong slot's keys");
             assert_eq!(stop, Some(Stop::Budget), "client {at}");
         }
     }
@@ -1757,8 +1861,8 @@ mod tests {
 
         // Far enough in that the abandoned seat holds a filled prompt and a
         // token of its own, which is the state one is actually abandoned in.
-        seated.step(usize::MAX);
-        seated.step(usize::MAX);
+        let _ = seated.step(usize::MAX);
+        let _ = seated.step(usize::MAX);
         assert_eq!(seated.engine.seated(), 1);
         assert_eq!(seated.engine.waiting(), 1);
 
@@ -1766,18 +1870,18 @@ mod tests {
         // The step that notices, which is the next one to send it a token. The
         // seat is given up in that step and filled in the one after it, because
         // a slot is admitted into at the top of a step.
-        seated.step(usize::MAX);
+        let _ = seated.step(usize::MAX);
         assert_eq!(seated.engine.seated(), 0, "the abandoned seat was kept");
         assert_eq!(seated.engine.waiting(), 1);
 
-        seated.step(usize::MAX);
+        let _ = seated.step(usize::MAX);
         assert_eq!(
             (seated.engine.seated(), seated.engine.waiting()),
             (1, 0),
             "the freed slot did not take the request behind it"
         );
 
-        seated.drain(usize::MAX);
+        let _ = seated.drain(usize::MAX);
         drop(seated);
         let (tokens, stop) = received(&waiting);
         assert_eq!(tokens, want, "the request behind read the abandoned keys");
@@ -1813,7 +1917,7 @@ mod tests {
         // and this must end on the first of them.
         let mut steps = 0;
         while seated.live.contains_key(&ticket) {
-            seated.step(eos);
+            let _ = seated.step(eos);
             steps += 1;
             assert!(steps < COUNT, "the terminator did not end the turn");
         }
@@ -1829,10 +1933,10 @@ mod tests {
 
         // And the next step is the one the request behind it is seated on,
         // rather than the step after a round trip through its client.
-        seated.step(eos);
+        let _ = seated.step(eos);
         assert_eq!((seated.engine.seated(), seated.engine.waiting()), (1, 0));
 
-        seated.drain(eos);
+        let _ = seated.drain(eos);
         drop(seated);
         assert_eq!(received(&behind).1, Some(Stop::Budget));
     }
@@ -1893,7 +1997,7 @@ mod tests {
             // Every sender gone is what ends the loop.
         });
 
-        stepping(&stack.config, &stack, &generator, asked, usize::MAX, 2)
+        stepping(&stack.config, &stack, &generator, asked, usize::MAX, 2, 0)
             .expect("the loop ends when its last client does");
         client.join().expect("the client thread");
 
