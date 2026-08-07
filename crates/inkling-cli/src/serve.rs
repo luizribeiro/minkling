@@ -6,20 +6,37 @@
 //! was trained on, without which nothing puts the model in a turn it could end
 //! and every request runs to `max_tokens`.
 //!
-//! # One request at a time, and the next one waits
+//! # Two paths, and `--slots` is which
 //!
-//! The checkpoint is loaded once — 0.3 s and 0.35 GiB peak — and every request is
-//! served against it in the order it arrived. There is no batching here, and
-//! saying otherwise would be the substantial lie: continuous batching is the
-//! reason this engine exists and it is a scheduler, not a request loop.
+//! The checkpoint is loaded once — 0.3 s and 0.35 GiB peak — and served against
+//! by one of two arrangements. They are not a fast path and a slow one; they
+//! trade different things, and neither dominates.
 //!
-//! So a second client waits rather than fails. `tiny_http` accepts and parses on
-//! a thread of its own and hands requests over one at a time, so a request that
-//! arrives mid-generation is queued and answered when the one before it is
-//! finished. At 0.055 s a token that is a wait a client can sit through, and at
-//! the CPU path's 9.0 s it is a long one — honest either way.
+//! **`--slots 1`, the default: one request at a time, and a conversation kept
+//! between them.** Requests are answered in the order they arrived, and what the
+//! last one left in the cache the next one starts from — which at 16384 tokens
+//! is 33 s of prefill not paid again, and is worth more than any kernel in this
+//! tree. A second client waits rather than fails.
 //!
-//! # A request prefills what the last one did not
+//! **`--slots N`: the scheduler, and the conversation is not kept.** This is
+//! [`Continuous`], the engine the batching figures were taken on, with the
+//! socket in front of it: N requests advance together, a request that arrives
+//! mid-generation joins the batch it found rather than waiting for it to drain,
+//! and a slot a request vacates is filled from the front of the queue in the
+//! very next step.
+//!
+//! **What the second gives up is [`Kept`](crate::kept::Kept), and that is not a
+//! decision made here.** A slot's cache is the *slot's* — the device holds one
+//! span and one window pair per layer per slot, and [`Continuous`] hands every
+//! joining sequence a fresh one precisely so that it does not attend over the
+//! keys of whoever sat there before. There is no position in that arrangement
+//! for a conversation to be resumed to. So a scheduled server re-prefills every
+//! turn, and a single-slot one does not, and which of those a workload wants is
+//! the question `--slots` asks. A fleet of agents at irregular times wants the
+//! scheduler; one coding session sending its context back turn after turn wants
+//! the cache.
+//!
+//! # A request prefills what the last one did not, on the serial path
 //!
 //! A conversation comes back turn after turn with a little added each time, so a
 //! server that keeps nothing re-prefills the whole of it every turn. Whether the
@@ -36,12 +53,31 @@
 //! one. A cache that had recorded the reply would match a position in the middle
 //! of it that no mark stands at.
 //!
+//! # Threads, and where the model stays
+//!
+//! **The model never moves.** One thread owns the weights, the generator and
+//! the scheduler, and it does nothing but step: there is one device and one set
+//! of slots, so a second thread touching either would be two callers writing the
+//! same spans. Around it are connection threads, which parse a request, hand the
+//! prompt over, and then do nothing but write frames as tokens come back — none
+//! of them ever sees a weight.
+//!
+//! What travels between them is ids. A prompt goes in on [`Wanted`] and tokens
+//! come back on [`Dispatch`], one per step that decoded for that ticket, which is
+//! what lets a client see its reply as it is produced rather than when the batch
+//! it is in finishes.
+//!
+//! **And a connection thread gives its seat back however it leaves.** See
+//! [`Seat`]: a client that hangs up mid-generation is not an edge case in a
+//! fleet, it is the ordinary way a request ends, and a seat that outlived one
+//! would decode a whole budget nobody reads while the request behind it waits.
+//!
 //! # Why `tiny_http`
 //!
-//! A blocking accept loop is what a server holding one model and decoding one
-//! request at a time actually is, so an async runtime would buy an executor to
-//! hide a step behind that the process has nothing else to do during, and
-//! hiding it is not possible. `tiny_http` is MIT/Apache-2.0 over four
+//! A blocking accept loop is what this is on both paths — a connection thread
+//! waiting for tokens has nothing else to do, and an async runtime would buy an
+//! executor to hide a step behind that nothing can be hidden behind.
+//! `tiny_http` is MIT/Apache-2.0 over four
 //! transitive crates — `ascii`, `chunked_transfer`,
 //! `httpdate`, `log` — against roughly a hundred for an `axum`/`hyper`/`tokio`
 //! stack, which matters in a tree where `tokenizers` has so far been the only
@@ -61,13 +97,21 @@
 //! [`EVENT_STREAM`] for why it has to be chunked rather than a body the close of
 //! the connection ends.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use inkling_core::{Checkpoint, CheckpointWeights, Ending, Generator, Stop, Tokenizer};
+use inkling_core::schedule::Request as SeatRequest;
+use inkling_core::{
+    Checkpoint, CheckpointWeights, Continuous, Detokenizer, Ending, Generator, ModelWeights,
+    Stepped, Stop, TextConfig, Tokenizer,
+};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::args::Serve;
@@ -400,39 +444,95 @@ impl<W: Write> Body<W> {
     }
 }
 
-/// Everything a request is answered against, loaded once.
-struct Engine<'a> {
+/// A reply on its way out: the tokens decoded, routed into their channels, and
+/// framed into the body.
+///
+/// **One type for both of the ways a request is served**, because what differs
+/// between answering a request alone and answering one of eight is where the
+/// tokens come from and nothing whatever about what is done with them. A second
+/// copy of this loop is where the two paths would drift, and what a drift would
+/// look like is a client seeing `<|content_text|>` in its `content` on one of
+/// them and not the other.
+struct Turn<'a, W: Write> {
+    text: Detokenizer<'a>,
+    channels: Channels,
+    body: Body<W>,
+}
+
+impl<'a, W: Write> Turn<'a, W> {
+    fn new(shared: &'a Shared, body: Body<W>) -> Self {
+        Self {
+            text: shared.tokenizer.stream(),
+            channels: Channels::new(shared.markers.iter().cloned()),
+            body,
+        }
+    }
+
+    /// One decoded token on its way to the client, and whether the generation
+    /// should go on.
+    fn push(&mut self, id: usize) -> ControlFlow<()> {
+        match self.text.push(id as u32) {
+            Ok(decoded) => self.body.push(self.channels.route(id as u32, &decoded)),
+            Err(err) => self.body.fail(err),
+        }
+    }
+
+    /// The response finished, however the generation ended.
+    fn close(mut self, stop: Stop) -> Result<()> {
+        // Bytes the last token left half a character with, which a budget that
+        // cut the reply off mid-character has and holding back would lose, and
+        // with them the call a budget cut short.
+        let held = self.text.finish();
+        self.body.close(self.channels.finish(&held), stop)
+    }
+}
+
+/// Everything every request is answered against, and the only state a
+/// connection thread holds.
+///
+/// Read-only once the server is up, which is what lets one copy serve every
+/// thread at once: a vocabulary, the marker ids read out of it, the name the
+/// checkpoint answers to, and the budget a request that names none is served
+/// under.
+struct Shared {
     tokenizer: Tokenizer,
-    weights: &'a CheckpointWeights<'a>,
-    generator: Generator<'a>,
     markers: Vec<(u32, String, Reading)>,
     model: String,
     max_tokens: usize,
-    served: u64,
-    /// The conversation the last request left behind, which the next one either
-    /// extends or replaces.
-    kept: Kept<'a>,
+    /// How many completions have been handed out, which is what makes their ids
+    /// distinct. Atomic because on the scheduled path several connection threads
+    /// mint one at once.
+    served: AtomicU64,
 }
 
-impl Engine<'_> {
-    /// What a request that could not be understood is answered with. Its message
-    /// is the one the parser or the turn structure produced, so a client is told
-    /// which role or which field it was.
-    fn refuse(&self, request: Request, status: u16, message: &str) -> Result<()> {
-        request
-            .respond(json(status, crate::openai::error(message)))
-            .context("answering a request that was refused")
-    }
+/// A request read and understood: the ids of its prompt, what ends it, and the
+/// response it will be written into.
+struct Understood<'a, W: Write> {
+    ids: Vec<usize>,
+    ending: Ending,
+    turn: Turn<'a, W>,
+}
 
-    /// A completion, streamed or collected.
+/// What a request that could not be understood is answered with. Its message is
+/// the one the parser or the turn structure produced, so a client is told which
+/// role or which field it was.
+fn refuse(request: Request, status: u16, message: &str) -> Result<()> {
+    request
+        .respond(json(status, crate::openai::error(message)))
+        .context("answering a request that was refused")
+}
+
+impl Shared {
+    /// A completion parsed, templated and encoded, or `None` where the request
+    /// has already been refused.
     ///
-    /// Everything that can be refused is refused before the socket is taken over
-    /// for the response, so a bad request gets a status code and a message rather
-    /// than an event stream carrying an apology.
-    fn complete(&mut self, mut request: Request) -> Result<()> {
+    /// **Everything that can be refused is refused before the socket is taken
+    /// over for the response**, so a bad request gets a status code and a
+    /// message rather than an event stream carrying an apology.
+    fn understand(&self, mut request: Request) -> Result<Option<Understood<'_, Wire>>> {
         if request.body_length().is_some_and(|len| len > LARGEST_BODY) {
             let message = format!("a request body is at most {LARGEST_BODY} bytes");
-            return self.refuse(request, 413, &message);
+            return refuse(request, 413, &message).map(|()| None);
         }
 
         let mut body = String::new();
@@ -441,85 +541,424 @@ impl Engine<'_> {
             .take(LARGEST_BODY as u64)
             .read_to_string(&mut body)
         {
-            return self.refuse(
-                request,
-                400,
-                &format!("the request body is not text: {err}"),
-            );
+            let message = format!("the request body is not text: {err}");
+            return refuse(request, 400, &message).map(|()| None);
         }
 
         let asked = match ChatRequest::parse(&body) {
             Ok(asked) => asked,
-            Err(err) => return self.refuse(request, 400, &err.to_string()),
+            Err(err) => return refuse(request, 400, &err.to_string()).map(|()| None),
         };
         let prompt = match chat::prompt(&asked.messages, asked.declared()) {
             Ok(prompt) => prompt,
-            Err(err) => return self.refuse(request, 400, &RequestError::from(err).to_string()),
+            Err(err) => {
+                let message = RequestError::from(err).to_string();
+                return refuse(request, 400, &message).map(|()| None);
+            }
         };
-
         let ids: Vec<usize> = match self.tokenizer.encode(&prompt) {
             Ok(ids) => ids.into_iter().map(|id| id as usize).collect(),
-            Err(err) => return self.refuse(request, 400, &err.to_string()),
+            Err(err) => return refuse(request, 400, &err.to_string()).map(|()| None),
         };
+
+        let budget = asked.max_tokens(self.max_tokens);
         eprintln!(
-            "{COMPLETIONS} {} messages, {} prompt tokens, budget {}{}",
+            "{COMPLETIONS} {} messages, {} prompt tokens, budget {budget}{}",
             asked.messages.len(),
             ids.len(),
-            asked.max_tokens(self.max_tokens),
             if asked.stream { ", streamed" } else { "" }
         );
 
-        self.served += 1;
         let created = now();
+        let served = self.served.fetch_add(1, Ordering::Relaxed) + 1;
         // The counts are on the collected body already, and are written after
         // the last token where they are known — so `include_usage` is a question
         // only a stream has, and a client that sent it without asking for one is
         // answered with what it wanted rather than refused for how it asked.
         let completion = Completion::new(
-            format!("chatcmpl-{created}{:04}", self.served),
+            format!("chatcmpl-{created}{served:04}"),
             created,
             self.model.clone(),
             ids.len(),
         )
         .reporting_usage(asked.stream && asked.wants_usage());
-        let stops = Stops::new(asked.stopping());
-        self.generate(
-            &asked,
-            &ids,
-            Body::open(request.into_writer(), completion, asked.stream, stops)?,
-        )
-    }
 
-    /// The loop: what the last request did not already hold of the prompt
-    /// prefilled — which is [`Kept::turn`] — then a token at a time into `out`
-    /// until the model ends its turn, the budget runs out, or the client hangs
-    /// up.
-    fn generate(
-        &mut self,
-        asked: &ChatRequest,
-        ids: &[usize],
-        mut out: Body<impl Write>,
-    ) -> Result<()> {
-        let ending = Ending {
-            budget: asked.max_tokens(self.max_tokens),
-            eos: Some(self.tokenizer.eos() as usize),
+        let body = Body::open(
+            request.into_writer(),
+            completion,
+            asked.stream,
+            Stops::new(asked.stopping()),
+        )?;
+        Ok(Some(Understood {
+            ids,
+            ending: Ending {
+                budget,
+                eos: Some(self.tokenizer.eos() as usize),
+            },
+            turn: Turn::new(self, body),
+        }))
+    }
+}
+
+/// The serial path: one request at a time, and the conversation the last one
+/// left behind.
+struct Engine<'a> {
+    shared: &'a Shared,
+    weights: &'a CheckpointWeights<'a>,
+    generator: Generator<'a>,
+    /// The conversation the last request left behind, which the next one either
+    /// extends or replaces.
+    kept: Kept<'a>,
+}
+
+impl Engine<'_> {
+    /// What the last request did not already hold of the prompt prefilled —
+    /// which is [`Kept::turn`] — then a token at a time until the model ends its
+    /// turn, the budget runs out, or the client hangs up.
+    fn complete(&mut self, request: Request) -> Result<()> {
+        let Some(understood) = self.shared.understand(request)? else {
+            return Ok(());
         };
-        let mut text = self.tokenizer.stream();
-        let mut channels = Channels::new(self.markers.iter().cloned());
+        let Understood {
+            ids,
+            ending,
+            mut turn,
+        } = understood;
 
         let (weights, generator) = (self.weights, self.generator);
-        let served = self.kept.turn(&generator, weights, ids, ending, |id| {
-            match text.push(id as u32) {
-                Ok(decoded) => out.push(channels.route(id as u32, &decoded)),
-                Err(err) => out.fail(err),
+        let served = self
+            .kept
+            .turn(&generator, weights, &ids, ending, |id| turn.push(id));
+        turn.close(served.stop)
+    }
+}
+
+/// The socket a response is written down, which is what `tiny_http` hands over
+/// when the length of a body is not known before its first byte.
+type Wire = Box<dyn Write + Send>;
+
+/// What a connection thread asks the engine for, and what it tells it
+/// afterwards.
+enum Wanted {
+    /// A prompt to generate from, and where to send its tokens.
+    Seat(Seating),
+    /// A ticket nobody is waiting for any more. See [`Seat`] for why every path
+    /// out of a connection thread sends one.
+    Release(usize),
+}
+
+/// A request on its way into a slot.
+struct Seating {
+    ids: Vec<usize>,
+    budget: usize,
+    reply: Sender<Dispatch>,
+}
+
+/// What the engine sends one connection thread.
+enum Dispatch {
+    /// The ticket this request was seated under, which is the first thing it
+    /// hears and the name it gives its seat back by.
+    Seated(usize),
+    /// One token, on the step that produced it.
+    Token(usize),
+    /// The generation is over, and why.
+    Done(Stop),
+}
+
+/// A ticket the engine is holding on one connection's behalf.
+///
+/// **Every path out of a connection thread gives the ticket back**, which is
+/// the whole of what [`Drop`] is doing here: a client that hangs up, a frame
+/// that will not write, a body that would not parse, a panic unwinding — all of
+/// them leave the scope, and a seat that outlived one would go on decoding a
+/// budget nobody reads while the request behind it waits for a slot.
+///
+/// That is not an edge case under the load a scheduler exists for. A fleet of
+/// agents cancels requests; it is the ordinary way one ends.
+struct Seat<'a> {
+    ticket: usize,
+    engine: &'a Sender<Wanted>,
+}
+
+impl Drop for Seat<'_> {
+    fn drop(&mut self) {
+        // An engine that has already stopped has no seats left to give back.
+        let _ = self.engine.send(Wanted::Release(self.ticket));
+    }
+}
+
+/// Prompt rows one step carries at most, over every seat that is filling.
+///
+/// **A latency knob and not a correctness one**: it changes no token — which
+/// [`Continuous`]'s own `the_rows_a_prompt_is_fed_in_change_no_token` asserts —
+/// and what it buys is a bound on the jitter one arrival costs the sequences
+/// already decoding. A 385-token prompt fed whole makes their next token wait
+/// 2.75 s against their own 73.6 ms; spread over this budget the worst one step
+/// costs them is 725 ms, and 199 at a budget of 16. Narrower is not free either:
+/// the same prompt in 24 chunks of 16 is 4.54 s of device where whole it is
+/// 1.78.
+///
+/// 128 because that is the budget the README's fleet table was taken at, so a
+/// server run at this width is being read against a measurement of it.
+const ADMIT: usize = 128;
+
+/// How many connections a scheduled server reads at once, for each slot it has.
+///
+/// A thread here is blocked on a socket rather than on the model — it parses a
+/// request, hands the prompt over, and then does nothing but wait for tokens —
+/// so what this bounds is how many clients can be mid-request and not how much
+/// work the engine does. Two apiece: one seated and one queued behind it, which
+/// is the deepest queue a slot can drain without the engine ever standing idle.
+/// Connections past that wait in the listener's own backlog, which is where a
+/// server with a bounded number of threads has to put them.
+const READERS_A_SLOT: usize = 2;
+
+/// One connection answered against the scheduler: parse it, hand the prompt to
+/// the engine, and write frames until the tokens stop.
+fn answer(shared: &Shared, engine: &Sender<Wanted>, request: Request) -> Result<()> {
+    let Some(understood) = shared.understand(request)? else {
+        return Ok(());
+    };
+    let Understood {
+        ids,
+        ending,
+        mut turn,
+    } = understood;
+
+    // **A request wanting no tokens is answered here rather than seated.** The
+    // scheduler walks its queue past one without ever answering it — a slot held
+    // by a request that is already finished is a slot standing empty in front of
+    // the one behind it — so a client that reached it would wait for ever, where
+    // the serial path answers the same request with an empty reply. Both
+    // entrances refuse a budget of zero already, and neither of them is
+    // something this loop can see.
+    if ending.budget == 0 {
+        return turn.close(Stop::Budget);
+    }
+
+    let (reply, dispatched) = mpsc::channel();
+    let seating = Seating {
+        ids,
+        budget: ending.budget,
+        reply,
+    };
+    engine
+        .send(Wanted::Seat(seating))
+        .map_err(|_| anyhow!("the engine has stopped and cannot seat a request"))?;
+
+    // The ticket before any token, because it is the name this gives the seat
+    // back by — and from here on there is a seat to give back.
+    let seated = dispatched.recv();
+    let Ok(Dispatch::Seated(ticket)) = seated else {
+        return Err(anyhow!("the engine seated a request without saying where"));
+    };
+    let seat = Seat { ticket, engine };
+
+    // `Sink` is what a stream that simply stopped arriving is: the engine
+    // dropped the other end without saying why, which is what a released seat
+    // looks like from here.
+    let mut stop = Stop::Sink;
+    while let Ok(dispatch) = dispatched.recv() {
+        match dispatch {
+            Dispatch::Token(id) if turn.push(id).is_break() => break,
+            Dispatch::Token(_) => {}
+            Dispatch::Done(ended) => {
+                stop = ended;
+                break;
+            }
+            // Seated once, above. A second is the engine contradicting itself
+            // and there is nothing to be done with it but stop.
+            Dispatch::Seated(_) => break,
+        }
+    }
+
+    // Given back before the last frame rather than after it, so the request
+    // behind this one is admitted into the slot while this one is still
+    // writing. A panic between here and the end is a seat already returned.
+    drop(seat);
+    turn.close(stop)
+}
+
+/// The scheduler behind the socket.
+///
+/// One thread — this one — owning the weights, the generator and the slots, and
+/// doing nothing but stepping them; `readers` connection threads around it
+/// doing nothing but sockets. See the module documentation for why the model
+/// does not move.
+fn schedule(
+    config: &TextConfig,
+    shared: &Arc<Shared>,
+    weights: &impl ModelWeights,
+    generator: &Generator<'_>,
+    server: Arc<Server>,
+    slots: usize,
+) -> Result<()> {
+    let (asking, asked) = mpsc::channel::<Wanted>();
+    for _ in 0..slots * READERS_A_SLOT {
+        let (server, shared, asking) = (Arc::clone(&server), Arc::clone(shared), asking.clone());
+        std::thread::spawn(move || {
+            while let Ok(request) = server.recv() {
+                route(&shared, request, |request| {
+                    answer(&shared, &asking, request)
+                });
             }
         });
+    }
+    // The last handle this thread holds, so that the loop below sees the channel
+    // closed once every connection thread has gone rather than never.
+    drop(asking);
+    stepping(
+        config,
+        weights,
+        generator,
+        asked,
+        shared.tokenizer.eos() as usize,
+        slots,
+    )
+}
 
-        // Bytes the last token left half a character with, which a budget that
-        // cut the reply off mid-character has and holding back would lose, and
-        // with them the call a budget cut short.
-        let held = text.finish();
-        out.close(channels.finish(&held), served.stop)
+/// The loop itself: admit whatever arrived, step, and send the step's tokens to
+/// whoever is waiting for them.
+///
+/// **Apart from the threads it runs between**, so that what a test drives is
+/// this rather than a copy of it. The interleavings worth being careful about
+/// are all here — a request arriving while the engine is busy, a request
+/// arriving while it is idle, and the last client going away — and none of them
+/// is about a socket.
+fn stepping(
+    config: &TextConfig,
+    weights: &impl ModelWeights,
+    generator: &Generator<'_>,
+    asked: Receiver<Wanted>,
+    eos: usize,
+    slots: usize,
+) -> Result<()> {
+    let mut engine = Continuous::new(config, slots, ADMIT);
+    let mut live: HashMap<usize, Sender<Dispatch>> = HashMap::new();
+
+    loop {
+        // Blocked rather than spinning where there is nothing to step, which is
+        // most of what a server does. **Only where there is nothing**: an engine
+        // with a seat in it must not wait on a channel to advance it, or a
+        // request already running would stall until the next one arrived.
+        if engine.idle() {
+            match asked.recv() {
+                Ok(wanted) => take(&mut engine, &mut live, wanted),
+                // Every connection thread has gone and nothing is seated, which
+                // is the only arrangement this can stop in.
+                Err(_) => return Ok(()),
+            }
+        }
+        for wanted in asked.try_iter() {
+            take(&mut engine, &mut live, wanted);
+        }
+        // Everything that arrived may have been a release, and a step over no
+        // seats is a forward pass over no rows.
+        if engine.idle() {
+            continue;
+        }
+        let stepped = engine.step(generator, weights);
+        dispatch(&mut engine, &mut live, stepped, eos);
+    }
+}
+
+/// One thing a connection thread asked for, done.
+fn take(engine: &mut Continuous<'_>, live: &mut HashMap<usize, Sender<Dispatch>>, wanted: Wanted) {
+    match wanted {
+        Wanted::Seat(seating) => {
+            let ticket = engine.submit(SeatRequest {
+                prompt: seating.ids,
+                count: seating.budget,
+            });
+            match seating.reply.send(Dispatch::Seated(ticket)) {
+                Ok(()) => {
+                    live.insert(ticket, seating.reply);
+                }
+                // Gone before it was ever seated, so nothing will read its
+                // tokens and the slot should not be spent producing them.
+                Err(_) => {
+                    engine.release(ticket);
+                }
+            }
+        }
+        Wanted::Release(ticket) => {
+            engine.release(ticket);
+            live.remove(&ticket);
+        }
+    }
+}
+
+/// What one step produced, sent to whoever is waiting for it.
+///
+/// **The end-of-sequence id is read here rather than by the connection thread**,
+/// and that is worth a line. A scheduler stops a request when its budget runs
+/// out and knows nothing about a vocabulary, so a server that let the client's
+/// own thread notice the terminator would free the seat a round trip later —
+/// and the engine would have built another step into it by then. Read here, the
+/// slot is empty before the next step is built.
+fn dispatch(
+    engine: &mut Continuous<'_>,
+    live: &mut HashMap<usize, Sender<Dispatch>>,
+    stepped: Stepped,
+    eos: usize,
+) {
+    for (ticket, id) in &stepped.produced {
+        let Some(reply) = live.get(ticket).cloned() else {
+            continue;
+        };
+        // The terminator reaches the client like any other token, which is what
+        // the serial path does with it too: the routing knows it as a marker and
+        // shows nothing, and a sink that swallowed it would leave the two paths
+        // counting different numbers of tokens.
+        let gone = reply.send(Dispatch::Token(*id)).is_err();
+        let ended = *id == eos;
+        if ended {
+            let _ = reply.send(Dispatch::Done(Stop::EndOfSequence));
+        }
+        // A send that failed is a connection thread already gone; its own
+        // release is on its way and this only frees the seat a step sooner.
+        if ended || gone {
+            engine.release(*ticket);
+            live.remove(ticket);
+        }
+    }
+    for answered in stepped.done {
+        if let Some(reply) = live.remove(&answered.ticket) {
+            let _ = reply.send(Dispatch::Done(Stop::Budget));
+        }
+    }
+}
+
+/// Where a request goes, which is the same four answers on both paths — and
+/// what becomes of a failure, which is the same on both too.
+///
+/// **One request failing is not the server failing.** A closed connection is
+/// much the commonest way for one to, and there is either a next client waiting
+/// or a slot to give back.
+fn route(shared: &Shared, request: Request, complete: impl FnOnce(Request) -> Result<()>) {
+    let path = request
+        .url()
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let served = match (request.method(), path.as_str()) {
+        (Method::Post, COMPLETIONS) => complete(request),
+        (Method::Get, MODELS) => request
+            .respond(json(200, crate::openai::models(&shared.model, now())))
+            .context("answering a model listing"),
+        (Method::Get | Method::Post, _) => refuse(
+            request,
+            404,
+            &format!("{path} is not an endpoint this serves"),
+        ),
+        (method, _) => {
+            let message = format!("{method} is not a method this serves");
+            refuse(request, 405, &message)
+        }
+    };
+    if let Err(err) = served {
+        eprintln!("request failed: {err:#}");
     }
 }
 
@@ -554,67 +993,68 @@ pub fn run(args: &Serve) -> Result<()> {
     let gpu = backend::open(args.backend, args.numerics)?;
     eprintln!("loading {}", args.checkpoint.display());
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
+    // **The slots are asked for where the layers are wrapped**, because a slot
+    // is a span and four convolution windows in every layer and is allocated
+    // then rather than when a sequence sits in one. A server that asked the
+    // scheduler for more than this would be refused one layer down.
     let weights = backend::weights(
         gpu.as_ref(),
         &checkpoint,
         &config.text_config,
         speculation,
-        1,
+        args.slots,
     )?;
     let generator = weights.generator();
 
-    let mut engine = Engine {
+    let shared = Arc::new(Shared {
         tokenizer,
-        weights: &weights,
-        generator,
         markers,
         model: model_name(&args.checkpoint),
         max_tokens: args.max_tokens,
-        served: 0,
-        kept: Kept::new(&config.text_config, args.reuse_tokens),
-    };
+        served: AtomicU64::new(0),
+    });
 
     let server = Server::http(&args.address)
         .map_err(|err| anyhow!("cannot listen on {}: {err}", args.address))?;
     eprintln!(
-        "serving {} on http://{}, one request at a time",
-        engine.model,
-        server.server_addr()
+        "serving {} on http://{}, {}",
+        shared.model,
+        server.server_addr(),
+        match args.slots {
+            1 => "one request at a time, keeping the conversation between them".to_string(),
+            slots => format!("{slots} requests at a time, keeping no conversation"),
+        }
     );
 
+    if args.slots > 1 {
+        return schedule(
+            &config.text_config,
+            &shared,
+            &weights,
+            &generator,
+            Arc::new(server),
+            args.slots,
+        );
+    }
+
+    let mut engine = Engine {
+        shared: &shared,
+        weights: &weights,
+        generator,
+        kept: Kept::new(&config.text_config, args.reuse_tokens),
+    };
     for request in server.incoming_requests() {
-        let path = request
-            .url()
-            .split('?')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        let served = match (request.method(), path.as_str()) {
-            (Method::Post, COMPLETIONS) => engine.complete(request),
-            (Method::Get, MODELS) => request
-                .respond(json(200, crate::openai::models(&engine.model, now())))
-                .context("answering a model listing"),
-            (Method::Get | Method::Post, _) => engine.refuse(
-                request,
-                404,
-                &format!("{path} is not an endpoint this serves"),
-            ),
-            (method, _) => {
-                let message = format!("{method} is not a method this serves");
-                engine.refuse(request, 405, &message)
-            }
-        };
-        // One request failing is not the server failing. A closed connection is
-        // the commonest way for one to, and the next client is still waiting.
-        if let Err(err) = served {
-            eprintln!("request failed: {err:#}");
-        }
+        route(&shared, request, |request| engine.complete(request));
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use inkling_core::fixture::Stack;
+    use inkling_core::head::LmHead;
+    use inkling_core::ops::DenseProjection;
+
     use super::*;
     use crate::chat::text;
     use crate::wire::{dechunked, delta, frames, payload, payloads};
@@ -1156,6 +1596,346 @@ mod tests {
     fn a_budget_that_ran_out_mid_call_is_still_a_budget_that_ran_out() {
         assert_eq!(finish(Stop::Budget, true), Finish::Length);
         assert_eq!(finish(Stop::Sink, true), Finish::Length);
+    }
+
+    /// The scheduler over the synthetic stack, with the pieces `schedule` holds
+    /// around it. Everything below drives the same three functions the server
+    /// does — [`take`], [`Continuous::step`] and [`dispatch`] — because a test
+    /// that drove its own loop would be testing its own loop.
+    struct Seated<'a> {
+        engine: Continuous<'a>,
+        live: HashMap<usize, Sender<Dispatch>>,
+        stack: &'a Stack,
+        head: &'a DenseProjection<'a>,
+    }
+
+    /// How many tokens the cases below ask for.
+    const COUNT: usize = 4;
+
+    impl<'a> Seated<'a> {
+        fn new(stack: &'a Stack, head: &'a DenseProjection<'a>, slots: usize) -> Self {
+            Self {
+                engine: Continuous::new(&stack.config, slots, 2),
+                live: HashMap::new(),
+                stack,
+                head,
+            }
+        }
+
+        fn generator(&self) -> Generator<'a> {
+            Generator::new(
+                self.stack.model(),
+                LmHead::for_config(&self.stack.config),
+                self.head,
+            )
+        }
+
+        /// A request handed over the way a connection thread hands one over, and
+        /// the ticket and the receiving end it gets back.
+        fn seat(&mut self, prompt: &[usize], budget: usize) -> (usize, Receiver<Dispatch>) {
+            let (reply, dispatched) = mpsc::channel();
+            let seating = Seating {
+                ids: prompt.to_vec(),
+                budget,
+                reply,
+            };
+            take(&mut self.engine, &mut self.live, Wanted::Seat(seating));
+            match dispatched.recv() {
+                Ok(Dispatch::Seated(ticket)) => (ticket, dispatched),
+                other => panic!("the engine seated nothing: {:?}", other.is_ok()),
+            }
+        }
+
+        /// One step, and everything it produced sent on.
+        fn step(&mut self, eos: usize) {
+            let generator = self.generator();
+            let stepped = self.engine.step(&generator, self.stack);
+            dispatch(&mut self.engine, &mut self.live, stepped, eos);
+        }
+
+        /// The engine run until it has nothing left.
+        fn drain(&mut self, eos: usize) {
+            while !self.engine.idle() {
+                self.step(eos);
+            }
+        }
+    }
+
+    /// What one client saw: its tokens, and how it was told the turn ended.
+    fn received(dispatched: &Receiver<Dispatch>) -> (Vec<usize>, Option<Stop>) {
+        let mut tokens = Vec::new();
+        while let Ok(dispatch) = dispatched.recv() {
+            match dispatch {
+                Dispatch::Token(id) => tokens.push(id),
+                Dispatch::Done(stop) => return (tokens, Some(stop)),
+                Dispatch::Seated(ticket) => panic!("seated twice, as {ticket}"),
+            }
+        }
+        (tokens, None)
+    }
+
+    /// The same generation run alone, which is what a client's tokens are held
+    /// against.
+    fn alone(stack: &Stack, prompt: &[usize], count: usize) -> Vec<usize> {
+        let head = stack.head();
+        let generator = Generator::new(stack.model(), LmHead::for_config(&stack.config), &head);
+        generator.generate(
+            &mut inkling_core::ModelCache::new(&stack.config),
+            prompt,
+            count,
+            stack,
+        )
+    }
+
+    /// **Two clients at once, each sent its own request's tokens and nobody
+    /// else's.** This is the whole of what wiring the socket to the scheduler
+    /// has to get right on the way back: the engine produces a step's worth of
+    /// tokens for every seat at once, and which connection each belongs to is a
+    /// lookup that could be wrong in a way that reads as a plausible reply.
+    ///
+    /// Held against each generation run alone, so it says the tokens are right
+    /// and not only that the two clients got different ones.
+    #[test]
+    fn two_clients_are_each_sent_the_tokens_of_their_own_request() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let sequence = stack.sequence();
+        let prompts = [sequence[..3].to_vec(), sequence[3..].to_vec()];
+        let want: Vec<Vec<usize>> = prompts
+            .iter()
+            .map(|prompt| alone(&stack, prompt, COUNT))
+            .collect();
+        assert_ne!(want[0], want[1], "two generations to tell apart");
+
+        let mut seated = Seated::new(&stack, &head, 2);
+        let clients: Vec<(usize, Receiver<Dispatch>)> = prompts
+            .iter()
+            .map(|prompt| seated.seat(prompt, COUNT))
+            .collect();
+
+        // An id the synthetic stack cannot produce, so nothing here ends on a
+        // terminator and every request ends on its budget.
+        seated.drain(usize::MAX);
+        drop(seated);
+
+        for (at, (_, dispatched)) in clients.iter().enumerate() {
+            let (tokens, stop) = received(dispatched);
+            assert_eq!(tokens, want[at], "client {at}");
+            assert_eq!(stop, Some(Stop::Budget), "client {at}");
+        }
+    }
+
+    /// **A client that hung up frees its slot, and the request behind it is
+    /// admitted into the slot it left.** A seat held for a connection that has
+    /// gone decodes a whole budget nobody reads, and under the load a scheduler
+    /// exists for that is not an edge case.
+    ///
+    /// The hanging up here is the receiving end going away, which is what a
+    /// connection thread leaving its scope does — see [`Seat`], which is the
+    /// other end of the same event.
+    #[test]
+    fn a_client_that_hung_up_frees_its_slot_for_the_request_behind_it() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let sequence = stack.sequence();
+        let (abandoned, behind) = (sequence[..3].to_vec(), sequence[3..].to_vec());
+        let want = alone(&stack, &behind, COUNT);
+
+        let mut seated = Seated::new(&stack, &head, 1);
+        let (_, gone) = seated.seat(&abandoned, COUNT);
+        let (_, waiting) = seated.seat(&behind, COUNT);
+
+        // Far enough in that the abandoned seat holds a filled prompt and a
+        // token of its own, which is the state one is actually abandoned in.
+        seated.step(usize::MAX);
+        seated.step(usize::MAX);
+        assert_eq!(seated.engine.seated(), 1);
+        assert_eq!(seated.engine.waiting(), 1);
+
+        drop(gone);
+        // The step that notices, which is the next one to send it a token. The
+        // seat is given up in that step and filled in the one after it, because
+        // a slot is admitted into at the top of a step.
+        seated.step(usize::MAX);
+        assert_eq!(seated.engine.seated(), 0, "the abandoned seat was kept");
+        assert_eq!(seated.engine.waiting(), 1);
+
+        seated.step(usize::MAX);
+        assert_eq!(
+            (seated.engine.seated(), seated.engine.waiting()),
+            (1, 0),
+            "the freed slot did not take the request behind it"
+        );
+
+        seated.drain(usize::MAX);
+        drop(seated);
+        let (tokens, stop) = received(&waiting);
+        assert_eq!(tokens, want, "the request behind read the abandoned keys");
+        assert_eq!(stop, Some(Stop::Budget));
+    }
+
+    /// **The terminator frees the seat on the step that produced it**, rather
+    /// than a round trip later.
+    ///
+    /// The scheduler stops a request when its budget runs out and knows nothing
+    /// about a vocabulary, so a server that left the client's own thread to
+    /// notice the end of a turn would give the seat back after the engine had
+    /// already built another step into it. Asserted as the slot being free
+    /// before the next step: the request behind is seated on it.
+    #[test]
+    fn a_turn_the_model_ended_frees_its_seat_before_the_next_step() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let sequence = stack.sequence();
+        let (first, second) = (sequence[..3].to_vec(), sequence[3..].to_vec());
+
+        // The stack's own first token for this prompt, used as the id that ends
+        // a turn — so the terminator arrives on the first decode step rather
+        // than at a budget nothing here would reach.
+        let eos = alone(&stack, &first, 1)[0];
+
+        let mut seated = Seated::new(&stack, &head, 1);
+        let (ticket, ending) = seated.seat(&first, COUNT);
+        let (_, behind) = seated.seat(&second, COUNT);
+
+        // Up to and including the step that decodes the terminator, which is
+        // the first step to produce anything at all. The budget is four tokens
+        // and this must end on the first of them.
+        let mut steps = 0;
+        while seated.live.contains_key(&ticket) {
+            seated.step(eos);
+            steps += 1;
+            assert!(steps < COUNT, "the terminator did not end the turn");
+        }
+        assert_eq!(
+            (seated.engine.seated(), seated.engine.waiting()),
+            (0, 1),
+            "the ended turn kept its seat"
+        );
+
+        let (tokens, stop) = received(&ending);
+        assert_eq!(tokens, [eos], "the terminator reaches the client");
+        assert_eq!(stop, Some(Stop::EndOfSequence));
+
+        // And the next step is the one the request behind it is seated on,
+        // rather than the step after a round trip through its client.
+        seated.step(eos);
+        assert_eq!((seated.engine.seated(), seated.engine.waiting()), (1, 0));
+
+        seated.drain(eos);
+        drop(seated);
+        assert_eq!(received(&behind).1, Some(Stop::Budget));
+    }
+
+    /// **The loop itself, driven across a thread boundary.** Everything above
+    /// calls [`take`] and [`dispatch`] straight, which is the loop's pieces and
+    /// not the loop: what [`stepping`] adds is *when* it blocks, and a scheduler
+    /// that blocked at the wrong moment would stall a request already running
+    /// until an unrelated one happened to arrive.
+    ///
+    /// So the requests are submitted from another thread, and the second is
+    /// submitted only after the first has produced a token — which is the
+    /// interleaving that matters, a request arriving while the engine is busy
+    /// rather than while it is waiting. The loop returns when the last sender is
+    /// dropped, and that it returns at all is half of what this asserts.
+    #[test]
+    fn the_loop_answers_a_request_that_arrives_while_it_is_already_running() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let generator = Generator::new(stack.model(), LmHead::for_config(&stack.config), &head);
+        let sequence = stack.sequence();
+        let prompts = [sequence[..3].to_vec(), sequence[3..].to_vec()];
+        let want: Vec<Vec<usize>> = prompts
+            .iter()
+            .map(|prompt| alone(&stack, prompt, COUNT))
+            .collect();
+        assert_ne!(want[0], want[1], "two generations to tell apart");
+
+        let (asking, asked) = mpsc::channel();
+        let (first, listening) = mpsc::channel();
+        let (second, joining) = mpsc::channel();
+
+        let client = std::thread::spawn(move || {
+            let seat = |prompt: &[usize]| {
+                let (reply, dispatched) = mpsc::channel();
+                let seating = Seating {
+                    ids: prompt.to_vec(),
+                    budget: COUNT,
+                    reply,
+                };
+                asking
+                    .send(Wanted::Seat(seating))
+                    .expect("the engine is up");
+                match dispatched.recv() {
+                    Ok(Dispatch::Seated(_)) => dispatched,
+                    _ => panic!("the engine seated nothing"),
+                }
+            };
+
+            let one = seat(&prompts[0]);
+            // Not until the engine has actually produced something, so the
+            // second request joins a batch that is running.
+            let started = one.recv().expect("a first token");
+            let two = seat(&prompts[1]);
+
+            first.send((started, received(&one))).expect("a listener");
+            second.send(received(&two)).expect("a listener");
+            // Every sender gone is what ends the loop.
+        });
+
+        stepping(&stack.config, &stack, &generator, asked, usize::MAX, 2)
+            .expect("the loop ends when its last client does");
+        client.join().expect("the client thread");
+
+        let (started, (rest, stop)) = listening.recv().expect("the first request");
+        let Dispatch::Token(opened) = started else {
+            panic!("the first request ended before it began")
+        };
+        let mut tokens = vec![opened];
+        tokens.extend(rest);
+        assert_eq!(tokens, want[0], "the request that was already running");
+        assert_eq!(stop, Some(Stop::Budget));
+
+        let (tokens, stop) = joining.recv().expect("the second request");
+        assert_eq!(tokens, want[1], "the request that joined it");
+        assert_eq!(stop, Some(Stop::Budget));
+    }
+
+    /// **There is no path out of a connection thread that does not give the
+    /// ticket back.** A write that fails, a body that would not parse, a client
+    /// that hung up, a panic unwinding — a seat that survived any of them is a
+    /// slot decoding a budget nobody reads.
+    ///
+    /// The panic is the case a guard exists for, because it is the one no
+    /// `return` covers.
+    #[test]
+    fn every_way_out_of_a_connection_gives_the_seat_back() {
+        let (engine, asked) = mpsc::channel();
+
+        let leaving = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _seat = Seat {
+                ticket: 7,
+                engine: &engine,
+            };
+            panic!("a connection thread came apart");
+        }));
+        assert!(leaving.is_err(), "the panic was swallowed");
+
+        {
+            let _seat = Seat {
+                ticket: 9,
+                engine: &engine,
+            };
+        }
+
+        let given: Vec<usize> = asked
+            .try_iter()
+            .map(|wanted| match wanted {
+                Wanted::Release(ticket) => ticket,
+                Wanted::Seat(_) => panic!("a seat asked for rather than given back"),
+            })
+            .collect();
+        assert_eq!(given, [7, 9]);
     }
 
     /// The name a model is listed and answered under is the directory it came

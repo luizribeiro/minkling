@@ -115,7 +115,23 @@ pub struct Serve {
     /// for a server that keeps nothing — which is the arm every figure for this
     /// is measured against.
     pub reuse_tokens: usize,
+    /// How many requests the engine advances together.
+    ///
+    /// One is a server that answers in the order the requests arrived and keeps
+    /// a conversation between them; more is the scheduler, which does neither.
+    /// See [`crate::serve`], where what the two paths are is stated.
+    pub slots: usize,
 }
+
+/// How many requests `serve` advances together when nobody says.
+///
+/// **One, which is the serial path and not a scheduler of width one.** The two
+/// differ in what they can do besides batch — a slot's cache belongs to the slot
+/// and is fresh at every handover, so an engine of any width forgets the
+/// conversation between turns, and keeping it is worth more than any kernel in
+/// this tree. A default that quietly gave that up to reach a batch nobody asked
+/// for would be a default that made the common case slower.
+pub const DEFAULT_SLOTS: usize = 1;
 
 /// How many tokens `generate` decodes when the caller names no budget.
 ///
@@ -163,7 +179,7 @@ pub fn usage() -> String {
             [--backend cpu|metal] [--numerics {numerics}] [--speculate <k>]\n  \
         inklingrs serve <checkpoint-dir> [--address <host:port>] [--max-tokens <n>] \
             [--backend cpu|metal] [--numerics {numerics}] \
-            [--reuse-tokens <n>]"
+            [--reuse-tokens <n>] [--slots <n>]"
     )
 }
 
@@ -328,11 +344,13 @@ fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
     let mut backend = Backend::default();
     let mut asked = None;
     let mut reuse_tokens = DEFAULT_BOUND;
+    let mut slots = DEFAULT_SLOTS;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--address" | "-a" => address = value(&arg, &mut args)?,
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
+            "--slots" => slots = count(&arg, &mut args)?,
             "--reuse-tokens" => reuse_tokens = zeroable(&arg, &mut args, ArgError::NotABound)?,
             "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
             "--numerics" => asked = Some(numerics(&arg, &mut args)?),
@@ -352,6 +370,7 @@ fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
         backend,
         numerics: on_device(backend, asked)?,
         reuse_tokens,
+        slots,
     }))
 }
 
@@ -835,7 +854,28 @@ mod tests {
                 backend: Backend::Metal,
                 numerics: Numerics::Reference,
                 reuse_tokens: DEFAULT_BOUND,
+                slots: DEFAULT_SLOTS,
             })
+        );
+    }
+
+    /// The flag that reaches the scheduler. One is the serial path and its kept
+    /// conversation, which is what a server that says nothing gets.
+    #[test]
+    fn serve_takes_the_slots_the_engine_advances_together() {
+        assert_eq!(
+            serving(&["serve", "models/small"]).map(|it| it.slots),
+            Ok(1)
+        );
+        assert_eq!(
+            serving(&["serve", "models/small", "--slots", "8"]).map(|it| it.slots),
+            Ok(8)
+        );
+        // An engine with no slots seats nobody, which the scheduler refuses one
+        // layer down and a command line should refuse before it loads 16.7 GiB.
+        assert_eq!(
+            serving(&["serve", "models/small", "--slots", "0"]),
+            Err(ArgError::NotACount("0".to_string()))
         );
     }
 
