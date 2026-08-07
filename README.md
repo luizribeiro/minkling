@@ -1384,8 +1384,10 @@ batching would rather not print.**
   finishes late together, where running groups to completion finishes the early
   groups early. The tail is a tie at the two loaded shapes — 101.5 against 101.2
   and 87.0 against 86.4 — because the last request out is the last request out
-  either way. **A fleet that is judged on when its answers land, rather than on
-  when they start, is a fleet a static batch serves as well or better.**
+  either way; at the light shape it goes to draining too, 27.6 against 35.7,
+  which is the same effect with fewer requests to hide it. **A fleet that is
+  judged on when its answers land, rather than on when they start, is a fleet a
+  static batch serves as well or better.**
 - **The throughput is the same and B1's bound holds exactly as stated.** 50.3
   against 50.2, 50.2 against 48.9, 46.3 against 42.3 — the light shape is the
   only one where continuous is ahead, by 9.5%, and it is ahead there because a
