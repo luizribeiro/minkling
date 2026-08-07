@@ -70,6 +70,8 @@ three; the pre-commit hooks already skip clippy on those by config.
     just bench HEAD~1 .    prefill --tokens 769
     just bench v1 v2       sweep --depth 4
     just bench . .         batch --batch 32   # what a token costs at each width
+    just bench . .         joining --batch 8  # what a request waits to join one
+    just bench . .         fleet --every 200  # N agents, and the distribution
     just bench-engines                        # this engine against mlx-vlm
     just bench-session                        # a conversation, kept against not
 
@@ -92,7 +94,7 @@ ref is built once into `target/bench/bin/<sha>` and kept, and the pairs are
 process launches against binaries that already exist. `.` is the working tree,
 which is the arm a change is measured from before it is a commit at all.
 
-**And two of them measure more than one request, in the two ways there are.**
+**And four of them measure more than one request, in the ways there are.**
 `just bench-session` is a conversation — several turns, each adding a question
 and each answered — because a cache kept between requests is worth nothing on a
 measurement of one call, which has no between. See "What a conversation costs
@@ -100,6 +102,15 @@ when its cache is kept". `bench batch` is several requests *at once* rather than
 one after another, which is the other thing a single call cannot say: what a
 token costs when the weights a step reads are read for N sequences instead of
 one. See "One weight read, many tokens".
+
+**`bench joining` and `bench fleet` are the two whose subject is a wait rather
+than a rate**, and they are the only rows here whose figure is a wall the device
+clock cannot stand in for: what a request waits for its first token when a batch
+is already running, and the distribution of that over a fleet of them arriving on
+their own schedule. Both run the same engine under two admission policies — into
+a free slot, or only into one that has drained — so what differs between their
+two arms is the policy and not two implementations. See "A slot that fills when a
+request arrives".
 
 The five things it measures are the five this file quotes: a decode step, a
 prefill at a given length, what a token costs as more sequences are decoded
