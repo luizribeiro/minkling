@@ -111,6 +111,23 @@ pub struct RoundTrip {
     /// What the GPU was executing it for, which is the only part of a round trip
     /// that is the model's arithmetic.
     pub executed: Duration,
+    /// How long the GPU ran nothing of this queue's between the buffer before
+    /// this one finishing and this one starting.
+    ///
+    /// **The one column here that is about the gaps rather than about the
+    /// buffers**, and the only one that says whether a wall a duty cycle cannot
+    /// see is the device standing still. `scheduled` and `queued` are each
+    /// buffer's own life and they *overlap* between buffers in flight — a
+    /// caller that commits three and waits for the third has three queue
+    /// intervals covering one stretch of clock, so their sum is not a share of
+    /// anything. These do not overlap: the queue executes one buffer at a time,
+    /// so the gaps between them and the executions between them tile the round.
+    ///
+    /// Nothing for the first buffer after recording was switched on, which has
+    /// no buffer before it to be idle since, and nothing after one whose own
+    /// clock the device never reported — see [`Device::idle_before`], where the
+    /// cases are.
+    pub idle: Duration,
 }
 
 impl RoundTrip {
@@ -152,6 +169,15 @@ pub struct Device {
     /// that nobody is measuring would otherwise grow a record per submission for
     /// as long as it runs.
     round_trips: RefCell<Option<Vec<RoundTrip>>>,
+    /// When the last recorded command buffer stopped executing, on the GPU's
+    /// own clock, which is what [`RoundTrip::idle`] is measured from.
+    ///
+    /// **An `Option` rather than a zero, because zero is a reading this device
+    /// gives.** A command buffer the watchdog killed completes with no
+    /// timestamps at all — see [`crate::Submitted::wait`], which is where that
+    /// error arrives — so a sentinel spelled `0.0` would be indistinguishable
+    /// from the buffer most likely to have a long gap after it.
+    finished: Cell<Option<f64>>,
 }
 
 impl Device {
@@ -170,6 +196,7 @@ impl Device {
             allocated_bytes: Cell::new(0),
             timestamps: RefCell::new(None),
             round_trips: RefCell::new(None),
+            finished: Cell::new(None),
         })
     }
 
@@ -226,6 +253,7 @@ impl Device {
     /// once and serves a whole process runs for a long time.
     pub fn record_round_trips(&self, recording: bool) {
         *self.round_trips.borrow_mut() = recording.then(Vec::new);
+        self.finished.set(None);
     }
 
     /// Every round trip since [`Device::record_round_trips`] was switched on,
@@ -235,9 +263,30 @@ impl Device {
     /// caller measuring one step of a loop wants that step rather than the run
     /// so far.
     pub fn round_trips(&self) -> Vec<RoundTrip> {
+        // Cleared with the records, so that the first buffer of the next stretch
+        // is not called idle since one the caller has already been handed.
+        self.finished.set(None);
         match self.round_trips.borrow_mut().as_mut() {
             None => Vec::new(),
             Some(taken) => std::mem::take(taken),
+        }
+    }
+
+    /// How long the GPU ran nothing of this queue's before a buffer that started
+    /// at `started`, and that buffer's end remembered for the next one.
+    ///
+    /// **Nothing, in each of the three cases where the gap is not a gap this
+    /// can see** — and each of them is a gap this must not invent rather than
+    /// one it may round to zero. No buffer recorded since the record was
+    /// cleared, so the clock it would measure from belongs to the caller's
+    /// previous stretch. A buffer whose own clock the device never reported,
+    /// which leaves the next one nothing to measure from. And two readings the
+    /// wrong way round, which the driver's clock may give in its last
+    /// microsecond.
+    pub(crate) fn idle_before(&self, started: f64, ended: f64) -> Duration {
+        match self.finished.replace((ended > 0.0).then_some(ended)) {
+            Some(since) if started > since => Duration::from_secs_f64(started - since),
+            _ => Duration::ZERO,
         }
     }
 
@@ -369,6 +418,11 @@ mod tests {
     /// panicking on a negative interval: the wall time is `Instant`'s clock and
     /// the other three are the driver's, so the two disagree in the last
     /// microsecond by construction.
+    ///
+    /// **The gap before the buffer is not one of the three**, which is what the
+    /// 5 ms here says: it is time before this wait began and charging it to a
+    /// wait it is not inside would make the remainder negative in exactly the
+    /// case the remainder exists to describe.
     #[test]
     fn a_round_trips_unattributed_time_is_what_its_three_parts_leave_over() {
         let trip = |waited: u64| RoundTrip {
@@ -377,6 +431,7 @@ mod tests {
             scheduled: Duration::from_micros(100),
             queued: Duration::from_micros(60),
             executed: Duration::from_micros(600),
+            idle: Duration::from_micros(5000),
         };
         assert_eq!(trip(1000).unattributed(), Duration::from_micros(240));
         assert_eq!(trip(700).unattributed(), Duration::ZERO);
@@ -410,6 +465,73 @@ mod tests {
         device.record_round_trips(false);
         run();
         assert!(device.round_trips().is_empty(), "recording stopped");
+    }
+
+    /// **A gap is between two buffers, so the first of a stretch has none** —
+    /// and the clock it would otherwise be measured from is a buffer the caller
+    /// has already been handed, which would charge the time between two
+    /// measurements to the second of them.
+    ///
+    /// The second dispatch's gap is asserted only to exist. **It is not bounded
+    /// by that buffer's own wait and must not be asserted to be**: the gap opens
+    /// when the buffer before it finished, which is before this one was
+    /// committed — so it covers the caller's own encoding as well as anything
+    /// the driver added, and a two-dispatch test spends more clock there than
+    /// inside either wait.
+    #[test]
+    fn the_first_buffer_of_a_recorded_stretch_is_idle_since_nothing() {
+        let Some(device) = device() else { return };
+        let mut empty = crate::testing::EmptyDispatch::new(&device);
+        let mut run = || empty.cost(&device, 1, crate::kernel::Grid::new(1, 1));
+
+        device.record_round_trips(true);
+        run();
+        run();
+        let recorded = device.round_trips();
+        assert_eq!(recorded[0].idle, Duration::ZERO, "{recorded:?}");
+        assert!(recorded[1].idle > Duration::ZERO, "{recorded:?}");
+
+        // And the reading clears it, so the next stretch opens the same way.
+        run();
+        run();
+        let next = device.round_trips();
+        assert_eq!(next[0].idle, Duration::ZERO, "{next:?}");
+        device.record_round_trips(false);
+    }
+
+    /// **A buffer that reported no clock leaves the next one nothing to measure
+    /// from**, which is the case a sentinel spelled `0.0` gets wrong in the one
+    /// direction that matters: the watchdog kills a command buffer that ran too
+    /// long, it completes with zero timestamps, and the buffer after it is the
+    /// one most likely to have a long gap in front of it. Reported as no gap it
+    /// would be an invented zero; measured from that zero it would be the whole
+    /// age of the machine.
+    ///
+    /// Driven against the clock directly rather than through a dispatch,
+    /// because a timed-out buffer is not a thing a test may ask this device for.
+    #[test]
+    fn a_buffer_that_reported_no_clock_is_not_a_gap_the_next_one_is_measured_from() {
+        let Some(device) = device() else { return };
+        device.record_round_trips(true);
+
+        assert_eq!(device.idle_before(4.0, 5.0), Duration::ZERO, "no baseline");
+        assert_eq!(
+            device.idle_before(6.0, 7.0),
+            Duration::from_secs_f64(1.0),
+            "6.0 is a second after the 5.0 before it"
+        );
+        // The watchdog's buffer: it neither reports a gap nor becomes one.
+        assert_eq!(device.idle_before(0.0, 0.0), Duration::ZERO, "no clock");
+        assert_eq!(
+            device.idle_before(400.0, 401.0),
+            Duration::ZERO,
+            "measured from a clock that was never read"
+        );
+        // And two readings the wrong way round are no gap rather than a
+        // negative one, which `Duration::from_secs_f64` would panic on.
+        assert_eq!(device.idle_before(400.5, 402.0), Duration::ZERO);
+
+        device.record_round_trips(false);
     }
 
     /// Every buffer is counted once, however it was asked for — and an

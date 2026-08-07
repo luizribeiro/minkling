@@ -579,6 +579,9 @@ impl Submitted<'_> {
             ),
             queued: since(self.commands.kernelEndTime(), self.commands.GPUStartTime()),
             executed,
+            idle: self
+                .device
+                .idle_before(self.commands.GPUStartTime(), self.commands.GPUEndTime()),
         }
     }
 }
