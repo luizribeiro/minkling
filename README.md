@@ -1225,7 +1225,432 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## The heads the engine ships, and the cell that turned out to be the other checkpoint
+
+**C4's sweep was taken on heads this engine does not ship.**
+`models/Inkling-Small-mxfp4` carries its MTP shard in the bfloat16 every
+quantiser left alone — 4.157 GiB — and `models/Inkling-Small-mxfp4-mtp4` is the
+same 131 GB stack behind forty symlinks with those heads packed into the format
+the stack is already in, 1.105 GiB. Four sections of this file quote the second
+checkpoint's acceptance. **C4's whole width × depth sweep ran against the
+first**, which is the half of "do speculation and batching multiply" that
+speculation lives or dies on.
+
+So it is re-taken with both checkpoints in one sitting, three alternating pairs
+with the order flipped each pair —
+`BENCH_PAIRS=3 just bench-weights models/Inkling-Small-mxfp4
+models/Inkling-Small-mxfp4-mtp4 batch --batch 32 --depth 3`. **Every table here
+names its checkpoint**, because a row that did not is what let three milestones
+be read as one measurement.
+
+**C4's conclusion survives, its crossover moves by one width, and the one cell
+it could not attribute was the bfloat16 heads.** Speculation still stops paying
+at a width and the loss still deepens past it; the last width that pays is
+**3 on the shipped heads and 2 on C4's**. And batch 32 at `k = 3` reads 0.860×
+its own `k = 0` on the shipped heads where C4 read 0.336 — because 0.87 s a
+round of that cell was the driver scheduling command buffers that name 4.157
+GiB of bfloat16, and the GPU standing still while it did.
+
+**So the heads' format is a scheduling decision and not only a bandwidth one,
+and that is the line to carry out of here.** At that cell the two shards issue
+the same 993 and 988 dispatches in the same 43.3 and 42.4 submissions over the
+same 1160 and 1153 allocations, and the driver spends **1008.7 ms a round on one
+against 37.6 on the other**. No parameter count predicts that and neither does
+the device's own clock, which prices the cell at 1.30× where the wall pays
+**2.51×**. Anyone weighing a checkpoint's heads on bytes or on device time is
+under-reading the batched, speculating corner by a factor of two — and the fix
+is `just quantize-mtp`, which is minutes and 1.105 GiB.
+
+### The acceptance question, answered by putting the two beside each other
+
+The acceptance four sections of this file quote and the acceptance C4 measured
+are **one generation through two sets of heads**, and one sitting says so. At
+batch 1, which is the unbatched shape both were taken at:
+
+    checkpoint                        k = 1     k = 2          k = 3
+    models/Inkling-Small-mxfp4       84.85%   91.30 73.91   84.21 73.68 63.16
+    models/Inkling-Small-mxfp4-mtp4  84.85    86.96 78.26   85.00 65.00 55.00
+
+The second row is `84.85 / 86.96-78.26 / 85-65-55` digit for digit, which is
+what this file has quoted since "Quantising the heads" and what C4 could match
+against neither of its binaries. **It is not a drift and it never was**: both of
+C4's binaries were reading the bfloat16 shard, and the figure they disagreed
+with was taken on the packed one. C4's paragraph calling it a drift is corrected
+where it stands.
+
+### C4's sweep, re-taken
+
+    tokens/second, the wall — three alternating pairs, means
+    models/Inkling-Small-mxfp4-mtp4, the packed heads the engine ships
+    width      k = 0    k = 1    k = 2    k = 3
+        1       60.37    65.84    66.38    66.87
+        2       78.10    90.92    81.47    77.26
+        3       85.76    91.21    86.22    84.79
+        4      107.33   103.99    97.71    91.27
+        8      118.12   110.53   102.38    94.55
+       16      126.22   114.73   103.25    88.36
+       32      130.49   110.56   125.19   112.29
+
+    models/Inkling-Small-mxfp4, the bfloat16 heads C4 measured
+    width      k = 0    k = 1    k = 2    k = 3
+        1       60.33    61.33    58.57    59.63
+        2       77.72    83.44    71.05    66.88
+        3       85.88    83.69    74.36    73.89
+        4      107.27    95.19    87.03    78.28
+        8      118.17    99.19    88.10    78.15
+       16      126.38   104.42    89.04    70.80
+       32      129.60   101.98   100.90    44.76
+
+Width 3 is a second sitting of the same pairing at `--batch 3`. **The sixteen
+cells the two sittings share agree to 0.8% at fifteen of them**, and the
+sixteenth is the bfloat16 arm's batch 2 at `k = 2` — 71.05 against 69.86, 1.7%
+— which is what this file already records as a drift inside one sitting on this
+host.
+
+**C4's own bfloat16 rows reproduce.** Its `k = 0` column reads 60.7, 78.4,
+107.9, 119.5, 129.0 and 131.1 against this sitting's 60.33, 77.72, 107.27,
+118.17, 126.38 and 129.60 — 0.6 to 2.0% low, every width the same direction,
+which is a sitting apart and not a change — and its batch 32 `k = 3` reads 44.1
+against 44.76.
+
+    against the width's own k = 0
+            …-mxfp4-mtp4, packed        …-mxfp4, bfloat16
+    width   k = 1  k = 2  k = 3        k = 1  k = 2  k = 3
+        1   1.091  1.100  1.108        1.017  0.971  0.989
+        2   1.164  1.043  0.989        1.074  0.914  0.860
+        3   1.064  1.005  0.989        0.975  0.866  0.860
+        4   0.969  0.910  0.850        0.887  0.811  0.730
+        8   0.936  0.867  0.800        0.839  0.746  0.661
+       16   0.909  0.818  0.700        0.826  0.705  0.560
+       32   0.847  0.959  0.860        0.787  0.779  0.345
+
+**Every column here is divided by a figure in the same column's own table**,
+which is the only division a sweep may make. Every speculating cell of the
+comparison behind these two tables moved the same way in all three pairs with
+the ranges apart; no `k = 0` cell did, which is the null below.
+
+    duty cycle, %
+            …-mxfp4-mtp4, packed heads      …-mxfp4, bfloat16 heads
+    width   k=0    k=1    k=2    k=3         k=0    k=1    k=2    k=3
+        1  93.3   91.6   90.0   88.0        93.2   91.4   90.8   89.8
+        2  94.8   91.5   90.7   88.8        94.6   91.4   91.7   89.2
+        4  95.1   91.3   86.9   88.4        95.0   91.9   89.2   91.6
+        8  95.1   88.8   89.3   89.7        95.2   89.5   91.0   91.6
+       16  92.0   91.3   91.5   87.2        92.1   90.7   91.7   84.4
+       32  91.6   87.8   89.3   87.6        91.0   88.3   86.7   45.3
+
+**One cell of forty-eight is not in the eighties or nineties**, and it is the
+one C4 quoted with its duty beside it. It is attributed below.
+
+### Where the crossover went, which is one width out
+
+**The last width at which speculation pays is 3 on the shipped heads and 2 on
+C4's.** At batch 3 the packed chain reads 1.064× its own `k = 0` and the
+bfloat16 one reads 0.975×; at batch 4 they read 0.969 and 0.887. That is the
+number a scheduler needs and it is a modest move — **the mechanism C4 described
+is not what packing the heads changes.** Both levers still fill the same idle
+machine and the second one to arrive still finds it fuller.
+
+What packing does change is how much the chain costs while it is losing, and on
+the device's own clock that is most of the table:
+
+    device a token, ms — device a round over tokens a round
+            …-mxfp4-mtp4, packed heads      …-mxfp4, bfloat16 heads
+    width   k=0    k=1    k=2    k=3         k=0    k=1    k=2    k=3
+        1  15.46  13.91  13.55  13.16       15.45  14.90  15.51  15.07
+        2  12.13  10.07  11.14  11.49       12.17  10.95  12.91  13.33
+        4   8.86   8.78   8.90   9.69        8.85   9.65  10.25  11.70
+        8   8.05   8.03   8.72   9.48        8.06   9.02  10.33  11.72
+       16   7.29   7.95   8.86   9.87        7.29   8.69  10.30  11.92
+       32   7.02   7.94   7.13   7.80        7.02   8.66   8.59  10.12
+
+**The `k = 0` column is the same number on both arms at every width** — 0.26%
+at the worst of the six and under 0.1% at the other five. It has to be, and that
+it is is what says the rest of the table is the heads.
+
+**On the device the crossover is two doublings further out than on the wall.**
+A packed `k = 1` round is 1.009× its own `k = 0` at batch 4 and 1.002× at batch
+8 — a wash either side — and only falls to 0.917 at batch 16, where the wall has
+it losing from batch 4. The difference is a round's host side: the encode in
+front of the submissions and the gaps between them, which the width does not
+amortise because they are per round and not per row. **The wall is the number
+that matters and the device is the number that explains it**, and this file
+quotes both for that reason.
+
+### The null this sitting carries, which is the column neither arm can move
+
+The two checkpoints are the same forty symlinks onto the same stack; only the
+MTP shard differs, and at `k = 0` no head is mapped at all. So every row that
+does not speculate is a null pair taken in the sitting that carries the claim,
+alternating with it, rather than a separate run somebody has to trust the
+machine did not move between.
+
+**Twenty-two of the twenty-four read no claim.** `batchN.step`, `batchN.rate`,
+`batchN.device`, `batchN.k0.rate` and `batchN.k0.device` at all six widths: the
+`k = 0` device column is 15.452 / 24.330 / 35.415 / 64.444 / 116.620 / 224.631
+ms against 15.456 / 24.268 / 35.435 / 64.427 / 116.656 / 224.644, and the
+largest gap in it is 0.26%. The two that do read a claim are batch 2's — the
+rate at +0.5% and the device at −0.3%, three pairs the same way with the ranges
+apart on a stack neither arm can touch. **That is the instrument's floor and it
+is worth having measured**: at three pairs, a figure this repeatable will put
+its ranges apart over a rounding, which is exactly what this file's own note
+about pair counts says.
+
+**And the sweep's other check is unmoved.** The `k = 0` column is taken through
+the speculative loop with a proposer that guesses nothing, which is a different
+code path from `bench batch`'s own harness over the same work, and the two are
+run at every width in the same sitting on the same binary — on the packed heads:
+
+    models/Inkling-Small-mxfp4-mtp4, packed heads
+    width   bench batch   the loop at k = 0   device   and at k = 0   change
+      1       19.29 ms         16.56 ms      15.46 ms     15.46 ms     -0.05%
+      2       25.62            25.61         24.33        24.27        -0.27
+      4       37.25            37.27         35.47        35.44        -0.11
+      8       67.54            67.73         64.50        64.43        -0.12
+     16      125.94           126.77        116.74       116.66        -0.07
+     32      244.50           245.22        224.93       224.64        -0.13
+
+The device columns agree to 0.27% at every width where C4 read -0.06 to -0.13,
+which is the same check reading the same way — and the exception is the wall at
+batch 1 again, which this arm read anywhere between 16.47 and 20.93 ms over
+three pairs.
+
+### The cell that was not the trade, which was the driver and the bfloat16 heads
+
+**C4 left this unattributed and named three candidates. The measurement refutes
+all three and finds a fourth.** What it needed was `submit and wait` broken up,
+which the driver's own clock can do and this milestone made the sweep report:
+`RoundTrip` already had what the driver spent scheduling a buffer and what the
+buffer then sat in the queue for, and it now also has **the gap between one
+buffer of a round finishing and the next one starting**. Executions and gaps
+tile a round exactly once — one queue runs one buffer at a time — where
+`scheduled` and `queued` are each buffer's own life and overlap between buffers
+in flight, so they are read per submission and never summed against a wall.
+
+    batch 32, k = 3, a round      executed    idle    scheduled  submissions   duty
+    models/Inkling-Small-mxfp4     755.4 ms  909.6 ms  1008.7 ms     43.3      45.3%
+    models/…-mxfp4-mtp4            524.0      72.1       37.6        42.4      87.6
+
+**So the 0.87 s C4 could not place is the GPU standing still, and what it is
+standing still for is the driver.** 1008.7 ms a round over 43.3 submissions is
+**23.3 ms a command buffer before the GPU may start on it**, against 0.9 ms for
+the same cell on the packed heads — a factor of 27 on the one column, over three
+alternating pairs, 985.5–1021.2 ms against 37.1–38.2.
+
+**It is not memory the round asked for.** The same sweep counts the buffers a
+round allocates, and at that cell the two arms read **1160.3 against 1153.3, 0.6%
+apart** — the same dispatches (993 against 988) in the same submissions, over
+the same allocations. The driver is doing 27× the work on the same number of
+buffers, and the one thing that differs is the bytes those buffers name: the
+round's three head weights, 532 MiB apiece in bfloat16 against 141 MiB packed.
+
+Which disposes of C4's three candidates:
+
+- **not the ragged verify's rewind.** A rewind is this process's arithmetic and
+  would be charged to encode, which reads 10.4 ms a round at the cell.
+- **not a submission per seat.** 43.3 submissions a round at batch 32 against
+  the packed heads' 42.4 and `k = 0`'s 31.0; a submission a seat would be 32 of
+  them at least.
+- **not the chain's buffers failing to overlap the stack's.** A buffer waiting
+  its turn is `queued`, which reads 214 ms at that cell against the packed
+  heads' 325 — *lower* on the arm that collapses. The buffers are not waiting to
+  be picked up; they are not ready to be.
+
+**And it is a cliff rather than a slope**, which is what says it is a threshold
+somebody could find rather than a rate:
+
+    scheduled a round, models/Inkling-Small-mxfp4, bfloat16 heads
+    width       k = 0    k = 1    k = 2      k = 3
+       16       14.0 ms  19.7 ms   22.6 ms    61.4 ms
+       32       22.7     24.1      69.8     1008.7
+
+Two cells lift to two or three times their neighbours and the third is forty
+times them. **Where the line is, and what the driver is doing on the far side of
+it, is not attributed here** — what is attributed is that it is the driver, that
+it is the heads' own bytes, and that packing them puts the cell back among its
+neighbours at 87.6% duty.
+
+### What this means for choosing heads, which is the part worth carrying out
+
+**Pack the heads. The measurement above is the reason, and the reason is not the
+bandwidth.** Everything this file has said about the MTP shard's format until
+now was bytes and device time: 4.157 GiB against 1.105, a chain's execution
+falling 18.9 ms to 10.3, `k = 2` paying 1.18× where it paid 1.10×. All of that
+is real and none of it is this. **This is a cost the driver charges per command
+buffer, and it scales with the bytes the buffer names rather than with the work
+inside it** — 993 dispatches against 988, in 43.3 submissions against 42.4, over
+1160 allocations against 1153, for 27× the scheduling. Nothing a reader could
+have priced from a parameter count or a bandwidth figure.
+
+**Three things follow, in the order somebody deciding would meet them.**
+
+- **The device's own clock will not warn you.** At the cell, the device reads
+  10.12 ms a token against 7.80 — 1.30× — and the wall reads 22.34 against 8.91,
+  which is **2.51×**. A choice made on device time alone under-prices the
+  bfloat16 shard here by a factor of **1.9**. This file quotes the device clock
+  beside every wall precisely so that a gap like that is visible rather than
+  averaged, and this is the largest gap between the two it has ever recorded.
+- **It only bites where an engine is worth building.** At batch 1 the two shards
+  are 15.46 ms a token against 15.45 on the device and 0.08% apart on the wall at
+  `k = 0`, and the packed shard is worth **7, 13 and 12%** at the three depths
+  that speculate. A single-sequence engine can weigh the shard on the device
+  clock and be
+  right. **A batched one that speculates cannot**, and that is exactly the engine
+  this repo has spent four milestones building — which is why three milestones of
+  unbatched measurement went past this without seeing it.
+- **The lever costs nothing to pull.** `just quantize-mtp` is minutes and leaves
+  the bfloat16 shard where it is; what lands is forty symlinks and a 1.105 GiB
+  file beside a 131 GB checkpoint. There is no version of this trade where the
+  packed shard is the wrong default, and `bench-engines`, the timing tier and
+  `just bench-weights` should all be pointed at it — which the justfile's own
+  comment already says and the sweep's default checkpoint still does not do.
+
+**And the rule under it generalises past these heads**: a weight a round's
+command buffers *name* is charged for at submission, every round, whether or not
+the round reads much of it — so the weights worth packing first are the ones a
+chain names once per round per head, not the ones a step reads most bytes of.
+That is a different ranking from the bandwidth one, and this is the first
+measurement in this file that separates them.
+
+### The floor this reaches, and its arithmetic
+
+**The verify is the same call on both arms, and that makes the chain's own cost
+a subtraction rather than a model.** At batch 32 and `k = 1` a round is one
+64-row verify plus one head over the rows the round committed, and the verify
+runs through the same 131 GB stack whichever shard is beside it:
+
+    a k = 1 round, batch 32, on the device   bfloat16   447.40 ms
+                                             packed     381.22
+                                                        ------
+    what the chain's own bfloat16 costs a round, at least   66.18 ms
+
+**At least, because the bfloat16 arm's chain runs over more rows**: it banks
+51.69 tokens a round against 48.00, so its head is asked for 7.7% more rows and
+some of the 66.18 is that rather than the format. At `k = 3` the same
+subtraction is 755.37 − 523.98 = **231.39 ms a round**, over three heads, and
+the same caveat is 74.67 tokens against 67.20.
+
+**And the same pair bounds the verify itself.** A `k = 0` round at batch 32 is
+224.64 ms for 32 rows; a `k = 1` round is 64 rows plus a chain, and a chain
+cannot cost less than nothing — so the verify's second 32 rows add **at most
+381.22 − 224.64 = 156.58 ms, which is 0.70× what its first 32 cost.** A row is
+cheaper at the wider call, exactly as C4's own residual said, and this puts a
+number on it from the side that does not need the chain to be free.
+
+**What that leaves is what C4 left.** The row that would move the headline is
+acceptance, and acceptance is the workload's: at `k = 1` the packed chain's
+first guess is taken 84.85% of the time at batch 1 and 79.34% at batch 32,
+against a ratio that falls from 1.091 to 0.847 over the same widths — **five
+points of acceptance against twenty-four of ratio**, so the width is not doing
+this through acceptance. The depth chosen per round rather than per run is still
+what the table argues for and `MtpProposer` still refuses it by name.
+
+### What only the measurement found
+
+**Three things, and none of them is a thing a reading of the code could have
+said.**
+
+**The first is that a milestone's headline cell was a checkpoint.** C4 quoted
+0.336× with a 44.6% duty beside it and reproduced it in three sittings; three
+sittings of one checkpoint reproduce a checkpoint. The only instrument that saw
+it was the two arms alternating in one sitting, which is this file's own
+standing lesson arriving for the fourth time: **a number is only a number of
+what you put beside it.**
+
+**The second is that the crossover needed a width the sweep does not run.** The
+widths double, so the sweep can say the turn is between 2 and 4 and no more —
+and between 2 and 4 is exactly where both checkpoints turn. `--batch 3` is one
+line of command and it is the difference between "the crossover did not move"
+and "it moved by one width."
+
+**The third is that the `k = 0` column is a null nobody had to arrange.** The
+two arms share every tensor but the MTP shard and `k = 0` maps no head, so
+twenty-four rows of the comparison are a null pair taken inside the claim rather
+than beside it. Two of the twenty-four read a claim at 0.3 and 0.5%, which is
+the floor of three pairs and is worth having in the same table as a 150.9%.
+
+### What the code-reviewer found
+
+- **The gap column's "nothing recorded yet" was spelled `0.0`, and `0.0` is a
+  reading this device gives.** A command buffer the watchdog kills completes
+  with no timestamps at all — this file has met that once already, on tensors
+  mapped off NFS — so the buffer after one of those is stored as a baseline of
+  zero and read back as the sentinel. **Checked against the arithmetic, the two
+  spellings answer the same thing on every input**: the sentinel says "no gap"
+  and a buffer with no clock should also say "no gap", so the branch that
+  conflates them happens to be right about both. That makes it a defect of the
+  kind worth fixing anyway — **it was correct by coincidence rather than by
+  construction**, and the next reader adding a case to that `match` has no way
+  to see which of the two they are editing. It is an `Option` now, which is the
+  idiom the two fields above it in the same struct already use.
+- **And the case that goes with it is falsifiable against the mistake, not
+  against the spelling.**
+  `a_buffer_that_reported_no_clock_is_not_a_gap_the_next_one_is_measured_from`
+  drives the clock directly, because a timed-out buffer is not a thing a case
+  may ask a device for — and what it fails is the arithmetic anyone would write
+  first, which subtracts the stored baseline without asking whether there is
+  one: that reads the first gap of a stretch as four seconds and the gap after a
+  timed-out buffer as four hundred.
+- **A new assertion that could not fail.** The sweep's integration case checked
+  that the gap column was `>= 0.0` on a figure built from a `Duration`, which is
+  true of every build there has ever been. It asserts what the column *claims*
+  now — that the executions and the gaps tile the round — against a wall the
+  same run reports, and that is an assertion a wrong `idle` fails.
+- **The clippy fix was riding along.** `1 * (SWEPT + 1) * 6` in C4's own
+  predicate case fails `-D warnings` on this toolchain, so `just fmt` was red on
+  HEAD before any of this. Its own commit, and the first of them.
+- One it raised and this does not take: `Divided` is divided by the rounds where
+  `Speculated::gpu` is a total divided at each call site, which is two spellings
+  of "per round" in one function. The second cannot be pre-divided — `duty`
+  needs the total against the total wall — so what would remove the second
+  spelling is a third.
+
+### What did not move
+
+**No kernel changed and no engine code changed at all.** Everything this
+milestone touched is the measurement: a field on `RoundTrip`, an accessor, and
+what `bench batch` prints. `just test-full` is green — **776 gated and 81
+timing, every one of them passing**, which is the 773 C4 left plus this
+milestone's three — the recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what the engine generates,
+`--backend cpu` is unmoved, `bench diverge` agrees **448 of 448** under
+`production` against `reference` with no prompt parting, and `rounded` is still
+opt-in.
+
+**It took four attempts to get the gated half, and why is worth a line.** The
+tier opens a process per test and every Metal one compiles the kernel library
+again, so run at nextest's default parallelism *after* two hours of
+benchmarking, 26 of those contend until a test that takes 5.9 s alone takes 200
+and the run stops advancing — the same shape `.config/nextest.toml` already
+refuses to take numbers under, arriving as a wall rather than as a wrong
+reading. **At `--test-threads 1` it does not contend and it passes, in 2029 s**,
+with the timing tier's own serial 81 in 2699 s after it. The GPU was never the
+problem, which `bench diverge` running end to end between two of the attempts is
+what said. **Run the tier before a long measurement series as well as after**,
+which is what the justfile already asks for and this sitting learned the other
+way round.
+
+**And instrumenting the sweep did not move what it measures.** The `k = 0`
+device column reads 15.46 / 24.27 / 35.44 / 64.43 / 116.66 / 224.64 ms against
+C4's uninstrumented 15.48 / 24.26 / 35.44 / 64.35 / 116.54 / 224.49 — within
+0.1% at five widths of six and 0.13% at the sixth. **That is two sittings and
+not a pair**, so it is evidence rather than a claim; what makes it the expected
+answer is that the timestamps behind a round trip are read off a buffer that has
+already completed, and what the record costs at run time is a struct pushed to a
+`Vec`. C4's contamination work stands: three scales, eight mutations, the two
+`MtpProposer` ones failing only at the checkpoint's scale, and the fixture
+lesson that a case built on the activation capture's eight ids holds zero
+accepted against zero. The ragged-seat cases, barriers derived == encoded, the
+duplicate-slot refusal, memory linear at 30.8 MiB a slot,
+`what_an_empty_seat_costs`, K1's kept cache and every prefill length are all
+where C4 left them.
+
 ## The MTP chain at batch, and the two levers that turn out to be one
+
+**Every table in this section is `models/Inkling-Small-mxfp4`, whose MTP shard is
+bfloat16 — which is not the checkpoint the engine ships against.** The section
+above is the same sweep on `models/Inkling-Small-mxfp4-mtp4` and says which of
+these figures survive it, which is most of them, and which one was the shard.
 
 **`ModelHeads::wrap` has taken a slot count since B1 and nothing had ever asked
 it for more than one.** So a batch that speculated ran its chain a sequence at a
@@ -1243,6 +1668,7 @@ at batch 32; speculation takes 15.48 to 14.89 at batch 1 — a 3.8% win — and
 machine, and the second one to arrive finds it already full.**
 
     tokens/second, one sitting, one binary, the wall
+    models/Inkling-Small-mxfp4, bfloat16 heads
     width      k = 0    k = 1    k = 2    k = 3
         1       60.7     62.0     57.6     59.8
         2       78.4     82.7     70.9     66.9
@@ -1272,6 +1698,7 @@ with a proposer that guesses nothing** — a different code path from `bench
 batch`'s own harness over the same work — and both are run at every width in the
 same sitting on the same binary:
 
+    models/Inkling-Small-mxfp4, bfloat16 heads
     width   bench batch   the loop at k = 0   device       and at k = 0   change
       1       20.22 ms         16.48 ms       15.49 ms       15.48 ms     -0.06%
       2       25.52            25.50          24.30          24.26        -0.16
@@ -1291,6 +1718,7 @@ The second check is `bench sweep` at the same depths, which is the *unbatched*
 chain through a third harness. Its column and the `--batch 1` column above, one
 sitting:
 
+    models/Inkling-Small-mxfp4, bfloat16 heads
     k       bench sweep   batch 1   acceptance, sweep          acceptance, batch 1
     0        16.434 ms    16.48 ms  —                          —
     1        16.031       16.12     84.85%                     85%
@@ -1356,7 +1784,8 @@ dividing it by the width understates acceptance. What the third table *is*
 exact about is the ratio of the first two, which is total device over total
 tokens whatever shape the rounds were.
 
-    device a round (ms)      k=0     k=1     k=2     k=3
+    device a round (ms), models/Inkling-Small-mxfp4, bfloat16 heads
+                             k=0     k=1     k=2     k=3
     width  1                15.48   27.54   40.63   47.46
            2                24.26   40.56   67.80   84.04
            4                35.44   71.53  107.62  147.38
@@ -1403,6 +1832,12 @@ is a measurement this file has not taken.
 
 ### The one cell that is not the trade, which is measured and not attributed
 
+**Attributed since, and it is the shard this section is taken on.** The section
+above divides that wait: 0.87 s a round is the GPU standing still while the
+driver schedules command buffers naming 4.157 GiB of bfloat16 heads, at 23.3 ms
+a buffer against 0.9 on the packed ones. The paragraphs below are what the
+instrument could say before it could divide a wait, and are left as that.
+
 **Batch 32 at `k = 3` reads 44.6% duty where every other cell reads 84 to 96%**,
 and that is half of the 0.336 in the ratio table rather than the trade the rest
 of the section is about: **on the device's own clock the same cell reads
@@ -1410,6 +1845,7 @@ of the section is about: **on the device's own clock the same cell reads
 neighbours, and the wall is what falls the rest of the way. What the instrument
 says:
 
+    models/Inkling-Small-mxfp4, bfloat16 heads
     batch 32, k = 3      device 755.14 ms a round    wait 1.63 s    encode 7.8 ms
                          43.3 submissions a round
 
@@ -1585,6 +2021,14 @@ earlier sections are left as the readings those milestones took, because a
 record of a measurement is not a claim about this sitting — but the four
 sentences that say `k = 3` is the best depth are now false of both binaries, and
 this is where that is written down.
+
+**Corrected: it is not a drift and the four sentences are not false.** Both
+binaries were reading `models/Inkling-Small-mxfp4`, whose heads are bfloat16,
+and the prose is `models/Inkling-Small-mxfp4-mtp4`, whose heads are packed. The
+section above measures the two side by side in one sitting and reads
+`84.85 / 86.96-78.26 / 85-65-55` off the second, digit for digit. What is true
+of this paragraph is that a row without its checkpoint on it cannot be told from
+a drift, which is why every row in that section carries one.
 
 The batched guarantees are unmoved too: the ragged-seat cases still drive both
 halves of a merged pair, barriers derived == encoded, the duplicate-slot refusal
