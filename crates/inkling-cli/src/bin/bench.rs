@@ -1829,12 +1829,17 @@ impl Engine<'_, '_> {
 
 /// What request `at` of a fleet asks for, around a budget of `tokens`.
 ///
-/// A quarter of the budget to twice it, walked by an odd stride so that the
-/// order requests arrive in is not the order of their lengths — a fleet whose
-/// short requests all came first would be measuring one arrangement of a queue
-/// rather than a policy.
+/// An eighth of the budget to twice it, walked by a stride coprime with the
+/// period so that the order requests arrive in is not the order of their
+/// lengths — a fleet whose short requests all came first would be measuring one
+/// arrangement of a queue rather than a policy.
+///
+/// **The period is [`AGENTS`] and not less**, which is what a shorter one cost:
+/// a period of eight over a default fleet of sixteen is two identical halves,
+/// and a distribution drawn from a workload that repeats itself is a
+/// distribution with half the shape it says it has.
 fn asked_for(tokens: usize, at: usize) -> usize {
-    tokens / 4 * (1 + at * 7 % 8)
+    tokens / 8 * (1 + at * 7 % AGENTS)
 }
 
 /// A fleet of requests arriving on `arrivals`, each asking for what
@@ -3600,15 +3605,23 @@ mod tests {
     /// their lengths.
     #[test]
     fn a_fleets_requests_do_not_all_ask_for_the_same_thing() {
-        let counts: Vec<usize> = (0..8).map(|at| asked_for(200, at)).collect();
-        assert_eq!(counts, vec![50, 400, 350, 300, 250, 200, 150, 100]);
+        // Over the default fleet's own size, which is where the property has to
+        // hold: a pattern that repeats inside one fleet is a fleet with fewer
+        // distinct requests in it than its size says.
+        let counts: Vec<usize> = (0..AGENTS).map(|at| asked_for(200, at)).collect();
+        assert_eq!(
+            counts,
+            vec![
+                25, 200, 375, 150, 325, 100, 275, 50, 225, 400, 175, 350, 125, 300, 75, 250
+            ]
+        );
         let mut sorted = counts.clone();
         sorted.sort_unstable();
         assert_ne!(counts, sorted, "the short requests all arrived first");
         assert_eq!(
             counts.iter().collect::<BTreeSet<_>>().len(),
             counts.len(),
-            "two requests of one length"
+            "two requests of one length inside one fleet"
         );
     }
 

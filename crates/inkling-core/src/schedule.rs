@@ -212,9 +212,11 @@ impl<'a> Continuous<'a> {
     /// scheduler needs.
     ///
     /// A seat always takes at least one row, so a budget smaller than the seats
-    /// filling is exceeded rather than starving one of them; and a seat with
-    /// less prompt left than its share takes what it has, so a call comes in
-    /// under the budget as often as at it.
+    /// filling is exceeded rather than starving one of them. **A seat with less
+    /// prompt left than its share takes what it has and the difference is not
+    /// handed to a seat that could use it**, so a call comes in under the budget
+    /// where the seats' prompts run out unevenly — which is a step this leaves
+    /// narrower than it had to be and never wider than it said.
     ///
     /// `slots` is the width the backend was wrapped for and not a number this
     /// picks: a slot is a span and four convolution windows in every layer,
@@ -313,16 +315,26 @@ impl<'a> Continuous<'a> {
             return stepped;
         }
 
-        // The step's prompt budget, split evenly over the seats that are
-        // filling — see [`Continuous::new`] for why the number is the call's and
-        // not the seat's.
+        // The step's prompt budget, split over the seats that are filling — see
+        // [`Continuous::new`] for why the number is the call's and not the
+        // seat's. **The remainder is handed out rather than dropped**: a budget
+        // of seven over three seats is 3, 2, 2 and not 2, 2, 2, because the
+        // rounding is otherwise a row a step that nobody may use and every
+        // prompt takes longer to enter for it.
         let filling = seated.iter().filter(|held| held.filling()).count();
-        let share = self.chunk / filling.max(1);
+        let (share, mut spare) = match filling {
+            0 => (0, 0),
+            filling => (self.chunk / filling, self.chunk % filling),
+        };
 
         let fed: Vec<Vec<usize>> = seated
             .iter()
             .map(|held| match held.filling() {
-                true => held.chunk(share).to_vec(),
+                true => {
+                    let over = usize::from(spare > 0);
+                    spare -= over;
+                    held.chunk(share + over).to_vec()
+                }
                 false => vec![held.owed()],
             })
             .collect();
@@ -762,6 +774,8 @@ mod tests {
     /// The two ends are asserted as well as the middle: a budget smaller than
     /// the seats filling gives each of them one row rather than starving one,
     /// and a budget wider than the prompts have left comes in under itself.
+    /// **And a budget that does not divide is met anyway**, which is what says
+    /// the remainder is handed out rather than truncated away.
     #[test]
     fn a_steps_prompt_rows_are_the_calls_budget_and_not_a_seats() {
         let stack = Stack::load();
@@ -779,6 +793,10 @@ mod tests {
             // Met exactly: two rows to each of three seats.
             (6, 6),
             (3, 3),
+            // **Met exactly where it does not divide**, which is the remainder
+            // being handed out rather than dropped: 3, 2, 2 and not 2, 2, 2.
+            (7, 7),
+            (5, 5),
             // Over the budget rather than starving a seat, which is the one
             // direction it may be missed in and is bounded by the seats.
             (2, 3),
@@ -800,6 +818,51 @@ mod tests {
                 "{} rows in one call against a budget of {chunk}",
                 ran.widest
             );
+        }
+    }
+
+    /// **Seats whose prompts run out at different steps still never take more
+    /// than the budget between them**, which is the case every other one here
+    /// misses: they all give their concurrently-filling seats the same prompt,
+    /// so a share nobody could use has never been left on the table.
+    ///
+    /// Three prompts of three lengths through a budget that does not divide
+    /// them. What this says is the direction the miss goes in — **under the
+    /// budget and never over it** — because a seat with less prompt left than
+    /// its share takes what it has and the difference is not handed on.
+    #[test]
+    fn seats_whose_prompts_run_out_unevenly_stay_inside_the_budget() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let sequence = stack.sequence();
+        let asked: Vec<Request> = [2usize, 5, sequence.len()]
+            .iter()
+            .map(|len| Request {
+                prompt: sequence[..*len].to_vec(),
+                count: COUNT,
+            })
+            .collect();
+        let want: Vec<Vec<usize>> = asked
+            .iter()
+            .map(|request| alone(&stack, &request.prompt, request.count))
+            .collect();
+
+        for chunk in [1, 2, 5, 7, 11] {
+            let mut engine = Continuous::new(&stack.config, asked.len(), chunk);
+            for request in &asked {
+                engine.submit(request.clone());
+            }
+            let mut ran = Ran::default();
+            ran.on(&mut engine, &stack, &head);
+            let answered = ran.against(&asked).to_vec();
+            assert!(
+                ran.widest <= chunk.max(asked.len()),
+                "{} rows in one call against a budget of {chunk}",
+                ran.widest
+            );
+            for (at, answer) in answered.iter().enumerate() {
+                assert_eq!(answer.produced, want[at], "request {at}, {chunk} a step");
+            }
         }
     }
 
