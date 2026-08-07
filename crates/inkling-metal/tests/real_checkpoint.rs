@@ -32,8 +32,8 @@ use inkling_core::quant::{BITS, dequantize_blocks_into};
 use inkling_core::workload::{DECODED, STRUCTURED_PROMPT, SWEPT, tiled};
 use inkling_core::{
     Answered, AttentionCache, AttentionStep, BandedMask, Bf16, Checkpoint, CheckpointWeights,
-    Continuous, Dtype, Ending, LayerStep, ModelCache, Packed as CorePacked, Projections, Request,
-    Sdpa, ShortConv, Tail, TensorView, Tokenizer, split_heads,
+    Continuous, DEFAULT_BOUND, Dtype, Ending, LayerStep, ModelCache, Packed as CorePacked,
+    Projections, Request, Sdpa, ShortConv, Tail, TensorView, Tokenizer, split_heads,
 };
 // The ceiling every "of peak" column here is a fraction of, read from the crate
 // rather than written down again: `what_a_prefills_blocked_matmul_is_bound_by`
@@ -4050,6 +4050,289 @@ fn a_request_that_joins_or_takes_over_a_slot_produces_what_it_produces_alone() {
                 "request {at} of a two-slot engine, {chunk} rows a chunk"
             );
         }
+    }
+}
+
+/// How many turns each conversation of the kept-slot case takes.
+///
+/// Three, because two cannot tell a conversation returning to its own slot from
+/// one handed the same slot twice by luck: the third turn has to find keys that
+/// a second departure left, in a slot other sequences have been through.
+const KEPT_TURNS: usize = 3;
+
+/// How many tokens of its own a turn adds on the end of the reply it was given.
+///
+/// Two, which is enough to make each turn's prompt a strict extension of the
+/// turn before it — the shape a coding turn has, and the only shape a kept
+/// conversation can be resumed for.
+const KEPT_ADDED: usize = 2;
+
+/// One conversation's turn, as an engine answered it.
+#[derive(Debug, Clone)]
+struct KeptTurn {
+    prompt: Vec<usize>,
+    produced: Vec<usize>,
+    slot: usize,
+    reused: usize,
+}
+
+/// Several conversations through one engine, each sending its whole history back
+/// every turn, and what each turn was answered.
+///
+/// A turn is the turn before it, the reply it was given and a couple of tokens
+/// of the user's own — which is what a client that sends a conversation back
+/// produces and is the only shape `Kept::matching` can serve. Every
+/// conversation's turn is submitted together and the engine drained before the
+/// next, so every slot is free when a turn arrives: a conversation given its own
+/// slot here was given it because its tokens said so and not because it was the
+/// only slot going.
+fn conversing(
+    engine: &mut Continuous<'_>,
+    weights: &CheckpointWeights<'_>,
+    openings: &[Vec<usize>],
+    added: &[usize],
+) -> Vec<Vec<KeptTurn>> {
+    let generator = weights.generator();
+    let mut prompts: Vec<Vec<usize>> = openings.to_vec();
+    let mut taken: Vec<Vec<KeptTurn>> = vec![Vec::new(); openings.len()];
+
+    for turn in 0..KEPT_TURNS {
+        let tickets: Vec<usize> = prompts
+            .iter()
+            .map(|prompt| {
+                engine.submit(Request {
+                    prompt: prompt.clone(),
+                    count: BATCHED,
+                })
+            })
+            .collect();
+        let at = |ticket: usize| {
+            tickets
+                .iter()
+                .position(|held| *held == ticket)
+                .expect("a ticket of this turn")
+        };
+
+        let mut seated: Vec<Option<(usize, usize)>> = vec![None; tickets.len()];
+        let mut answered: Vec<Option<Vec<usize>>> = vec![None; tickets.len()];
+        while !engine.idle() {
+            let stepped = engine.step(&generator, weights);
+            assert!(!stepped.empty(), "a step that carried no rows");
+            for admitted in stepped.admitted {
+                seated[at(admitted.ticket)] = Some((admitted.slot, admitted.reused));
+            }
+            for answer in stepped.done {
+                answered[at(answer.ticket)] = Some(answer.produced);
+            }
+        }
+
+        for (which, prompt) in prompts.iter_mut().enumerate() {
+            let (slot, reused) = seated[which].expect("every turn seated");
+            let produced = answered[which].take().expect("every turn answered");
+            taken[which].push(KeptTurn {
+                prompt: prompt.clone(),
+                produced: produced.clone(),
+                slot,
+                reused,
+            });
+            prompt.extend_from_slice(&produced);
+            prompt.extend(added.iter().copied().cycle().skip(turn).take(KEPT_ADDED));
+        }
+    }
+    taken
+}
+
+/// **The contamination case for a slot a conversation comes back to, on the real
+/// checkpoint** — and it is the one that had to be added rather than kept
+/// passing, because this milestone relaxes the invariant the other two rest on.
+///
+/// The two cases above say a sequence never attends over what it found in its
+/// slot: a joining prompt riding beside decoders, and a slot handed on to a
+/// stranger. Both are ways for one sequence's keys to reach another's tokens and
+/// both are answered by handing every joiner a cache at no keys. A returning
+/// conversation is handed a cache that **is** at keys, deliberately, so the
+/// question changes from "did it start from nothing" to "were the keys it
+/// started from its own" — and there is no arrangement of one conversation that
+/// can tell those apart. A sequence resumed onto a neighbour's keys generates
+/// fluent text; so does one resumed onto its own from the wrong position.
+///
+/// So two conversations, three turns each, interleaved through the same slots,
+/// and every turn held against its own whole prompt generated alone from
+/// nothing. **One of the openings is the oracle's**, so the recorded
+/// continuation is asserted from inside a conversation that goes on to be
+/// resumed twice.
+///
+/// Three arrangements, because the failures are different in each:
+///
+/// - **Two slots keeping**: every turn after the first comes back to its own
+///   slot, resumes to the position its last prompt ended at, and prefills only
+///   what was added. This is the milestone, and the leak it could have is a
+///   conversation resumed onto the *other* one's keys.
+/// - **One slot keeping**: the two conversations contend for the one slot, so
+///   every turn lands in a slot the other conversation's keys were in a moment
+///   ago and no turn ever finds where its own last turn ended. This is the
+///   eviction, and the leak it could have is a slot handed on still counting the
+///   evicted conversation's keys. **What such a turn may still resume is the
+///   opening the two share** — and that is right rather than a leak, because
+///   what the matching compares is the tokens: keys the arriving prompt names
+///   are its own keys whoever last computed them. So what is asserted here is
+///   the bound, that nothing past the shared opening is ever resumed.
+/// - **Two slots keeping nothing**: the same fleet through the engine every
+///   batching figure in this repo was taken on. **Cold and warm must be
+///   byte-identical**, which K1 asserted at width one and which now has to hold
+///   at width N — and it is asserted beside the comparison against `alone`,
+///   because two arms can agree by being wrong the same way.
+///
+/// **Four mutations**, run by hand against this case and each caught by it:
+/// dropping `starts_with` from the matching hands a returning conversation a
+/// slot it does not extend, which is the wrong slot; dropping the resume in
+/// `Continuous::vacate` leaves the slot where the generation ended rather than
+/// where the prompt did, which is the right slot at the wrong mark; recording
+/// the whole prompt rather than the mark's own position claims a token more than
+/// was resumed to; and not forgetting on a miss resumes a slot that was evicted.
+#[test]
+fn two_conversations_coming_back_to_their_slots_each_produce_what_they_produce_alone() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(device) = device() else { return };
+    let config = fixture::config(&dir).text_config;
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint opens");
+    let gpu = Kernels::compile(&device);
+
+    let recorded = indices(&fixture::tensor(&fixture::open(ACTIVATIONS), "input_ids"));
+    let oracle = indices(&fixture::tensor(
+        &fixture::open(ACTIVATIONS),
+        "greedy_continuation",
+    ));
+    // Two conversations, the first opening on the oracle's own prompt and the
+    // second on half of it. **A shared opening rather than two unrelated ones**,
+    // which is both the harder fixture and the realistic one: a fleet of agents
+    // shares a system prompt, so a turn of one conversation matches the other's
+    // slot as well as its own and what decides is the *longer* match. Two
+    // conversations with nothing in common would never reach that rule.
+    let openings = vec![recorded.clone(), recorded[..recorded.len() / 2].to_vec()];
+    let added = recorded.clone();
+
+    // Every arrangement's turns are the same prompts, so the reference is built
+    // once — each turn's whole prompt, generated from a cache holding nothing.
+    let reference = |turns: &[Vec<KeptTurn>], weights: &CheckpointWeights<'_>| {
+        let generator = weights.generator();
+        turns
+            .iter()
+            .map(|turns| {
+                turns
+                    .iter()
+                    .map(|turn| {
+                        generator.generate(
+                            &mut ModelCache::new(&config),
+                            &turn.prompt,
+                            BATCHED,
+                            weights,
+                        )
+                    })
+                    .collect::<Vec<Vec<usize>>>()
+            })
+            .collect::<Vec<Vec<Vec<usize>>>>()
+    };
+
+    let kept = {
+        let weights = gpu.wrap_batch(&ckpt, &config, 2);
+        let mut engine = Continuous::keeping(&config, 2, 2, DEFAULT_BOUND);
+        conversing(&mut engine, &weights, &openings, &added)
+    };
+    let evicting = {
+        let weights = gpu.wrap_batch(&ckpt, &config, 1);
+        let mut engine = Continuous::keeping(&config, 1, 2, DEFAULT_BOUND);
+        conversing(&mut engine, &weights, &openings, &added)
+    };
+    let cold = {
+        let weights = gpu.wrap_batch(&ckpt, &config, 2);
+        let mut engine = Continuous::new(&config, 2, 2);
+        conversing(&mut engine, &weights, &openings, &added)
+    };
+
+    // The oracle, from inside the arrangement rather than beside it: the first
+    // conversation's opening turn is the recorded prompt, and what a resumed
+    // slot's engine answered it is the recorded continuation.
+    assert_eq!(
+        kept[0][0].produced,
+        oracle[..BATCHED],
+        "the recorded continuation, out of an engine that keeps its slots"
+    );
+    assert_ne!(
+        kept[0][0].produced, kept[1][0].produced,
+        "two conversations to tell apart"
+    );
+
+    let alone = {
+        let weights = gpu.wrap(&ckpt, &config, 0);
+        reference(&kept, &weights)
+    };
+    for (name, arrangement) in [("kept", &kept), ("evicting", &evicting), ("cold", &cold)] {
+        for (which, turns) in arrangement.iter().enumerate() {
+            assert_eq!(turns.len(), KEPT_TURNS);
+            for (turn, taken) in turns.iter().enumerate() {
+                assert_eq!(
+                    taken.prompt, kept[which][turn].prompt,
+                    "{name}: conversation {which} sent a different turn {turn}"
+                );
+                assert_eq!(
+                    taken.produced, alone[which][turn],
+                    "{name}: conversation {which}, turn {turn}, against its whole prompt alone"
+                );
+            }
+        }
+    }
+
+    // **Two slots keeping: each conversation came back to its own slot and
+    // resumed to exactly where its last prompt ended.** Anything else is a
+    // conversation reading keys it did not put there, and the tokens above are
+    // what say it did not — this is what says the arrangement is the one that
+    // was measured.
+    assert_ne!(kept[0][0].slot, kept[1][0].slot, "both opened in one slot");
+    for (which, turns) in kept.iter().enumerate() {
+        assert_eq!(turns[0].reused, 0, "conversation {which} opened warm");
+        for turn in 1..KEPT_TURNS {
+            assert_eq!(
+                turns[turn].slot, turns[0].slot,
+                "conversation {which} came back to another slot at turn {turn}"
+            );
+            assert_eq!(
+                turns[turn].reused,
+                turns[turn - 1].prompt.len() - 1,
+                "conversation {which} resumed to the wrong position at turn {turn}"
+            );
+        }
+    }
+
+    // **One slot keeping: no turn ever found where its own last turn ended**,
+    // because the other conversation had the slot in between. What a turn may
+    // still resume is the opening the two share, and never a token past it —
+    // which is the bound, and is what says the eviction actually happened.
+    let shared = recorded.len() / 2;
+    for (which, turns) in evicting.iter().enumerate() {
+        assert_eq!(turns[0].reused, 0, "conversation {which} opened warm");
+        for turn in 1..KEPT_TURNS {
+            assert!(
+                turns[turn].reused <= shared,
+                "{}: conversation {which} resumed {} tokens past the {shared} the two share",
+                "one slot",
+                turns[turn].reused
+            );
+            assert!(
+                turns[turn].reused < turns[turn - 1].prompt.len() - 1,
+                "conversation {which} resumed its own position from a slot the other one took"
+            );
+        }
+    }
+    // **Two slots keeping nothing: the same ids, byte for byte.**
+    assert!(
+        cold.iter().flatten().all(|turn| turn.reused == 0),
+        "the engine that keeps nothing kept something"
+    );
+    for (which, (cold, kept)) in cold.iter().zip(&kept).enumerate() {
+        let cold: Vec<&Vec<usize>> = cold.iter().map(|turn| &turn.produced).collect();
+        let warm: Vec<&Vec<usize>> = kept.iter().map(|turn| &turn.produced).collect();
+        assert_eq!(cold, warm, "conversation {which}, cold against kept");
     }
 }
 
