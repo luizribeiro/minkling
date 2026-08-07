@@ -471,12 +471,17 @@ impl Engine<'_> {
 
         self.served += 1;
         let created = now();
+        // The counts are on the collected body already, and are written after
+        // the last token where they are known — so `include_usage` is a question
+        // only a stream has, and a client that sent it without asking for one is
+        // answered with what it wanted rather than refused for how it asked.
         let completion = Completion::new(
             format!("chatcmpl-{created}{:04}", self.served),
             created,
             self.model.clone(),
             ids.len(),
-        );
+        )
+        .reporting_usage(asked.stream && asked.wants_usage());
         let stops = Stops::new(asked.stopping());
         self.generate(
             &asked,

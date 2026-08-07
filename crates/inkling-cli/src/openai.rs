@@ -313,6 +313,14 @@ pub struct Completion {
     /// The calls the model asked for, each as the object a collected body
     /// carries — a streamed one is the same object with its index beside it.
     calls: Vec<serde_json::Value>,
+    /// Whether the stream carries token counts, which is
+    /// `stream_options.include_usage`.
+    ///
+    /// A question only a stream has. The collected body has reported usage since
+    /// there was one — it is written after the last token, when the counts are
+    /// known — where a stream's frames all go out before that, so a client
+    /// reading counts off a stream needs a frame that exists for nothing else.
+    reporting: bool,
 }
 
 impl Completion {
@@ -326,7 +334,15 @@ impl Completion {
             content: String::new(),
             reasoning: String::new(),
             calls: Vec::new(),
+            reporting: false,
         }
+    }
+
+    /// The same completion with token counts on its stream, which is what
+    /// `stream_options.include_usage` asks for.
+    pub fn reporting_usage(mut self, wanted: bool) -> Self {
+        self.reporting = wanted;
+        self
     }
 
     /// Whether the model asked for a tool, which is what decides between two of
@@ -335,13 +351,38 @@ impl Completion {
         !self.calls.is_empty()
     }
 
-    fn envelope(&self, object: &str, choice: serde_json::Value) -> serde_json::Value {
+    fn envelope(&self, object: &str, choices: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
             "object": object,
             "created": self.created,
             "model": self.model,
-            "choices": [choice],
+            "choices": choices,
+        })
+    }
+
+    /// One chunk of a stream, around the one choice this returns.
+    ///
+    /// **`usage` is on every chunk once a client has asked for counts**, null
+    /// until the one that carries them. That is the shape OpenAI sends and it is
+    /// not decoration: a client reading the field off each chunk as it arrives
+    /// finds a key rather than an absence, so the chunk that finally has counts
+    /// is the same shape as the ones before it.
+    fn chunk(&self, choice: serde_json::Value) -> serde_json::Value {
+        let mut body = self.envelope("chat.completion.chunk", serde_json::json!([choice]));
+        if self.reporting {
+            body["usage"] = serde_json::Value::Null;
+        }
+        body
+    }
+
+    /// What the request spent, which is the same three counts however they
+    /// leave — on the collected body, or on a stream's last chunk.
+    fn usage(&self) -> serde_json::Value {
+        serde_json::json!({
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.prompt_tokens + self.completion_tokens,
         })
     }
 
@@ -350,14 +391,11 @@ impl Completion {
     /// OpenAI sends it, and clients that build a message out of the deltas need
     /// something to build it on before any text arrives.
     pub fn opening(&self) -> String {
-        frame(&self.envelope(
-            "chat.completion.chunk",
-            serde_json::json!({
-                "index": 0,
-                "delta": {"role": "assistant"},
-                "finish_reason": null,
-            }),
-        ))
+        frame(&self.chunk(serde_json::json!({
+            "index": 0,
+            "delta": {"role": "assistant"},
+            "finish_reason": null,
+        })))
     }
 
     /// One token's worth of whatever it turned out to be, added to the reply and
@@ -410,14 +448,11 @@ impl Completion {
                 "content"
             }
         };
-        Some(frame(&self.envelope(
-            "chat.completion.chunk",
-            serde_json::json!({
-                "index": 0,
-                "delta": {field: text},
-                "finish_reason": null,
-            }),
-        )))
+        Some(frame(&self.chunk(serde_json::json!({
+            "index": 0,
+            "delta": {field: text},
+            "finish_reason": null,
+        }))))
     }
 
     /// A call, kept for the collected body and framed for the stream.
@@ -437,27 +472,38 @@ impl Completion {
 
         let mut streamed = made;
         streamed["index"] = index.into();
-        frame(&self.envelope(
-            "chat.completion.chunk",
-            serde_json::json!({
-                "index": 0,
-                "delta": {"tool_calls": [streamed]},
-                "finish_reason": null,
-            }),
-        ))
+        frame(&self.chunk(serde_json::json!({
+            "index": 0,
+            "delta": {"tool_calls": [streamed]},
+            "finish_reason": null,
+        })))
     }
 
-    /// The frames that end the stream: why it ended, and then the terminator.
+    /// The frames that end the stream: why it ended, what it spent if the client
+    /// asked, and then the terminator.
+    ///
+    /// **The counts come after the reason and not with it**, in a chunk whose
+    /// `choices` is empty. That is OpenAI's shape and the reason is the one every
+    /// streaming client is written around: a client assembles its message out of
+    /// `choices[0].delta`, and counts hung off the chunk that carries the reason
+    /// would be counts a client has to look for in a chunk it may already have
+    /// stopped reading. An empty `choices` says this chunk is not part of the
+    /// message.
     pub fn closing(&self, finish: Finish) -> String {
-        let last = frame(&self.envelope(
-            "chat.completion.chunk",
-            serde_json::json!({
-                "index": 0,
-                "delta": {},
-                "finish_reason": finish.reason(),
-            }),
-        ));
-        format!("{last}{DONE}")
+        let last = frame(&self.chunk(serde_json::json!({
+            "index": 0,
+            "delta": {},
+            "finish_reason": finish.reason(),
+        })));
+        let counts = match self.reporting {
+            false => String::new(),
+            true => {
+                let mut chunk = self.envelope("chat.completion.chunk", serde_json::json!([]));
+                chunk["usage"] = self.usage();
+                frame(&chunk)
+            }
+        };
+        format!("{last}{counts}{DONE}")
     }
 
     /// The whole reply as one body, which is every delta that was pushed.
@@ -485,17 +531,13 @@ impl Completion {
 
         let mut body = self.envelope(
             "chat.completion",
-            serde_json::json!({
+            serde_json::json!([{
                 "index": 0,
                 "message": message,
                 "finish_reason": finish.reason(),
-            }),
+            }]),
         );
-        body["usage"] = serde_json::json!({
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.prompt_tokens + self.completion_tokens,
-        });
+        body["usage"] = self.usage();
         body.to_string()
     }
 }
@@ -795,6 +837,85 @@ mod tests {
         assert_eq!(body["usage"]["prompt_tokens"], PROMPT_TOKENS);
         assert_eq!(body["usage"]["completion_tokens"], reply().len());
         assert_eq!(body["usage"]["total_tokens"], PROMPT_TOKENS + reply().len());
+    }
+
+    /// **The chunk `include_usage` exists for**: after the reason, before the
+    /// terminator, with an empty `choices` so a client assembling a message out
+    /// of `choices[0].delta` reads it as no part of the message.
+    #[test]
+    fn a_stream_that_asked_for_usage_ends_with_a_chunk_carrying_it() {
+        let mut completion = completion().reporting_usage(true);
+        let stream = streamed(&mut completion, &reply(), Finish::Stop);
+
+        let chunks = payloads(&stream);
+        let last = chunks.last().expect("a last chunk");
+        assert_eq!(
+            last["choices"].as_array().expect("an array").len(),
+            0,
+            "{last}"
+        );
+        assert_eq!(last["object"], "chat.completion.chunk");
+        assert_eq!(last["usage"]["prompt_tokens"], PROMPT_TOKENS);
+        assert_eq!(last["usage"]["completion_tokens"], reply().len());
+        assert_eq!(last["usage"]["total_tokens"], PROMPT_TOKENS + reply().len());
+
+        // The reason is the chunk before it, and it is still a chunk of the
+        // message: a client that stopped reading at the reason would have the
+        // whole reply and none of the counts.
+        let reason = &chunks[chunks.len() - 2];
+        assert_eq!(reason["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// **The counts on the stream are the counts on the body.** Two ways out of
+    /// one completion, and a client that reconciles them against a budget has to
+    /// find them equal — which they are by construction here, and this is what
+    /// says the construction survived.
+    #[test]
+    fn a_stream_and_a_collected_body_report_the_same_usage() {
+        let mut completion = completion().reporting_usage(true);
+        let stream = streamed(&mut completion, &reply(), Finish::Stop);
+        let last = payloads(&stream).pop().expect("a last chunk");
+
+        let body: serde_json::Value =
+            serde_json::from_str(&completion.collected(Finish::Stop)).expect("a json body");
+        assert_eq!(last["usage"], body["usage"]);
+    }
+
+    /// **A client gets counts only where it asked for them.** The chunk is
+    /// OpenAI's opt-in, and a stream that grew one unasked is a stream whose
+    /// last frame before the terminator is not the one every existing client
+    /// expects.
+    #[test]
+    fn a_stream_that_did_not_ask_for_usage_carries_none() {
+        let stream = streamed(&mut completion(), &reply(), Finish::Stop);
+        let chunks = payloads(&stream);
+
+        assert!(
+            chunks.iter().all(|chunk| chunk.get("usage").is_none()),
+            "{chunks:?}"
+        );
+        let last = chunks.last().expect("a last chunk");
+        assert_eq!(last["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// Every chunk carries the key once it was asked for, null until the one
+    /// that has the counts. A client reading `usage` off each chunk as it
+    /// arrives finds a field rather than an absence, which is the shape OpenAI
+    /// sends and the reason the last chunk is not the only one shaped
+    /// differently.
+    #[test]
+    fn every_chunk_carries_the_usage_key_once_a_client_has_asked_for_it() {
+        let mut completion = completion().reporting_usage(true);
+        let stream = streamed(&mut completion, &reply(), Finish::Stop);
+
+        let mut chunks = payloads(&stream);
+        let counted = chunks.pop().expect("a last chunk");
+        assert!(!chunks.is_empty(), "nothing before the counts");
+        for chunk in &chunks {
+            assert_eq!(chunk["usage"], serde_json::Value::Null, "{chunk}");
+            assert!(chunk.get("usage").is_some(), "{chunk} has no usage key");
+        }
+        assert_ne!(counted["usage"], serde_json::Value::Null);
     }
 
     /// What no token produced is not counted as one. The bytes left over at the
