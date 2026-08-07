@@ -1261,6 +1261,15 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                         taken.push(Reading::new(format!("{row}.ttft"), millis(run.ttft), "ms"));
                         taken.push(Reading::new(format!("{row}.steps"), run.steps as f64, "n"));
                         taken.push(Reading::new(format!("{row}.device"), millis(run.gpu), "ms"));
+                        // **The duty cycle beside the figure**, which is the
+                        // rule every table in this file is read under: what a
+                        // wall says depends on what the part was clocked at
+                        // while it ran, and the ratio is what says so.
+                        taken.push(Reading::new(
+                            format!("{row}.duty"),
+                            duty(run.gpu, run.ttft),
+                            "%",
+                        ));
                         // **What the joining prompt costs the sequences already
                         // in flight**, which is the other half of the trade and
                         // is a row rather than a sentence.
@@ -1281,12 +1290,6 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 let weights = backend::weights(gpu.as_ref(), &ckpt, text, 0, slots)?;
                 let every = shape.gap.every().unwrap_or(ARRIVAL);
                 let arrivals: Vec<Duration> = (0..agents).map(|at| every * at as u32).collect();
-                eprintln!(
-                    "fleet: {agents} requests one every {:.0?}, {tokens} tokens each, \
-                     {slots} slots, {}-token prompts over {admit} prompt rows a step",
-                    every,
-                    ids.len(),
-                );
                 let engine = Engine {
                     weights: &weights,
                     config: text,
@@ -1295,6 +1298,14 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                     admit,
                     tokens,
                 };
+                let asked: usize = (0..agents).map(|at| engine.asking_at(at).count).sum();
+                eprintln!(
+                    "fleet: {agents} requests one every {:.0?}, {asked} tokens between them \
+                     around a budget of {tokens}, {slots} slots, {}-token prompts over {admit} \
+                     prompt rows a step",
+                    every,
+                    ids.len(),
+                );
                 // Thrown away, for the reason the joining arm's are.
                 for _ in 0..WARM {
                     joined(&engine, 0, Admitting::Continuously);
@@ -1302,9 +1313,8 @@ fn measure(what: What, dir: &Path, asked: Asked) -> Result<Vec<Reading>> {
                 for policy in [Admitting::Continuously, Admitting::InBatches] {
                     let run = fleeted(&engine, &arrivals, policy);
                     assert_eq!(
-                        run.tokens,
-                        agents * tokens,
-                        "every request answered in full"
+                        run.tokens, asked,
+                        "every request of the fleet answered in full"
                     );
                     let name = policy.named();
                     for (what, said, waits) in [
@@ -1783,19 +1793,51 @@ impl Engine<'_, '_> {
         Continuous::new(self.config, self.slots, self.admit)
     }
 
-    /// What every request of both measurements asks for, which is one prompt and
-    /// one budget: two requests of different lengths would be two measurements
-    /// with the wait attributed to whichever of them the reader assumed.
+    /// What every request of the joining measurement asks for, which is one
+    /// prompt and one budget: two requests of different lengths would be two
+    /// measurements with the wait attributed to whichever of them the reader
+    /// assumed.
     fn asking(&self) -> Request {
         Request {
             prompt: self.prompt.to_vec(),
             count: self.tokens,
         }
     }
+
+    /// What request `at` of a *fleet* asks for, which is a budget that varies.
+    ///
+    /// **A fleet whose every request asks for the same number of tokens is the
+    /// one shape a static batch is not penalised by, and taking the measurement
+    /// on it would report the difference between the two policies as zero for a
+    /// reason that belongs to the fixture.** A batch of identical budgets
+    /// finishes together — every sequence produces its last token on the same
+    /// step — so no slot ever frees early and continuous admission has nothing
+    /// to admit into that draining does not offer at the same moment. Measured
+    /// that way, 24 requests of 200 tokens read 46.2 s to a first token against
+    /// draining's 46.4, which is a null result about the fixture.
+    ///
+    /// The rule is [`asked_for`], which is a free function so that what a fleet
+    /// asks for can be checked without a checkpoint behind it.
+    fn asking_at(&self, at: usize) -> Request {
+        Request {
+            prompt: self.prompt.to_vec(),
+            count: asked_for(self.tokens, at),
+        }
+    }
+}
+
+/// What request `at` of a fleet asks for, around a budget of `tokens`.
+///
+/// A quarter of the budget to twice it, walked by an odd stride so that the
+/// order requests arrive in is not the order of their lengths — a fleet whose
+/// short requests all came first would be measuring one arrangement of a queue
+/// rather than a policy.
+fn asked_for(tokens: usize, at: usize) -> usize {
+    tokens / 4 * (1 + at * 7 % 8)
 }
 
 /// A fleet of requests arriving on `arrivals`, each asking for what
-/// [`Engine::asking`] says, through one engine.
+/// [`Engine::asking_at`] says, through one engine.
 ///
 /// **The arrivals are wall-clock and the engine is not driven ahead of them**: a
 /// request that has not been made yet is not in the queue, and an engine with
@@ -1804,7 +1846,7 @@ impl Engine<'_, '_> {
 fn fleeted(engine: &Engine<'_, '_>, arrivals: &[Duration], policy: Admitting) -> Fleeted {
     let Engine { weights, slots, .. } = *engine;
     let generator = weights.generator();
-    let asking = engine.asking();
+    let asking: Vec<Request> = (0..arrivals.len()).map(|at| engine.asking_at(at)).collect();
     let mut engine = engine.seating();
     let mut felt: Vec<Felt> = arrivals
         .iter()
@@ -1830,7 +1872,7 @@ fn fleeted(engine: &Engine<'_, '_>, arrivals: &[Duration], policy: Admitting) ->
         let mut took = 0;
         while took < taking && next < felt.len() && felt[next].arrived <= started.elapsed() {
             assert_eq!(
-                engine.submit(asking.clone()),
+                engine.submit(asking[next].clone()),
                 next,
                 "a ticket per request, in arrival order"
             );
@@ -3547,6 +3589,26 @@ mod tests {
                 "an occupancy with no slot left for the joiner at {slots}"
             );
         }
+    }
+
+    /// **A fleet's requests do not all ask for the same thing**, because a batch
+    /// of identical budgets finishes together and a static batch is not
+    /// penalised by a slot that never frees early. What that would report is a
+    /// null result about the fixture, so the spread is asserted rather than
+    /// assumed — and so is that the order they arrive in is not the order of
+    /// their lengths.
+    #[test]
+    fn a_fleets_requests_do_not_all_ask_for_the_same_thing() {
+        let counts: Vec<usize> = (0..8).map(|at| asked_for(200, at)).collect();
+        assert_eq!(counts, vec![50, 400, 350, 300, 250, 200, 150, 100]);
+        let mut sorted = counts.clone();
+        sorted.sort_unstable();
+        assert_ne!(counts, sorted, "the short requests all arrived first");
+        assert_eq!(
+            counts.iter().collect::<BTreeSet<_>>().len(),
+            counts.len(),
+            "two requests of one length"
+        );
     }
 
     /// **A percentile is a wait some request actually had.** Interpolating

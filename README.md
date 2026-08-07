@@ -1210,6 +1210,383 @@ count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
 
+## A slot that fills when a request arrives
+
+**B1 through B3 built a batch whose membership never changes: N prompts
+prefilled a sequence at a time, all of them decoded together, and a slot a
+sequence vacates left empty for the rest of the run.** What that arrangement is
+worth is settled — 2.21× at width 32, a ceiling of 1.08× above it, and 0.215 ms
+a sequence left to the scheduler. B1 bounded what was left and bounded it in the
+right currency for the wrong question:
+
+> what continuous would be worth is bounded above by the curve — **a slot that
+> fills sooner earns the same 1.78× sooner.**
+
+**That bound is about throughput, and it holds. The value of continuous is
+latency, and nothing here had ever measured one.** A request arriving while a
+batch is running waits for the batch to drain before it is prefilled at all, and
+for a fleet of agents asking at irregular times that wait is the whole of what
+anybody feels.
+
+**It is 2.25 s against 17.40 s, at eight slots with seven of them decoding.**
+A request joining a running batch waits 10% longer for its first token than the
+same request at an idle engine, and **7.7× less than the same request waiting
+for the batch it arrived behind.** The throughput is unmoved either way, which
+is B1's bound holding exactly as stated.
+
+**And the fleet says the trade is a trade.** Over 24 agents at three arrival
+rates, continuous admission wins the first token at every one of them — 1.4×,
+1.9× and 4.3× at the median — and **loses the whole answer at every one of
+them**, 68.7 s against 60.3 at the median of the loaded shape. Running
+everything at once means everything finishes late together, where running groups
+to completion finishes the early groups early. So the honest statement of what
+this milestone buys is: **a request's first token, and not its last.**
+
+### What one request waits, at each occupancy it can arrive at
+
+Eight slots, a 385-token prompt, 200 tokens a request, the step's prompt budget
+at 128 rows. `joining` is the request admitted into a free slot; `draining` is
+the same request at the same engine, admitted only once the batch it arrived
+behind has decoded the last token any of its sequences asked for — which is
+what `generate_batch`'s admission rule makes it do.
+
+**Every row holds the engine, the prompt, the budget and the request still and
+moves only how many sequences were already decoding**, and both arms of a row
+are the same binary in the same sitting.
+
+    decoding      joining                         draining
+              first token  steps  device  duty     first token  steps  device  duty
+        0        2.05 s       4    1.84 s  89.9%        —          —      —       —
+        1        2.13         4    1.90    89.1      5.69 s      201    5.17 s  90.8%
+        2        2.13         4    1.92    90.4      7.58        201    7.17    94.5
+        4        2.17         4    1.97    90.9     10.36        201    9.80    94.6
+        7        2.25         4    2.06    91.5     17.40        201   16.66    95.7
+
+**The joining column is four steps at every occupancy and the draining column is
+201.** That is the finding stated in the only unit that does not move with the
+machine: what a joining request waits is its own prompt and one decode step,
+and what a draining request waits is *the batch's remaining budget* — 200 steps
+here because the sequences it arrived behind had 200 tokens to produce. **A
+request answered by a longer generation makes the next one wait longer**, which
+is a property no amount of throughput fixes and is what continuous admission is
+for.
+
+**The 10% the joining column does grow by is the batch's own rows.** Seven
+decoders riding along four steps is 28 more rows in the call, and at the batch
+table's own 8.35 ms a token that is 0.23 s against the 0.20 s measured.
+
+### What it costs the sequences already in flight, which is the whole trade
+
+The other side of admitting mid-flight is that the joining prompt's rows are in
+the same call as the decoders' rows, so a step that carries a chunk costs what
+a step of that many rows costs. Seven sequences decoding, the same 385-token
+prompt joining them, and the step's prompt budget swept:
+
+    budget   steps  own first token  device   the batch's step   with the prompt in it
+        16     25       4.86 s        4.54 s        74.70 ms          199.39 ms
+        32     13       3.89          3.60          74.99             317.26
+        64      7       3.27          3.08          73.57             532.19
+       128      4       2.25          2.06          73.55             725.20
+       384      2       3.64          1.78          73.63            2750
+
+**Three readings, and only the first is the one a scheduler is usually told
+about.**
+
+- **The budget bounds the jitter of one token and nothing else bounds it.** The
+  worst single step a decoder waits is 199 ms at a budget of 16 and 2.75 s at a
+  budget wide enough to swallow the prompt — against its own 73.6 ms, that is
+  2.7× and 37×.
+- **The budget does not bound the total.** Summed over the steps a prompt fills
+  in, the delay is `(riding − own) × (steps − 1)`: **2.99, 2.91, 2.75, 1.96 and
+  2.68 seconds** at the five budgets. That is the prefill's own work, and
+  somebody has to do it — a standalone 385-token prefill on this build is
+  **1.63 s of device and 3.06 s of wall**, measured in the same sitting.
+- **A narrow budget costs the joiner.** 25 calls where one would do is 4.54 s of
+  device against 1.78, because a call's own overhead is paid once per chunk. The
+  wall does not follow the device to the bottom — a single 385-row call is 1.78 s
+  of device inside a 3.64 s wall, which is 49% duty against the four-call arm's
+  91% — so the **minimum of both columns is at 128 rows**, and that is what
+  `--admit` defaults to.
+
+**And what it is not is the query block.** `FusedAttention::blocked` refuses a
+call carrying more than one sequence — a block stages one tile of keys for the 64
+query rows sharing it, and rows attending over different spans cannot share one —
+so a chunk riding beside decoders can never be given one. **This section cannot
+have measured that**, and it is worth saying so rather than letting the numbers
+imply it: the entry is behind `--numerics production` and every figure here is
+taken under the default word, which has no block to lose.
+
+What the numbers *do* bound is everything a second sequence in the call costs
+together. Device time at one decoder against none, per filling step:
+
+    budget   0 decoding   1 decoding    per step   less a decode row
+        16     2.86 s       3.41 s       22.0 ms        13.4 ms
+        32     2.70         2.97         20.8           12.1
+        64     2.62         2.75         18.6            9.9
+       128     1.84         1.90         15.0            6.4
+
+A decode row's own marginal cost is 8.65 ms — the batch table's 24.23 ms at two
+sequences against 15.58 at one — so what is left is 6 to 13 ms a step of a
+second seat's own overhead. **These are differences of a few percent between two
+large numbers and they bound rather than resolve**: whatever the block would
+have been worth to a chunk of this width, it is under 13 ms a step here.
+
+### The fleet, which is where the two policies are asked the same question
+
+A request measured on its own is one arrival at one occupancy. A fleet is N
+agents asking at irregular intervals and every request's wait recorded, which is
+the shape the table above is a slice of — and it is where the answer stops being
+one-sided.
+
+Eight slots, 385-token prompts, a 128-row prompt budget, and **budgets that
+vary**: a quarter of a nominal 200 tokens to twice it, walked by an odd stride
+so the order of arrivals is not the order of lengths. That last is not
+decoration. **A fleet whose every request asks for the same number of tokens is
+the one shape a static batch is not penalised by** — its sequences produce their
+last token on the same step, so no slot ever frees early and there is nothing
+for continuous admission to admit into that draining does not offer at the same
+moment. Measured that way, 24 requests of exactly 200 tokens read 46.2 s to a
+first token against draining's 46.4, which is a null result about the fixture and
+not about the scheduler.
+
+    fleet                policy      to the first token        to the whole answer      tok/s  steps  duty
+                                    p50     p90    worst      p50     p90    worst
+    24 every 200 ms      joining   34.5 s  82.0 s  82.2 s   68.7 s 101.2 s 104.0 s   50.3    896  93.3%
+                        draining   49.0    82.7    83.1     60.3   101.5   104.2     50.2   1323  93.6
+    24 every 1 s         joining   26.3    64.8    65.7     63.8    86.4    90.6     50.2    870  93.3
+                        draining   48.6    76.8    78.8     54.4    87.0    91.4     48.9   1623  93.5
+    8 every 3 s          joining    2.17    2.33    2.33    21.3    35.7    35.7     46.3    466  92.9
+                        draining    9.32   21.4    21.4     19.2    27.6    27.6     42.3   1026  93.6
+
+**Three readings, and the second is the one a milestone about continuous
+batching would rather not print.**
+
+- **Continuous admission wins the first token at every rate, and by more the
+  less loaded the engine is.** The median is 1.42×, 1.85× and 4.30×; the tail is
+  1.01×, 1.18× and 9.19×. At the lightest shape — eight agents three seconds
+  apart, which is a fleet of agents rather than a load test — **a request's first
+  token comes back in 2.17 s at the median and 2.33 s at the worst**, which is
+  the joining table's own figure, arriving on time whatever else is running.
+- **Draining wins the whole answer at the median, at every rate.** 60.3 s
+  against 68.7, 54.4 against 63.8, 19.2 against 21.3. That is not a defect in the
+  scheduler and it is not noise: running everything at once means everything
+  finishes late together, where running groups to completion finishes the early
+  groups early. The tail is a tie at the two loaded shapes — 101.5 against 101.2
+  and 87.0 against 86.4 — because the last request out is the last request out
+  either way. **A fleet that is judged on when its answers land, rather than on
+  when they start, is a fleet a static batch serves as well or better.**
+- **The throughput is the same and B1's bound holds exactly as stated.** 50.3
+  against 50.2, 50.2 against 48.9, 46.3 against 42.3 — the light shape is the
+  only one where continuous is ahead, by 9.5%, and it is ahead there because a
+  static batch of one leaves seven slots empty. **The same 14616 rows go through
+  896 steps against 1323**, which is what continuous admission actually is:
+  the same work in wider calls.
+
+**The rate column is a whole-workload figure and the batch table's is not.** The
+fleet's 50 tokens a second is 5400 tokens out of 14616 rows — the other 9216 are
+prompt — against `bench batch`'s **119.7 tokens a second at width 8**, which is
+decode steps and nothing else. Beside C2's own static table, taken at the same
+width in the same sitting:
+
+    width   back to back   every 200 ms      every 1 s        this sitting
+      1     15.412 ms      19.106 ·  9.2%   18.947 · 1.9%     15.58 ms
+      8     64.059         67.588 · 32.7%   68.525 · 6.8%     63.80
+     32    223.155        223.024 · 90.5%  226.884 · 22.5%       —
+
+**The duty column is 92.9 to 93.6% in every row of the fleet**, so none of the
+above is the clock: the toll C2 priced is 3.5 ms on the first dispatch after a
+gap and there are no gaps in a fleet this loaded to charge it to.
+
+### Starvation, which is a correctness property and is asserted
+
+A scheduler that never admits a waiting request is wrong however fast its steps
+are, so it is not left to a comment. The queue is first in, first out and every
+free slot is filled from the front of it before a step is built, and
+`Continuous::step` asserts the consequence on every step it takes:
+
+    a request waiting while a slot stands empty
+
+**Which is a guard against a future change rather than a claim about this
+code**, and the tests say so from both sides. `no_request_waits_while_a_slot_is_free`
+counts the sequences each step carried against what the test knows is
+outstanding — an engine that admitted one request a step, or only ever into slot
+zero, drains its queue eventually and has a full complement of empty slots to
+point at while doing it, and only the count catches that. Both mutations fail it:
+*only slot zero is ever filled* trips the assertion inside the engine, and with
+the assertion removed as well it still fails on the count. *The queue served
+last in, first out* fails the order the tickets come back in.
+
+### The tests, and the two shapes nothing in this tree had driven
+
+**Every batched case here starts its sequences at step zero and leaves a slot a
+sequence vacated empty.** That is `generate_batch`'s shape and it was the only
+one anything drove — so a joining prompt's rows had never been in a call with a
+decode row in them, and a slot had never been handed from one sequence to the
+next. Both are exactly where one sequence's state can reach another's tokens,
+and both are invisible in the output: a leak answers a row of the right shape
+out of a plausible softmax, `o_proj` projects it, forty-one more layers refine
+it, and the text stays fluent.
+
+They are driven at three scales, each against the same oracle — the sequence run
+alone, exactly and not nearly:
+
+- **The loop, on the synthetic stack** (`inkling_core::schedule`). A request
+  joining a running batch at every arrival offset the budget allows and at three
+  budgets; a slot taken over four times running; and the row accounting, which
+  is the half a token comparison cannot state — the synthetic stack settles onto
+  a repeated id within a couple of steps, so a sequence handed one token twice
+  can produce the same continuation as one handed it once.
+- **The layers, on the device** (`inkling_metal::projections`). The existing
+  contamination case is now one arrangement with every stay beginning at step
+  zero; the new one has a stay beginning at step two, in a slot whose first
+  occupant has left, beside a slot that has been decoding throughout.
+- **The whole engine, on the real checkpoint** (`a_request_that_joins_or_takes_over_a_slot_produces_what_it_produces_alone`).
+  Four requests through two slots, one of the prompts the oracle's own, at four
+  budgets — so the recorded continuation is asserted from inside a joining
+  request as well as beside one.
+
+**Nine mutations, and which scale catches which is itself the finding.** At the
+loop's scale:
+
+    mutation                                            fails
+    seats ordered decoding-first                        join, one-token, chunk-invariance
+    a prompt filled to its last token as well           join, evict, budget, chunk-invariance
+    the budget spent per seat rather than per call      budget
+    a seat allowed no rows where the budget is thin     join, budget, chunk-invariance
+    a vacated slot's cache handed to the next request   evict
+    only slot zero is ever filled                       starvation and three more
+    the queue served last in, first out                 starvation, the empty request
+    one slot filled a step                              starvation and four more
+    a joining sequence given slot zero's cache          nothing
+
+**The last one is the point.** On the CPU path the `ModelCache` *is* the
+sequence's state and the slot index is bookkeeping nothing reads, so two seats
+naming one slot is not a leak there and no case at that scale can be made to
+care. On the device it is refused where it is handed over — the duplicate-slot
+check B3 built — and the real-checkpoint case fails on it. Two of the nine go
+the other way: *the budget spent per seat* and *last in, first out* are
+scheduling policy, which the device cannot see, and they survive the
+real-checkpoint case and fail at the loop's scale. **A mutation that only one
+scale catches is a case that had to exist at that scale.**
+
+The layer scale has three of its own — a stay's slot not restarted where it
+begins, a step's rows laid in stay order rather than in slot order, and a stay's
+rows salted by the run's step rather than by its own — and both cases there also
+fail the kernel mutation the older one exists for, every slot's keys based at
+row zero.
+
+### What the code-reviewer found, which is four things and one of them is a lie
+
+**None of the four is a shipped kernel with an arm no test drove**, which the
+three milestones before B3's binding could not say and C2 was the first to. All
+four here are about the measurement or its edges:
+
+- **The draining arm's documentation claimed `generate_batch` and was wrong.**
+  There the prompts enter one sequence at a time and nothing decodes until all
+  of them are in; here a batch's prompts fill together, because that is what
+  this engine does with several sequences admitted at once. The difference
+  reaches the prefill phase of a batch and nothing after it — one call's shape
+  per batch, against a wait measured in hundreds of decode steps — so it is
+  named in the code rather than corrected.
+- **The throwaway runs warmed the shape the sweep happens to run first.** The
+  occupancy loop runs `joining` before `draining` at every occupancy, so the
+  first call of every "joiner beside N decoders" shape landed inside a timed
+  run, and inside the same arm every time. That is a bias in one direction
+  rather than noise, and it flattered the arm this milestone is about the least.
+  Every occupancy is now settled before either policy is timed.
+- **A budget of two tokens or fewer** would have the row named "the batch's
+  step" be a mean over calls to an empty engine, because the held sequences
+  finish inside the settling. Refused at the command line, beside the two other
+  widths that are refused there.
+- **The one-token prompt** is the branch that skips filling entirely — its whole
+  prompt is the row that is a question — and nothing drove it.
+
+The review also asked whether `Seated`, which prefills one sequence at a time
+for the batch sweep, should be what these two measurements build their batches
+out of. It should not: what they are measuring *is* the scheduler, so a batch
+assembled by anything else would be a measurement of the harness.
+
+**And it did not find the one that mattered most, which the measurement did.**
+`--admit` was a chunk per seat, so eight slots filling 128 rows apiece was a call
+of 1024 rows — the fleet read **46 tokens a second where the same width decodes
+at 119**. A per-seat number bounds nothing and cannot be read as the cost of a
+step; it is a budget on the call now, split over the seats filling, and a seat
+still takes at least one row so a budget thinner than the seats is exceeded
+rather than starving one of them into a slot it never leaves.
+
+### What did not move
+
+**No kernel changed and no dispatch changed.** What this milestone added is one
+module in `inkling-core`, one batched step beside the one that was there, two
+measurements, and the cases beside all of them. `just test-full` is green —
+**763 gated and 81 timing**, which is the 748 C2 left plus the fifteen this
+milestone brought — the recorded continuation
+`[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what the engine generates,
+`--backend cpu` is unmoved,
+`bench diverge` re-run here agrees **448 of 448** under `production` against
+`reference` with no prompt parting, and `rounded` is still opt-in.
+
+**The contamination cases pass at every scale and their mutations still fail**,
+which is stated above rather than asserted here, and it is not the sentence C2
+was able to write: C2's mutations were not re-run because nothing it touched
+reached a seat or a slot, and this milestone reaches both. The ragged-seat cases
+still drive both halves of a merged pair, barriers derived == encoded, the
+duplicate-slot refusal still refuses — and now refuses a mutation of *this*
+milestone's own admission — memory is linear at 30.8 MiB a slot and
+`what_an_empty_seat_costs` still bounds an idle seat.
+
+**The batch's own figures, re-measured in this sitting as the controls the
+latency tables are read against:**
+
+    width    device here    the batch's own   change
+      1      15.58 ms          15.412 ms       +1.1%
+      2      24.23             24.230           0.0
+      4      34.97             35.327          -1.0
+      8      63.80             64.059          -0.4
+
+and a 385-token prefill at **1631.90 ms of device**, which is the figure the
+"what it costs the sequences in flight" column is divided against and was taken
+twice a day apart at 1631.98 and 1631.90.
+
+**One timing case still fails intermittently and it is not this.**
+`a_blocks_table_reports_one_dispatch_of_the_shape_it_names` holds a ratio
+between a warmed sweep and a lone dispatch, which are the two occupancies C2's
+section is about; nothing here touches that kernel or that table.
+
+### The floor this stops at, and its arithmetic
+
+**A joining request waits its own prompt and one decode step, and there is
+nothing else left in it. The floor is a prefill, and the widest budget is
+already on it.** At eight slots and seven decoding, the whole prompt in one
+call is 1.78 s of device, and that is a 385-token prefill plus the decode rows
+that rode in the same two calls:
+
+    a 385-token prefill, standalone, this sitting   1.632 s of device
+    15 decode rows at the batch table's 8.35 ms     0.125
+                                                    -----
+                                                    1.757 s against 1.780 measured, +1.3%
+
+At the 128-row budget the same arithmetic gives 1.874 s against 2.060 measured,
+and **the 0.19 s between them is the chunking** — four calls where one would do,
+which the budget sweep prices from below: 1.78 s at one call, 2.06 at four, 3.08
+at seven and 4.54 at twenty-five.
+
+**So the arrangement is within 12% of the floor on the device, and it is not
+where the wall's minimum is.** The one-call arm reads 1.78 s of device inside a
+3.64 s wall — 49% duty — against the four-call arm's 2.06 inside 2.25 at 91.5%.
+A 385-token prefill *standalone* is the same shape: 1.632 s of device inside
+3.061 s of wall. **What is under this floor is not the scheduler and not the
+chunk; it is the 1.4 s of host time a single wide call carries**, which
+`bench prefill` has been reporting all along and which the four-call arm happens
+to hide by giving the device more to do between the host's turns.
+
+**What that leaves for whoever comes next is the prefill.** A request's first
+token is a prefill, and a prefill of 385 tokens is 4.2 ms a token of device
+against a decode step's 8.35 ms for a whole token — so the row that would move
+this milestone's headline figure is the one "The block a short prompt could not
+have" already names, and it is behind `--numerics production` where this
+section's figures are not.
+
 ## The workload below the knee, which is a toll a wake and not a slower clock
 
 **C1 left one sentence for this milestone to check: a server holding a batch

@@ -51,14 +51,22 @@
 //! work and somebody has to do it. The chunk is a bound on the jitter of one
 //! token and not a reduction in what the prompt costs.
 //!
-//! **And a chunk is not free either, for two reasons.** It pays a call's
-//! overhead once per chunk rather than once per prompt; and the joiner's rows
-//! lose the query block — `FusedAttention::blocked` refuses a call carrying more
-//! than one sequence, because a block stages one tile of keys for the 64 query
-//! rows sharing it and rows attending over different spans cannot share one. So
-//! a prompt in 24 chunks of 16 costs 4.53 s of device where the same prompt
-//! whole costs 1.79. Both prices are measured rather than assumed; the README
-//! has the sweep.
+//! **And a narrow budget is not free either.** It pays a call's overhead once
+//! per chunk rather than once per prompt, and that is most of what the sweep
+//! measures: a 385-token prompt in 24 chunks of 16 costs 4.53 s of device where
+//! the same prompt whole costs 1.79.
+//!
+//! **What it is not is the query block.** `FusedAttention::blocked` does refuse
+//! a call carrying more than one sequence — a block stages one tile of keys for
+//! the 64 query rows sharing it, and rows attending over different spans cannot
+//! share one — so a chunk riding beside decoders can never be given one. It
+//! turns out to cost nothing measurable at these shapes, and it is worth saying
+//! why twice over: the entry is behind `--numerics production` and the figures
+//! here are taken under the default word, which has no block to lose; and the
+//! device time a second sequence in the call adds is **about 7 ms a step
+//! whatever the chunk is** — 176 ms over 25 steps at a budget of 16, 4 ms over 2
+//! at 384 — which is a seat's own overhead and not a term in the rows. The
+//! README has the arithmetic.
 //!
 //! # Starvation is a correctness property
 //!
