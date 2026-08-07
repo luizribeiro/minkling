@@ -1750,6 +1750,85 @@ mod tests {
         }
     }
 
+    /// **The longest match wins, and it takes two slots that both match to say
+    /// so.**
+    ///
+    /// Every other case here has at most one free slot matching the arriving
+    /// prompt, so all of them pass under a rule that picks *any* match — and
+    /// [`Continuous::seat_for`]'s first rule is not "a match" but "the longest
+    /// one". Two mutations survived the whole suite before this: ranking the
+    /// free slots by index alone among the nonzero matches, and ranking them by
+    /// the shortest match. Both seat the prompt in the slot holding less of it,
+    /// which is a correct answer computed from a colder cache — **a silent loss
+    /// of exactly the thing the milestone is for, invisible to every assertion
+    /// about tokens.**
+    ///
+    /// The ambiguity has to be built on purpose, because the workload does not
+    /// produce it: two conversations that have each taken a turn have diverged
+    /// past their shared opening, so only one of them matches. Here the two
+    /// openings are a short and a long prefix of one sequence, submitted *in the
+    /// same turn* — the long one cannot be seated in the short one's slot
+    /// because that slot is busy — and the prompt that arrives afterwards
+    /// extends both of them.
+    #[test]
+    fn a_prompt_matching_two_slots_is_given_the_one_holding_more_of_it() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let generator = generator(&stack, &head);
+        let sequence = stack.sequence();
+        assert!(
+            sequence.len() >= 9,
+            "the fixture's sequence is too short to hold two prefixes and a prompt past both"
+        );
+
+        // Three slots, so the arriving prompt has a free slot that matches
+        // nothing to be wrongly seated into as well as two that match.
+        let mut engine = Continuous::keeping(&stack.config, 3, 2, DEFAULT_BOUND);
+
+        let shorter = sequence[..3].to_vec();
+        let longer = sequence[..6].to_vec();
+        let answered = turned(
+            &mut engine,
+            &generator,
+            &stack,
+            &[
+                Request {
+                    prompt: shorter.clone(),
+                    count: COUNT,
+                },
+                Request {
+                    prompt: longer.clone(),
+                    count: COUNT,
+                },
+            ],
+            |_| {},
+        );
+        assert_ne!(
+            answered[0].seat.slot, answered[1].seat.slot,
+            "the two openings shared a slot, so nothing was left holding two matches"
+        );
+        let (short_slot, long_slot) = (answered[0].seat.slot, answered[1].seat.slot);
+        assert_eq!(
+            (engine.kept_at(short_slot), engine.kept_at(long_slot)),
+            (shorter.len() - 1, longer.len() - 1),
+            "the two slots are not holding the two prefixes"
+        );
+
+        // A prompt that extends both of them, so both slots match it and they
+        // match it by different amounts.
+        let arriving = sequence[..9].to_vec();
+        let (seat, _) = once(&mut engine, &stack, &head, &arriving);
+        assert_eq!(
+            seat.slot, long_slot,
+            "the prompt was seated in the slot holding less of it"
+        );
+        assert_eq!(
+            seat.reused,
+            longer.len() - 1,
+            "the prompt did not resume to the end of the longer match"
+        );
+    }
+
     /// **A conversation returning to a slot that was evicted prefills from the
     /// beginning, and is right.** This is the case that decides whether eviction
     /// is a policy or a bug: a slot handed to somebody else and then handed back
