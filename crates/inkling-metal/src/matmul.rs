@@ -6221,7 +6221,7 @@ kernel void mma_lane_probe___T__(
             !matmul.groups(16 * (SWEPT + 1) * 6, 256),
             "batch 16 at k = 4"
         );
-        assert!(!matmul.groups(1 * (SWEPT + 1) * 6, 256), "alone at k = 4");
+        assert!(!matmul.groups((SWEPT + 1) * 6, 256), "alone at k = 4");
     }
 
     /// **The two grouped entries answer the same bits**, which is what makes the
