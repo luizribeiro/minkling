@@ -645,8 +645,21 @@ impl<'a> Continuous<'a> {
     /// prompt matching that position is a prompt nothing could honour, which is
     /// why the ids recorded are the ones the mark stands at.
     ///
-    /// A sequence that never finished filling never took a mark, and there is no
-    /// position in this cache anything could be resumed to — so its slot is
+    /// **A sequence with no mark has not generated anything, which is two
+    /// different states and not one.** The mark is taken at the top of the first
+    /// step a seat is not filling in, so there is an inter-step window — after
+    /// the step that fed a prompt's last chunk, before the step that feeds its
+    /// first row that is a question — where the cache stands exactly at
+    /// [`Resident::kept`] and nothing has been marked. A client that hangs up
+    /// waiting for a first token leaves its seat precisely there, and a prompt
+    /// short enough to fill in one step passes through that window on the way to
+    /// every reply. So what decides is whether the prompt is *in*, and not
+    /// whether a mark was taken: a seat that is no longer filling is a seat whose
+    /// cache is already where a mark would have put it, and the only thing left
+    /// to do with it is record the ids.
+    ///
+    /// A sequence that never finished filling is the other state, and there is no
+    /// position in that cache anything could be resumed to — so its slot is
     /// forgotten, which is to say handed on holding no keys at all. **That is
     /// this engine's own behaviour before there was a conversation to keep**, and
     /// it is what an engine keeping nothing does at every departure.
@@ -661,6 +674,7 @@ impl<'a> Continuous<'a> {
                 weights.resume(slot.kept.cache_mut(), mark);
                 slot.kept.keep(held.kept());
             }
+            None if !held.filling() => slot.kept.keep(held.kept()),
             None => slot.kept.forget(),
         }
     }
@@ -1933,6 +1947,64 @@ mod tests {
             produced,
             alone(&stack, &returning, COUNT),
             "the resumed turn read the cancelled generation's keys"
+        );
+    }
+
+    /// **A seat given up between its prompt going in and its first token coming
+    /// out keeps the conversation**, which is a window one step wide and is
+    /// where a client waiting on a first token actually hangs up.
+    ///
+    /// The mark is taken at the top of the first step a seat is *not* filling
+    /// in, so a seat that finished filling in the step just gone has no mark and
+    /// a cache standing exactly where one would have put it. Deciding on the
+    /// mark rather than on the prompt threw that conversation away — silently,
+    /// and for every prompt short enough to fill in one step, which is every
+    /// prompt under the server's own budget of 128 rows.
+    ///
+    /// Two turns rather than a count of positions, because the position is what
+    /// the bug hid behind: the second turn resumes and produces what its whole
+    /// prompt produces alone.
+    #[test]
+    fn a_seat_given_up_between_its_prompt_and_its_first_token_keeps_the_conversation() {
+        let stack = Stack::load();
+        let head = stack.head();
+        let generator = generator(&stack, &head);
+        let sequence = stack.sequence();
+        let opening = sequence[..4].to_vec();
+
+        // A budget wide enough to swallow the prompt in one step, which is what
+        // makes the window the step after admission.
+        let mut engine = Continuous::keeping(&stack.config, 1, 64, DEFAULT_BOUND);
+        let abandoned = engine.submit(Request {
+            prompt: opening.clone(),
+            count: COUNT,
+        });
+        let stepped = engine.step(&generator, &stack);
+        assert_eq!(
+            stepped.filling,
+            opening.len() - 1,
+            "the prompt went in whole"
+        );
+        assert_eq!(
+            stepped.decoding, 0,
+            "a token was produced before the window"
+        );
+
+        assert!(engine.release(abandoned, &stack), "the seat was there");
+        assert_eq!(
+            engine.kept_at(0),
+            opening.len() - 1,
+            "a prompt that was fully in was thrown away"
+        );
+
+        let mut returning = opening.clone();
+        returning.extend_from_slice(&sequence[..ADDED]);
+        let (back, produced) = once(&mut engine, &stack, &head, &returning);
+        assert_eq!(back.reused, opening.len() - 1);
+        assert_eq!(
+            produced,
+            alone(&stack, &returning, COUNT),
+            "the resumed turn read a cache that was not where it was recorded"
         );
     }
 

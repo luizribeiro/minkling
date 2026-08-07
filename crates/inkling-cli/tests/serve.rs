@@ -375,8 +375,12 @@ fn a_tool_a_request_declares_is_a_tool_the_model_calls_and_answers_from() {
 ///
 /// A turn that answers a call is the turn before it with three things added —
 /// the call, the marker that ends the model's turn, and the result — so it is an
-/// exact extension, which is the only thing [`Kept`] can serve from. That is a
-/// claim about *tokens* and not about markers: the two prompts could agree
+/// exact extension, which is the only thing [`Kept`] can serve from. **And that
+/// now settles it on both paths**, because the scheduler asks a slot the same
+/// question through the same type: a tool round trip resumes at width N exactly
+/// where it resumes at width one, and there is no second matching rule that
+/// could disagree. That is a claim about *tokens* and not about markers: the two
+/// prompts could agree
 /// character for character and still part company at the first token if a merge
 /// straddled the boundary, so it is asked of the vocabulary rather than of the
 /// strings.

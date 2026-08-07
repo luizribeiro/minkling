@@ -77,6 +77,7 @@ three; the pre-commit hooks already skip clippy on those by config.
     just bench . .         fleet --every 200  # N agents, and the distribution
     just bench-engines                        # this engine against mlx-vlm
     just bench-session                        # a conversation, kept against not
+    just bench-conversations                  # several of them, at width > 1
 
 **A decode step is the one measurement here with a context to be taken at** —
 and the batch sweep with it, which is decode steps — and until the occupancy turn
@@ -99,7 +100,7 @@ ref is built once into `target/bench/bin/<sha>` and kept, and the pairs are
 process launches against binaries that already exist. `.` is the working tree,
 which is the arm a change is measured from before it is a commit at all.
 
-**And four of them measure more than one request, in the ways there are.**
+**And five of them measure more than one request, in the ways there are.**
 `just bench-session` is a conversation — several turns, each adding a question
 and each answered — because a cache kept between requests is worth nothing on a
 measurement of one call, which has no between. See "What a conversation costs
@@ -107,6 +108,13 @@ when its cache is kept". `bench batch` is several requests *at once* rather than
 one after another, which is the other thing a single call cannot say: what a
 token costs when the weights a step reads are read for N sequences instead of
 one. See "One weight read, many tokens".
+
+**`just bench-conversations` is both of those at once**, which is the workload a
+fleet of coding agents actually is and was not a shape this engine could run
+until a slot could keep the conversation it last held: several conversations,
+each coming back with the last turn and a little more, through the engine that
+seats several. `--agents 1` is a session at width N and is the row read against
+`bench-session`'s own. See "A conversation that comes back to its own keys".
 
 **`bench joining` and `bench fleet` are the two whose subject is a wait rather
 than a rate**, and they are the only rows here whose figure is a wall the device
@@ -1487,22 +1495,24 @@ width 2, against the 91.1–93.1% every row of the fleet sat in. And the physics
 width 2 is 244 — both under this part's 725 GB/s, so neither is a measurement
 bug.
 
-### What `--slots 1` keeps, which is why it is still the default
+### What `--slots N` gave up, which was the conversation
 
-**A scheduled server forgets the conversation, and that is not a decision the
-server makes.** A slot's cache belongs to the slot — the device holds one span
-and one window pair per layer per slot — and `Continuous` hands every joining
-sequence a *fresh* one, precisely so that it does not attend over the keys of
-whoever sat there before. There is no position in that arrangement for a
-conversation to be resumed to, at any width. So `--slots N` re-prefills every
+**A scheduled server forgot the conversation, and that was not a decision the
+server made.** A slot's cache belongs to the slot — the device holds one span and
+one window pair per layer per slot — and `Continuous` handed every joining
+sequence a *fresh* one, precisely so that it did not attend over the keys of
+whoever sat there before. There was no position in that arrangement for a
+conversation to be resumed to, at any width. So `--slots N` re-prefilled every
 turn, where `Kept` costs about a millisecond a turn and saves 33 s of prefill at
-16384 tokens.
+16384 tokens, and which of the two a workload wanted was the question the flag
+asked.
 
-Which of the two a workload wants is the question the flag asks. A fleet of
-agents arriving at irregular times wants the scheduler; one coding session
-sending its context back turn after turn wants the cache. A default that reached
-for a batch nobody asked for would make the common case slower, so the default
-is one slot.
+**That trade is gone and the next section is how.** What the freshness ruled out
+was a sequence reading a *stranger's* keys, and it ruled out a conversation
+reading its own along with it; a slot that records the ids its cache sits at the
+end of can tell those two apart. `--slots 1` is still the default, for what is
+now the only reason left: a server answering one client is a server whose other
+slots are slots nobody sits in, at 30.8 MiB apiece.
 
 **A client that hangs up frees its slot**, which under the load a scheduler
 exists for is the ordinary way a request ends rather than an edge case. It is a
@@ -1551,8 +1561,18 @@ already have stopped reading.
   its own equivalence argument.
 - **Ask for more than one choice**, or for a `tool_choice` of `required` or a
   named function. All three are refused rather than ignored.
-- **Keep a conversation and batch at the same time.** The two are the two ends
-  of `--slots`, for the reason above.
+- **Name the conversation it is continuing.** There is no field for it in the
+  OpenAI schema and this server invents none, so which slot a turn is resumed
+  into is decided by the tokens the client sent — see the section below, where
+  that is a choice rather than a limitation. What a client *cannot* do as a
+  consequence: keep its slot across a turn it edited in the middle. Change one
+  token of the history and the match is gone, the whole prompt is prefilled, and
+  the reply is right.
+- **Hold a slot while it thinks.** A conversation whose own slot is taken when
+  its next turn arrives is admitted somewhere else and prefills from the
+  beginning, because waiting for a cache means waiting out another request's
+  whole generation. Under a fleet larger than `--slots`, the same is true of a
+  conversation that was evicted while its user was reading.
 - **Have a `stop` honoured against its reasoning**, or a disconnect noticed
   during a non-streaming request — nothing is written until the last token, so
   there is no failing write to notice it by.
