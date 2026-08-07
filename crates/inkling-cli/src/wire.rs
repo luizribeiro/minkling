@@ -70,6 +70,10 @@ pub fn payloads(stream: &str) -> Vec<serde_json::Value> {
 }
 
 /// The delta of a chunk, as the field it landed in and the text it carried.
+///
+/// `tool_calls` is not one of the fields: a call is not text, and a client that
+/// appended it to a message would print JSON at a user. [`calls`] is where one
+/// is read off instead.
 pub fn delta(chunk: &serde_json::Value) -> Option<(String, String)> {
     let delta = &chunk["choices"][0]["delta"];
     for field in ["content", "reasoning_content"] {
@@ -78,4 +82,13 @@ pub fn delta(chunk: &serde_json::Value) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// The calls a chunk carried, which is what a client builds `tool_calls` out
+/// of. Empty for every chunk that is not one.
+pub fn calls(chunk: &serde_json::Value) -> Vec<serde_json::Value> {
+    chunk["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
 }

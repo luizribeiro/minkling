@@ -30,19 +30,33 @@
 //! rather than any other name because it is the field the checkpoint's *own*
 //! `chat_template.jinja` reads an assistant turn's thinking out of, which makes
 //! the round trip closed — [`crate::chat`] writes back what this wrote out.
+//!
+//! # A tool call is a third shape, and it is not text
+//!
+//! The model spells a call out in its own turn — see [`crate::chat`] for the
+//! markers — and what a client needs is `tool_calls`, a `finish_reason` of
+//! `tool_calls`, and an id per call for the result to answer by. None of the
+//! three is text, so none of them goes through the two channels: a call reaches
+//! [`Completion`] already assembled, and what it produces is a delta of its own.
+//!
+//! The id is minted here because the model does not produce one. It only has to
+//! be unique inside a conversation — a client sends it back on the `tool`
+//! message, and [`crate::chat`] looks the tool's name up by it — so it is the
+//! completion's own id and the call's index in it.
 
 use serde::Deserialize;
 
-use crate::chat::{Channel, ChatError, Message};
+use crate::chat::{Call, Channel, ChatError, Message, Routed};
 
 /// What a client asked for.
 ///
 /// Unknown fields are accepted and ignored, which is what an OpenAI client
 /// needs — they all send fields this does not have. Two exceptions are refused
 /// rather than ignored, because ignoring them changes the shape of the answer
-/// and not just its wording: `tools`, whose disappearance turns a tool call into
-/// a refusal to make one, and an `n` above one, which asks for choices this
-/// would silently return one of.
+/// and not just its wording: a `tool_choice` this does not implement, whose
+/// disappearance turns "you must call a tool" into a paragraph about calling
+/// one, and an `n` above one, which asks for choices this would silently return
+/// one of.
 ///
 /// The sampling parameters — `temperature`, `top_p`, and the rest — are among
 /// the ignored. Decoding is greedy and only greedy; see
@@ -61,8 +75,47 @@ pub struct ChatRequest {
     pub max_completion_tokens: Option<usize>,
     #[serde(default)]
     pub n: Option<usize>,
+    /// The specs to declare, held as they arrived: [`crate::chat`] builds the
+    /// declaration out of whatever the client sent, the way the template does,
+    /// rather than out of a shape this insisted on first.
     #[serde(default)]
-    pub tools: Option<serde_json::Value>,
+    pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+/// Which of OpenAI's `tool_choice` values this implements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    /// The model decides, which is the default and what a declaration alone
+    /// expresses.
+    Auto,
+    /// The tools are not declared at all, which is what leaves the model
+    /// nothing to call.
+    None,
+}
+
+impl Choice {
+    /// What `tool_choice` asked for, or which value it is that this does not
+    /// implement.
+    ///
+    /// `required` and a named function are the two it does not. Both are a
+    /// constraint on what the model may produce, and there is nothing in a
+    /// prompt that constrains it — honouring either needs the sampler to refuse
+    /// the tokens that would leave the turn, which is a decode-time mechanism
+    /// this engine has no flag for. Refused rather than treated as `auto`,
+    /// because a client that asked for a call and got a sentence has no way to
+    /// tell that from a model that would not call one.
+    fn parse(asked: Option<&serde_json::Value>) -> Result<Self, RequestError> {
+        let Some(asked) = asked else {
+            return Ok(Choice::Auto);
+        };
+        match asked.as_str() {
+            Some("auto") => Ok(Choice::Auto),
+            Some("none") => Ok(Choice::None),
+            _ => Err(RequestError::ToolChoice(asked.to_string())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -70,8 +123,8 @@ pub enum RequestError {
     #[error("the request body is not the JSON this takes: {0}")]
     Malformed(String),
 
-    #[error("this server implements no tools")]
-    Tools,
+    #[error("this server implements tool_choice auto and none, not {0}")]
+    ToolChoice(String),
 
     #[error("this server returns one choice, so n must be 1")]
     Choices,
@@ -87,9 +140,7 @@ impl ChatRequest {
     pub fn parse(body: &str) -> Result<Self, RequestError> {
         let request: Self =
             serde_json::from_str(body).map_err(|err| RequestError::Malformed(err.to_string()))?;
-        if request.tools.is_some() {
-            return Err(RequestError::Tools);
-        }
+        Choice::parse(request.tool_choice.as_ref())?;
         if request.n.is_some_and(|choices| choices != 1) {
             return Err(RequestError::Choices);
         }
@@ -97,6 +148,18 @@ impl ChatRequest {
             return Err(RequestError::NotACount);
         }
         Ok(request)
+    }
+
+    /// The specs the prompt declares, which is none of them where the caller
+    /// asked for none.
+    ///
+    /// `tool_choice` was checked when the request was parsed, so a value this
+    /// does not implement never reaches here.
+    pub fn declared(&self) -> &[serde_json::Value] {
+        match Choice::parse(self.tool_choice.as_ref()) {
+            Ok(Choice::None) => &[],
+            _ => self.tools.as_deref().unwrap_or_default(),
+        }
     }
 
     /// The budget this request named, under either of OpenAI's two names for
@@ -123,6 +186,9 @@ pub enum Finish {
     Stop,
     /// The budget ran out with the model still going.
     Length,
+    /// The model ended its turn having asked for a tool, which is what a client
+    /// branches on to run one rather than to show the reply.
+    ToolCalls,
 }
 
 impl Finish {
@@ -130,6 +196,7 @@ impl Finish {
         match self {
             Finish::Stop => "stop",
             Finish::Length => "length",
+            Finish::ToolCalls => "tool_calls",
         }
     }
 }
@@ -167,6 +234,9 @@ pub struct Completion {
     completion_tokens: usize,
     content: String,
     reasoning: String,
+    /// The calls the model asked for, each as the object a collected body
+    /// carries — a streamed one is the same object with its index beside it.
+    calls: Vec<serde_json::Value>,
 }
 
 impl Completion {
@@ -179,7 +249,14 @@ impl Completion {
             completion_tokens: 0,
             content: String::new(),
             reasoning: String::new(),
+            calls: Vec::new(),
         }
+    }
+
+    /// Whether the model asked for a tool, which is what decides between two of
+    /// OpenAI's reasons for a turn the model ended.
+    pub fn called(&self) -> bool {
+        !self.calls.is_empty()
     }
 
     fn envelope(&self, object: &str, choice: serde_json::Value) -> serde_json::Value {
@@ -207,31 +284,41 @@ impl Completion {
         ))
     }
 
-    /// One token's worth of text, added to the reply and framed.
+    /// One token's worth of whatever it turned out to be, added to the reply and
+    /// framed.
     ///
     /// The token is counted whether or not it showed anything. What the budget
     /// spends is decode steps, and a step that produced no visible text cost the
     /// same as one that did.
-    pub fn push(&mut self, channel: Channel, text: &str) -> Option<String> {
+    pub fn push(&mut self, routed: Routed) -> Option<String> {
         self.completion_tokens += 1;
-        self.delta(channel, text)
+        self.add(routed)
     }
 
-    /// Text no token contributed: the bytes a detokenizer was still holding when
-    /// the generation ended, which a budget that cut a reply off mid-character
-    /// leaves behind.
+    /// What no token contributed: the bytes a detokenizer was still holding when
+    /// the generation ended, and the call a budget cut short — both of which
+    /// [`Channels`](crate::chat::Channels) hands back at the end.
     ///
     /// Added and framed like any other delta, and counted against nothing. No
     /// decode step produced it — it is the tail of ones already charged for —
     /// and `usage` a client reconciles against a budget has to say so.
-    pub fn tail(&mut self, channel: Channel, text: &str) -> Option<String> {
-        self.delta(channel, text)
+    pub fn tail(&mut self, routed: Routed) -> Option<String> {
+        self.add(routed)
     }
 
-    /// `None` where there is no text — a marker, or a token that only completed
-    /// part of a character. Both are ordinary and neither is an event: a frame
-    /// carrying an empty delta is one a client has to be careful about for no
-    /// reason.
+    /// `None` where there is nothing to show — a marker, a token that only
+    /// completed part of a character, or text held back until it is known
+    /// whether it names a tool. All three are ordinary and none is an event: a
+    /// frame carrying an empty delta is one a client has to be careful about for
+    /// no reason.
+    fn add(&mut self, routed: Routed) -> Option<String> {
+        match routed {
+            Routed::Nothing => None,
+            Routed::Text(channel, text) => self.delta(channel, &text),
+            Routed::Call(call) => Some(self.invocation(call)),
+        }
+    }
+
     fn delta(&mut self, channel: Channel, text: &str) -> Option<String> {
         if text.is_empty() {
             return None;
@@ -257,6 +344,33 @@ impl Completion {
         )))
     }
 
+    /// A call, kept for the collected body and framed for the stream.
+    ///
+    /// `index` is on the streamed copy and not on the kept one, which is where
+    /// OpenAI puts it: a client building a message out of deltas needs to know
+    /// which call a delta belongs to, and one reading a whole message has the
+    /// array's own order.
+    fn invocation(&mut self, call: Call) -> String {
+        let index = self.calls.len();
+        let made = serde_json::json!({
+            "id": format!("call_{}_{index}", self.id),
+            "type": "function",
+            "function": {"name": call.name, "arguments": call.arguments},
+        });
+        self.calls.push(made.clone());
+
+        let mut streamed = made;
+        streamed["index"] = index.into();
+        frame(&self.envelope(
+            "chat.completion.chunk",
+            serde_json::json!({
+                "index": 0,
+                "delta": {"tool_calls": [streamed]},
+                "finish_reason": null,
+            }),
+        ))
+    }
+
     /// The frames that end the stream: why it ended, and then the terminator.
     pub fn closing(&self, finish: Finish) -> String {
         let last = frame(&self.envelope(
@@ -274,12 +388,21 @@ impl Completion {
     ///
     /// `reasoning_content` is omitted rather than empty when the model opened no
     /// thinking channel, so that a reply with none looks like an ordinary
-    /// OpenAI one.
+    /// OpenAI one. `content` is null rather than empty on a turn that was
+    /// nothing but calls, which is the shape OpenAI sends one in and the shape
+    /// [`crate::chat`] reads back — an empty string there is a message the
+    /// template renders as an empty one rather than as no message at all.
     pub fn collected(&self, finish: Finish) -> String {
         let mut message = serde_json::json!({
             "role": "assistant",
             "content": self.content,
         });
+        if self.content.is_empty() && self.called() {
+            message["content"] = serde_json::Value::Null;
+        }
+        if !self.calls.is_empty() {
+            message["tool_calls"] = self.calls.clone().into();
+        }
         if !self.reasoning.is_empty() {
             message["reasoning_content"] = self.reasoning.as_str().into();
         }
@@ -337,7 +460,8 @@ mod tests {
     use inkling_core::Utf8Stream;
 
     use super::*;
-    use crate::wire::{delta, frames, payload, payloads};
+    use crate::chat::{invoked, text};
+    use crate::wire::{calls, delta, frames, payload, payloads};
 
     const MODEL: &str = "Inkling-Small-mxfp4";
     const CREATED: u64 = 1_774_000_000;
@@ -369,10 +493,10 @@ mod tests {
     }
 
     /// A whole streamed reply, as it reaches a socket.
-    fn streamed(completion: &mut Completion, deltas: &[(Channel, &str)], finish: Finish) -> String {
+    fn streamed(completion: &mut Completion, reply: &[Routed], finish: Finish) -> String {
         let mut stream = completion.opening();
-        for (channel, text) in deltas {
-            if let Some(chunk) = completion.push(*channel, text) {
+        for routed in reply {
+            if let Some(chunk) = completion.push(routed.clone()) {
                 stream.push_str(&chunk);
             }
         }
@@ -380,19 +504,21 @@ mod tests {
         stream
     }
 
-    const REPLY: [(Channel, &str); 5] = [
-        (Channel::Thinking, "Weigh"),
-        (Channel::Thinking, " it up."),
-        (Channel::Content, "Caf"),
-        (Channel::Content, "é."),
-        (Channel::Content, ""),
-    ];
+    fn reply() -> Vec<Routed> {
+        vec![
+            text(Channel::Thinking, "Weigh"),
+            text(Channel::Thinking, " it up."),
+            text(Channel::Content, "Caf"),
+            text(Channel::Content, "é."),
+            Routed::Nothing,
+        ]
+    }
 
     /// What a client parsing the stream sees, frame by frame: a role to build
     /// on, one delta per token that had text, a reason, and the terminator.
     #[test]
     fn a_stream_opens_with_a_role_and_ends_with_a_reason_and_a_terminator() {
-        let stream = streamed(&mut completion(), &REPLY, Finish::Stop);
+        let stream = streamed(&mut completion(), &reply(), Finish::Stop);
         // `payloads` drops the terminator and refuses a stream without one, so
         // a chunk count here is a count of the chunks alone: a role, and four
         // tokens that had text, and the reason. The fifth token contributed
@@ -414,7 +540,7 @@ mod tests {
     /// considers finished.
     #[test]
     fn a_budget_that_ran_out_is_reported_apart_from_a_turn_the_model_ended() {
-        let stream = streamed(&mut completion(), &REPLY, Finish::Length);
+        let stream = streamed(&mut completion(), &reply(), Finish::Length);
         let last = payloads(&stream).pop().expect("a last chunk");
         assert_eq!(last["choices"][0]["finish_reason"], "length");
     }
@@ -423,7 +549,7 @@ mod tests {
     /// other's text.
     #[test]
     fn thinking_and_content_arrive_in_fields_of_their_own() {
-        let stream = streamed(&mut completion(), &REPLY, Finish::Stop);
+        let stream = streamed(&mut completion(), &reply(), Finish::Stop);
         let deltas: Vec<(String, String)> = payloads(&stream).iter().filter_map(delta).collect();
 
         assert_eq!(
@@ -442,8 +568,8 @@ mod tests {
     #[test]
     fn a_token_that_contributed_no_text_is_not_framed() {
         let mut completion = completion();
-        assert_eq!(completion.push(Channel::Content, ""), None);
-        assert!(completion.push(Channel::Content, "Hi").is_some());
+        assert_eq!(completion.push(text(Channel::Content, "")), None);
+        assert!(completion.push(text(Channel::Content, "Hi")).is_some());
     }
 
     /// The claim the whole type exists to make: the body a non-streaming request
@@ -453,7 +579,7 @@ mod tests {
     #[test]
     fn the_collected_body_is_the_stream_added_up() {
         let mut completion = completion();
-        let stream = streamed(&mut completion, &REPLY, Finish::Stop);
+        let stream = streamed(&mut completion, &reply(), Finish::Stop);
 
         let mut content = String::new();
         let mut reasoning = String::new();
@@ -480,7 +606,7 @@ mod tests {
     #[test]
     fn a_reply_without_thinking_carries_no_reasoning_field() {
         let mut completion = completion();
-        assert!(completion.push(Channel::Content, "Hello.").is_some());
+        assert!(completion.push(text(Channel::Content, "Hello.")).is_some());
         let body: serde_json::Value =
             serde_json::from_str(&completion.collected(Finish::Stop)).expect("a json body");
 
@@ -491,21 +617,108 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "Hello.");
     }
 
+    /// The milestone, as a client reads it: the call arrives in a delta of its
+    /// own and again in the collected body, the two carry the same id, and the
+    /// reason says a tool was asked for rather than that the model had its say.
+    #[test]
+    fn a_call_reaches_a_client_as_tool_calls_and_not_as_text() {
+        let mut completion = completion();
+        let asked = [invoked("get_weather", "{\"city\":\"Paris\"}")];
+        let stream = streamed(&mut completion, &asked, Finish::ToolCalls);
+
+        let chunks = payloads(&stream);
+        let streamed: Vec<serde_json::Value> = chunks.iter().flat_map(calls).collect();
+        assert_eq!(streamed.len(), 1, "{chunks:?}");
+        assert_eq!(streamed[0]["index"], 0);
+        assert_eq!(streamed[0]["type"], "function");
+        assert_eq!(streamed[0]["function"]["name"], "get_weather");
+        assert_eq!(streamed[0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+        assert!(
+            chunks.iter().all(|chunk| delta(chunk).is_none()),
+            "{chunks:?}"
+        );
+
+        let last = chunks.last().expect("a last chunk");
+        assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+
+        let body: serde_json::Value =
+            serde_json::from_str(&completion.collected(Finish::ToolCalls)).expect("a json body");
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["tool_calls"][0]["id"], streamed[0]["id"]);
+        assert_eq!(
+            message["tool_calls"][0]["function"],
+            streamed[0]["function"]
+        );
+        // OpenAI's own shape for a turn that was nothing but calls, and the one
+        // `crate::chat` reads back as a message with no content of its own.
+        assert_eq!(message["content"], serde_json::Value::Null);
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    /// Two calls out of one turn, which is what an agent asking for two files
+    /// at once produces. A client builds its array by `index`, and answers each
+    /// call by its own id — so two calls sharing either would be one call.
+    #[test]
+    fn two_calls_are_told_apart_by_their_index_and_by_their_id() {
+        let mut completion = completion();
+        let asked = [invoked("a", "{}"), invoked("b", "{\"x\":1}")];
+        let stream = streamed(&mut completion, &asked, Finish::ToolCalls);
+
+        let made: Vec<serde_json::Value> = payloads(&stream).iter().flat_map(calls).collect();
+        assert_eq!(made.len(), 2, "{made:?}");
+        assert_eq!(made[0]["index"], 0);
+        assert_eq!(made[1]["index"], 1);
+        assert_ne!(made[0]["id"], made[1]["id"]);
+        assert_eq!(made[1]["function"]["name"], "b");
+    }
+
+    /// A turn that said something *and* called a tool keeps both. The text is
+    /// the answer and the call is the ask, and a client that got only one of
+    /// them is missing the other.
+    #[test]
+    fn a_turn_that_answered_and_called_keeps_both() {
+        let mut completion = completion();
+        let asked = [text(Channel::Content, "Looking."), invoked("a", "{}")];
+        let _ = streamed(&mut completion, &asked, Finish::ToolCalls);
+
+        let body: serde_json::Value =
+            serde_json::from_str(&completion.collected(Finish::ToolCalls)).expect("a json body");
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["content"], "Looking.");
+        assert_eq!(message["tool_calls"].as_array().expect("calls").len(), 1);
+    }
+
+    /// A reply nobody asked a tool for carries no `tool_calls` key at all,
+    /// rather than an empty array a client has to check the length of.
+    #[test]
+    fn a_reply_without_a_call_carries_no_tool_calls_field() {
+        let mut completion = completion();
+        let _ = streamed(&mut completion, &reply(), Finish::Stop);
+        let body: serde_json::Value =
+            serde_json::from_str(&completion.collected(Finish::Stop)).expect("a json body");
+
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"],
+            serde_json::Value::Null
+        );
+        assert_eq!(body["choices"][0]["message"]["content"], "Café.");
+    }
+
     /// Every token is counted, including the ones that showed nothing — a
     /// marker, or half a character. Each cost a decode step, and usage that
     /// counted only the visible ones would understate what the request spent.
     #[test]
     fn usage_counts_every_token_the_budget_was_charged_for() {
         let mut completion = completion();
-        for (channel, text) in REPLY {
-            let _ = completion.push(channel, text);
+        for routed in reply() {
+            let _ = completion.push(routed);
         }
         let body: serde_json::Value =
             serde_json::from_str(&completion.collected(Finish::Stop)).expect("a json body");
 
         assert_eq!(body["usage"]["prompt_tokens"], PROMPT_TOKENS);
-        assert_eq!(body["usage"]["completion_tokens"], REPLY.len());
-        assert_eq!(body["usage"]["total_tokens"], PROMPT_TOKENS + REPLY.len());
+        assert_eq!(body["usage"]["completion_tokens"], reply().len());
+        assert_eq!(body["usage"]["total_tokens"], PROMPT_TOKENS + reply().len());
     }
 
     /// What no token produced is not counted as one. The bytes left over at the
@@ -516,8 +729,12 @@ mod tests {
     #[test]
     fn the_text_left_over_at_the_end_is_not_a_token() {
         let mut completion = completion();
-        let _ = completion.push(Channel::Content, "The");
-        assert!(completion.tail(Channel::Content, "\u{fffd}").is_some());
+        let _ = completion.push(text(Channel::Content, "The"));
+        assert!(
+            completion
+                .tail(text(Channel::Content, "\u{fffd}"))
+                .is_some()
+        );
 
         let body: serde_json::Value =
             serde_json::from_str(&completion.collected(Finish::Length)).expect("a json body");
@@ -534,13 +751,13 @@ mod tests {
     /// byte-level vocabulary produces whenever no merge covers a character.
     #[test]
     fn a_character_split_across_tokens_reaches_the_client_in_one_frame() {
-        let text = "Café, 日本語, 🙂.";
+        let split = "Café, 日本語, 🙂.";
         let mut stream = Utf8Stream::new();
         let mut completion = completion();
 
         let mut frames = String::new();
-        for byte in text.as_bytes() {
-            if let Some(chunk) = completion.push(Channel::Content, &stream.push(&[*byte])) {
+        for byte in split.as_bytes() {
+            if let Some(chunk) = completion.push(text(Channel::Content, &stream.push(&[*byte]))) {
                 frames.push_str(&chunk);
             }
         }
@@ -552,7 +769,7 @@ mod tests {
             .filter_map(delta)
             .map(|(_, text)| text)
             .collect();
-        assert_eq!(arrived, text);
+        assert_eq!(arrived, split);
         assert!(
             !arrived.contains(char::REPLACEMENT_CHARACTER),
             "{arrived:?}"
@@ -565,7 +782,7 @@ mod tests {
     fn text_with_newlines_in_it_stays_inside_one_frame() {
         let mut completion = completion();
         let chunk = completion
-            .push(Channel::Content, "one\n\ntwo")
+            .push(text(Channel::Content, "one\n\ntwo"))
             .expect("a frame");
 
         assert_eq!(frames(&chunk).len(), 1, "{chunk:?}");
@@ -593,16 +810,63 @@ mod tests {
         assert!(!request.stream);
     }
 
-    /// Two fields that change the shape of the answer rather than its wording,
-    /// which is why these are the two that are refused.
+    /// A second choice changes the shape of the answer rather than its wording,
+    /// which is why it is refused where `temperature` is ignored.
     #[test]
-    fn tools_and_a_second_choice_are_refused() {
-        assert_eq!(
-            refused(serde_json::json!({"tools": []})),
-            RequestError::Tools
-        );
+    fn a_second_choice_is_refused() {
         assert_eq!(refused(serde_json::json!({"n": 2})), RequestError::Choices);
         assert!(request(asking(serde_json::json!({"n": 1}))).is_ok());
+    }
+
+    const WEATHER: fn() -> serde_json::Value =
+        || serde_json::json!([{"type": "function", "function": {"name": "get_weather"}}]);
+
+    /// The declaration reaches the prompt, which is the whole of what accepting
+    /// `tools` means here.
+    #[test]
+    fn the_tools_a_request_names_are_the_tools_the_prompt_declares() {
+        let asked = request(asking(serde_json::json!({"tools": WEATHER()}))).expect("parses");
+        assert_eq!(asked.declared(), WEATHER().as_array().expect("a list"));
+        assert!(
+            request(asking(serde_json::json!({})))
+                .expect("parses")
+                .declared()
+                .is_empty()
+        );
+    }
+
+    /// `none` is the one `tool_choice` with something to do rather than
+    /// something to refuse, and what it does is leave the specs out: a model
+    /// that was never told the tools has none to reach for.
+    #[test]
+    fn tool_choice_none_declares_no_tools_at_all() {
+        let extra = serde_json::json!({"tools": WEATHER(), "tool_choice": "none"});
+        let asked = request(asking(extra)).expect("parses");
+        assert!(asked.declared().is_empty());
+
+        let extra = serde_json::json!({"tools": WEATHER(), "tool_choice": "auto"});
+        let auto = request(asking(extra)).expect("parses");
+        assert_eq!(auto.declared().len(), 1);
+    }
+
+    /// The two `tool_choice` values this does not implement. Both are a
+    /// constraint on what the model may produce and nothing in a prompt is one,
+    /// so both are named back — a client that asked for a call and got a
+    /// sentence cannot tell that from a model that would not call one.
+    #[test]
+    fn a_tool_choice_this_cannot_honour_is_refused_rather_than_ignored() {
+        for asked in [
+            serde_json::json!("required"),
+            serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+            serde_json::json!(7),
+        ] {
+            let extra = serde_json::json!({"tools": WEATHER(), "tool_choice": asked});
+            assert_eq!(
+                refused(extra),
+                RequestError::ToolChoice(asked.to_string()),
+                "{asked}"
+            );
+        }
     }
 
     /// The newer name wins where a client sends both, which is what a client
@@ -635,7 +899,7 @@ mod tests {
     fn a_role_that_cannot_be_mapped_surfaces_as_a_request_error() {
         let body = serde_json::json!({"messages": [{"role": "sudo", "content": "Hi"}]});
         let request = ChatRequest::parse(&body.to_string()).expect("the body parses");
-        let refused = crate::chat::prompt(&request.messages).expect_err("the role is refused");
+        let refused = crate::chat::prompt(&request.messages, &[]).expect_err("the role is refused");
 
         assert_eq!(refused, ChatError::UnknownRole("sudo".to_string()));
         let message = RequestError::from(refused).to_string();

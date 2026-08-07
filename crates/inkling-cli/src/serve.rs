@@ -71,7 +71,7 @@ use inkling_core::{Checkpoint, CheckpointWeights, Ending, Generator, Stop, Token
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::args::Serve;
-use crate::chat::{self, Channel, Channels, MARKERS};
+use crate::chat::{self, Channel, Channels, MARKERS, Reading, Routed};
 use crate::kept::Kept;
 use crate::openai::{ChatRequest, Completion, Finish, RequestError};
 use crate::{backend, config};
@@ -149,7 +149,7 @@ fn model_name(checkpoint: &Path) -> String {
 /// vocabulary spells these differently is one whose replies would carry
 /// `<|end_message|><|content_model_end_sampling|>` on the end of every message,
 /// and a server should not have to serve one request to find that out.
-fn markers(tokenizer: &Tokenizer) -> Result<Vec<(u32, String, Option<Channel>)>> {
+fn markers(tokenizer: &Tokenizer) -> Result<Vec<(u32, String, Reading)>> {
     // The config's end-of-sequence id, which is `<|content_model_end_sampling|>`
     // for this checkpoint and is asked for by id rather than assumed to be —
     // `Tokenizer` takes it from the config precisely because the vocabulary's
@@ -161,9 +161,12 @@ fn markers(tokenizer: &Tokenizer) -> Result<Vec<(u32, String, Option<Channel>)>>
         )
     })?;
 
-    let mut markers: Vec<(u32, String, Option<Channel>)> = Vec::new();
+    let mut markers: Vec<(u32, String, Reading)> = Vec::new();
     let named = MARKERS.iter().map(|(marker, channel)| (*marker, *channel));
-    for (marker, channel) in named.chain([(eos.as_str(), None)]) {
+    // The end of the turn leaves the reader where the end of a message does:
+    // in content, which is where text nobody has named a channel for goes.
+    let ends = [(eos.as_str(), Reading::Channel(Channel::Content))];
+    for (marker, channel) in named.chain(ends) {
         let id = tokenizer.id_of(marker).ok_or_else(|| {
             anyhow!("this vocabulary has no {marker}, so it is not an Inkling one")
         })?;
@@ -256,13 +259,14 @@ impl<W: Write> Body<W> {
         }
     }
 
-    /// One token's worth of text, and whether the generation should go on.
+    /// One token's worth of whatever it turned out to be, and whether the
+    /// generation should go on.
     ///
     /// [`ControlFlow::Break`] is what reaches `Generator::stream` as
     /// [`Stop::Sink`], and it is why a client that hung up costs one more decode
     /// step rather than the whole budget.
-    fn push(&mut self, channel: Channel, text: &str) -> ControlFlow<()> {
-        let frame = self.completion.push(channel, text);
+    fn push(&mut self, routed: Routed) -> ControlFlow<()> {
+        let frame = self.completion.push(routed);
         self.emit(frame)
     }
 
@@ -282,15 +286,19 @@ impl<W: Write> Body<W> {
         ControlFlow::Break(())
     }
 
-    /// The last of the text, and then whichever ending the caller asked for.
+    /// The last of it, and then the ending the stop maps onto.
     ///
-    /// A generation that failed has no ending to report — neither of OpenAI's
-    /// two reasons is true of it — so the response is finished rather than
+    /// The ending is decided after the tail rather than before it, because the
+    /// tail can be the call a budget cut short — and a turn that asked for a
+    /// tool ends for a different reason from one that did not.
+    ///
+    /// A generation that failed has no ending to report — none of OpenAI's
+    /// reasons is true of it — so the response is finished rather than
     /// concluded: a stream gets its last chunk and nothing else, and a collected
     /// body that never went out at all becomes the failure it hit. Both are
     /// worse answers than a reply, and both are better than a client left
     /// reading a response that has already stopped.
-    fn close(mut self, tail: (Channel, &str), finish: Finish) -> Result<()> {
+    fn close(mut self, tail: Routed, stop: Stop) -> Result<()> {
         let rest = match self.failed.is_some() {
             true if self.streaming => LAST_CHUNK.to_string(),
             true => {
@@ -306,8 +314,9 @@ impl<W: Write> Body<W> {
             false => {
                 // The `Break` this can return says the write failed, and
                 // `self.failed` is where that is read off below.
-                let leftover = self.completion.tail(tail.0, tail.1);
+                let leftover = self.completion.tail(tail);
                 let _ = self.emit(leftover);
+                let finish = finish(stop, self.completion.called());
                 match self.streaming {
                     true => format!("{}{LAST_CHUNK}", chunked(&self.completion.closing(finish))),
                     false => {
@@ -330,7 +339,7 @@ struct Engine<'a> {
     tokenizer: Tokenizer,
     weights: &'a CheckpointWeights<'a>,
     generator: Generator<'a>,
-    markers: Vec<(u32, String, Option<Channel>)>,
+    markers: Vec<(u32, String, Reading)>,
     model: String,
     max_tokens: usize,
     served: u64,
@@ -377,7 +386,7 @@ impl Engine<'_> {
             Ok(asked) => asked,
             Err(err) => return self.refuse(request, 400, &err.to_string()),
         };
-        let prompt = match chat::prompt(&asked.messages) {
+        let prompt = match chat::prompt(&asked.messages, asked.declared()) {
             Ok(prompt) => prompt,
             Err(err) => return self.refuse(request, 400, &RequestError::from(err).to_string()),
         };
@@ -429,28 +438,32 @@ impl Engine<'_> {
         let (weights, generator) = (self.weights, self.generator);
         let served = self.kept.turn(&generator, weights, ids, ending, |id| {
             match text.push(id as u32) {
-                Ok(decoded) => {
-                    let (channel, decoded) = channels.route(id as u32, &decoded);
-                    out.push(channel, &decoded)
-                }
+                Ok(decoded) => out.push(channels.route(id as u32, &decoded)),
                 Err(err) => out.fail(err),
             }
         });
 
         // Bytes the last token left half a character with, which a budget that
-        // cut the reply off mid-character has and holding back would lose.
-        let tail = text.finish();
-        out.close((channels.current(), &tail), finish(served.stop))
+        // cut the reply off mid-character has and holding back would lose, and
+        // with them the call a budget cut short.
+        let held = text.finish();
+        out.close(channels.finish(&held), served.stop)
     }
 }
 
-/// Which of OpenAI's two endings a stop is.
+/// Which of OpenAI's endings a stop is.
 ///
-/// [`Stop::Sink`] is neither. The client is gone or the write failed, so there is
-/// nothing left to tell it why — the failure surfaces on the server's own stderr
-/// instead.
-fn finish(stop: Stop) -> Finish {
+/// A turn the model ended has two of them and `called` is what tells them
+/// apart: a client branches on `tool_calls` to run a tool where it would
+/// otherwise show the reply, so reporting `stop` for a turn that asked for one
+/// is a reply the client renders as an empty message.
+///
+/// [`Stop::Sink`] is none of them. The client is gone or the write failed, so
+/// there is nothing left to tell it why — the failure surfaces on the server's
+/// own stderr instead.
+fn finish(stop: Stop, called: bool) -> Finish {
     match stop {
+        Stop::EndOfSequence if called => Finish::ToolCalls,
         Stop::EndOfSequence => Finish::Stop,
         Stop::Budget | Stop::Sink => Finish::Length,
     }
@@ -531,6 +544,7 @@ pub fn run(args: &Serve) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::text;
     use crate::wire::{dechunked, frames, payload};
 
     /// A socket that remembers what reached it, and can close under the writer
@@ -571,26 +585,28 @@ mod tests {
     }
 
     /// A whole reply written to a socket, the way `generate` drives one.
-    fn served(socket: &mut Socket, streaming: bool, deltas: &[(Channel, &str)]) -> Result<()> {
+    fn served(socket: &mut Socket, streaming: bool, reply: &[Routed]) -> Result<()> {
         let mut body = Body::open(socket, completion(), streaming).expect("the head goes out");
-        for (channel, text) in deltas {
-            assert_eq!(body.push(*channel, text), ControlFlow::Continue(()));
+        for routed in reply {
+            assert_eq!(body.push(routed.clone()), ControlFlow::Continue(()));
         }
-        body.close((Channel::Content, ""), Finish::Stop)
+        body.close(Routed::Nothing, Stop::EndOfSequence)
     }
 
-    const REPLY: [(Channel, &str); 3] = [
-        (Channel::Thinking, "Weigh it up."),
-        (Channel::Content, "Hello"),
-        (Channel::Content, "."),
-    ];
+    fn reply() -> Vec<Routed> {
+        vec![
+            text(Channel::Thinking, "Weigh it up."),
+            text(Channel::Content, "Hello"),
+            text(Channel::Content, "."),
+        ]
+    }
 
     /// What a client asking for a stream gets: the event-stream head, and then
     /// frames.
     #[test]
     fn a_streamed_completion_is_an_event_stream_that_terminates() {
         let mut socket = Socket::default();
-        served(&mut socket, true, &REPLY).expect("it is written");
+        served(&mut socket, true, &reply()).expect("it is written");
 
         let (head, body) = socket
             .written
@@ -612,7 +628,7 @@ mod tests {
     #[test]
     fn a_stream_is_chunked_because_this_cannot_close_the_connection() {
         let mut socket = Socket::default();
-        served(&mut socket, true, &REPLY).expect("it is written");
+        served(&mut socket, true, &reply()).expect("it is written");
 
         let (head, body) = socket
             .written
@@ -644,10 +660,10 @@ mod tests {
 
         // The head and the opening role frame.
         let opened = body.out.writes;
-        for (channel, text) in REPLY {
+        for routed in reply() {
             let before = body.out.writes;
-            assert_eq!(body.push(channel, text), ControlFlow::Continue(()));
-            assert_eq!(body.out.writes, before + 1, "{text:?} was buffered");
+            assert_eq!(body.push(routed.clone()), ControlFlow::Continue(()));
+            assert_eq!(body.out.writes, before + 1, "{routed:?} was buffered");
         }
         assert!(opened >= 2, "the stream opened in one write");
     }
@@ -658,7 +674,7 @@ mod tests {
     #[test]
     fn a_collected_completion_is_one_json_body_with_its_length_declared() {
         let mut socket = Socket::default();
-        served(&mut socket, false, &REPLY).expect("it is written");
+        served(&mut socket, false, &reply()).expect("it is written");
 
         let (head, body) = socket
             .written
@@ -685,11 +701,11 @@ mod tests {
     fn a_collected_completion_writes_nothing_until_it_is_whole() {
         let mut socket = Socket::default();
         let mut body = Body::open(&mut socket, completion(), false).expect("nothing goes out");
-        for (channel, text) in REPLY {
-            assert_eq!(body.push(channel, text), ControlFlow::Continue(()));
+        for routed in reply() {
+            assert_eq!(body.push(routed), ControlFlow::Continue(()));
         }
         assert_eq!(body.out.writes, 0);
-        body.close((Channel::Content, ""), Finish::Stop)
+        body.close(Routed::Nothing, Stop::EndOfSequence)
             .expect("it is written");
         assert_eq!(socket.writes, 1);
     }
@@ -709,14 +725,20 @@ mod tests {
         let mut body = Body::open(&mut socket, completion(), true).expect("the head goes out");
 
         assert_eq!(
-            body.push(Channel::Content, "Hello"),
+            body.push(text(Channel::Content, "Hello")),
             ControlFlow::Continue(())
         );
-        assert_eq!(body.push(Channel::Content, "."), ControlFlow::Break(()));
-        assert_eq!(body.push(Channel::Content, " More"), ControlFlow::Break(()));
+        assert_eq!(
+            body.push(text(Channel::Content, ".")),
+            ControlFlow::Break(())
+        );
+        assert_eq!(
+            body.push(text(Channel::Content, " More")),
+            ControlFlow::Break(())
+        );
 
         let err = body
-            .close((Channel::Content, ""), Finish::Length)
+            .close(Routed::Nothing, Stop::Budget)
             .expect_err("the failure surfaces");
         assert!(
             format!("{err:#}").contains("writing to the client"),
@@ -740,7 +762,7 @@ mod tests {
         let unspellable = anyhow!("no token with id 4096 in this vocabulary");
         assert_eq!(body.fail(unspellable), ControlFlow::Break(()));
         let err = body
-            .close((Channel::Content, ""), Finish::Length)
+            .close(Routed::Nothing, Stop::Budget)
             .expect_err("the failure surfaces");
         assert!(format!("{err:#}").contains("4096"), "{err:#}");
 
@@ -766,14 +788,14 @@ mod tests {
         let mut socket = Socket::default();
         let mut body = Body::open(&mut socket, completion(), false).expect("nothing goes out");
         assert_eq!(
-            body.push(Channel::Content, "The"),
+            body.push(text(Channel::Content, "The")),
             ControlFlow::Continue(())
         );
         assert_eq!(
             body.fail(anyhow!("no token with id 4096 in this vocabulary")),
             ControlFlow::Break(())
         );
-        body.close((Channel::Content, ""), Finish::Length)
+        body.close(Routed::Nothing, Stop::Budget)
             .expect_err("the failure surfaces");
 
         let (head, written) = socket.written.split_once("\r\n\r\n").expect("a body");
@@ -803,8 +825,11 @@ mod tests {
             ..Socket::default()
         };
         let mut body = Body::open(&mut socket, completion(), true).expect("the head goes out");
-        assert_eq!(body.push(Channel::Content, "Hello"), ControlFlow::Break(()));
-        body.close((Channel::Content, ""), Finish::Length)
+        assert_eq!(
+            body.push(text(Channel::Content, "Hello")),
+            ControlFlow::Break(())
+        );
+        body.close(Routed::Nothing, Stop::Budget)
             .expect_err("the failure surfaces");
 
         assert_eq!(socket.writes, 3, "it wrote past the disconnect");
@@ -817,10 +842,10 @@ mod tests {
         let mut socket = Socket::default();
         let mut body = Body::open(&mut socket, completion(), false).expect("nothing goes out");
         assert_eq!(
-            body.push(Channel::Content, "The"),
+            body.push(text(Channel::Content, "The")),
             ControlFlow::Continue(())
         );
-        body.close((Channel::Content, "\u{fffd}"), Finish::Length)
+        body.close(text(Channel::Content, "\u{fffd}"), Stop::Budget)
             .expect("it is written");
 
         let (_, written) = socket.written.split_once("\r\n\r\n").expect("a body");
@@ -833,10 +858,20 @@ mod tests {
     /// only matters where it is written down: nothing goes back to that client,
     /// but a reply cut short is a reply cut short.
     #[test]
-    fn the_endings_a_generation_can_have_map_onto_the_two_openai_has() {
-        assert_eq!(finish(Stop::EndOfSequence), Finish::Stop);
-        assert_eq!(finish(Stop::Budget), Finish::Length);
-        assert_eq!(finish(Stop::Sink), Finish::Length);
+    fn the_endings_a_generation_can_have_map_onto_the_ones_openai_has() {
+        assert_eq!(finish(Stop::EndOfSequence, false), Finish::Stop);
+        assert_eq!(finish(Stop::EndOfSequence, true), Finish::ToolCalls);
+        assert_eq!(finish(Stop::Budget, false), Finish::Length);
+        assert_eq!(finish(Stop::Sink, false), Finish::Length);
+    }
+
+    /// A budget that ran out is a budget that ran out, whatever the turn had
+    /// asked for. A client told `tool_calls` runs a tool it was handed half of;
+    /// one told `length` knows the reply is not whole.
+    #[test]
+    fn a_budget_that_ran_out_mid_call_is_still_a_budget_that_ran_out() {
+        assert_eq!(finish(Stop::Budget, true), Finish::Length);
+        assert_eq!(finish(Stop::Sink, true), Finish::Length);
     }
 
     /// The name a model is listed and answered under is the directory it came
