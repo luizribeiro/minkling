@@ -1275,6 +1275,13 @@ what `generate_batch`'s admission rule makes it do.
 moves only how many sequences were already decoding**, and both arms of a row
 are the same binary in the same sitting.
 
+**And every row is a request joining a batch that has just settled**, three
+tokens into the sequences it is joining rather than a hundred and ninety. That
+is not free of consequence and this file has the figure for it: a decode loop
+drifts +1.33% per 200 keys, so joining a long-running batch would cost the
+decoders a little more per step than the right-hand columns say and would not
+move the step count at all. The finding is the step count.
+
     decoding      joining                         draining
               first token  steps  device  duty     first token  steps  device  duty
         0        2.05 s       4    1.84 s  89.9%        —          —      —       —
@@ -1322,12 +1329,14 @@ about.**
   2.68 seconds** at the five budgets. That is the prefill's own work, and
   somebody has to do it — a standalone 385-token prefill on this build is
   **1.63 s of device and 3.06 s of wall**, measured in the same sitting.
-- **A narrow budget costs the joiner.** 25 calls where one would do is 4.54 s of
-  device against 1.78, because a call's own overhead is paid once per chunk. The
-  wall does not follow the device to the bottom — a single 385-row call is 1.78 s
-  of device inside a 3.64 s wall, which is 49% duty against the four-call arm's
-  91% — so the **minimum of both columns is at 128 rows**, and that is what
-  `--admit` defaults to.
+- **A narrow budget costs the joiner.** 25 steps where two would do is 4.54 s of
+  device against 1.78, because a call's own overhead is paid once per chunk.
+  **The two columns bottom out in different places and that is the whole of the
+  choice**: the device falls all the way to the widest budget — 4.54, 3.60, 3.08,
+  2.06, 1.78 — where the wall turns round at 128, because a single 385-row call
+  is 1.78 s of device inside a 3.64 s wall at **49% duty** against the four-step
+  arm's 2.06 inside 2.25 at 91%. A request waits the wall, so `--admit` defaults
+  to the wall's minimum and gives up 0.28 s of device for 1.39 s of it.
 
 **And what it is not is the query block.** `FusedAttention::blocked` refuses a
 call carrying more than one sequence — a block stages one tile of keys for the 64
@@ -1350,7 +1359,8 @@ A decode row's own marginal cost is 8.65 ms — the batch table's 24.23 ms at tw
 sequences against 15.58 at one — so what is left is 6 to 13 ms a step of a
 second seat's own overhead. **These are differences of a few percent between two
 large numbers and they bound rather than resolve**: whatever the block would
-have been worth to a chunk of this width, it is under 13 ms a step here.
+have been worth to a chunk of this width, it is under the 13.4 ms a step that
+column tops out at.
 
 ### The fleet, which is where the two policies are asked the same question
 
@@ -1611,8 +1621,8 @@ section is about; nothing here touches that kernel or that table.
 **A joining request waits its own prompt and one decode step, and there is
 nothing else left in it. The floor is a prefill, and the widest budget is
 already on it.** At eight slots and seven decoding, the whole prompt in one
-call is 1.78 s of device, and that is a 385-token prefill plus the decode rows
-that rode in the same two calls:
+filling call — two steps with the decode step behind it — is 1.78 s of device,
+and that is a 385-token prefill plus the decode rows that rode in those two:
 
     a 385-token prefill, standalone, this sitting   1.632 s of device
     15 decode rows at the batch table's 8.35 ms     0.125
@@ -1620,18 +1630,28 @@ that rode in the same two calls:
                                                     1.757 s against 1.780 measured, +1.3%
 
 At the 128-row budget the same arithmetic gives 1.874 s against 2.060 measured,
-and **the 0.19 s between them is the chunking** — four calls where one would do,
-which the budget sweep prices from below: 1.78 s at one call, 2.06 at four, 3.08
-at seven and 4.54 at twenty-five.
+and **the 0.19 s between them is the chunking** — four steps where two would do,
+which the budget sweep prices from below: 1.78 s at two steps, 2.06 at four,
+3.08 at seven and 4.54 at twenty-five.
 
-**So the arrangement is within 12% of the floor on the device, and it is not
-where the wall's minimum is.** The one-call arm reads 1.78 s of device inside a
-3.64 s wall — 49% duty — against the four-call arm's 2.06 inside 2.25 at 91.5%.
-A 385-token prefill *standalone* is the same shape: 1.632 s of device inside
-3.061 s of wall. **What is under this floor is not the scheduler and not the
-chunk; it is the 1.4 s of host time a single wide call carries**, which
-`bench prefill` has been reporting all along and which the four-call arm happens
-to hide by giving the device more to do between the host's turns.
+**So the arrangement is 9.9% above the floor on the device — 2.060 s against
+1.874 — and it is not where the wall's minimum is.** The two-step arm reads
+1.78 s of device inside a 3.64 s wall — 49% duty — against the four-step arm's
+2.06 inside 2.25 at 91.5%. A 385-token prefill *standalone* is the same shape:
+1.632 s of device inside 3.061 s of wall. **What is under this floor is not the
+scheduler and not the chunk; it is the 1.4 s of host time a single wide call
+carries**, which `bench prefill` has been reporting all along and which the
+four-step arm happens to hide by giving the device more to do between the host's
+turns.
+
+**And the floor is a floor rather than an estimate**, because the rate it uses is
+the wrong way round: the decode rows are charged at the batch table's 8.35 ms a
+token, which is a *marginal row in a single-sequence call*, where the section
+above measures a second seat in a call costing 6 to 13 ms a step of its own
+beyond that. So the arithmetic under-counts what the decoders in these calls
+actually cost, which is why all of it comes out positive — +1.3%, +9.9% — rather
+than scattering either side of zero. What that means is the 0.19 s attributed to
+chunking is an upper bound on it and not a measurement of it.
 
 **What that leaves for whoever comes next is the prefill.** A request's first
 token is a prefill, and a prefill of 385 tokens is 4.2 ms a token of device
