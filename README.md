@@ -1418,6 +1418,145 @@ still reproduce prompt for prompt.
 - **A number the two JSON writers spell differently.** Python writes `1e+30`
   where `serde_json` writes `1e30`. Every other value a JSON Schema has agrees.
 
+## The scheduler nothing could reach
+
+**No HTTP request had ever reached the batching engine.** `serve.rs` ran one
+blocking accept loop, called `Kept::turn` inside it, and never imported
+`schedule` at all — `Continuous`'s only caller in the tree was `bench`. Four
+readings agreed and the module said so itself, under a heading reading *"One
+request at a time, and the next one waits"*: `Engine::complete` took `&mut self`
+over a single `Kept`, so two requests could not both hold the borrow, and no
+module of the crate held a `thread::spawn`, an `Arc` or a `Mutex`.
+
+So every architectural result on this page — the 2.21× batch, continuous
+admission's first-token win, the 30.8 MiB a slot — was unreachable from
+`POST /v1/chat/completions`. The engine had a scheduler and the server had a
+queue of one.
+
+`--slots N` puts the socket in front of `Continuous`: one thread owning the
+weights, the generator and the slots and doing nothing but stepping them, and
+`2N` connection threads that parse a request, hand the prompt over a channel,
+and write frames as tokens come back. Only ids travel between them, so the model
+never moves.
+
+### What two clients get, which is what the batch curve said they would
+
+Five pairs, arms alternating and the order flipped every pair, 256 tokens a
+client, `bench batch` taken in the same sitting for the device side.
+
+    two clients                       wall   spread   tok/s    first token
+                                                             earliest   last
+    one alone, --slots 2            4.431 s   0.21%   57.78     0.212      —
+    two at once, --slots 1          8.832     2.13    57.97     0.181    4.616
+    two at once, --slots 2          7.075     0.15    72.37     0.394    0.419
+
+**The serial server's throughput with two clients is its throughput with one.**
+57.97 against 57.78, three parts in a thousand apart — which is what a queue of
+one means and is the finding above stated as a number rather than as a reading
+of the source. The second client's reply took 8.832 s to land where one alone
+takes 4.431.
+
+**Seated, the two clients are worth 1.253× one**, and the engine's own batch
+curve in the same sitting says 1.283× — `bench batch --batch 2` read 60.99 tok/s
+at width 1 against 78.26 at width 2. **The server delivers 97.6% of what the
+engine can do**, and the missing 2.4% is its own overhead and not the
+scheduler's. Taken as a wall a token:
+
+    a token                     device (bench)   wall (server)   the server's own
+    one client, width 1            15.36 ms         17.31 ms          1.94 ms
+    two clients, width 2           12.09            13.82             1.72
+
+**And the second client waits 11.02× less for its first token** — 4.616 s
+against 0.419. That is the largest number here and it is the one a user feels:
+serially, the second client waits for the whole of the first client's
+generation, because there is nowhere else for it to wait.
+
+**Two of those three are C3's own predictions and one is not.** The fleet
+table's +1.3% / +3.4% / +13.2% is *continuous against draining admission at the
+same width*, which is a different axis from this: what predicts a scheduler
+against no scheduler is the batch curve, and that is the 1.283× hit to 97.7%.
+The first-token axis is C3's, which read 1.38×, 1.75× and 3.88× at the median
+and said the win grows as the engine empties — two clients into two slots is
+lighter than any row in that table, and 11.02× is where that direction leads.
+The fleet's own 48 tok/s is not comparable to the 72 here: two thirds of its
+rows were 385-token prompts, and almost all of these are decode.
+
+**Nothing here is the clock.** The duty cycle read 92.6% at width 1 and 94.5% at
+width 2, against the 91.1–93.1% every row of the fleet sat in. And the physics:
+5.9 GB of weights a decode step over 15.36 ms is 384 GB/s, and over 24.19 ms at
+width 2 is 244 — both under this part's 725 GB/s, so neither is a measurement
+bug.
+
+### What `--slots 1` keeps, which is why it is still the default
+
+**A scheduled server forgets the conversation, and that is not a decision the
+server makes.** A slot's cache belongs to the slot — the device holds one span
+and one window pair per layer per slot — and `Continuous` hands every joining
+sequence a *fresh* one, precisely so that it does not attend over the keys of
+whoever sat there before. There is no position in that arrangement for a
+conversation to be resumed to, at any width. So `--slots N` re-prefills every
+turn, where `Kept` costs about a millisecond a turn and saves 33 s of prefill at
+16384 tokens.
+
+Which of the two a workload wants is the question the flag asks. A fleet of
+agents arriving at irregular times wants the scheduler; one coding session
+sending its context back turn after turn wants the cache. A default that reached
+for a batch nobody asked for would make the common case slower, so the default
+is one slot.
+
+**A client that hangs up frees its slot**, which under the load a scheduler
+exists for is the ordinary way a request ends rather than an edge case. It is a
+guard and not a code path: every way out of a connection thread returns the
+ticket, including the panic no `return` covers. And the end of a turn is read by
+the engine rather than by the client's own thread, so the slot is empty before
+the next step is built instead of a round trip later.
+
+## Three things clients need, and what each of them had to decide
+
+**Stop sequences, matched over decoded text.** A client writes `"\nUser:"` and
+the vocabulary has no such id — the string arrives spread over however many
+tokens the merges produced — so the matching runs over what `Utf8Stream`
+decoded, which is the only place the sequence exists. And because this server
+streams, a frame is gone the moment it is flushed: text whose tail could still
+begin a sequence is held until the next token settles it, so nothing is ever
+emitted that a match would have to retract.
+
+**Against `content` and nothing else, which is the decision.** `chat.rs` strips
+the template's markers and splits the thinking channel into `reasoning_content`,
+and a client's rule is written against the field it renders. Matched against the
+reasoning instead, a `stop` of `"\nUser:"` would fire inside the thinking of half
+the requests carrying one and cut the turn off before the answer had started —
+and a client that wanted that would have no way to ask for the other. What it
+costs is a turn that never leaves the thinking channel, which no `stop` can end
+and the budget ends instead; that failure was reproduced against the running
+server and is the right one. Content is still one string across a thinking
+interruption, because that is what the client's own field holds.
+
+A match reaches the generation as the same `Break` a client that hung up
+produces, which is `Stop::Sink`, and `Sink` maps onto `length` — so the match is
+remembered separately. A reply cut where the client asked reports `stop`.
+
+**Usage on streams.** The collected body has carried token counts since there
+was one, written after the last token when they are known; a stream's frames all
+go out before that. `stream_options.include_usage` adds a chunk after the reason
+and before the terminator, carrying `usage` and an **empty `choices`** — because
+a client assembles its message out of `choices[0].delta`, and counts hung off the
+chunk that carries the reason would be counts to look for in a chunk it may
+already have stopped reading.
+
+### What a real OpenAI client still cannot do
+
+- **Sample.** `temperature`, `top_p` and `seed` are accepted and ignored, and
+  decoding is greedy and only greedy. A sampler over this port's logits needs
+  its own equivalence argument.
+- **Ask for more than one choice**, or for a `tool_choice` of `required` or a
+  named function. All three are refused rather than ignored.
+- **Keep a conversation and batch at the same time.** The two are the two ends
+  of `--slots`, for the reason above.
+- **Have a `stop` honoured against its reasoning**, or a disconnect noticed
+  during a non-streaming request — nothing is written until the last token, so
+  there is no failing write to notice it by.
+
 ## The heads the engine ships, and the cell that turned out to be the other checkpoint
 
 **C4's sweep was taken on heads this engine does not ship.**
