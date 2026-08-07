@@ -23,19 +23,20 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **773 of the 854 tests, no
+`just test` is the one to run while iterating: **806 of the 887 tests, no
 checkpoint, fourteen seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
-42 that need weights report a skip and pass. It runs through libtest, which puts
+44 that need the checkpoint report a skip and pass — 43 of them for its weights,
+and one for its vocabulary alone. It runs through libtest, which puts
 a crate's tests in one process: opening a Metal device costs a second, so the 256
 kernel tests are 13.6 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 854 against a
+`just test-full` is what has to pass at the ends of a series: **all 887 against a
 real checkpoint, twenty-six minutes and forty-five more for the measurements
 after it.**
-The 773 the gated tier runs and the 81 the timing tier does. The 58 gated tests — the 42
+The 806 the gated tier runs and the 81 the timing tier does. The 60 gated tests — the 44
 above and sixteen of the measurements below, which need weights as well as a
 clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -1224,6 +1225,198 @@ and 769 tokens cost 2.04, 5.45 and 10.1 s before the budget replaced the row
 count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
+
+## The tools a coding agent needs, which the server refused
+
+The server had streaming, sessions, the kept cache, `max_tokens` and unknown
+fields ignored so that real clients work — and it refused `tools` outright, for
+a reason its own comment gave: a request whose tools vanished gets an answer
+that reads as a refusal to use them. The refusal was right and it also made the
+server **unusable for the one workload this engine exists for**. A coding agent
+is a conversation that calls tools; every architectural result here — the kept
+cache at about a millisecond a turn, continuous admission's first-token win, the
+batch curve — is machinery such an agent would exercise and could not reach.
+
+**The format is specified rather than guessed.**
+`models/Inkling-Small-mxfp4/chat_template.jinja` defines all of it, and the
+server writes the turn structure out by hand rather than interpreting the Jinja
+— so what says the two agree is `reference/fixtures/chat_template_cases.json`,
+dumped from the template through the same `apply_chat_template` the reference
+would use. **That fixture is the oracle, and it grew from 8 cases to 18**, with
+four the template refuses and one it refuses that the server deliberately does
+not. Every prompt below is a string the template produced, not one that looked
+reasonable.
+
+### What the template specifies, and what the server now emits
+
+    declaring       <|message_system|>tool_declare<|content_xml|>
+                    <specs, tojson(sort_keys=true, separators=(",",":"))>
+                    <|end_message|>
+
+    a call          <|message_model|><fn.name><|content_invoke_tool_json|>
+                    {"name":<fn.name>,"args":<arguments>}<|end_message|>
+
+    a result        <|message_tool|><name><|content_text|><content><|end_message|>
+
+Four things about that are worth stating because a reader would get them wrong:
+
+- **The declaration precedes the thinking-effort message**, and the effort
+  message is itself emitted before the first message whose role is not `system`.
+  So the order is specs, then the caller's own system prompt, then the effort.
+  It is not "prepend a system message".
+- **The serialisation is load-bearing.** Keys sorted at *every* depth, no space
+  after a comma or a colon, non-ASCII left as it stands. A spec serialised any
+  other way is a valid prompt the model was never trained on, and the only
+  symptom is a model that reaches for nothing. `serde_json`'s map is a
+  `BTreeMap`, so the sorting is the library's; the fixture is what says so.
+- **The envelope's own keys are not sorted.** `{"name":…,"args":…}` is
+  hand-concatenated in the template rather than passed through `tojson`, so
+  `args` follows `name` — the one place in the format where alphabetical order
+  would be wrong.
+- **`<|content_model_end_sampling|>` closes the assistant's *turn*, once**, not
+  each call inside it. A turn that called two tools carries two
+  `<|content_invoke_tool_json|>` messages and one end-of-sampling marker.
+
+**`arguments` arrives as a JSON string and leaves as an object.** Every OpenAI
+client sends the arguments of a call it is replaying as a string, and the
+template refuses one by name — *"tool call arguments must be a parsed object,
+not a JSON string; canonicalize upstream"*. So the server is upstream: it parses
+the string and writes it back out sorted and space-free. The fixture records
+both forms against the one prompt under `canonicalised`, and the test asserts
+the server reaches that prompt from either.
+
+The template's defaults are reproduced rather than approximated, because each of
+them is a different prompt: a tool with no `function` wrapper *is* the function,
+a spec missing `description` or `parameters` gets an empty one of each rather
+than losing the key, and Jinja truthiness decides — `false`, `0`, `""`, `[]` and
+`{}` all fall back to the default the same way `null` does. A result's tool is
+named by the message's own `name`, or looked up by `tool_call_id` among the
+calls the conversation carries, or left unnamed where the id names nothing. All
+three are the template's, the third included.
+
+### Reading a call back out of the model's own turn
+
+The model spells a call out as `<|message_model|>` then the function's name then
+`<|content_invoke_tool_json|>` — **the name comes before the marker that says
+what it is**, which is the whole difficulty. So the reader is a small state
+machine rather than a channel switch: text after `<|message_model|>` is held
+back, and the marker that follows says whether it was a tool's name or text the
+model put where a name goes. It starts held back, because the prompt ends with
+`<|message_model|>` and that is exactly the position a call starts from.
+
+Nothing is delayed by that in practice: the model's first token is a channel
+marker — it opens `<|content_thinking|>` unprompted — so the held text is empty
+and the marker flushes it. A reply that opened no channel at all would arrive in
+one delta at the end rather than token by token, which is the honest cost of not
+guessing.
+
+**A call reaches the client whole rather than in fragments.** OpenAI's streaming
+shape allows either, and the envelope is why: a client's `arguments` is the
+`args` alone, which cannot be cut out of a stream of fragments without having
+the whole of it. A half-written `arguments` is a half-written JSON object no
+client can do anything with, so what that costs is a wait the client already had.
+
+`<|message_model|>` had to be named as a marker for this, and it was not one
+before — so a model that emitted one mid-reply used to put the literal
+`<|message_model|>` into the field a client renders.
+
+### What a client gets
+
+    $ curl -sN http://127.0.0.1:8080/v1/chat/completions -d '{…,"tools":[…]}'
+
+    "finish_reason": "tool_calls",
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "reasoning_content": "The user is asking for the current weather in Paris. I have a
+                            tool called `get_weather` that can look up a city's current
+                            weather. I should call it with \"Paris\" as the city parameter.",
+      "tool_calls": [{
+        "id": "call_chatcmpl-17861123690001_0",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+      }]
+    }
+
+That is the real reply, at 78 prompt tokens and 62 generated. `content` is null
+rather than empty, which is the shape OpenAI sends a turn that was nothing but
+calls in and the shape the turn structure reads back as a message with no
+content of its own. The id is minted here — the model produces none — as the
+completion's own id and the call's index in it, which is all it has to be: a
+client sends it back on the `tool` message and the lookup finds the name by it.
+
+Hand that back with a result and the second turn answers from it, at 107 prompt
+tokens and 18 generated, `finish_reason: "stop"`, *"The weather in Paris right
+now is **17°C with light rain**."*
+
+**`tool_choice` is `auto` and `none`, and the other two are refused.** `auto` is
+the default and is what a declaration alone expresses. `none` is implemented by
+not declaring the specs at all — a model that was never told the tools has none
+to reach for, and it measures as 24 prompt tokens against `auto`'s 78 and no
+call. `required` and a named function are refused with a 400 naming the value,
+because both are a constraint on what the model may *produce* and nothing in a
+prompt is one: honouring either needs the sampler to refuse the tokens that
+would leave the turn, and this engine has no flag for that. Ignoring them is the
+failure the old `tools` refusal existed to prevent — a client that asked for a
+call and got a sentence cannot tell that from a model that would not call one.
+
+**Malformed arguments are passed through rather than invented.** If what follows
+the marker is not the envelope — not JSON, or JSON without an object-valued
+`args` — its text becomes the `arguments` verbatim, and the client's own parse
+fails on what the model actually said. A budget that ran out mid-call gets the
+same treatment and keeps `finish_reason: "length"`: a client told `tool_calls`
+would run a tool it was handed half of.
+
+### The kept cache across a tool round-trip
+
+A turn that answers a call is the turn before it with three things added — the
+call, the marker that ends the model's turn, and the result — so it is an *exact
+extension*, which is the only thing `Kept` can serve from. That is a claim about
+tokens rather than about markers, and it is asked of the vocabulary: a gated test
+templates both turns, encodes both, and asserts `Kept::matching` returns the
+whole of the first prompt bar its last token.
+
+Measured, three pairs in one sitting, the same 107-token round trip warm and
+then cold — cold being the same request after another conversation displaced the
+cache:
+
+    round trip, warm    507.9   508.3   507.9 ms
+    round trip, cold    839.7   841.3   851.8 ms
+
+The ranges are nowhere near each other, and warm and cold returned the same
+answer character for character in all three pairs. Not order-flipped, which
+every timed claim in this file otherwise is: what is being compared is a cache
+that hit against one that could not, and the arms cannot be run in the other
+order without the cold one warming the next warm one.
+
+Declaring one tool costs 54 prompt tokens on this checkpoint — 24 against 78 for
+the same question — which is a fixed cost per request that the kept cache pays
+once per conversation.
+
+### What did not move
+
+No kernel changed, and nothing this milestone touched is on a decode step's
+path. `just test-full` is green — **806 gated and 81 timing** — which is the 776 the
+milestone before it left plus the thirty this added. The recorded continuation, `--backend cpu`,
+`reference` bit-exact, `production` at 448/448 and `rounded` opt-in are all as
+they were. The server's existing behaviour is unchanged where it was not the
+subject: streaming, sessions, `finish_reason` `stop` and `length`, unknown fields
+ignored, and the eight turn-structure cases the fixture already carried, which
+still reproduce prompt for prompt.
+
+### What the template does that the server still does not
+
+- **Content parts.** A `content` that is a list — text parts, `input_image`,
+  `input_audio` — is refused. The engine is text-only.
+- **`reasoning_effort`.** Six names onto numbers, and a float. Only the default
+  0.9 is emitted.
+- **A message with no content and nothing else**, which the template renders as
+  nothing at all — not even a role marker. Refused, because a message that
+  silently contributes nothing is a request the client will not recognise the
+  answer to. The exception is now the two shapes that *do* carry something else:
+  an assistant turn with `tool_calls`, and a tool result that returned nothing.
+- **A number the two JSON writers spell differently.** Python writes `1e+30`
+  where `serde_json` writes `1e30`. Every other value a JSON Schema has agrees.
 
 ## The heads the engine ships, and the cell that turned out to be the other checkpoint
 
@@ -11358,6 +11551,13 @@ Here the turn structure *is* applied — hard-coded rather than interpreted from
 without it nothing puts the model in a turn it could end and every request runs
 to `max_tokens`. The model's thinking channel arrives in `reasoning_content` and
 its answer in `content`, with the markers themselves in neither.
+
+**`tools` works**, which is what makes this usable by a coding agent: the specs
+are declared the way the template declares them, a call comes back as
+`tool_calls` with `finish_reason: "tool_calls"`, and a `tool` message hands the
+result to the next turn. `tool_choice` is `auto` and `none`; `required` and a
+named function are refused rather than ignored. See "The tools a coding agent
+needs".
 
 One request at a time; a second client waits. Batching is the scheduler's job
 and the scheduler is the reason this engine exists.
