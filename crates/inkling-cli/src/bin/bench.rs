@@ -96,7 +96,7 @@ const USAGE: &str = "usage:\n  \
     bench sweep   <checkpoint> [--tokens <n>] [--depth <k>] [--numerics <which>]\n  \
     bench engines <checkpoint> [--depth <k>] [--numerics <which>]\n  \
     bench session <checkpoint> [--tokens <n>] [--reuse-tokens <n>] [--numerics <which>]\n  \
-    bench batch   <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>]\n  \
+    bench batch   <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>] [--depth <k>]\n  \
     bench clock   <checkpoint> [--tokens <n>] [--context <n>] [--idle <ms>] \
 [--every <ms>] [--burst <n>] [--keep-warm <ms>] [--prefill <n>] [--batch <n>]\n  \
     bench joining <checkpoint> [--tokens <n>] [--context <n>] [--batch <n>] \
@@ -3721,6 +3721,36 @@ mod tests {
         }
     }
 
+    /// **A depth given on the command line is the depth the measurement runs
+    /// at**, and one given to a measurement that decodes a token at a time is
+    /// refused rather than dropped.
+    ///
+    /// **Stated because a default cannot state it.** A batch sweep carried a
+    /// depth of four and ran at none — the flag's value never reached the call,
+    /// which shadowed it — and every row it printed was plausible: the table
+    /// was a `k = 0` table under a header saying otherwise. Nothing about the
+    /// default was wrong and nothing about the refusals was wrong, so what has
+    /// to be asserted is the number arriving.
+    #[test]
+    fn a_batch_sweeps_depth_is_the_one_the_command_line_asked_for() {
+        let depth = |what: &str, k: &str| match Job::parse(
+            [what, "models/small", "--depth", k].map(str::to_string),
+        ) {
+            Ok(Job::Measure { depth, .. }) => Some(depth),
+            _ => None,
+        };
+        assert_eq!(depth("batch", "3"), Some(3));
+        assert_eq!(depth("sweep", "2"), Some(2));
+        assert_eq!(depth("engines", "5"), Some(5));
+
+        for what in ["decode", "prefill", "session", "clock", "joining", "fleet"] {
+            assert!(
+                depth(what, "3").is_none(),
+                "{what} took a depth it decodes no block at"
+            );
+        }
+    }
+
     /// **Only the two measurements that decode more than one sequence take a
     /// width**, and every other one refuses it rather than dropping it — which
     /// is the rule the numbers above are refused under.
@@ -3728,6 +3758,11 @@ mod tests {
     /// Both take a context for the reason a decode step does: a batch is decode
     /// steps, and a step is the one measurement here with a context to be taken
     /// at.
+    ///
+    /// **A batch sweep's default depth is none**, which is the column every
+    /// other one is read against — see [`What::Batch`] in [`measure`], and
+    /// `a_batch_sweeps_depth_is_the_one_the_command_line_asked_for` for the
+    /// half of this that a default cannot say.
     #[test]
     fn only_the_measurements_that_decode_a_batch_take_a_width() {
         assert_eq!(
@@ -3740,7 +3775,7 @@ mod tests {
                 checkpoint: PathBuf::from("models/small"),
                 tokens: DECODED,
                 context: 8192,
-                depth: SWEPT,
+                depth: 0,
                 numerics: Numerics::default(),
                 reuse: DEFAULT_BOUND,
                 widest: Some(8),

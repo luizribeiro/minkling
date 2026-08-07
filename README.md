@@ -23,18 +23,19 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **723 of the 804 tests, no
-checkpoint, thirteen seconds.** Everything a fixture can settle is here — the
+`just test` is the one to run while iterating: **773 of the 854 tests, no
+checkpoint, fourteen seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
-41 that need weights report a skip and pass. It runs through libtest, which puts
+42 that need weights report a skip and pass. It runs through libtest, which puts
 a crate's tests in one process: opening a Metal device costs a second, so the 256
 kernel tests are 13.6 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 804 against a
-real checkpoint, twenty minutes and forty more for the measurements after it.**
-The 723 the gated tier runs and the 81 the timing tier does. The 57 gated tests — the 41
+`just test-full` is what has to pass at the ends of a series: **all 854 against a
+real checkpoint, twenty-six minutes and forty-five more for the measurements
+after it.**
+The 773 the gated tier runs and the 81 the timing tier does. The 58 gated tests — the 42
 above and sixteen of the measurements below, which need weights as well as a
 clock — are what
 only weights can settle — that the packed tensors decode to what the reference
@@ -70,6 +71,7 @@ three; the pre-commit hooks already skip clippy on those by config.
     just bench HEAD~1 .    prefill --tokens 769
     just bench v1 v2       sweep --depth 4
     just bench . .         batch --batch 32   # what a token costs at each width
+    just bench . .         batch --batch 8 --depth 3   # and at each depth beside it
     just bench . .         joining --batch 8  # what a request waits to join one
     just bench . .         fleet --every 200  # N agents, and the distribution
     just bench-engines                        # this engine against mlx-vlm
@@ -83,7 +85,9 @@ context. `--context` tiles the prompt to the length asked for first. The other
 three refuse the flag rather than drop it: a prefill's context is its prompt and
 `--tokens` already says how long that is, and a sweep and a cross-engine table
 fix their own prompts because acceptance is the workload's. `--batch` is refused
-the same way by everything but the sweep it belongs to.
+the same way by everything but the sweep it belongs to, and `--depth` by
+everything that decodes a token at a time — which is every measurement here but
+the three that speculate.
 
 Every timed claim in this file is paired and alternating — build A, build B, run
 them in one sitting with the order flipped each pair, and report whether the
@@ -1220,6 +1224,406 @@ and 769 tokens cost 2.04, 5.45 and 10.1 s before the budget replaced the row
 count and 1.87, 5.32 and 10.2 s after it, which is the same figure three times
 and is the point of where the line was drawn. Those two are that commit's own
 pair rather than what a prefill costs today — the prefill section above is.
+
+## The MTP chain at batch, and the two levers that turn out to be one
+
+**`ModelHeads::wrap` has taken a slot count since B1 and nothing had ever asked
+it for more than one.** So a batch that speculated ran its chain a sequence at a
+time — eight weight reads and nineteen dispatches per sequence per head — where
+the stack beside it has read its own once for the whole batch since B1. This
+milestone batches the chain, batches the loop around it, and drives the ragged
+seats B3 built and named as unreached.
+
+**The engineering works and the hypothesis it was built on does not.** The
+answer to "do speculation and batching multiply" is **no, they substitute**:
+past batch 2, speculation is a loss at every depth and the loss deepens with the
+width. On the device's own clock a token costs 15.48 ms at batch 1 and 7.02 ms
+at batch 32; speculation takes 15.48 to 14.89 at batch 1 — a 3.8% win — and
+7.02 to 10.11 at batch 32, a 44% loss. **Both levers fill the same idle
+machine, and the second one to arrive finds it already full.**
+
+    tokens/second, one sitting, one binary, the wall
+    width      k = 0    k = 1    k = 2    k = 3
+        1       60.7     62.0     57.6     59.8
+        2       78.4     82.7     70.9     66.9
+        4      107.9     95.6     85.1     75.4
+        8      119.5    100.2     86.3     75.3
+       16      129.0    103.5     89.0     70.5
+       32      131.1    102.0     98.8     44.1
+
+    against the same width's own k = 0
+        1      1.000    1.021    0.949    0.985
+        2      1.000    1.055    0.904    0.853
+        4      1.000    0.886    0.789    0.699
+        8      1.000    0.838    0.722    0.630
+       16      1.000    0.802    0.690    0.547
+       32      1.000    0.778    0.754    0.336
+
+**Every column of that table is divided by a figure in the same table**, which
+is the only division a sweep may make — see "Measuring two refs against each
+other". Duty was 84 to 96% in every cell but one, which is named below.
+
+### What the k = 0 column is checked against, which is a figure it does not choose
+
+C3's largest defect was a number that was a number of the wrong thing, and the
+only instrument that saw it was one putting the number beside another it had to
+agree with. So the `k = 0` column here is taken through **the speculative loop
+with a proposer that guesses nothing** — a different code path from `bench
+batch`'s own harness over the same work — and both are run at every width in the
+same sitting on the same binary:
+
+    width   bench batch   the loop at k = 0   device       and at k = 0   change
+      1       20.22 ms         16.48 ms       15.49 ms       15.48 ms     -0.06%
+      2       25.52            25.50          24.30          24.26        -0.16
+      4       37.13            37.08          35.47          35.44        -0.08
+      8       67.26            66.96          64.42          64.35        -0.11
+     16      124.53           124.00         116.66         116.54        -0.10
+     32      244.97           244.16         224.78         224.49        -0.13
+
+**The device columns agree to 0.16% at every width and the walls to within half
+a percent at every width but one**, and the exception is batch 1 — the width this file
+already says a wall does not survive a sitting at, and which reads 20.22 ms of
+wall around a device clock that moved 0.06%. Against the figures C2 quotes,
+15.412 / 64.059 / 223.155 ms, this sitting reads 15.49 / 64.42 / 224.78 — +0.5,
++0.6 and +0.7%, one direction and half a percent, which is a sitting's drift.
+
+The second check is `bench sweep` at the same depths, which is the *unbatched*
+chain through a third harness. Its column and the `--batch 1` column above, one
+sitting:
+
+    k       bench sweep   batch 1   acceptance, sweep          acceptance, batch 1
+    0        16.434 ms    16.48 ms  —                          —
+    1        16.031       16.12     84.85%                     85%
+    2        17.222       17.36     91.30  73.91               91  74
+    3        16.795       16.72     84.21  73.68  63.16        84  74  63
+
+0.3 to 0.8% apart on the token, and acceptance digit for digit.
+
+### The verify's rows against the floors, and which floor is the real one
+
+The premise this milestone was set out under is that a `k = 3` verify at batch 8
+is 32 rows, "exactly the MMA floor", and that batching therefore puts the verify
+on a fast path speculation alone has always missed. **The arithmetic is right
+and the floor is the wrong one**, and
+`what_a_batched_verify_reaches_at_each_width_and_depth` states it off the shipped
+predicates rather than off a paragraph:
+
+- **`MMA_ROWS_A_BLOCK` is 32 and it is a block's *height*.** What a call has to
+  bring before it is *given* a block is `SHORTEST_BLOCKED_CALL`, which is
+  `MMA_BLOCKS_A_CALL × MMA_ROWS_A_BLOCK` = **64 rows** — a line the sweep behind
+  `PackedMatmul::blocks` drew from a measurement, because the block is behind
+  the reference tile at 40 and 48 rows and ahead only from 64. A `k = 3` verify
+  at batch 8 is half of it.
+- **And it is behind `--numerics production`**, under which nothing in this file
+  measures a decode step. That paragraph already records what the block cost a
+  speculative round before the floor existed: `k = 3` read **37.33 ms a token
+  against the reference's 17.08**.
+- **The floor that binds under the shipped word is `ROWS_A_TILE`, which is
+  four** — and an *unbatched* `k = 3` verify already clears it. The verify has
+  not been missing this path; it has been on it since depth three existed.
+
+So the rows a verify dispatches, `width × (k + 1)`, against the three lines:
+
+    rows in the call        k=0   k=1   k=2   k=3     lines crossed at k = 3
+    width  1                  1     2     3     4     the tile (4)
+           2                  2     4     6     8     the tile
+           4                  4     8    12    16     the tile
+           8                  8    16    24    32     the tile
+          16                 16    32    48    64     the tile, the block (64, production)
+          32                 32    64    96   128     the tile, the block, the grouping
+
+**The one line batching does move is the routed bank's**, and depth alone cannot
+reach it: a routed bank is six rows a token against 256 experts, so
+`RUNS_A_GROUPING` puts the grouping at 512 rows and therefore at **86 tokens in
+the call** — which batch 32 crosses at `k = 2` and nothing narrower crosses at
+any depth this table runs. It is also the only crossing in the table
+that lands on the bank holding most of a step's bytes. **And it buys nothing
+measurable here**: batch 32 at `k = 2` is 0.754× its own `k = 0`, which is
+between `k = 1`'s 0.778 and `k = 3`'s 0.336 rather than above either.
+
+### Why they substitute, in the currency the table is in
+
+A round costs a verify plus `k` head calls and buys the tokens acceptance
+banked. Both sides scale with the width, and only one of them scales with the
+depth.
+
+**A round is not the same width all the way through, and the middle table
+below has to be read knowing it.** Sequences bank different numbers of guesses,
+so they run out of budget on different rounds and the batch narrows towards its
+tail — which is what any real batch does. So "tokens a round" is the run's
+tokens over the run's rounds and not a per-sequence rate times the width, and
+dividing it by the width understates acceptance. What the third table *is*
+exact about is the ratio of the first two, which is total device over total
+tokens whatever shape the rounds were.
+
+    device a round (ms)      k=0     k=1     k=2     k=3
+    width  1                15.48   27.54   40.63   47.46
+           2                24.26   40.56   67.80   84.04
+           4                35.44   71.53  107.62  147.38
+           8                64.35  129.87  185.76  245.96
+          16               116.54  243.05  370.75  461.76
+          32               224.49  447.39  558.56  755.14
+
+    tokens a round           k=0     k=1     k=2     k=3
+    width  1                 1.00    1.85    2.62    3.15
+           2                 2.00    3.71    5.25    6.30
+           4                 4.00    7.41   10.50   12.60
+           8                 8.00   14.40   18.00   21.00
+          16                16.00   28.00   36.00   38.77
+          32                32.00   51.69   65.03   74.67
+
+    device a token           k=0     k=1     k=2     k=3
+    width  1                15.48   14.89   15.51   15.07
+           2                12.13   10.93   12.91   13.34
+           4                 8.86    9.65   10.25   11.70
+           8                 8.04    9.02   10.32   11.71
+          16                 7.28    8.68   10.30   11.91
+          32                 7.02    8.66    8.59   10.11
+
+**The last table is the finding and it is one sentence: the row a batch already
+bought is the row speculation is trying to sell it.** At batch 1 a decode step
+reads 5.9 GB of weights to produce one token, so a round that produces 1.85 of
+them for 1.78× the device time is ahead — 15.48 ms a token to 14.89, a ratio
+of 1.040 where `bench sweep`'s own device rows read 1.035 and its wall rows —
+which are what the `speedup` column quotes — read 1.019. At batch
+32 the same 5.9 GB already produces 32 tokens, so the verify's extra rows are
+work with nothing left to amortise: `k = 1` costs 1.99× the device and banks
+1.62× the tokens.
+
+**Acceptance is what decides the ratio and it falls a little as the batch
+widens** — 85% at batch 1 and 83% at batch 32 for the first guess, 63% and 51%
+for the third, as `MtpProposer::rates` counts them over every sequence
+together. That is not the engine and it is worth saying so: each slot runs a
+rotation of the same prompt, so a wider batch is a wider sample of the same
+workload and the mean regresses. **The trend is in the same direction the width
+pushes**, so it is named rather than corrected — but it is two points at the
+first guess against a ratio that falls from 1.021 to 0.778, so acceptance is
+not what the width is doing here. What a fleet of unrelated prompts would read
+is a measurement this file has not taken.
+
+### The one cell that is not the trade, which is measured and not attributed
+
+**Batch 32 at `k = 3` reads 44.6% duty where every other cell reads 84 to 96%**,
+and that is half of the 0.336 in the ratio table rather than the trade the rest
+of the section is about: **on the device's own clock the same cell reads
+0.694** — 10.11 ms a token against `k = 0`'s 7.02 — which is in line with its
+neighbours, and the wall is what falls the rest of the way. What the instrument
+says:
+
+    batch 32, k = 3      device 755.14 ms a round    wait 1.63 s    encode 7.8 ms
+                         43.3 submissions a round
+
+So 0.87 s a round is inside `submit and wait` and is not execution, against an
+encode row of 7.8 ms — which rules out the host's own arithmetic and leaves the
+driver, the queue, or the device. It reproduces: three separate sittings read
+44.6, 46.7 and 47.0%. **It is not attributed here**, and the cell is quoted with
+the duty beside it so a reader can discount it.
+
+**And one thing the instrument did find on the way**: at the widest arms the run
+of layers stops carrying and the tail leaves the device path, so the argmax over
+200058 logits runs on the CPU — 40 times a round at batch 16 `k = 3` and 53 at
+batch 32 `k = 1`, and zero at every width through 8. **The stack's tail and not
+the chain's**, which is the one thing that reading needs pinning down: a head's
+guess comes back out of the head's own command buffer whenever `ModelTail::wrap`
+took the tail, so `Generator::id_from_hidden` is not reached at all here and
+every one of those argmaxes is a verify's. That is
+`RETAINED_BUDGET`'s 160 MiB doing what it says it does, on calls it was sized
+before there were: it was set at "about nine rows of this stack", which is the
+deepest block the eight heads can propose *for one sequence*. A batched verify
+passes it, and passes it sporadically rather than at a width, because what it
+reads is what the process has allocated at that moment.
+
+### The ragged verify, and which scale catches which mutation
+
+A batched verify is ragged by construction. At `k = 3` one sequence may accept
+three guesses and its neighbour none, so the next call's seats are different
+lengths and **each sequence rewinds its span and its four convolution windows by
+its own amount** — which is exactly D3's warning, since a rewind that returns
+the wrong seat's window is correct on the step it ran and wrong on every one
+after.
+
+Three scales, each against the same oracle — the sequence run alone, exactly and
+not nearly:
+
+- **The loop, on the synthetic stack** (`inkling_core::generate`). A batched
+  speculative generation at every position of three, beside neighbours accepting
+  a different number of guesses, with a sequence leaving the batch from the
+  *middle* of the live set. Asserted on the tokens **and on the rows every round
+  handed each sequence to be chained from**, because a proposer built to be
+  deliberately wrong guesses without reading those rows.
+- **The kernels, on the device** (`inkling_metal::norm`). The tail's own gather:
+  a norm over the rows it names, out of order and with a repeat, answering what
+  a norm over the whole call answers in those places. B3's ragged-seat cases
+  already cover the block, a head's block being a decoder layer.
+- **The whole engine, on the real checkpoint**
+  (`a_speculating_generation_in_a_batch_produces_what_it_produces_alone_on_the_device`).
+  Three prompts through three slots at `k = 3`, one of them the activation
+  capture's own, with **acceptance asserted beside the tokens**: a guess cannot
+  move a token, so a chain that has leaked shows up as a rejected guess and
+  fluent text, and only acceptance sees it.
+
+**Eight mutations, and which scale catches which is the finding again:**
+
+    mutation                                             loop   checkpoint
+    a round never takes its rejected rows back            yes       —
+    a sequence rewound by the call's rows, not its own    yes      yes
+    a sequence chained from the call's first rows         yes      yes
+    the guesses handed back in round order, not by slot   yes       —
+    the chain's seats laid in round order, not by slot     no      yes
+    a chain scored against the seat before it              no      yes
+    every sequence's chain given slot zero                  —      yes
+    a guess taken from a seat's first row, not its last     —      yes
+
+**The two the loop cannot catch are the chain's own.** A proposer built to be
+deliberately wrong has no chain to seat in the wrong slot and nothing to score
+against the wrong sequence, so both mutations of `MtpProposer` walk straight
+through the loop's scale and fail at the checkpoint's. That is C3's finding
+arriving again from the other side: *a mutation only one scale catches is a case
+that had to exist at that scale.*
+
+**And the null fixture caught one of them out.** Built from the activation
+capture's eight recorded ids alone, the checkpoint case held **zero accepted
+against zero accepted** — the heads guess nothing right on that fragment — and
+*a guess taken from a seat's first row rather than its last* passed it. Two of
+the three prompts are the workload this file measures acceptance on now, and the
+case asserts that the chains apart banked something, and that the seats went
+ragged, before it compares either number.
+
+### What only the measurement found
+
+**Two things, and the first is C3's defect wearing a different face.** `bench
+batch` has taken a `--depth` all along and dropped it: the flag's default was
+the sweep's four, and the loop that wraps the weights per depth **shadowed the
+binding** — so every row a batch sweep printed was `k = 0` whatever the command
+line said. The code was four lines and they were the four lines the interface
+described. What said so was **a row that never appeared**: the table prints one
+line per depth and only one came out. A measurement that had printed a single
+headline ratio would have reported *speculation at batch is worth exactly
+1.00×*, which is a plausible null result and would have been wrong about the
+reason.
+
+**The second is the settling.** Whichever arm ran first at a width paid for the
+device coming up from idle — batch 1 read 20.10 ms of wall against its own 16.30
+with a device clock that had not moved — which is C3's own review finding
+arriving on a different axis. Every width is settled before either arm is timed
+now.
+
+### What the code-reviewer found
+
+- **The multi-sequence path had no caller and no case.** Every batched test used
+  a hand-rolled proposer that bypassed `MtpProposer`, `CheckpointHeads` and
+  Metal entirely, and every real call site asked for one slot. That is the
+  "shipped arm nothing drove" the reviewer has now named in four milestones
+  running; the checkpoint case and the batch sweep are both answers to it.
+- **The slot counts on the two sides of the seam were unchecked in both
+  directions.** A chain built for more sequences than `ModelHeads::wrap` holds
+  would seat one in a slot nothing allocated. `HeadBackend::slots` is what the
+  chain now asks, and `MtpProposer::batched` refuses the mismatch by name.
+- **A dead single-seat wrapper.** `CheckpointHeads::forward` lost its last
+  caller once the proposer went batched, and two spellings of one thing are two
+  that can drift.
+- `Landed::guess` went the same way when `Landed::guesses` took its caller.
+
+**And a second pass, once the measurement was in**, which found the same class
+of thing one level up:
+
+- **The slot refusal above was itself an arm nothing drove.** A check built to
+  close a contamination hazard, shipped with nothing proving it fires, is the
+  finding it was the fix for — arriving one milestone later and one layer in.
+  `a_chain_of_more_sequences_than_the_heads_hold_is_refused` is it as a case,
+  with `a_chain_the_heads_have_slots_for_is_built` beside it so the refusal is
+  refusing the mismatch rather than refusing every batch.
+- **A budget of nothing had no case in the batched loop.** A sequence asked for
+  no tokens is never prefilled and never live, which is a branch both batched
+  loops have and neither drove; the `k = 0` equivalence case now carries one.
+- **Two figures in this section did not match its own tables.** The 1.019× at
+  batch 1 is a *wall* ratio and was quoted as a device one, where the device
+  rows read 1.035 and 1.040; and "tokens a round" is a whole-run figure over a
+  batch that narrows as its sequences finish, so dividing it by the width
+  understates acceptance — which is how the review arrived at 61.5% where the
+  chain reports 83%. Both are corrected above rather than removed, and the
+  second is now stated where the table is.
+- The accept-and-keep prefix was written twice, once in each loop. One
+  spelling now, for the reason two are a defect here.
+
+### What did not move
+
+**No kernel changed.** `just test-full` is green — **773 gated and 81 timing**,
+which is the 764 C3 left plus the nine this milestone brought — the recorded
+continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]` is what the engine
+generates, `--backend cpu` is unmoved, `bench diverge` agrees **448 of 448**
+under `production` against `reference` with no prompt parting, and `rounded` is
+still opt-in.
+
+**The unbatched speculative path is unmoved digit for digit**, which is the
+guarantee this milestone was most able to break. Seven alternating pairs of
+`bench sweep --depth 3`, C3's head against this tree:
+
+    row              C3        here     ranges    pairs
+    k0.device   15.393 ms   15.400 ms   across    5 of 7   no claim
+    k1.device   14.877      14.876      across    4 of 7   no claim
+    k2.device   15.508      15.504      across    3 of 7   no claim
+    k3.device   15.055      15.048      across    3 of 7   no claim
+    k1.accept1  84.848 %    84.848 %    across    0 of 7   no claim
+    k2.accept1  91.304      91.304      across    0 of 7   no claim
+    k2.accept2  73.913      73.913      across    0 of 7   no claim
+    k3.accept1  84.211      84.211      across    0 of 7   no claim
+    k3.accept2  73.684      73.684      across    0 of 7   no claim
+    k3.accept3  63.158      63.158      across    0 of 7   no claim
+
+and tokens a round at 1.829, 2.560 and 3.048 on both arms.
+
+**Two of the figures this file quotes for that path do not match either binary,
+and they did not move here.** The acceptance row above reads
+**84.85 / 91.30-73.91 / 84.21-73.68-63.16** where four sections of this file
+quote `84.85 / 86.96-78.26 / 85-65-55`, and the best depth is `k = 1`, at 1.019× on
+the wall and 1.035 on the device, where they say `k = 3`. Both binaries agree with each other and neither agrees
+with the prose, so the drift predates this milestone — and the timing tier's own
+`what_a_speculative_round_costs_and_what_it_buys` has been printing the new
+figures beside the old sentence. The rows above are what this engine reads today. The
+earlier sections are left as the readings those milestones took, because a
+record of a measurement is not a claim about this sitting — but the four
+sentences that say `k = 3` is the best depth are now false of both binaries, and
+this is where that is written down.
+
+The batched guarantees are unmoved too: the ragged-seat cases still drive both
+halves of a merged pair, barriers derived == encoded, the duplicate-slot refusal
+still refuses — and now refuses a chain that seated every sequence in slot zero
+— memory is linear at 30.8 MiB a slot, `what_an_empty_seat_costs` still bounds
+an idle seat, K1's kept cache and every prefill length are unmoved.
+
+### The floor this stops at, and its arithmetic
+
+**A round's floor is its verify plus its chain, and neither has slack left at
+width.** At batch 32, `k = 1`:
+
+    the verify, 64 rows            2 × the k = 0 round's 224.49 ms   448.98 ms
+    what the round actually cost                                     447.39
+                                                                     ------
+                                                                      -0.4%
+
+So the whole of a `k = 1` round at batch 32 is two `k = 0` rounds' device time,
+to within four parts in a thousand — the chain's own eight weight reads a head
+are **free at this width**, which is what batching them bought and is the one
+part of the hypothesis that held. What it does not buy is the ratio: two rounds'
+device time banks 1.62 tokens a round against two, so the arithmetic is 0.81×
+before anything about the chain is measured, and the table reads 0.778.
+
+**And that is a lower bound whose residual is an upper bound on the chain.** The
+verify is charged at the `k = 0` round's rate, which is a call of 32 rows where
+this one is 64 — and the section above shows a row costs *less* at the wider
+call, not more. So the arithmetic over-counts the verify, the residual
+under-counts the chain, and the -0.4% is the chain costing at most nothing
+rather than the chain costing nothing.
+
+**What that leaves is not a wider lane or a deeper chain.** The row that would
+move this milestone's headline is acceptance, and acceptance is the workload's:
+at 85% the first guess is nearly free and at 51% the third is a row bought and
+thrown away. **A depth chosen per round rather than per run** is what the table
+argues for — batch 1 wants `k = 1`, batch 32 wants none — and `MtpProposer`
+refuses it by name today: a round that asks for fewer heads than the last leaves
+the caches of the heads past it where they are, so whatever chooses a depth
+adaptively has to run the heads it skipped or start their caches over.
 
 ## A slot that fills when a request arrives
 

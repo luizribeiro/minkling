@@ -305,14 +305,14 @@ impl WrappedHead<'_> {
 
         let produced = profile::timed(Op::Readback, || rows.to_vec());
         let guesses = landed.as_ref().map(Landed::guesses);
-        let width = produced.len() / counts.iter().sum::<usize>().max(1);
+        let width = produced.len() / counts.iter().sum::<usize>();
         let mut from = 0;
         Ok(counts
             .iter()
             .enumerate()
-            .map(|(at, rows)| {
-                let own = produced[from..from + rows * width].to_vec();
-                from += rows * width;
+            .map(|(at, queries)| {
+                let own = produced[from..from + queries * width].to_vec();
+                from += queries * width;
                 Guessed {
                     hidden: Passed::Rows(own),
                     guess: guesses.as_ref().map(|guesses| guesses[at]),

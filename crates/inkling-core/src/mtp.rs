@@ -1960,6 +1960,103 @@ mod tests {
         }
     }
 
+    /// A backend that holds a head's state for a stated number of sequences and
+    /// answers for nothing else, which is the one thing
+    /// [`MtpProposer::batched`] asks a backend before it builds a chain.
+    struct Seating(usize);
+
+    impl HeadBackend for Seating {
+        fn input_proj(&self, _: usize) -> Option<&dyn Projection> {
+            None
+        }
+
+        fn attention(&self, _: usize) -> Option<&dyn Projections> {
+            None
+        }
+
+        fn mlp(&self, _: usize) -> Option<&dyn MlpProjections> {
+            None
+        }
+
+        fn slots(&self) -> Option<usize> {
+            Some(self.0)
+        }
+    }
+
+    /// The heads out of the synthetic shard, with `held` slots' worth of state
+    /// claimed by whatever runs them.
+    fn seated_heads<'a>(ckpt: &'a Checkpoint, config: &Config, held: usize) -> CheckpointHeads<'a> {
+        CheckpointHeads::open(
+            ckpt,
+            &config.text_config,
+            config.mtp_config.as_ref().expect("an mtp_config"),
+        )
+        .expect("the heads open")
+        .with_backend(Box::new(Seating(held)))
+    }
+
+    /// **A chain of more sequences than the heads were wrapped for is refused
+    /// by name.**
+    ///
+    /// The two counts are decided in two places — a slot is allocated where the
+    /// heads are wrapped and a chain is built where a run decides how many
+    /// sequences it serves — so nothing but this asks them to agree. A chain
+    /// that outran the wrap would seat a sequence in a slot nothing allocated,
+    /// which is the failure the whole milestone is about arriving through the
+    /// one door no contamination case can watch.
+    #[test]
+    #[should_panic(expected = "a chain of 2 sequences against heads wrapped for 1")]
+    fn a_chain_of_more_sequences_than_the_heads_hold_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mtp.safetensors");
+        write_heads(&path);
+        let ckpt = crate::Checkpoint::open(&path).expect("the shard opens");
+        let config = fixture_config();
+        let heads = seated_heads(&ckpt, &config, 1);
+
+        let stack = Stack::load();
+        let head = stack.head();
+        MtpProposer::batched(
+            &heads,
+            Generator::new(
+                stack.model(),
+                crate::LmHead::for_config(&stack.config),
+                &head,
+            ),
+            &stack,
+            0,
+            2,
+        );
+    }
+
+    /// And that a chain the wrap has room for is built, so the case above is
+    /// refusing the mismatch rather than refusing every batch.
+    #[test]
+    fn a_chain_the_heads_have_slots_for_is_built() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mtp.safetensors");
+        write_heads(&path);
+        let ckpt = crate::Checkpoint::open(&path).expect("the shard opens");
+        let config = fixture_config();
+        let heads = seated_heads(&ckpt, &config, 4);
+        assert_eq!(heads.slots(), Some(4));
+
+        let stack = Stack::load();
+        let head = stack.head();
+        let chain = MtpProposer::batched(
+            &heads,
+            Generator::new(
+                stack.model(),
+                crate::LmHead::for_config(&stack.config),
+                &head,
+            ),
+            &stack,
+            0,
+            4,
+        );
+        assert_eq!(BatchProposer::depth(&chain), 0);
+    }
+
     #[test]
     fn the_heads_a_checkpoint_holds_answer_what_their_tensors_answer() {
         let dir = tempfile::tempdir().expect("tempdir");

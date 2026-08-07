@@ -75,6 +75,27 @@ use crate::model::{Batched, Model, ModelCache, ModelWeights};
 use crate::ops::{Projection, top_k};
 use crate::profile::{self, Op};
 
+/// What a round of a speculative loop produced: the guesses the model agreed
+/// with, in order, and its own answer to the first position it did not.
+///
+/// **The first disagreeing answer is kept too**, and that is what makes a round
+/// that guessed nothing right still a decode step: it is the model's own next
+/// token, arrived at from a prefix the model agrees with.
+///
+/// One spelling for both loops, because a batched round does to one sequence
+/// exactly what an unbatched one does to it and two spellings of that are two
+/// that can drift.
+fn banked(guesses: &[usize], picks: &[usize]) -> Vec<usize> {
+    let agreed = guesses
+        .iter()
+        .zip(picks)
+        .take_while(|(guess, pick)| guess == pick)
+        .count();
+    let mut round = guesses[..agreed].to_vec();
+    round.push(picks[agreed]);
+    round
+}
+
 /// The id a greedy sampler takes.
 ///
 /// [`top_k`] rather than a fresh argmax, so that the rule for a tie — the lower
@@ -754,16 +775,7 @@ impl<'a> Generator<'a> {
             );
             let picks = &tailed.picks;
             assert_eq!(picks.len(), block, "an id per row of the block");
-            let agreed = guesses
-                .iter()
-                .zip(picks)
-                .take_while(|(guess, pick)| guess == pick)
-                .count();
-
-            // What the round produced: the guesses the model agreed with, and
-            // its own answer to the first position it did not.
-            let mut produced = guesses[..agreed].to_vec();
-            produced.push(picks[agreed]);
+            let produced = banked(&guesses, picks);
 
             let mut stop = None;
             let mut kept = base + 1;
@@ -995,13 +1007,7 @@ impl<'a> Generator<'a> {
             // round accepts what the model agreed with for that sequence alone.
             let mut kept: Vec<(usize, Vec<usize>)> = Vec::with_capacity(live.len());
             for ((at, ids), picked) in live.iter().zip(&feeding).zip(&verified.picked) {
-                let agreed = run.guesses[*at]
-                    .iter()
-                    .zip(&picked.picks)
-                    .take_while(|(guess, pick)| guess == pick)
-                    .count();
-                let mut round = run.guesses[*at][..agreed].to_vec();
-                round.push(picked.picks[agreed]);
+                let mut round = banked(&run.guesses[*at], &picked.picks);
                 round.truncate(counts[*at] - run.produced[*at].len());
 
                 let held = round.len();
@@ -2020,7 +2026,13 @@ mod tests {
         let head = stack.head();
         let generator = generator(&stack, &head);
         let prompts = prompts(&stack);
-        let counts = [COUNT, COUNT, COUNT - 2];
+        // **One of the three is asked for nothing**, which is the arm that never
+        // prefills at all: a prompt whose next token is never asked for is a
+        // forward pass with no answer, and a sequence that took one would be a
+        // slot's worth of state nobody reads. Driven here rather than at the
+        // speculating case because it is the same branch in both loops and this
+        // one holds them against each other.
+        let counts = [COUNT, 0, COUNT - 2];
         let ids: Vec<&[usize]> = prompts.iter().map(Vec::as_slice).collect();
 
         let mut plain: Vec<ModelCache> = (0..prompts.len())
@@ -2030,9 +2042,14 @@ mod tests {
             .map(|slot| ModelCache::in_slot(&stack.config, 0, slot))
             .collect();
 
+        let batched = generator.generate_batch(&mut plain, &ids, &counts, &stack);
+        assert!(
+            batched[1].is_empty(),
+            "a budget of nothing produced a token"
+        );
         assert_eq!(
             generator.speculate_batch(&mut speculating, &ids, &counts, &stack, &mut Alone),
-            generator.generate_batch(&mut plain, &ids, &counts, &stack)
+            batched
         );
     }
 }
