@@ -1688,16 +1688,16 @@ const WARM: usize = 3;
 /// **The knob a joining request's own wait trades against the wait it puts on
 /// the sequences it joins**, and 128 is where both are least at this
 /// checkpoint's shapes. A 385-token prompt joining seven decoders reads, at 16,
-/// 32, 64, 128 and 384 rows a chunk: **4866, 3843, 3311, 2259 and 3571 ms to
-/// its own first token**, and **199, 314, 539, 727 and 2650 ms on each step the
-/// seven decoders take while it is filling**, against their own 73.8 ms.
+/// 32, 64, 128 and 384 rows a step: **4864, 3885, 3269, 2252 and 3636 ms to its
+/// own first token**, and **199, 317, 532, 725 and 2750 ms on each step the
+/// seven decoders take while it is filling**, against their own 73.6 ms.
 ///
-/// The two ends are two different prices. A narrow chunk pays call overhead
-/// once per chunk — 25 calls where 4 would do — and a whole prompt makes one
-/// call the decoders wait 36 of their own steps inside. What the chunk does
-/// *not* buy is the total: the delay summed over the decoders is 2.0 to 3.0 s
+/// The two ends are two different prices. A narrow budget pays call overhead
+/// once per chunk — 25 calls where 2 would do — and a whole prompt makes one
+/// call the decoders wait 37 of their own steps inside. What the budget does
+/// *not* buy is the total: the delay summed over the decoders is 1.96 to 2.99 s
 /// whatever it is, which is the prefill's own work and has to be paid. **It is
-/// a bound on the jitter of one token, and it is worth about 4.4× of that.**
+/// a bound on the jitter of one token, and it is worth about 3.7× of that.**
 const ADMITTED: usize = 128;
 
 /// Requests a fleet makes, when nobody says. Two per slot at the default width,

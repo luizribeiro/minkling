@@ -36,25 +36,25 @@
 //!
 //! A joining prompt fed whole is one call of `n + d` rows, and the `d`
 //! sequences already decoding wait the whole of it — a 385-token prompt riding
-//! with seven decoders is a **2.65 s** step against their own **73.8 ms**, so
-//! one arrival costs every sequence in flight thirty-six steps' worth of jitter
-//! on a single token. Given a budget of `b` prompt rows a step, the same prompt
-//! is spread over `ceil((n-1)/b)` steps and the worst any one of them costs them
-//! is bounded by that budget: 727 ms at 128 rows, 199 at 16.
+//! with seven decoders is a **2.75 s** step against their own **73.6 ms**, so
+//! one arrival costs every sequence in flight thirty-seven steps' worth of
+//! jitter on a single token. Given a budget of `b` prompt rows a step, the same
+//! prompt is spread over `ceil((n-1)/b)` steps and the worst any one of them
+//! costs them is bounded by that budget: 725 ms at 128 rows, 199 at 16.
 //!
 //! **The budget is the call's and not the seat's** — see [`Continuous::new`],
 //! where the measurement that decided it is. A per-seat number bounds nothing:
 //! eight slots filling 128 rows apiece is a call of 1024 rows.
 //!
-//! **What the chunk does not buy is the total.** Summed over the decoders the
-//! delay is 2.0 to 3.0 s whatever the chunk, because it is the prefill's own
-//! work and somebody has to do it. The chunk is a bound on the jitter of one
-//! token and not a reduction in what the prompt costs.
+//! **What the budget does not buy is the total.** Summed over the decoders the
+//! delay is 1.96 to 2.99 s whatever it is, because it is the prefill's own work
+//! and somebody has to do it. The budget is a bound on the jitter of one token
+//! and not a reduction in what the prompt costs.
 //!
 //! **And a narrow budget is not free either.** It pays a call's overhead once
 //! per chunk rather than once per prompt, and that is most of what the sweep
-//! measures: a 385-token prompt in 24 chunks of 16 costs 4.53 s of device where
-//! the same prompt whole costs 1.79.
+//! measures: a 385-token prompt in 24 chunks of 16 costs 4.54 s of device where
+//! the same prompt whole costs 1.78.
 //!
 //! **What it is not is the query block.** `FusedAttention::blocked` does refuse
 //! a call carrying more than one sequence — a block stages one tile of keys for
@@ -63,10 +63,12 @@
 //! turns out to cost nothing measurable at these shapes, and it is worth saying
 //! why twice over: the entry is behind `--numerics production` and the figures
 //! here are taken under the default word, which has no block to lose; and the
-//! device time a second sequence in the call adds is **about 7 ms a step
-//! whatever the chunk is** — 176 ms over 25 steps at a budget of 16, 4 ms over 2
-//! at 384 — which is a seat's own overhead and not a term in the rows. The
-//! README has the arithmetic.
+//! device time a second sequence in the call adds is **15 to 22 ms a step**, of
+//! which 8.65 is the decode row's own marginal cost — so what is left is 6 to
+//! 13 ms of a second seat's overhead, and it does not scale with the rows the
+//! way a lost block would. These are differences of a few percent between two
+//! large numbers and they bound rather than resolve; the README has the
+//! arithmetic.
 //!
 //! # Starvation is a correctness property
 //!
