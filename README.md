@@ -1245,10 +1245,10 @@ same request at an idle engine, and **7.7× less than the same request waiting
 for the batch it arrived behind.** The throughput is unmoved either way, which
 is B1's bound holding exactly as stated.
 
-**And the fleet says the trade is a trade.** Over 24 agents at three arrival
-rates, continuous admission wins the first token at every one of them — 1.4×,
-1.9× and 4.3× at the median — and **loses the whole answer at every one of
-them**, 68.7 s against 60.3 at the median of the loaded shape. Running
+**And the fleet says the trade is a trade.** Over three arrival rates,
+continuous admission wins the first token at every one of them — 1.4×, 1.8× and
+3.9× at the median — and **loses the whole answer at every one of them**, 62.7 s
+against 57.3 at the median of the loaded shape. Running
 everything at once means everything finishes late together, where running groups
 to completion finishes the early groups early. So the honest statement of what
 this milestone buys is: **a request's first token, and not its last.**
@@ -1370,8 +1370,9 @@ the shape the table above is a slice of — and it is where the answer stops bei
 one-sided.
 
 Eight slots, 385-token prompts, a 128-row prompt budget, and **budgets that
-vary**: a quarter of a nominal 200 tokens to twice it, walked by an odd stride
-so the order of arrivals is not the order of lengths. That last is not
+vary**: an eighth of a nominal 200 tokens to twice it, walked by a stride coprime
+with the fleet's own size so no two of its requests are the same length and the
+order they arrive in is not the order of their lengths. That last is not
 decoration. **A fleet whose every request asks for the same number of tokens is
 the one shape a static batch is not penalised by** — its sequences produce their
 last token on the same step, so no slot ever frees early and there is nothing
@@ -1380,43 +1381,45 @@ moment. Measured that way, 24 requests of exactly 200 tokens read 46.2 s to a
 first token against draining's 46.4, which is a null result about the fixture and
 not about the scheduler.
 
-    fleet                policy      to the first token        to the whole answer      tok/s  steps  duty
+    fleet                policy      to the first token        to the whole answer     tok/s  steps  duty
                                     p50     p90    worst      p50     p90    worst
-    24 every 200 ms      joining   34.5 s  82.0 s  82.2 s   68.7 s 101.2 s 104.0 s   50.3    896  93.3%
-                        draining   49.0    82.7    83.1     60.3   101.5   104.2     50.2   1323  93.6
-    24 every 1 s         joining   26.3    64.8    65.7     63.8    86.4    90.6     50.2    870  93.3
-                        draining   48.6    76.8    78.8     54.4    87.0    91.4     48.9   1623  93.5
-    8 every 3 s          joining    2.17    2.33    2.33    21.3    35.7    35.7     46.3    466  92.9
-                        draining    9.32   21.4    21.4     19.2    27.6    27.6     42.3   1026  93.6
+    24 every 200 ms      joining   34.4 s  77.7 s  85.9 s   62.7 s  95.7 s  97.0 s   48.3    804  92.8%
+                        draining   47.6    80.8    81.1     57.3    95.9    99.1     47.7   1247  93.1
+    24 every 1 s         joining   26.1    61.6    68.1     57.4    80.1    82.8     48.1    802  93.0
+                        draining   45.6    72.8    74.8     49.5    81.8    85.3     46.5   1572  92.7
+    8 every 3 s          joining    2.17    2.36    2.36    18.1    30.1    30.1     41.3    469  91.1
+                        draining    8.43   17.6    17.6     12.2    23.0    23.0     36.5   1224  91.9
 
 **Three readings, and the second is the one a milestone about continuous
 batching would rather not print.**
 
 - **Continuous admission wins the first token at every rate, and by more the
-  less loaded the engine is.** The median is 1.42×, 1.85× and 4.30×; the tail is
-  1.01×, 1.18× and 9.19×. At the lightest shape — eight agents three seconds
+  less loaded the engine is.** The median is 1.38×, 1.75× and 3.88×; the p90 is
+  1.04×, 1.18× and 7.47×. At the lightest shape — eight agents three seconds
   apart, which is a fleet of agents rather than a load test — **a request's first
-  token comes back in 2.17 s at the median and 2.33 s at the worst**, which is
+  token comes back in 2.17 s at the median and 2.36 s at the worst**, which is
   the joining table's own figure, arriving on time whatever else is running.
-- **Draining wins the whole answer at the median, at every rate.** 60.3 s
-  against 68.7, 54.4 against 63.8, 19.2 against 21.3. That is not a defect in the
+- **Draining wins the whole answer at the median, at every rate.** 57.3 s
+  against 62.7, 49.5 against 57.4, 12.2 against 18.1. That is not a defect in the
   scheduler and it is not noise: running everything at once means everything
   finishes late together, where running groups to completion finishes the early
-  groups early. The tail is a tie at the two loaded shapes — 101.5 against 101.2
-  and 87.0 against 86.4 — because the last request out is the last request out
-  either way; at the light shape it goes to draining too, 27.6 against 35.7,
-  which is the same effect with fewer requests to hide it. **A fleet that is
-  judged on when its answers land, rather than on when they start, is a fleet a
-  static batch serves as well or better.**
-- **The throughput is the same and B1's bound holds exactly as stated.** 50.3
-  against 50.2, 50.2 against 48.9, 46.3 against 42.3 — the light shape is the
-  only one where continuous is ahead, by 9.5%, and it is ahead there because a
-  static batch of one leaves seven slots empty. **The same 14616 rows go through
-  896 steps against 1323**, which is what continuous admission actually is:
-  the same work in wider calls.
+  groups early. **The median is the whole of it** — the tail is a tie at the two
+  loaded shapes, 95.9 against 95.7 and 81.8 against 80.1 with the sign going both
+  ways, because the last request out is the last request out either way — and at
+  the light shape draining takes the tail as well, 23.0 against 30.1, which is
+  the same effect with too few requests to average over. **A fleet judged on when
+  its answers land, rather than on when they start, is a fleet a static batch
+  serves as well or better.**
+- **The throughput is continuous admission's at every rate, and only just.**
+  48.3 against 47.7, 48.1 against 46.5, 41.3 against 36.5 — +1.3%, +3.4% and
+  +13.2%, the last because a static batch admitted alone at a light rate leaves
+  seven slots empty. This is B1's bound doing exactly what it said: a slot that
+  fills sooner earns the same tokens sooner and no more of them. **The same
+  14116 rows go through 804 steps against 1247**, which is what continuous
+  admission actually is — the same work in wider calls.
 
 **The rate column is a whole-workload figure and the batch table's is not.** The
-fleet's 50 tokens a second is 5400 tokens out of 14616 rows — the other 9216 are
+fleet's 48 tokens a second is 4900 tokens out of 14116 rows — the other 9216 are
 prompt — against `bench batch`'s **119.7 tokens a second at width 8**, which is
 decode steps and nothing else. Beside C2's own static table, taken at the same
 width in the same sitting:
@@ -1426,9 +1429,10 @@ width in the same sitting:
       8     64.059         67.588 · 32.7%   68.525 · 6.8%     63.80
      32    223.155        223.024 · 90.5%  226.884 · 22.5%       —
 
-**The duty column is 92.9 to 93.6% in every row of the fleet**, so none of the
+**The duty column is 91.1 to 93.1% in every row of the fleet**, so none of the
 above is the clock: the toll C2 priced is 3.5 ms on the first dispatch after a
-gap and there are no gaps in a fleet this loaded to charge it to.
+gap, and the lowest duty here is the lightest shape where both policies sit
+within 0.8 points of each other.
 
 ### Starvation, which is a correctness property and is asserted
 
