@@ -1253,6 +1253,16 @@ everything at once means everything finishes late together, where running groups
 to completion finishes the early groups early. So the honest statement of what
 this milestone buys is: **a request's first token, and not its last.**
 
+**And the largest defect this milestone had was one no review would have caught
+and the measurement did.** The knob that caps a step's prompt rows was a budget
+*per seat*, so eight slots filling 128 rows apiece made a call of 1024 — and the
+fleet reported **46 tokens a second where the same width decodes at 119**, a
+2.6× error wearing exactly the face a fleet's throughput ought to wear. The code
+was what its interface said, the tokens were bit-exact at three scales, and every
+mutation failed as it should. What found it was a figure the code does not get to
+choose, taken beside it in the same sitting. See "The one the review could not
+have found".
+
 ### What one request waits, at each occupancy it can arrive at
 
 Eight slots, a 385-token prompt, 200 tokens a request, the step's prompt budget
@@ -1488,6 +1498,40 @@ rows salted by the run's step rather than by its own — and both cases there al
 fail the kernel mutation the older one exists for, every slot's keys based at
 row zero.
 
+### The one the review could not have found, which the measurement did
+
+**`--admit` was a chunk *per seat*, and every reading it produced was
+plausible.** Eight slots filling 128 rows apiece is a call of **1024 rows**, not
+128 — the number in the flag was eight times the number in the call — and what
+came back was a fleet running at **46 tokens a second where the same width
+decodes at 119**. A 2.6× error, on a row that looks exactly like a fleet's
+tokens a second ought to look: below the batch table's figure, as a workload
+carrying prefills must be, at a duty cycle of 93%, from a scheduler whose tokens
+were bit-for-bit correct at three scales and whose mutations all failed as they
+should.
+
+**Nothing on the reviewing side of this milestone was going to catch it.** The
+code is four lines and they are the four lines the interface describes; the
+tests assert what the engine produces, and the engine produced the right tokens;
+the mutations ask whether a case can tell right from wrong, and every one of them
+could. The defect was not in what the code does but in **what the number is a
+number of**, and the only instrument that can see that is one that puts the
+number beside another number it has to agree with. Here that was `bench batch`'s
+119.7 tokens a second at the same width, in the same sitting, on the same
+binary — and the two did not agree.
+
+**Which is the case for measuring and not only reviewing**, and it is the second
+time this file has had to make it: C1 nearly published a clock drift that was the
+key count growing, and no reading of C1's code would have said so either. A
+review bounds what the code can do wrong. A measurement against a figure the code
+does not get to choose is what bounds what the *claim* can be wrong about.
+
+The budget is on the call now, split over the seats filling, and a seat still
+takes at least one row so a budget thinner than the seats is exceeded rather than
+starving one of them into a slot it never leaves.
+`a_steps_prompt_rows_are_the_calls_budget_and_not_a_seats` is it as a case, and
+*the budget spent per seat rather than per call* is the mutation that fails it.
+
 ### What the code-reviewer found, which is four things and one of them is a lie
 
 **None of the four is a shipped kernel with an arm no test drove**, which the
@@ -1519,13 +1563,9 @@ for the batch sweep, should be what these two measurements build their batches
 out of. It should not: what they are measuring *is* the scheduler, so a batch
 assembled by anything else would be a measurement of the harness.
 
-**And it did not find the one that mattered most, which the measurement did.**
-`--admit` was a chunk per seat, so eight slots filling 128 rows apiece was a call
-of 1024 rows — the fleet read **46 tokens a second where the same width decodes
-at 119**. A per-seat number bounds nothing and cannot be read as the cost of a
-step; it is a budget on the call now, split over the seats filling, and a seat
-still takes at least one row so a budget thinner than the seats is exceeded
-rather than starving one of them into a slot it never leaves.
+**And the one it did not find is the section above**, which is not a criticism of
+the review: a per-seat budget is what the interface said it was, and every test
+of it passed.
 
 ### What did not move
 
