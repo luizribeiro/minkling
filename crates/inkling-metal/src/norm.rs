@@ -254,18 +254,50 @@ impl<'a> LayerNorm<'a> {
         x: &mut Buffer<f32>,
         rows: usize,
     ) -> Result<Buffer<f32>, MetalError> {
+        self.encode_runs(batch, x, &[(self.rows(x.len()) - rows, rows)])
+    }
+
+    /// The same normalisation over the runs of rows `runs` names — `(first,
+    /// rows)` apiece — laid end to end in the order they are given.
+    ///
+    /// **A list of runs rather than a suffix, because a batched call's rows of
+    /// interest are not one.** A chain of heads over N sequences lays each
+    /// sequence's rows after the last's, and the row a round takes its guess
+    /// from is the last of each sequence's run rather than the last of the
+    /// call — so what the tail behind it needs is N rows scattered through the
+    /// buffer, gathered into the N the projection then reads.
+    ///
+    /// **Gathered here rather than left to the projection**, for the reason the
+    /// suffix above is: `lm_head` is 200058 rows read once per tile of four, so
+    /// a call of the whole buffer would read it once per four rows of every
+    /// sequence where this reads it once per four sequences.
+    pub fn encode_runs(
+        &self,
+        batch: &mut Batch<'_>,
+        x: &mut Buffer<f32>,
+        runs: &[(usize, usize)],
+    ) -> Result<Buffer<f32>, MetalError> {
         let _timed = profile::scope(Op::Encode);
-        let from = self.rows(x.len()) - rows;
+        let rows: usize = runs.iter().map(|(_, rows)| rows).sum();
+        let mut base = 0;
+        let seats: Vec<Seating<'_>> = runs
+            .iter()
+            .map(|(from, taking)| {
+                let seat = Seating {
+                    from: *from,
+                    rows: *taking,
+                    base,
+                    scale: None,
+                };
+                base += taking;
+                seat
+            })
+            .collect();
         let mut out = self.device.zeroed::<f32>(rows * self.width)?;
         self.encoding(
             batch,
             x,
-            &[Seating {
-                from,
-                rows,
-                base: 0,
-                scale: None,
-            }],
+            &seats,
             Landing {
                 out: &mut out,
                 groups: 1,
@@ -1083,6 +1115,52 @@ mod tests {
                 whole[(ROWS - last) * WIDTH..],
                 "the last {last} rows"
             );
+        }
+    }
+
+    /// **The rows a batched chain's tail reads are one per sequence and they
+    /// are not a suffix**, so the norm gathers the rows it is given into the
+    /// compact block the projection behind it then reads.
+    ///
+    /// Each sequence of a batched round owns a run of the call and the row its
+    /// guess comes from is the last of that run — which past one sequence is
+    /// neither the last row nor a contiguous span of them. What this asserts is
+    /// the gather: the named rows, in the order they were named, holding the
+    /// values a norm over the whole call left in those places.
+    ///
+    /// **Named out of order and with a repeat**, because both are things the
+    /// caller could ask for and neither is what a suffix can express — and
+    /// because a gather that quietly sorted or deduplicated would answer the
+    /// right values in the wrong rows. The rows are all different, so a row
+    /// taken from the wrong place is a different answer rather than the same
+    /// one.
+    #[test]
+    fn a_norm_over_the_rows_it_names_gathers_them_in_the_order_it_was_given() {
+        let Some(device) = device() else { return };
+        const WIDTH: usize = 128;
+        const ROWS: usize = 7;
+        let norm = RmsNorm::new(&device).expect("the norm compiles");
+        let weight: Vec<f32> = (0..WIDTH).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+        let layer = LayerNorm::new(&device, &norm, &weight, 1e-6).expect("the weight uploads");
+        let rows: Vec<f32> = (0..ROWS * WIDTH)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) * (1 + i / WIDTH) as f32)
+            .collect();
+        let whole = layer.forward(&rows).expect("the dispatch completes");
+
+        for taking in [vec![3], vec![0, 2, 6], vec![6, 1, 4], vec![5, 5, 0]] {
+            let mut x = device.buffer(&rows).expect("the rows upload");
+            let mut batch = device.batch().expect("a command buffer opens");
+            let runs: Vec<(usize, usize)> = taking.iter().map(|row| (*row, 1)).collect();
+            let gathered = layer
+                .encode_runs(&mut batch, &mut x, &runs)
+                .expect("the dispatch encodes");
+            batch.wait().expect("the dispatch completes");
+
+            let want: Vec<f32> = taking
+                .iter()
+                .flat_map(|row| whole[row * WIDTH..(row + 1) * WIDTH].to_vec())
+                .collect();
+            assert_eq!(gathered.to_vec(), want, "the rows {taking:?}");
         }
     }
 
