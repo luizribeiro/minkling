@@ -79,7 +79,7 @@ test-full checkpoint=checkpoint: && (test-timing checkpoint)
 bench a b *measurement:
     #!/usr/bin/env bash
     set -euo pipefail
-    root="$(git rev-parse --show-toplevel)"
+    root="{{ justfile_directory() }}"
     bin="$root/target/bench/bin"
     mkdir -p "$bin"
     git worktree prune
@@ -102,8 +102,12 @@ bench a b *measurement:
             git worktree add --detach --quiet "$tree" "$sha"
             # A target directory of its own, so that building the other ref does
             # not invalidate this one and turn the pairs back into rebuilds.
+            local manifest="$tree/slop/Cargo.toml"
+            if [ ! -f "$manifest" ]; then
+                manifest="$tree/Cargo.toml"
+            fi
             CARGO_TARGET_DIR="$root/target/bench/target" \
-                cargo build --quiet --manifest-path "$tree/Cargo.toml" --bin bench
+                cargo build --quiet --manifest-path "$manifest" --bin bench
             cp "$root/target/bench/target/debug/bench" "$bin/$sha"
             git worktree remove --force "$tree"
         fi
@@ -130,7 +134,7 @@ bench a b *measurement:
 bench-weights a b *measurement:
     #!/usr/bin/env bash
     set -euo pipefail
-    root="$(git rev-parse --show-toplevel)"
+    root="{{ justfile_directory() }}"
     cargo build --quiet --bin bench
     bin="$root/target/bench/bin/working-tree"
     mkdir -p "$(dirname "$bin")"
@@ -172,7 +176,7 @@ bench-weights a b *measurement:
 bench-engines *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    root="$(git rev-parse --show-toplevel)"
+    root="{{ justfile_directory() }}"
     cargo build --quiet --bin bench
     bin="$root/target/bench/bin/working-tree"
     mkdir -p "$(dirname "$bin")"
@@ -212,7 +216,7 @@ bench-engines *args:
 bench-session a="cold" b="kept" *measurement:
     #!/usr/bin/env bash
     set -euo pipefail
-    root="$(git rev-parse --show-toplevel)"
+    root="{{ justfile_directory() }}"
     cargo build --quiet --bin bench
     bin="$root/target/bench/bin/working-tree"
     mkdir -p "$(dirname "$bin")"
@@ -265,7 +269,7 @@ bench-session a="cold" b="kept" *measurement:
 bench-conversations a="cold" b="kept" *measurement:
     #!/usr/bin/env bash
     set -euo pipefail
-    root="$(git rev-parse --show-toplevel)"
+    root="{{ justfile_directory() }}"
     cargo build --quiet --bin bench
     bin="$root/target/bench/bin/working-tree"
     mkdir -p "$(dirname "$bin")"
@@ -304,7 +308,7 @@ bench-conversations a="cold" b="kept" *measurement:
 bench-numerics a b *measurement:
     #!/usr/bin/env bash
     set -euo pipefail
-    root="$(git rev-parse --show-toplevel)"
+    root="{{ justfile_directory() }}"
     cargo build --quiet --bin bench
     bin="$root/target/bench/bin/working-tree"
     mkdir -p "$(dirname "$bin")"
