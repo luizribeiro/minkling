@@ -26,23 +26,30 @@
 //! which weights another dispatch will read and what the rows they produce are
 //! worth, and [`combine`] is where those rows and those weights meet.
 
+#[allow(unsafe_code)]
 pub mod argmax;
 pub mod attention;
+#[allow(unsafe_code)]
 pub mod buffer;
 pub mod combine;
+#[allow(unsafe_code)]
 pub mod dense;
 pub mod device;
 pub mod experts;
 pub mod grouping;
 pub mod heads;
+#[allow(unsafe_code)]
 pub mod indirect;
+#[allow(unsafe_code)]
 pub mod kernel;
+#[allow(unsafe_code)]
 pub mod matmul;
 pub mod norm;
 pub mod numerics;
 pub mod ordering;
 pub mod projections;
 pub mod router;
+#[allow(unsafe_code)]
 pub mod sampling;
 pub mod sconv;
 pub mod swiglu;

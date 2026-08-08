@@ -1,0 +1,18 @@
+# Capabilities the quarantined implementation does not currently need. Clippy
+# resolves these symbols after imports and aliases, unlike a textual scan.
+disallowed-methods = [
+  { path = "std::env::remove_var", reason = "quarantined code must not mutate process state" },
+  { path = "std::env::set_current_dir", reason = "quarantined code must not mutate process state" },
+  { path = "std::env::set_var", reason = "quarantined code must not mutate process state" },
+  { path = "std::fs::remove_dir", reason = "quarantined code must not remove directories" },
+  { path = "std::fs::remove_dir_all", reason = "quarantined code must not remove directories" },
+  { path = "std::fs::rename", reason = "quarantined code must not move filesystem entries" },
+  { path = "std::mem::forget", reason = "quarantined code must run destructors normally" },
+  { path = "std::process::abort", reason = "quarantined code must return errors to its caller" },
+  { path = "std::process::exit", reason = "quarantined code must return errors to its caller" },
+]
+
+disallowed-types = [
+  { path = "std::net::TcpListener", reason = "the legacy server owns the only approved listener" },
+  { path = "std::net::UdpSocket", reason = "quarantined code has no UDP role" },
+]

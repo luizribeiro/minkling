@@ -38,9 +38,13 @@
         pre-commit = git-hooks.lib.${system}.run {
           src = ./.;
 
+          settings.rust.check.cargoDeps = pkgs.rustPlatform.importCargoLock {
+            lockFile = ./Cargo.lock;
+          };
+
           # Context lines in a diff carry significant trailing whitespace, so
           # the whitespace hooks would corrupt these into unappliable patches.
-          excludes = [ "^reference/patches/" ];
+          excludes = [ "^slop/reference/patches/" ];
 
           hooks = {
             rustfmt = {
@@ -57,6 +61,13 @@
                 clippy = rust;
               };
               settings.denyWarnings = true;
+            };
+
+            cargo-deny = {
+              enable = true;
+              name = "cargo-deny";
+              entry = "${pkgs.cargo-deny}/bin/cargo-deny --frozen check bans sources";
+              pass_filenames = false;
             };
 
             nixfmt.enable = true;
@@ -80,6 +91,7 @@
             rust
             pkgs.cargo-nextest
             pkgs.cargo-flamegraph
+            pkgs.cargo-deny
 
             python
             pkgs.uv
@@ -99,7 +111,7 @@
 
           shellHook = ''
             ${pre-commit.shellHook}
-            export INKLINGRS_ROOT="$PWD"
+            export INKLINGRS_ROOT="$PWD/slop"
             export HF_XET_HIGH_PERFORMANCE=1
             export HF_HOME="''${HF_HOME:-$HOME/.cache/huggingface}"
           '';

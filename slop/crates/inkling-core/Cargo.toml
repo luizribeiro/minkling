@@ -5,6 +5,9 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 memmap2.workspace = true
@@ -23,6 +26,6 @@ tokenizers.workspace = true
 test-support = []
 
 [dev-dependencies]
-inkling-core = { path = ".", features = [ "test-support" ] }
+inkling-core = { workspace = true, features = [ "test-support" ] }
 tempfile.workspace = true
 tokenizers.workspace = true

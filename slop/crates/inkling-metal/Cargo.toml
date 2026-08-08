@@ -5,6 +5,9 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 # The MXFP4 format, which the matmul kernel decodes in registers and which
 # `inkling_core::quant` is the authority on. A dependency the other way round

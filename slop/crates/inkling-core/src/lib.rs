@@ -1,4 +1,5 @@
 pub mod attention;
+#[allow(unsafe_code)]
 pub mod checkpoint;
 pub mod config;
 pub mod detokenize;

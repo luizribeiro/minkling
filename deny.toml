@@ -1,0 +1,150 @@
+# This is a deny-by-default snapshot of the resolved legacy graph. Cargo.lock
+# remains the authority on versions; this list makes a new crate name an
+# explicit policy change. Workspace packages are reviewed in this repository.
+[bans]
+allow-workspace = true
+allow = [
+  "ahash",
+  "aho-corasick",
+  "anyhow",
+  "ascii",
+  "base64",
+  "bit-set",
+  "bit-vec",
+  "bitflags",
+  "block2",
+  "castaway",
+  "cfg-if",
+  "chunked_transfer",
+  "compact_str",
+  "crossbeam-deque",
+  "crossbeam-epoch",
+  "crossbeam-utils",
+  "daachorse",
+  "darling",
+  "darling_core",
+  "darling_macro",
+  "dary_heap",
+  "derive_builder",
+  "derive_builder_core",
+  "derive_builder_macro",
+  "dispatch2",
+  "either",
+  "errno",
+  "esaxx-rs",
+  "fancy-regex",
+  "fastrand",
+  "fnv",
+  "getrandom",
+  "httpdate",
+  "ident_case",
+  "itertools",
+  "itoa",
+  "libc",
+  "linux-raw-sys",
+  "log",
+  "macro_rules_attribute",
+  "macro_rules_attribute-proc_macro",
+  "memchr",
+  "memmap2",
+  "minimal-lexical",
+  "monostate",
+  "monostate-impl",
+  "nom",
+  "objc2",
+  "objc2-core-foundation",
+  "objc2-encode",
+  "objc2-foundation",
+  "objc2-metal",
+  "once_cell",
+  "paste",
+  "pastey",
+  "ppv-lite86",
+  "proc-macro2",
+  "quote",
+  "r-efi",
+  "rand",
+  "rand_chacha",
+  "rand_core",
+  "rayon",
+  "rayon-cond",
+  "rayon-core",
+  "regex",
+  "regex-automata",
+  "regex-syntax",
+  "rustix",
+  "rustversion",
+  "ryu",
+  "safetensors",
+  "serde",
+  "serde_core",
+  "serde_derive",
+  "serde_json",
+  "smallvec",
+  "spm_precompiled",
+  "static_assertions",
+  "strsim",
+  "syn",
+  "tempfile",
+  "thiserror",
+  "thiserror-impl",
+  "tiny_http",
+  "tokenizers",
+  "unicode-ident",
+  "unicode-normalization-alignments",
+  "unicode-segmentation",
+  "unicode_categories",
+  "version_check",
+  "wasip2",
+  "windows-link",
+  "windows-sys",
+  "wit-bindgen",
+  "zerocopy",
+  "zerocopy-derive",
+  "zmij",
+]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[bans.workspace-dependencies]
+duplicates = "deny"
+include-path-dependencies = true
+# Nix replaces registry sources with vendored directory sources, which prevents
+# cargo-deny from recognizing inherited registry dependencies as used.
+unused = "allow"
+
+# Build scripts execute during compilation. Every current script is named so a
+# newly introduced one fails review even if its crate was already in the graph.
+[bans.build]
+executables = "allow"
+interpreted = "allow"
+allow-build-scripts = [
+  "ahash",
+  "anyhow",
+  "crossbeam-deque",
+  "crossbeam-epoch",
+  "crossbeam-utils",
+  "esaxx-rs",
+  "getrandom",
+  "libc",
+  "objc2",
+  "paste",
+  "proc-macro2",
+  "quote",
+  "rayon-core",
+  "rustix",
+  "rustversion",
+  "serde",
+  "serde_core",
+  "serde_json",
+  "thiserror",
+  "wit-bindgen",
+  "zerocopy",
+  "zmij",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

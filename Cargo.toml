@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [ "crates/*" ]
+members = [ "slop/crates/*" ]
 
 [workspace.package]
 edition = "2024"
@@ -9,8 +9,8 @@ license = "MIT"
 rust-version = "1.85"
 
 [workspace.dependencies]
-inkling-core = { path = "crates/inkling-core" }
-inkling-metal = { path = "crates/inkling-metal" }
+inkling-core = { path = "slop/crates/inkling-core", version = "=0.1.0" }
+inkling-metal = { path = "slop/crates/inkling-metal", version = "=0.1.0" }
 
 anyhow = "1"
 
@@ -89,6 +89,16 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 # and no executor to pretend a 9 s CPU decode step can be awaited. TLS is behind
 # a feature this does not turn on.
 tiny_http = { version = "0.12", default-features = false }
+
+# Legacy crates opt into these from their own manifests. `deny` permits a
+# narrow, visible `#[allow]` around the Metal implementation's existing unsafe
+# modules; new unsafe code is rejected everywhere else.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"
 
 # The CPU ops are scalar loops, and a test that drives the whole 42-layer stack
 # runs tens of gigabytes through them. Unoptimised that is half an hour; this

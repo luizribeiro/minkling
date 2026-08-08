@@ -1,0 +1,6 @@
+/target/
+/result
+/.direnv/
+/.ruff_cache/
+/.pre-commit-config.yaml
+.DS_Store
