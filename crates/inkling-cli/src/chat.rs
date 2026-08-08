@@ -24,12 +24,20 @@
 //! reproduces the template exactly for the messages it accepts. It does not
 //! implement:
 //!
-//! - **Content parts.** A `content` that is a list — text parts, `input_image`,
-//!   `input_audio` — is refused, on every role and whatever else the message
-//!   carries. The engine is text-only, so an empty list on an assistant turn
-//!   that also has `tool_calls` is refused too, where the template reads the
-//!   empty list as nothing and renders the calls alone. `null` is the shape a
-//!   client sends that turn in; a list is a client this cannot serve anyway.
+//! - **Content parts that are not text.** A `content` that is a list of text
+//!   parts is written out the way the template writes one — a message *apiece*
+//!   rather than one message of joined text — because that is how most OpenAI
+//!   clients send a user turn and refusing it made this server unusable from
+//!   them. `input_image` and `input_audio` parts are still refused, where the
+//!   template renders a placeholder message for each: the engine is text-only,
+//!   and a prompt that says an image was attached to a model that was handed
+//!   none is a worse answer than a 400. An empty list is the template's own
+//!   nothing and is treated here exactly as an absent `content` is — refused
+//!   on a turn that carries nothing else, and rendered as the calls alone on
+//!   an assistant turn that made some.
+//! - **Content parts on a `tool` message.** The template emits a tool result's
+//!   `content` only where it is a string and renders an empty result for a
+//!   list, which is a silent mangle rather than a format. Refused here.
 //! - **`reasoning_effort`.** The template maps six names onto numbers and accepts
 //!   a float, defaulting to 0.9 when the caller names none. Only the default is
 //!   emitted here, which is the string `generate`'s docs measured the template
@@ -166,6 +174,11 @@ pub enum ChatError {
     #[error("the content of the {0} message is not a string; this server takes no content parts")]
     ContentNotText(String),
 
+    #[error(
+        "the {0} message carries a content part that is not text; this engine serves text alone"
+    )]
+    ContentPartNotText(String),
+
     #[error("a tool call needs a function name, which must be a string")]
     CallWithoutAName,
 
@@ -216,7 +229,8 @@ impl Message {
     /// The message's text, or `None` where it carries no `content` at all.
     ///
     /// A `content` that is present and is not a string is refused rather than
-    /// flattened — see the module docs on content parts.
+    /// flattened. This is the rule the template applies to a `tool` message
+    /// alone; every other role takes [`Message::texts`].
     fn text(&self) -> Result<Option<&str>, ChatError> {
         match &self.content {
             None | Some(Value::Null) => Ok(None),
@@ -225,9 +239,65 @@ impl Message {
         }
     }
 
+    /// The messages this one's `content` writes out, which is one apiece for
+    /// the parts of a list and one for a plain string. `None` where the
+    /// message carries no `content` at all.
+    ///
+    /// **A list is not joined**, because the template does not join one: each
+    /// part gets its own role marker and its own `<|end_message|>`, and a
+    /// conversation whose parts arrived as one message is a prompt the model
+    /// was not trained on. An empty list yields `None` rather than an empty
+    /// list of messages, so that it is refused where a missing `content` is.
+    fn texts(&self) -> Result<Option<Vec<&str>>, ChatError> {
+        match &self.content {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) => Ok(Some(vec![text])),
+            Some(Value::Array(parts)) if parts.is_empty() => Ok(None),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .map(|part| self.part(part))
+                .collect::<Result<Vec<&str>, ChatError>>()
+                .map(Some),
+            Some(_) => Err(ChatError::ContentNotText(self.role.clone())),
+        }
+    }
+
+    /// One content part as the text it contributes.
+    ///
+    /// The template reads a bare string as text, and reads an object as text
+    /// where it names no `type` at all or names one of the two the format
+    /// spells text with. A `type` that is present and is anything else — an
+    /// image, an audio clip, a word this vocabulary has no channel for, or a
+    /// value that is not even a string — is refused. `text` missing from a
+    /// text part is the empty string rather than a refusal, which is the
+    /// template's own default and not a guess.
+    fn part<'a>(&self, part: &'a Value) -> Result<&'a str, ChatError> {
+        let refused = || Err(ChatError::ContentPartNotText(self.role.clone()));
+        match part {
+            Value::String(text) => Ok(text),
+            Value::Object(fields) => match fields.get("type") {
+                None => Ok(text_of(fields)),
+                Some(Value::String(named)) if TEXT_PARTS.contains(&named.as_str()) => {
+                    Ok(text_of(fields))
+                }
+                Some(_) => refused(),
+            },
+            _ => refused(),
+        }
+    }
+
     fn calls(&self) -> &[ToolCall] {
         self.tool_calls.as_deref().unwrap_or_default()
     }
+}
+
+/// The two words the format spells a text part's `type` with.
+const TEXT_PARTS: [&str; 2] = ["text", "input_text"];
+
+/// A text part's own text, which the template defaults to the empty string
+/// where the key is missing or is not a string.
+fn text_of(part: &serde_json::Map<String, Value>) -> &str {
+    part.get("text").and_then(Value::as_str).unwrap_or_default()
 }
 
 /// Jinja's own notion of truth, which is what every `x if x is defined and x
@@ -303,7 +373,7 @@ pub fn prompt(messages: &[Message], tools: &[Value]) -> Result<String, ChatError
 /// model turn, then the text, then the calls it made, then the marker that says
 /// the model ended it.
 fn turn(sent: &Message, role: Role, out: &mut String) -> Result<(), ChatError> {
-    let content = sent.text()?;
+    let content = sent.texts()?;
     let calls = sent.calls();
     // A message with no content is only a message at all when it carries calls,
     // and only an assistant turn carries those.
@@ -314,8 +384,8 @@ fn turn(sent: &Message, role: Role, out: &mut String) -> Result<(), ChatError> {
     if let (Role::Model, Some(thinking)) = (role, &sent.reasoning_content) {
         message(MODEL, CONTENT_THINKING, thinking, out);
     }
-    if let Some(content) = content {
-        message(role.marker(), CONTENT_TEXT, content, out);
+    for text in content.into_iter().flatten() {
+        message(role.marker(), CONTENT_TEXT, text, out);
     }
     if role == Role::Model {
         for call in calls {
@@ -744,7 +814,7 @@ mod tests {
     #[test]
     fn every_recorded_case_reproduces_what_the_checkpoints_own_template_renders() {
         let recorded = template_cases();
-        assert!(recorded.cases.len() >= 18, "the fixture went missing cases");
+        assert!(recorded.cases.len() >= 25, "the fixture went missing cases");
 
         for (name, case) in &recorded.cases {
             assert_eq!(
@@ -955,15 +1025,12 @@ mod tests {
         );
     }
 
-    /// Content parts — the shape an OpenAI client sends an image in, and the
-    /// shape several send plain text in. Refused by name rather than flattened,
-    /// which is what silently mangling one would look like from the outside.
+    /// A `content` that is neither a string nor a list is refused. The list is
+    /// the shape most OpenAI clients send a user turn in and is written out
+    /// above; a number is a client this cannot serve either way.
     #[test]
-    fn content_that_is_not_a_string_is_refused() {
-        for content in [
-            serde_json::json!([{"type": "text", "text": "Hi"}]),
-            serde_json::json!(7),
-        ] {
+    fn content_that_is_neither_a_string_nor_a_list_is_refused() {
+        for content in [serde_json::json!(7), serde_json::json!({"text": "Hi"})] {
             let mut asked = sent("user", "Hi");
             asked.content = Some(content.clone());
             assert_eq!(
@@ -972,6 +1039,83 @@ mod tests {
                 "{content}"
             );
         }
+    }
+
+    /// The parts the engine cannot serve. The template renders a placeholder
+    /// message for an image and for an audio clip, and raises on a type it has
+    /// no channel for — this refuses all three, because a prompt that tells a
+    /// text-only model an image was attached is a worse answer than a 400.
+    #[test]
+    fn a_content_part_that_is_not_text_is_refused() {
+        for part in [
+            serde_json::json!({"type": "image_url", "image_url": {"url": "data:,"}}),
+            serde_json::json!({"type": "input_image", "image_url": "data:,"}),
+            serde_json::json!({"type": "input_audio", "input_audio": {"data": ""}}),
+            serde_json::json!({"type": "file", "file": {"file_id": "f"}}),
+            serde_json::json!({"type": 7}),
+            serde_json::json!({"type": null}),
+            serde_json::json!(7),
+        ] {
+            let mut asked = sent("user", "Hi");
+            asked.content = Some(serde_json::json!([{"type": "text", "text": "Hi"}, part]));
+            assert_eq!(
+                prompt(&[asked], &[]),
+                Err(ChatError::ContentPartNotText("user".to_string())),
+                "{part}"
+            );
+        }
+    }
+
+    /// An empty list is the template's own nothing, and this treats it as an
+    /// absent `content`: a turn carrying nothing else is refused, and the one
+    /// shape the template still renders — an assistant turn whose calls go out
+    /// alone — reaches the prompt those calls alone produce.
+    #[test]
+    fn an_empty_content_list_is_an_absent_one() {
+        for role in ["user", "assistant"] {
+            let mut asked = sent(role, "");
+            asked.content = Some(serde_json::json!([]));
+            assert_eq!(
+                prompt(&[asked], &[]),
+                Err(ChatError::ContentNotText(role.to_string())),
+                "{role}"
+            );
+        }
+
+        let calling = |content: Value| {
+            let mut turn = sent("assistant", "");
+            turn.content = Some(content);
+            turn.tool_calls = Some(vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "call_1",
+                    "function": {"name": "get_weather", "arguments": {}}
+                }))
+                .expect("the call parses"),
+            ]);
+            prompt(&[sent("user", "Hi"), turn], &[])
+        };
+        let absent = calling(Value::Null);
+        assert!(
+            absent
+                .as_deref()
+                .is_ok_and(|it| it.contains(CONTENT_INVOKE)),
+            "the calls go out alone: {absent:?}"
+        );
+        assert_eq!(calling(serde_json::json!([])), absent);
+    }
+
+    /// A tool result's content parts, which the template renders as an empty
+    /// result rather than as text. Refused, so that a client sending one is
+    /// told rather than answered from a prompt its result vanished out of.
+    #[test]
+    fn a_tool_results_content_parts_are_refused() {
+        let mut result = sent("tool", "");
+        result.name = Some("get_weather".to_string());
+        result.content = Some(serde_json::json!([{"type": "text", "text": "17C"}]));
+        assert_eq!(
+            prompt(&[sent("user", "Hi"), result], &[]),
+            Err(ChatError::ContentNotText("tool".to_string()))
+        );
     }
 
     /// A message with no `content` key at all and nothing else in it. The

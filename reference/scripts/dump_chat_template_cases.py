@@ -248,6 +248,70 @@ CASES = {
         "messages": [{"role": "user", "content": "Hi"}],
         "tools": [{"type": "function", "function": {"name": "a"}}],
     },
+    # Content parts, which is how most OpenAI clients send a user turn. A list
+    # is a message *apiece* rather than one message of joined text, so these
+    # cases are what says the two sides agree about the count as well as the
+    # characters.
+    "text_content_parts": {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Hi"},
+                    {"type": "text", "text": "and hello"},
+                ],
+            }
+        ]
+    },
+    "an_input_text_part": {
+        "messages": [
+            {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}
+        ]
+    },
+    # The three shapes the template reads as text without being told: a bare
+    # string, a part that names no type, and a part whose `text` is missing —
+    # which renders the empty string rather than losing the message.
+    "a_content_part_that_is_a_bare_string": {
+        "messages": [{"role": "user", "content": ["Hi", "and hello"]}]
+    },
+    "a_content_part_that_names_no_type": {
+        "messages": [{"role": "user", "content": [{"text": "Hi"}]}]
+    },
+    "a_text_part_carrying_no_text": {
+        "messages": [{"role": "user", "content": [{"type": "text"}]}]
+    },
+    # An empty list is Jinja's nothing, so the turn renders as its calls alone
+    # — which is what an absent `content` renders as, and is the reason the
+    # Rust side treats the two the same.
+    "an_empty_content_list_on_a_turn_that_calls": {
+        "messages": [
+            {"role": "user", "content": "Weather?"},
+            {
+                "role": "assistant",
+                "content": [],
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": {}},
+                    }
+                ],
+            },
+        ]
+    },
+    # Every role that is not `tool` takes the same branch, and an assistant
+    # turn's parts follow its thinking and precede its calls.
+    "content_parts_on_a_system_and_an_assistant_turn": {
+        "messages": [
+            {"role": "system", "content": [{"type": "text", "text": "Be brief."}]},
+            {"role": "user", "content": "Hi"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hello."}],
+                "reasoning_content": "Weigh it up.",
+            },
+        ]
+    },
 }
 
 REFUSED = {
