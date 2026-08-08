@@ -1643,27 +1643,42 @@ differs in is what the slots had already prefilled. **`--agents 1 --batch 4` is 
 coding session through an engine wide enough for a fleet**, which is the
 arrangement `--slots N` could not serve at all before this.
 
-**The null pair first**: the kept arm against itself, at the same width and
-opening, read **+0.4% on the session with the ranges across, no claim** — which
-is what says the column below is not the harness.
+**Every table in this section carries a null pair of its own**, and each is taken
+on a host with nothing else on the GPU. The three tables are not one sitting and
+are not read as one: what crosses between them is a ratio, never a wall. Where a
+wall is compared across two of them — and it is, once, for the opening — the
+comparison is checked against the null first.
 
     turn   prompt   prefilled  ─── not kept ───   ──── kept ────   change
                     not/kept     wall     first    wall    first    wall
-      0      2048   2048/2048  32.58 s   31.02 s 32.66 s  31.10 s   +0.2%
-      1      2368   2368/ 321  16.06 s   14.71 s  3.63 s   2.28 s  -77.4%
-      2      2688   2688/ 321  18.11 s   16.75 s  3.69 s   2.33 s  -79.6%
-      3      3008   3008/ 321  20.24 s   18.87 s  3.72 s   2.36 s  -81.6%
-      4      3328   3328/ 321  22.30 s   20.92 s  3.74 s   2.37 s  -83.2%
-    session                   109.29 s           47.44 s          -56.6%
+      0      2048   2048/2048  20.14 s   18.61 s 20.20 s  18.66 s   +0.3%
+      1      2368   2368/ 321  16.04 s   14.68 s  3.57 s   2.22 s  -77.7%
+      2      2688   2688/ 321  18.13 s   16.76 s  3.62 s   2.26 s  -80.0%
+      3      3008   3008/ 321  20.35 s   18.98 s  3.73 s   2.36 s  -81.7%
+      4      3328   3328/ 321  22.43 s   21.05 s  3.78 s   2.40 s  -83.2%
+    session                    97.09 s           34.90 s          -64.1%
 
-Three of three the same way with the ranges apart on every row but turn zero,
-which is the sitting's own control and reads +0.2% with the ranges across.
-**Device time moves with the wall** — 83.48 s against 26.61, -68.1% — so this is
-work not done rather than a clock. The duty cycle is 76.4% on the cold arm and
-56.1% on the kept one, which is the same finding read the other way: the kept arm
-has less for the device to do and spends more of its wall between steps.
+**97.09 s against 34.90**, three of three with the ranges apart on every row but
+turn zero. **Device time moves with the wall** — 83.22 s against 26.42, -68.3% —
+so this is work not done rather than a clock. The duty cycle is 85.8% on the cold
+arm and 75.8% on the kept one, which is the same finding read the other way: the
+kept arm has less for the device to do and spends more of its wall between steps.
 
-**And the arrangement's own cost is 1.83 ms a turn on the miss path against 1.53
+**The null pair says which rows to read.** The kept arm against itself, at the
+same width and opening: turns one to four read 0.9%, 1.7%, -1.8% and 0.4% and the
+device reads +0.2%, all with the ranges across — so the -77.7% to -83.2% below
+them are the workload and not the harness. The one row it does move is turn
+three's wait for a first token, -3.1% with the ranges apart, against a -87.6% in
+the table. **Turn zero is the exception and it is a large one: the null puts
++16.8% on it**, one of its six readings landing at 31.00 s against a 19.97–21.62
+s spread on the other arm.
+
+**So turn zero's +0.3% is not a reading**, and it is quoted here for the same
+reason the harness quotes it as no claim: it is where a fresh process first
+touches a 131 GB stack, and that lands on the opening's wall rather than on the
+device. Nothing in this section rests on it.
+
+**And the arrangement's own cost is 1.58 ms a turn on the miss path against 1.37
 on the hit**, ranges across, no claim between them — which is the same
 millisecond-a-turn `Kept` costs at width one, over four slots instead of one.
 
@@ -1706,15 +1721,16 @@ the bar the width-one comparison below is held to.
 null, which is what the harness is saying by quoting it as no claim. The
 session's -69.6% is five times its own null and the device's -75.9% is some
 hundreds of times its. It is also why nothing here compares a wall against the
-2048 table above or the fleet below, which are a different sitting — the ratios
-cross sittings and the absolute walls do not.
+2048 table above or the fleet below: this table was the first work the GPU did
+after a restart and those two were taken later on a warmed page cache, which is
+a difference the opening's wall carries and the device column does not.
 
 **Against K1's width-one figures, what width costs is the opening and nothing
 after it.** Those figures are a different sitting again, so what is read across
 them here is only what is far larger than the null: at 8192 width one read
 264.51 s cold against 72.36 kept, where width four reads 410.82 against 124.99;
-at 2048 width one read 85.10 against 32.68, where width four reads 109.29 against
-47.44. Both arms cost more at width four and it is the same `--admit` budget both
+at 2048 width one read 85.10 against 32.68, where width four reads 97.09 against
+34.90. Both arms cost more at width four and it is the same `--admit` budget both
 times.
 
 **Turn zero is where that budget is**: 100.94 s against 49.07, a factor of 2.06,
@@ -1738,20 +1754,30 @@ this whole engine exists for and was not a shape it could run.
 
     turn   prompt   prefilled over 4   ── not kept ──   ─── kept ───   change
                        not/kept          wall   first   wall   first    wall
-      0      2048    8192/ 8192       56.35 s 52.96 s 56.71 s 53.32 s   +0.6%
-      1      2368    9472/ 1284       61.68   58.61   11.77    8.69   -80.9%
-      2      2688   10752/ 1284       70.10   66.92   11.94    8.78   -83.0%
-      3      3008   12032/ 1284       78.67   75.48   12.17    8.97   -84.5%
-      4      3328   13312/ 1284       89.39   86.08   12.40    9.09   -86.1%
-    whole                            356.18 s         104.99 s        -70.5%
+      0      2048    8192/ 8192       54.39 s 50.99 s 54.42 s 51.01 s   +0.1%
+      1      2368    9472/ 1284       60.48   57.37   11.50    8.39   -81.0%
+      2      2688   10752/ 1284       68.92   65.72   11.77    8.59   -82.9%
+      3      3008   12032/ 1284       77.61   74.38   12.06    8.84   -84.5%
+      4      3328   13312/ 1284       86.43   83.08   12.26    8.91   -85.8%
+    whole                            347.83 s         102.01 s        -70.7%
 
-**356.18 s against 104.99**, three of three with the ranges apart, and turn zero
-+0.6% with the ranges across. Throughput over the whole run is **3.59 tok/s
-against 12.20**, and the last turn's wait for a first token is **86.08 s against
-9.09**. Device time is 323.44 s against 93.43, -71.1%; the duty cycle is 90.8%
-against 89.0 with the ranges across, so nothing here is the clock either.
+**347.83 s against 102.01**, three of three with the ranges apart. Throughput
+over the whole run is **3.68 tok/s against 12.55**, and the last turn's wait for
+a first token is **83.08 s against 8.91**. Device time is 323.68 s against 93.55,
+-71.1%, and the duty cycle is 93.1% against 91.7 — a gap of 1.4 points where the
+session's is ten, because a fleet keeps the device busy whether or not it is
+re-prefilling.
 
-**The fleet gains more than the single session does** — 70.5% against 56.6% — and
+**This is the one table here whose turn zero is a reading**, and its own null
+says so: kept against kept, every row lands within 1.1% and the device within
+0.0%, where the single session's null put 16.8% on the same row. The difference
+is what turn zero *is* in each. For one conversation it is 20 s of opening beside
+a process's first touch of the weights; for four it is 54 s of real prefill over
+four openings, and the same first touch is a small fraction of it. **So the
+fleet's +0.1% at turn zero is a control that holds**, which is what makes the
+rest of its column readable without qualification.
+
+**The fleet gains more than the single session does** — 70.7% against 64.1% — and
 the reason is the one thing a fleet has that a session does not: four
 conversations' re-prefills are four times the work, and they are all work that
 stops happening, while the decode steps they share do not multiply the same way.
@@ -1793,7 +1819,7 @@ reading the source or by mistyping a word and reading the refusal.
 
 ### What only the measurement found
 
-**Turn zero at 2048 costs 32.58 s here where `bench session` reads a fraction of
+**Turn zero at 2048 costs 20.14 s here where `bench session` reads a fraction of
 that at width one, and the difference is the prompt budget rather than anything
 this milestone did.** A scheduled server feeds a joining prompt `--admit` rows a
 step — 128 by default — so a 2048-token opening enters in sixteen calls where the
@@ -1804,8 +1830,9 @@ same prompt whole is 1.78.
 That budget exists to bound the jitter one arrival costs **the sequences already
 decoding**. When nothing is decoding there is no jitter to bound, and every
 opening turn of every conversation here pays for a bound on nothing. It is
-visible in the duty cycle too: 56.1% on the kept arm, against the 91–93% the
-fleet table sits in.
+visible in the duty cycle too: 75.8% on the kept arm at width four, against the
+91.7–93.1% the fleet table sits in — and the gap is the opening, because that is
+the only turn a kept fleet still prefills.
 
 **It is not fixed here and should be.** Making the share conditional on
 `Stepped::decoding` being zero would move `bench joining`'s and `bench fleet`'s
