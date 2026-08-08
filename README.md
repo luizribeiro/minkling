@@ -23,7 +23,7 @@ than a request loop.
 
 ### Which of the three test runs to use
 
-`just test` is the one to run while iterating: **806 of the 887 tests, no
+`just test` is the one to run while iterating: **859 of the 940 tests, no
 checkpoint, fourteen seconds.** Everything a fixture can settle is here — the
 kernels against the CPU, the CPU against mlx-vlm's recorded activations, the
 tokenizer against the whole vocabulary, the server against its own frames. The
@@ -33,12 +33,11 @@ a crate's tests in one process: opening a Metal device costs a second, so the 25
 kernel tests are 13.6 s sharing a process and minutes with one each. Nothing in this
 tier measures the process it runs in, which is what makes sharing one free.
 
-`just test-full` is what has to pass at the ends of a series: **all 887 against a
+`just test-full` is what has to pass at the ends of a series: **all 940 against a
 real checkpoint, twenty-six minutes and forty-five more for the measurements
-after it.**
-The 806 the gated tier runs and the 81 the timing tier does. The 60 gated tests — the 44
-above and sixteen of the measurements below, which need weights as well as a
-clock — are what
+after it.** The 859 the gated tier runs and the 81 the timing tier does. The 60
+gated tests — the 44 above and sixteen of the measurements below, which need
+weights as well as a clock — are what
 only weights can settle — that the packed tensors decode to what the reference
 decodes, that 42 trained layers reproduce the recorded stack, that the engine
 generates the oracle's own continuation, and that it generates the same
@@ -1521,6 +1520,332 @@ ticket, including the panic no `return` covers. And the end of a turn is read by
 the engine rather than by the client's own thread, so the slot is empty before
 the next step is built instead of a round trip later.
 
+## A conversation that comes back to its own keys
+
+The trade above was real and it was not a design: **the freshness that costs
+`Kept` is the same property that makes batching safe.** B1 built it and every
+milestone since has protected it — a joining sequence must not attend over the
+keys of whoever sat in that slot before, and `what_an_empty_seat_costs`, the
+duplicate-slot refusal and the two contamination cases all exist to hold it.
+
+But what that rules out is a sequence reading a **stranger's** keys, and it ruled
+out a conversation reading **its own** along with them. So the target was never
+"let a sequence keep whatever is in the slot". It is: *a returning conversation
+is given back the slot holding its own keys, and proves they are its own.*
+
+Every slot now carries a `Kept` — the ids its cache sits at the end of, and
+nothing where it holds none — and an arriving prompt is admitted into a free slot
+**only where the prompt starts with those ids**. Below that line nothing changed:
+a slot that did not match hands over a cache at no keys, exactly as it always
+did.
+
+### What identifies a conversation, and why it is the tokens
+
+**The tokens, compared against the slot's own record.** A session id would be
+cheaper — one integer against a prefix walk — and it would be a *claim*. The
+whole risk of this milestone is a sequence attending over keys that are not its
+own, and a client that reused an id, or two clients that collided on one, would
+produce exactly that: a coherent-looking reply out of a stranger's cache, and no
+oracle over a single sequence can see it. A prefix is not a claim about the keys,
+it is a fact about them — every key the arriving prompt is given is a key that
+prompt named.
+
+It also needs no client cooperation, which matters because **there is no field in
+the OpenAI schema to put a session id in.** Inventing one would make the feature
+reachable only from clients that had been changed for it, and the whole point of
+this server is that real ones work.
+
+What it costs is a `usize` compare per kept token per free slot, and the
+measurement below prices the whole arrangement — matching, mark, resume and
+recording — at **1.2 to 1.9 ms a turn** across both sittings, against turns that
+are seconds either way. `Stepped::bookkeeping` is that number and it is reported
+by every arm, so the bad case is a row rather than an argument.
+
+### What happens when every slot holds someone else's conversation
+
+**Least recently vacated, among the free slots only.** A slot with a sequence in
+it is not a candidate under any rule, which is the admission this engine always
+had. Among the free ones the order is: a slot whose conversation the arriving
+prompt extends (longest match first), then a slot holding nothing at all, then
+the one that last had a sequence leave it longest ago.
+
+So **N conversations through N slots evict nothing**, and past that the
+conversation that has gone longest without a turn goes first — which is where a
+fleet lives, since the agent that has not spoken in a minute is the one likeliest
+to have finished. The eviction itself is not a code path: a slot chosen by the
+third rule is one the prompt matches nothing of, and a prompt that matches
+nothing is answered by forgetting. **A conversation returning to a slot that was
+evicted is a miss like any other**, which is to say a cold prefill and a cache
+holding no keys, which is what this engine gave every sequence before any of
+this.
+
+**And a conversation whose own slot is busy does not wait for it.** It is
+admitted somewhere else and prefills from the beginning, because waiting for a
+cache means waiting out another request's whole generation — a second turn
+arriving while the first is still decoding would sit in the queue behind seconds
+of somebody else's budget to save a prefill. The starvation guarantee is the
+stronger promise and this is where the two meet.
+
+### The contamination cases, extended rather than kept passing
+
+**This is the highest-risk change since batching itself**, and the reason is that
+the failure is invisible to every case that came before. Both existing cases ask
+*did this sequence start from nothing* — a joining prompt riding beside decoders,
+and a slot handed on to a stranger. A returning conversation starts from
+something on purpose, so the question becomes *were the keys it started from its
+own*, and no arrangement of **one** conversation can tell those apart: a sequence
+resumed onto a neighbour's keys generates fluent text, and so does one resumed
+onto its own from the wrong position.
+
+`two_conversations_coming_back_to_their_slots_each_produce_what_they_produce_alone`
+is the new case, on the real checkpoint. Two conversations, three turns each,
+through three arrangements, every turn held against **its own whole prompt
+generated from a cache holding none of it**:
+
+- **Two slots keeping** — each conversation comes back to its own slot, resumes
+  to exactly where its last prompt ended, and prefills only what was added.
+- **One slot keeping** — the two evict each other every turn, so no turn ever
+  finds where its own last turn ended and each lands in a slot the other's keys
+  were in a moment ago.
+- **Two slots keeping nothing** — the engine every batching figure was taken on.
+  **Cold and warm are byte-identical**, which K1 asserted at width one and which
+  now holds at width N.
+
+**The two openings share a prefix on purpose**, which is both the realistic
+fixture and the harder one: a fleet of agents shares a system prompt, so a turn
+matches the other conversation's slot as well as its own and what decides is the
+*longer* match. Two conversations with nothing in common would never reach that
+rule. It also produced the one thing the fixture taught: in the one-slot arm a
+turn does still resume the opening the two genuinely share, and **that is right
+rather than a leak** — what the matching compares is tokens, so keys the arriving
+prompt names are its own keys whoever last computed them. What the case asserts
+there is the bound: never a token past the shared opening.
+
+**Five mutations, each caught.** Four of them by wrong tokens against the
+run-alone reference, which is the claim rather than a proxy for it:
+
+    mutation                                            caught by
+    the resuming sequence is given its neighbour's cache  the case (a turn unanswered)
+    a prompt matches a slot it does not extend            tokens, evicting turn 2
+    the slot is left where the generation ended           tokens, evicting turn 1
+    a longer record than was resumed to                   tokens, kept turn 2
+    a miss does not forget                                tokens, evicting turn 0
+
+The same five run against the synthetic scheduler cases as well, where four are
+caught by three or more of them.
+
+### What it is worth: a session at width greater than one
+
+`just bench-conversations`, three pairs, order flipped each pair, on this repo's
+default checkpoint under the default numerics. An arm is the same binary told to
+keep a different number of positions, so the width is held and what the pair
+differs in is what the slots had already prefilled. **`--agents 1 --batch 4` is a
+coding session through an engine wide enough for a fleet**, which is the
+arrangement `--slots N` could not serve at all before this.
+
+**The null pair first**: the kept arm against itself, at the same width and
+opening, read **+0.4% on the session with the ranges across, no claim** — which
+is what says the column below is not the harness.
+
+    turn   prompt   prefilled  ─── not kept ───   ──── kept ────   change
+                    not/kept     wall     first    wall    first    wall
+      0      2048   2048/2048  32.58 s   31.02 s 32.66 s  31.10 s   +0.2%
+      1      2368   2368/ 321  16.06 s   14.71 s  3.63 s   2.28 s  -77.4%
+      2      2688   2688/ 321  18.11 s   16.75 s  3.69 s   2.33 s  -79.6%
+      3      3008   3008/ 321  20.24 s   18.87 s  3.72 s   2.36 s  -81.6%
+      4      3328   3328/ 321  22.30 s   20.92 s  3.74 s   2.37 s  -83.2%
+    session                   109.29 s           47.44 s          -56.6%
+
+Three of three the same way with the ranges apart on every row but turn zero,
+which is the sitting's own control and reads +0.2% with the ranges across.
+**Device time moves with the wall** — 83.48 s against 26.61, -68.1% — so this is
+work not done rather than a clock. The duty cycle is 76.4% on the cold arm and
+56.1% on the kept one, which is the same finding read the other way: the kept arm
+has less for the device to do and spends more of its wall between steps.
+
+**And the arrangement's own cost is 1.83 ms a turn on the miss path against 1.53
+on the hit**, ranges across, no claim between them — which is the same
+millisecond-a-turn `Kept` costs at width one, over four slots instead of one.
+
+### The same session at the opening a coding turn actually has
+
+**A coding turn opens nearer 8192 than 2048**, which is why K1's width-one table
+is quoted at both, so this is taken at both. Same recipe, same arms, three pairs,
+a sitting of its own.
+
+    turn   prompt   prefilled  ─── not kept ───   ──── kept ────   change
+                    not/kept     wall     first    wall    first    wall
+      0      8192   8192/8192 109.09 s  106.79 s 100.94 s  98.61 s   -7.5%
+      1      8512   8512/ 321  64.88 s   63.25 s   5.43 s   3.80 s  -91.6%
+      2      8832   8832/ 321  70.90 s   69.26 s   6.32 s   4.69 s  -91.1%
+      3      9152   9152/ 321  76.96 s   75.32 s   6.56 s   4.93 s  -91.5%
+      4      9472   9472/ 321  89.00 s   87.36 s   5.75 s   4.10 s  -93.5%
+    session                   410.82 s          124.99 s          -69.6%
+
+**410.82 s against 124.99**, three of three with the ranges apart on every row
+but turn zero. Device time is **305.90 s against 73.81, -75.9%**, and those two
+columns are the tightest numbers in this file — 305.83–306.04 and 73.78–73.87,
+a spread of 0.07% and 0.12% — so what the session lost is work rather than a
+clock. Throughput over the run is 0.78 tok/s against 2.56, and the wait for a
+first token on turn four is **87.36 s against 4.10**.
+
+**The null pair this sitting says which of those columns to trust, and it is not
+the wall.** The kept arm against itself, at the same width and opening: the
+session reads +13.0% with the ranges across, and **turn zero reads +17.5% with
+the ranges apart — a claim, between two arms that differ in nothing.** Device
+time on the same pair reads **+0.2%**. Every arm is a fresh process first
+touching a 131 GB stack and turn zero is where it touches it, so the opening's
+wall carries the page cache and the device column does not.
+
+**Turn zero is not the only row the null moves**: turn two reads -9.2% with the
+ranges apart there as well, between the same two identical arms. So the bar a
+resumed turn's wall has to clear in this sitting is 9.2% and not zero — which is
+the bar the width-one comparison below is held to.
+
+**So turn zero's -7.5% above is not a reading at all**: it sits inside its own
+null, which is what the harness is saying by quoting it as no claim. The
+session's -69.6% is five times its own null and the device's -75.9% is some
+hundreds of times its. It is also why nothing here compares a wall against the
+2048 table above or the fleet below, which are a different sitting — the ratios
+cross sittings and the absolute walls do not.
+
+**Against K1's width-one figures, what width costs is the opening and nothing
+after it.** Those figures are a different sitting again, so what is read across
+them here is only what is far larger than the null: at 8192 width one read
+264.51 s cold against 72.36 kept, where width four reads 410.82 against 124.99;
+at 2048 width one read 85.10 against 32.68, where width four reads 109.29 against
+47.44. Both arms cost more at width four and it is the same `--admit` budget both
+times.
+
+**Turn zero is where that budget is**: 100.94 s against 49.07, a factor of 2.06,
+which is an opening entering `--admit` rows a step instead of at once and is the
+one cross-sitting ratio here big enough to survive a 17.5% null on an opening's
+wall. **Every turn after it is width-one's turn** — 5.43, 6.32, 6.56 and 5.75 s
+here against 5.76, 5.86, 5.78 and 5.90 at width one, which is the same number
+four times over at the resolution a wall has across two sittings, the widest of
+them 13.5% apart against a null that puts 9.2% on a resumed turn inside a single
+sitting.
+
+So a conversation that has been seated once decodes at width four as it did at
+width one, and **the arrangement `--slots N` could not serve at all before this
+is now the arrangement it serves at width-one's price**, once the opening is
+paid.
+
+### The fleet nobody had measured
+
+Four conversations, five turns each, through four slots — which is the workload
+this whole engine exists for and was not a shape it could run.
+
+    turn   prompt   prefilled over 4   ── not kept ──   ─── kept ───   change
+                       not/kept          wall   first   wall   first    wall
+      0      2048    8192/ 8192       56.35 s 52.96 s 56.71 s 53.32 s   +0.6%
+      1      2368    9472/ 1284       61.68   58.61   11.77    8.69   -80.9%
+      2      2688   10752/ 1284       70.10   66.92   11.94    8.78   -83.0%
+      3      3008   12032/ 1284       78.67   75.48   12.17    8.97   -84.5%
+      4      3328   13312/ 1284       89.39   86.08   12.40    9.09   -86.1%
+    whole                            356.18 s         104.99 s        -70.5%
+
+**356.18 s against 104.99**, three of three with the ranges apart, and turn zero
++0.6% with the ranges across. Throughput over the whole run is **3.59 tok/s
+against 12.20**, and the last turn's wait for a first token is **86.08 s against
+9.09**. Device time is 323.44 s against 93.43, -71.1%; the duty cycle is 90.8%
+against 89.0 with the ranges across, so nothing here is the clock either.
+
+**The fleet gains more than the single session does** — 70.5% against 56.6% — and
+the reason is the one thing a fleet has that a session does not: four
+conversations' re-prefills are four times the work, and they are all work that
+stops happening, while the decode steps they share do not multiply the same way.
+
+### What the code-reviewer found
+
+**A rule with no case that could tell it from the rule beside it.**
+`Continuous::seat_for`'s first admission rule is not "a slot that matches" but
+"the slot that matches *most*", and every case in the tree had at most one free
+slot matching the arriving prompt — so all of them passed under a rule that took
+any match at all. Two mutations survived the whole suite, gated and ungated:
+ranking the free slots by index alone among the nonzero matches, and preferring
+the **shortest** match.
+
+**Neither produces a wrong token, which is why nothing caught them.** They seat
+the prompt in a slot holding less of it, and the reply is correct and computed
+from a colder cache — so what is lost is precisely the thing this milestone is
+for, and it is invisible to every assertion here, all of which are about tokens.
+The workload will not build the ambiguity either: two conversations that have
+each taken a turn have diverged past whatever opening they shared, so only one of
+them still matches. It has to be built on purpose — a short and a long prefix of
+one sequence, admitted in the same turn so the long one cannot take the short
+one's slot — and now it is.
+
+**And the serial path had no case at all without a checkpoint.** `Kept::turn` is
+where the three things a turn has to get right actually live, and its module
+tested `matching`, `opened` and `keep` one at a time while the function that puts
+them in order was driven only by tests gated on a checkpoint. So a bare
+`cargo test` ran it zero times — **the path K1's session figures were taken on** —
+while the milestone above built a second copy of the same invariant beside it for
+the slots. Recording the whole prompt rather than what was resumed to, leaving
+the cache where the generation ended, and prefilling the last prompt token are
+each caught now.
+
+**The smallest one, and the one that says the most about how a measurement goes
+missing:** `bench conversations` was never named in the usage text. It parsed, it
+ran, and it had a recipe of its own for a whole milestone, discoverable only by
+reading the source or by mistyping a word and reading the refusal.
+
+### What only the measurement found
+
+**Turn zero at 2048 costs 32.58 s here where `bench session` reads a fraction of
+that at width one, and the difference is the prompt budget rather than anything
+this milestone did.** A scheduled server feeds a joining prompt `--admit` rows a
+step — 128 by default — so a 2048-token opening enters in sixteen calls where the
+serial path enters it in one, and the module's own arithmetic already says what
+that costs: a 385-token prompt in 24 chunks of 16 is 4.54 s of device where the
+same prompt whole is 1.78.
+
+That budget exists to bound the jitter one arrival costs **the sequences already
+decoding**. When nothing is decoding there is no jitter to bound, and every
+opening turn of every conversation here pays for a bound on nothing. It is
+visible in the duty cycle too: 56.1% on the kept arm, against the 91–93% the
+fleet table sits in.
+
+**It is not fixed here and should be.** Making the share conditional on
+`Stepped::decoding` being zero would move `bench joining`'s and `bench fleet`'s
+own fixtures, which are figures this milestone is supposed to leave alone, so it
+belongs to the milestone that can re-take them. What this measurement establishes
+is that it is worth taking: it is the largest remaining term in a scheduled
+server's first turn.
+
+### What it costs to hold
+
+**A slot's cache is now allocated for the life of the engine rather than the life
+of a resident.** On the device the spans and windows were always the backend's
+and are unmoved — memory is still linear at 30.8 MiB a slot, which
+`a_slot_costs_a_span_and_four_windows_in_every_layer` still asserts. What is new
+is host-side: the `ModelCache` a slot holds between residents, whose four
+convolution windows a layer are 4.92 MiB across the stack, and the ids, at eight
+bytes a position and 256 KiB at the 32768-position bound. So an idle eight-slot
+server holds about **41 MiB it used to release**, and a 32-slot one about 165.
+
+On `--backend cpu` the keys *are* those vectors and the bound is the whole of
+what stands between a server and a resident set that only climbs — the same
+sentence `Kept` carried at width one, now multiplied by the slots.
+
+### What did not move
+
+**No kernel changed, and nothing here is on a decode step's path.**
+`just test-full` is green — **859 gated and 81 timing** — which is the 806 the
+milestone before it left plus the fifty-three this added. The recorded
+continuation `[656, 13, 623, 180069, 86333, 60500, 220, 23]`, `--backend cpu`,
+`reference` bit-exact, `production` at 448/448 and `rounded` opt-in are all as
+they were, and the hermetic tier runs the same 859 with the checkpoint unset.
+
+**S2's server is unchanged where it was not the subject**: the scheduler behind
+the socket, a disconnect freeing its slot at both ends, stop sequences matched
+over `content`, usage on streams, tool calling end to end and the kept cache
+across a tool round-trip. `what_an_empty_seat_costs`, the duplicate-slot
+refusal, barriers derived == encoded, ragged seats and memory linear at 30.8 MiB
+a slot are all still asserted and all still pass — the last of them is what says
+the host-side cost above is the only memory this milestone added.
+
 ## Three things clients need, and what each of them had to decide
 
 **Stop sequences, matched over decoded text.** A client writes `"\nUser:"` and
@@ -1563,11 +1888,11 @@ already have stopped reading.
   named function. All three are refused rather than ignored.
 - **Name the conversation it is continuing.** There is no field for it in the
   OpenAI schema and this server invents none, so which slot a turn is resumed
-  into is decided by the tokens the client sent — see the section below, where
-  that is a choice rather than a limitation. What a client *cannot* do as a
-  consequence: keep its slot across a turn it edited in the middle. Change one
-  token of the history and the match is gone, the whole prompt is prefilled, and
-  the reply is right.
+  into is decided by the tokens the client sent — see "A conversation that comes
+  back to its own keys" above, where that is a choice rather than a limitation.
+  What a client *cannot* do as a consequence: keep its slot across a turn it
+  edited in the middle. Change one token of the history and the match is gone,
+  the whole prompt is prefilled, and the reply is right.
 - **Hold a slot while it thinks.** A conversation whose own slot is taken when
   its next turn arrives is admitted somewhere else and prefills from the
   beginning, because waiting for a cache means waiting out another request's
