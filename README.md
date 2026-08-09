@@ -5,55 +5,29 @@
 Minkling is an AI-generated inference engine for
 [Thinking Machine](https://thinkingmachines.ai/)'s
 [Inkling Small](https://huggingface.co/thinkingmachines/Inkling-Small) model,
-focused on fast inference on Apple Silicon with Metal kernels.
+served through an OpenAI-compatible HTTP API on Apple Silicon.
 
-It has the following features:
+## Run
 
-* Packed MXFP4 inference on Metal, without expanding the model's weights in
-  memory
-* Speculative decoding using Inkling's native multi-token prediction heads
-* Continuous batching, including admitting new requests into a running batch
-* KV-cache reuse across multi-turn conversations, both serially and in batches
-* An OpenAI-compatible chat completions server with streaming, tool calling,
-  stop sequences, and token usage
-* CPU and Metal backends, with selectable Metal numerics for validation and
-  performance tuning
-
-## Running
-
-Minkling runs on Apple Silicon and requires the Xcode Command Line Tools and a
-Rust toolchain. The provided Nix development shell includes Rust and the other
-development tools:
-
-```sh
-nix develop
-```
-
-Download the roughly 140 GB
-[MXFP4 checkpoint](https://huggingface.co/mlx-community/Inkling-Small-mxfp4)
-from Hugging Face:
+Install the Xcode Command Line Tools and [Nix](https://nixos.org/), then download
+the roughly 140 GB MXFP4 checkpoint:
 
 ```sh
 mkdir -p slop/models
-uvx --from huggingface-hub hf download mlx-community/Inkling-Small-mxfp4 \
+nix develop --command uvx --from huggingface-hub hf download \
+  mlx-community/Inkling-Small-mxfp4 \
   --local-dir slop/models/Inkling-Small-mxfp4
 ```
 
-Build the reviewed server and load the checkpoint:
+Start Minkling:
 
 ```sh
-cargo build --release --bin minkling
-
-target/release/minkling serve slop/models/Inkling-Small-mxfp4 \
-  --max-tokens 64 \
+nix develop --command cargo run --release --bin minkling -- \
+  serve slop/models/Inkling-Small-mxfp4 \
   --numerics production
 ```
 
-`--numerics production` selects the faster prefill kernels. Omit it to use the
-bit-reproducible reference numerics. `--max-tokens` is both the default and the
-largest budget a request may ask for.
-
-Then send an OpenAI-compatible request:
+Send a streaming chat completion:
 
 ```sh
 curl -sN http://127.0.0.1:8080/v1/chat/completions \
@@ -61,13 +35,5 @@ curl -sN http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hi!"}],"max_tokens":64,"stream":true}'
 ```
 
-The host listens on loopback by default, limits request bodies to 1 MiB, and
-queues at most 16 requests for its single model-owning inference worker. It
-also exposes `GET /healthz` and `GET /v1/models`.
-
-Both collected and streaming completions are supported. A stream buffers at
-most eight chunks between the model and the socket; a disconnected client or a
-full buffer cancels its generation and releases the worker for the next
-request. Continuous batching and speculative generation remain available in
-the quarantined `inklingrs` CLI and are documented in
-[`slop/README.md`](slop/README.md).
+Set `"stream": false` for a collected response. The server also exposes
+`GET /healthz` and `GET /v1/models`.
