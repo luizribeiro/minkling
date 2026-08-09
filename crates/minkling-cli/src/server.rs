@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use axum::Router;
 use tokio::net::TcpListener;
+
+use crate::api::{self, Unavailable};
 
 pub async fn run(address: SocketAddr) -> std::io::Result<()> {
     let listener = TcpListener::bind(address).await?;
@@ -9,7 +11,7 @@ pub async fn run(address: SocketAddr) -> std::io::Result<()> {
 
     eprintln!("listening on http://{address}");
 
-    axum::serve(listener, Router::new())
+    axum::serve(listener, api::router(Arc::new(Unavailable)))
         .with_graceful_shutdown(shutdown_signal())
         .await
 }

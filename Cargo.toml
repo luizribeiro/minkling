@@ -24,6 +24,7 @@ clap = { version = "4.5", default-features = false, features = [
   "usage",
 ] }
 tokio = { version = "1", features = [ "macros", "net", "rt-multi-thread", "signal" ] }
+tower = { version = "0.5", features = [ "util" ] }
 
 # `sysconf(_SC_PAGESIZE)`, and nothing else. Metal takes the bounds of a no-copy
 # wrap in pages and raises an Objective-C exception for bounds that are not — an
