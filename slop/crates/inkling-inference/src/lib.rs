@@ -9,11 +9,11 @@ use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, Ending, Kept, ModelWeights, Stop, Tokenizer};
 use serde_json::Value;
 
-use crate::args::Backend;
-use crate::chat::{self, Channel, Channels, MARKERS, Reading, Routed};
-use crate::openai::{ChatRequest, Completion, Finish};
-use crate::stop::Stops;
-use crate::{backend, config};
+use inkling_cli::args::Backend;
+use inkling_cli::chat::{self, Channel, Channels, MARKERS, Reading, Routed};
+use inkling_cli::openai::{ChatRequest, Completion, Finish};
+use inkling_cli::stop::Stops;
+use inkling_cli::{backend, config};
 
 pub use inkling_metal::Numerics;
 

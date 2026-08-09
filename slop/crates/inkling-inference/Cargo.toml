@@ -1,0 +1,17 @@
+[package]
+name = "inkling-inference"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+inkling-cli.workspace = true
+inkling-core.workspace = true
+inkling-metal.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

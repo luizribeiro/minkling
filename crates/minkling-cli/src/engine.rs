@@ -3,7 +3,7 @@ use std::thread;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::stream;
-use inkling_cli::inference::{self, Options, Request, StreamEvent};
+use inkling_inference::{self as inference, Options, Request, StreamEvent};
 use serde_json::Value;
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 

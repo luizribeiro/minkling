@@ -553,6 +553,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkling-inference"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "inkling-cli",
+ "inkling-core",
+ "inkling-metal",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "inkling-metal"
 version = "0.1.0"
 dependencies = [
@@ -656,7 +668,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
- "inkling-cli",
+ "inkling-inference",
  "serde",
  "serde_json",
  "tokio",

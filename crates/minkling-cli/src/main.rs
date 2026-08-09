@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
-use inkling_cli::inference::{DEFAULT_REUSE_TOKENS, Numerics, Options};
+use inkling_inference::{DEFAULT_REUSE_TOKENS, Numerics, Options};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
 const DEFAULT_MAX_TOKENS: usize = 64;

@@ -14,6 +14,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 inkling-core = { path = "slop/crates/inkling-core", version = "=0.1.0" }
 inkling-cli = { path = "slop/crates/inkling-cli", version = "=0.1.0" }
+inkling-inference = { path = "slop/crates/inkling-inference", version = "=0.1.0" }
 inkling-metal = { path = "slop/crates/inkling-metal", version = "=0.1.0" }
 
 anyhow = "1"
