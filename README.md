@@ -7,6 +7,20 @@ Minkling is an AI-generated inference engine for
 [Inkling Small](https://huggingface.co/thinkingmachines/Inkling-Small) model,
 served through an OpenAI-compatible HTTP API on Apple Silicon.
 
+## Features
+
+* Packed MXFP4 inference on Metal
+* Native multi-token prediction and speculative decoding
+* Continuous batching and KV-cache reuse
+* A CPU reference backend and selectable Metal numerics
+* Collected and streaming OpenAI-compatible chat completions
+* Tool calling, stop sequences, and token usage
+* Bounded request queues and cancellation on client disconnect
+
+`minkling serve` currently uses the single-request, single-token decode path;
+MTP and continuous batching are engine capabilities still to be wired into the
+new host.
+
 ## Run
 
 Install the Xcode Command Line Tools and [Nix](https://nixos.org/), then download
