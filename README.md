@@ -13,8 +13,10 @@ Install the Xcode Command Line Tools and [Nix](https://nixos.org/), then downloa
 the roughly 140 GB MXFP4 checkpoint:
 
 ```sh
+nix develop
+
 mkdir -p slop/models
-nix develop --command uvx --from huggingface-hub hf download \
+uvx --from huggingface-hub hf download \
   mlx-community/Inkling-Small-mxfp4 \
   --local-dir slop/models/Inkling-Small-mxfp4
 ```
@@ -22,7 +24,7 @@ nix develop --command uvx --from huggingface-hub hf download \
 Start Minkling:
 
 ```sh
-nix develop --command cargo run --release --bin minkling -- \
+cargo run --release --bin minkling -- \
   serve slop/models/Inkling-Small-mxfp4 \
   --numerics production
 ```
