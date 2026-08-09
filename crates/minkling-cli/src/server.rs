@@ -3,15 +3,15 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use crate::api::{self, Unavailable};
+use crate::api::{self, Inference};
 
-pub async fn run(address: SocketAddr) -> std::io::Result<()> {
+pub async fn run(address: SocketAddr, inference: Arc<dyn Inference>) -> std::io::Result<()> {
     let listener = TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
 
     eprintln!("listening on http://{address}");
 
-    axum::serve(listener, api::router(Arc::new(Unavailable)))
+    axum::serve(listener, api::router(inference))
         .with_graceful_shutdown(shutdown_signal())
         .await
 }

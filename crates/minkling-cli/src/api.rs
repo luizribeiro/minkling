@@ -1,4 +1,4 @@
-use std::future::{Future, ready};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +11,9 @@ use axum::{Json, Router};
 use serde::Serialize;
 use serde_json::Value;
 
+#[cfg(test)]
+use std::future::ready;
+
 const LARGEST_BODY: usize = 1 << 20;
 
 pub type Completion<'a> = Pin<Box<dyn Future<Output = Result<Value, InferenceError>> + Send + 'a>>;
@@ -21,8 +24,10 @@ pub trait Inference: Send + Sync + 'static {
     fn complete(&self, request: Value) -> Completion<'_>;
 }
 
+#[cfg(test)]
 pub struct Unavailable;
 
+#[cfg(test)]
 impl Inference for Unavailable {
     fn model(&self) -> Option<&str> {
         None
@@ -43,9 +48,25 @@ pub struct InferenceError {
 }
 
 impl InferenceError {
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            message: message.into(),
+        }
+    }
+
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: "server_error",
+            message: message.into(),
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             kind: "server_error",
             message: message.into(),
         }

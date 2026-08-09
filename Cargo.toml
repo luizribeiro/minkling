@@ -13,6 +13,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 inkling-core = { path = "slop/crates/inkling-core", version = "=0.1.0" }
+inkling-cli = { path = "slop/crates/inkling-cli", version = "=0.1.0" }
 inkling-metal = { path = "slop/crates/inkling-metal", version = "=0.1.0" }
 
 anyhow = "1"
@@ -23,7 +24,7 @@ clap = { version = "4.5", default-features = false, features = [
   "std",
   "usage",
 ] }
-tokio = { version = "1", features = [ "macros", "net", "rt-multi-thread", "signal" ] }
+tokio = { version = "1", features = [ "macros", "net", "rt-multi-thread", "signal", "sync" ] }
 tower = { version = "0.5", features = [ "util" ] }
 
 # `sysconf(_SC_PAGESIZE)`, and nothing else. Metal takes the bounds of a no-copy

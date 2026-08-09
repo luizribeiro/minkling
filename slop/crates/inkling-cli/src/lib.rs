@@ -16,6 +16,7 @@ pub mod backend;
 pub mod chat;
 pub mod config;
 pub mod generate;
+pub mod inference;
 pub mod inspect;
 pub mod openai;
 pub mod serve;

@@ -39,80 +39,34 @@ uvx --from huggingface-hub hf download mlx-community/Inkling-Small-mxfp4 \
   --local-dir slop/models/Inkling-Small-mxfp4
 ```
 
-Build the release binary and continue a prompt:
+Build the reviewed server and load the checkpoint:
 
 ```sh
-cargo build --release --bin inklingrs
+cargo build --release --bin minkling
 
-target/release/inklingrs generate slop/models/Inkling-Small-mxfp4 \
-  --prompt "The lighthouse keeper" \
+target/release/minkling serve slop/models/Inkling-Small-mxfp4 \
   --max-tokens 64 \
   --numerics production
 ```
 
 `--numerics production` selects the faster prefill kernels. Omit it to use the
-bit-reproducible reference numerics.
-
-`generate` continues the prompt exactly as provided; it does not apply the
-model's chat template. To serve templated chat completions instead, start the
-HTTP server:
-
-```sh
-target/release/inklingrs serve slop/models/Inkling-Small-mxfp4 \
-  --numerics production \
-  --slots 4
-```
+bit-reproducible reference numerics. `--max-tokens` is both the default and the
+largest budget a request may ask for.
 
 Then send an OpenAI-compatible request:
 
 ```sh
-curl -sN http://127.0.0.1:8080/v1/chat/completions \
+curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Hi!"}],"max_tokens":64,"stream":true}'
+  -d '{"messages":[{"role":"user","content":"Hi!"}],"max_tokens":64}'
 ```
 
-The server uses one slot by default. Set `--slots N` to advance up to `N`
-requests together, or omit it for the lowest memory use. You can also inspect a
-checkpoint without loading its weights:
+The host listens on loopback by default, limits request bodies to 1 MiB, and
+queues at most 16 requests for its single model-owning inference worker. It
+also exposes `GET /healthz` and `GET /v1/models`.
 
-```sh
-target/release/inklingrs inspect slop/models/Inkling-Small-mxfp4/config.json
-```
-
-### Speculative decoding
-
-The published MXFP4 checkpoint declares the model's eight MTP heads but omits
-their weights. Download the original BF16 head shard into the checkpoint:
-
-```sh
-uvx --from huggingface-hub hf download thinkingmachines/Inkling-Small \
-  mtp.safetensors \
-  --local-dir slop/models/Inkling-Small-mxfp4
-```
-
-Minkling can use that shard directly, but it is roughly 4.46 GB. The repository
-includes a script that packs its matrix weights into MXFP4 and produces a
-roughly 1.19 GB shard instead:
-
-```sh
-cd slop
-just sync
-just quantize-mtp
-cd ..
-```
-
-This creates `slop/models/Inkling-Small-mxfp4-mtp4`. Its model files are
-symlinks to the downloaded MXFP4 checkpoint, while its `mtp.safetensors` is the
-locally packed shard. Use that checkpoint with `--speculate N`:
-
-```sh
-target/release/inklingrs generate slop/models/Inkling-Small-mxfp4-mtp4 \
-  --prompt "The lighthouse keeper" \
-  --max-tokens 64 \
-  --numerics production \
-  --speculate 2
-```
-
-Speculation is currently available for `generate`; the HTTP server decodes
-without the MTP heads. See the [weights documentation](slop/README.md#weights)
-for how the two head formats are validated against each other.
+This first host milestone returns collected completions. It explicitly rejects
+`"stream": true`; streaming needs cancellation and backpressure at the worker
+boundary and will be migrated separately. Continuous batching, streaming, and
+speculative generation remain available in the quarantined `inklingrs` CLI and
+are documented in [`slop/README.md`](slop/README.md).
