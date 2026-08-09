@@ -10,8 +10,14 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-inkling-cli.workspace = true
 inkling-core.workspace = true
 inkling-metal.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[features]
+test-support = []
+
+[dev-dependencies]
+inkling-core = { workspace = true, features = [ "test-support" ] }

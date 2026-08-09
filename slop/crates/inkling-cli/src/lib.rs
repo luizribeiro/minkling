@@ -12,15 +12,11 @@
 //! and moving a module is a smaller thing than lifting one out of a binary.
 
 pub mod args;
-pub mod backend;
-pub mod chat;
-pub mod config;
 pub mod generate;
 pub mod inspect;
-pub mod openai;
 pub mod serve;
 pub mod session;
-pub mod stop;
+pub use inkling_inference::{backend, chat, config, openai, stop};
 
 /// The width a report's labels are padded to.
 ///
@@ -33,4 +29,4 @@ pub const LABEL: usize = 9;
 /// checkpoint-gated test in `tests/` — which links this crate from outside and
 /// cannot see a `cfg(test)` module — and the unit tests here share one copy.
 #[cfg(feature = "test-support")]
-pub mod wire;
+pub use inkling_inference::wire;

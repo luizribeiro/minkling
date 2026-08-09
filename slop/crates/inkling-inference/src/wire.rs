@@ -1,4 +1,4 @@
-//! Reading a response the way a client does, behind the `test-support` feature.
+//! Reading a response the way a client does for tests.
 //!
 //! The server writes its own framing — see [`crate::serve`] for why — and a test
 //! that asserts on the frames has to take that framing apart first. Both the

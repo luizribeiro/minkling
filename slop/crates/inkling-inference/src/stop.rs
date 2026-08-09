@@ -1,4 +1,4 @@
-//! The `stop` a client sends, matched against the text it will see.
+//! Matching a client's `stop` against the text it will see.
 //!
 //! Without it a model that runs on costs a client tokens it pays for and
 //! returns junk past the answer, and every OpenAI client sends one. What makes

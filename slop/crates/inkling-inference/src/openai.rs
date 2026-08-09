@@ -1,4 +1,4 @@
-//! The wire shapes of `/v1/chat/completions`, and the framing that carries them.
+//! The wire shapes and framing of `/v1/chat/completions`.
 //!
 //! Nothing here knows what a model is. What arrives is a request to parse and
 //! then text a token at a time; what leaves is either a stream of

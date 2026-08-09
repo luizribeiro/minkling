@@ -1,5 +1,13 @@
 //! The model loop behind a host that owns its transport and threads.
 
+pub mod backend;
+pub mod chat;
+pub mod config;
+pub mod openai;
+pub mod stop;
+#[cfg(any(test, feature = "test-support"))]
+pub mod wire;
+
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -9,15 +17,33 @@ use anyhow::{Context, Result};
 use inkling_core::{Checkpoint, Ending, Kept, ModelWeights, Stop, Tokenizer};
 use serde_json::Value;
 
-use inkling_cli::args::Backend;
-use inkling_cli::chat::{self, Channel, Channels, MARKERS, Reading, Routed};
-use inkling_cli::openai::{ChatRequest, Completion, Finish};
-use inkling_cli::stop::Stops;
-use inkling_cli::{backend, config};
+use crate::chat::{Channel, Channels, MARKERS, Reading, Routed};
+use crate::openai::{ChatRequest, Completion, Finish};
+use crate::stop::Stops;
 
 pub use inkling_metal::Numerics;
 
 pub const DEFAULT_REUSE_TOKENS: usize = inkling_core::DEFAULT_BOUND;
+
+/// Where the model's weights are multiplied against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// Every weight is decoded on the CPU as it is used.
+    Cpu,
+    /// The packed model runs on Metal.
+    #[default]
+    Metal,
+}
+
+impl Backend {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "cpu" => Some(Self::Cpu),
+            "metal" => Some(Self::Metal),
+            _ => None,
+        }
+    }
+}
 
 pub struct Options {
     pub checkpoint: PathBuf,
@@ -395,3 +421,6 @@ fn now() -> u64 {
         .map(|since| since.as_secs())
         .unwrap_or_default()
 }
+
+/// The width shared diagnostic labels are padded to.
+pub(crate) const LABEL: usize = 9;

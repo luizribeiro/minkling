@@ -43,8 +43,7 @@ use inkling_metal::{
     StackShape, SwiGlu, TailWeights,
 };
 
-use crate::LABEL;
-use crate::args::Backend;
+use crate::{Backend, LABEL};
 
 /// What a Metal-backed run holds for its whole life: the device, and the
 /// compiled kernels everything on it shares.

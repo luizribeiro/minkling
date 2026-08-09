@@ -529,6 +529,7 @@ dependencies = [
  "anyhow",
  "inkling-cli",
  "inkling-core",
+ "inkling-inference",
  "inkling-metal",
  "serde",
  "serde_json",
@@ -557,9 +558,9 @@ name = "inkling-inference"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "inkling-cli",
  "inkling-core",
  "inkling-metal",
+ "serde",
  "serde_json",
  "thiserror",
 ]

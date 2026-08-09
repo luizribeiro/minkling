@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use inkling_metal::Numerics;
 
 use inkling_core::DEFAULT_BOUND;
+pub use inkling_inference::Backend;
 
 /// What to run, and what against.
 #[derive(Debug, PartialEq, Eq)]
@@ -24,38 +25,8 @@ pub enum Command {
     Serve(Serve),
 }
 
-/// Where the model's weights are multiplied against.
-///
-/// A runtime flag rather than a Cargo feature, and the reason is what the CPU
-/// path is for. It is the oracle every kernel in this tree is validated against,
-/// so a disagreement between the two is settled by putting the same prompt
-/// through both — which a flag allows and a build-time choice would turn into a
-/// rebuild. It is also the first thing a report about a wrong token has to say,
-/// and a flag can be printed back where a feature has to be remembered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Backend {
-    /// Every weight decoded on the way through, a row at a time — 9.0 s a
-    /// token. The path every fixture in the tree pins.
-    Cpu,
-    /// `lm_head`, the experts and every layer's own projections multiplied on
-    /// the GPU against codes that are never decoded, which is 0.055 s a token.
-    ///
-    /// The default, because the two produce the same tokens and this is the
-    /// faster of them. Asking for it explicitly is still worth allowing: a
-    /// command line that says which backend ran is a command line that can be
-    /// pasted into a bug report.
-    #[default]
-    Metal,
-}
-
-impl Backend {
-    fn parse(name: &str) -> Result<Self, ArgError> {
-        match name {
-            "cpu" => Ok(Self::Cpu),
-            "metal" => Ok(Self::Metal),
-            _ => Err(ArgError::UnknownBackend(name.to_string())),
-        }
-    }
+fn parse_backend(name: &str) -> Result<Backend, ArgError> {
+    Backend::parse(name).ok_or_else(|| ArgError::UnknownBackend(name.to_string()))
 }
 
 /// Which arithmetic the device's innermost accumulation may use, and the refusal
@@ -297,7 +268,7 @@ fn generate(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
         match arg.as_str() {
             "--prompt" | "-p" => prompt = Some(value(&arg, &mut args)?),
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
-            "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
+            "--backend" | "-b" => backend = parse_backend(&value(&arg, &mut args)?)?,
             "--numerics" => asked = Some(numerics(&arg, &mut args)?),
             "--speculate" | "-k" => speculate = zeroable(&arg, &mut args, ArgError::NotADepth)?,
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
@@ -352,7 +323,7 @@ fn serve(args: impl Iterator<Item = String>) -> Result<Command, ArgError> {
             "--max-tokens" | "-n" => max_tokens = count(&arg, &mut args)?,
             "--slots" => slots = count(&arg, &mut args)?,
             "--reuse-tokens" => reuse_tokens = zeroable(&arg, &mut args, ArgError::NotABound)?,
-            "--backend" | "-b" => backend = Backend::parse(&value(&arg, &mut args)?)?,
+            "--backend" | "-b" => backend = parse_backend(&value(&arg, &mut args)?)?,
             "--numerics" => asked = Some(numerics(&arg, &mut args)?),
             _ if arg.starts_with('-') => return Err(ArgError::Unexpected(arg)),
             _ if checkpoint.is_none() => checkpoint = Some(PathBuf::from(arg)),

@@ -1,4 +1,4 @@
-//! The turn structure, written out from a messages array.
+//! The turn structure written from a messages array.
 //!
 //! `generate` sends its prompt to the tokenizer as it stands, and records what
 //! that costs: nothing in an untemplated prompt puts the model in a turn it could
@@ -717,13 +717,13 @@ impl Channels {
 ///
 /// Here rather than in each of the three, because three copies of a two-line
 /// constructor are three places a change to [`Routed`] has to land.
-#[cfg(test)]
-pub(crate) fn text(channel: Channel, text: &str) -> Routed {
+#[cfg(any(test, feature = "test-support"))]
+pub fn text(channel: Channel, text: &str) -> Routed {
     Routed::Text(channel, text.to_string())
 }
 
-#[cfg(test)]
-pub(crate) fn invoked(name: &str, arguments: &str) -> Routed {
+#[cfg(any(test, feature = "test-support"))]
+pub fn invoked(name: &str, arguments: &str) -> Routed {
     Routed::Call(Call {
         name: name.to_string(),
         arguments: arguments.to_string(),

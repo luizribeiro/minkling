@@ -1,4 +1,4 @@
-//! Reading a `config.json`, which is where every command starts.
+//! Reading the checkpoint's `config.json`.
 
 use std::path::Path;
 

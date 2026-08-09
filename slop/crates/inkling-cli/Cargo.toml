@@ -27,6 +27,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tiny_http.workspace = true
 inkling-core.workspace = true
+inkling-inference.workspace = true
 inkling-metal.workspace = true
 
 [features]
@@ -35,7 +36,7 @@ inkling-metal.workspace = true
 # which links this crate from outside. Depending on ourselves turns it on for
 # every test target and leaves it off in the shipped binary, the same way
 # `inkling-core` does it for the reference fixtures.
-test-support = []
+test-support = [ "inkling-inference/test-support" ]
 
 [dev-dependencies]
 # `test-support` for the committed activation dump, which is where the recorded
