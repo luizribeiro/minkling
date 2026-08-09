@@ -28,27 +28,56 @@ pub struct Options {
 
 pub type Response = std::result::Result<Value, Error>;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
     Invalid(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
+pub enum StreamEvent {
+    /// A token produced no frame, but gives the host a cancellation checkpoint.
+    Pulse,
+    /// One or more complete SSE frames.
+    Frame(String),
+    /// Generation failed after the response had already started.
     Failed(String),
 }
 
 pub struct Request {
     body: Value,
-    answer: Box<dyn FnOnce(Response) + Send>,
+    delivery: Delivery,
+}
+
+enum Delivery {
+    Collected(Box<dyn FnOnce(Response) + Send>),
+    Streaming {
+        started: Box<dyn FnOnce(std::result::Result<(), Error>) -> bool + Send>,
+        event: Box<dyn FnMut(StreamEvent) -> ControlFlow<()> + Send>,
+    },
 }
 
 impl Request {
-    pub fn new(body: Value, answer: impl FnOnce(Response) + Send + 'static) -> Self {
+    pub fn collected(body: Value, answer: impl FnOnce(Response) + Send + 'static) -> Self {
         Self {
             body,
-            answer: Box::new(answer),
+            delivery: Delivery::Collected(Box::new(answer)),
         }
     }
 
-    fn answer(self, response: Response) {
-        (self.answer)(response);
+    pub fn streaming(
+        body: Value,
+        started: impl FnOnce(std::result::Result<(), Error>) -> bool + Send + 'static,
+        event: impl FnMut(StreamEvent) -> ControlFlow<()> + Send + 'static,
+    ) -> Self {
+        Self {
+            body,
+            delivery: Delivery::Streaming {
+                started: Box::new(started),
+                event: Box::new(event),
+            },
+        }
     }
 }
 
@@ -88,8 +117,8 @@ fn run_loaded(
 
     for request in requests {
         served += 1;
-        let response = complete(
-            &request.body,
+        serve(
+            request,
             options.max_tokens,
             served,
             &model,
@@ -99,7 +128,6 @@ fn run_loaded(
             &weights,
             &mut kept,
         );
-        request.answer(response);
     }
     Ok(())
 }
@@ -108,8 +136,8 @@ fn run_loaded(
     clippy::too_many_arguments,
     reason = "the model references stay borrowed on the worker stack while request values vary"
 )]
-fn complete(
-    body: &Value,
+fn serve(
+    request: Request,
     default_max_tokens: usize,
     served: u64,
     model: &str,
@@ -118,14 +146,57 @@ fn complete(
     generator: &inkling_core::Generator<'_>,
     weights: &impl ModelWeights,
     kept: &mut Kept<'_>,
-) -> Response {
-    let asked = ChatRequest::parse(&body.to_string()).map_err(invalid)?;
-    if asked.stream {
-        return Err(Error::Invalid(
-            "streaming responses are not implemented by minkling yet".to_string(),
-        ));
-    }
+) {
+    let prepared = prepare(&request.body, default_max_tokens, served, model, tokenizer);
 
+    match request.delivery {
+        Delivery::Collected(answer) => {
+            let response = prepared.and_then(|prepared| {
+                generate(prepared, tokenizer, markers, generator, weights, kept, None)
+            });
+            answer(response);
+        }
+        Delivery::Streaming { started, mut event } => {
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = started(Err(error));
+                    return;
+                }
+            };
+            if !started(Ok(())) {
+                return;
+            }
+            if let Err(error) = generate(
+                prepared,
+                tokenizer,
+                markers,
+                generator,
+                weights,
+                kept,
+                Some(event.as_mut()),
+            ) {
+                let _ = event(StreamEvent::Failed(error.to_string()));
+            }
+        }
+    }
+}
+
+struct Prepared {
+    ids: Vec<usize>,
+    ending: Ending,
+    completion: Completion,
+    stops: Stops,
+}
+
+fn prepare(
+    body: &Value,
+    default_max_tokens: usize,
+    served: u64,
+    model: &str,
+    tokenizer: &Tokenizer,
+) -> std::result::Result<Prepared, Error> {
+    let asked = ChatRequest::parse(&body.to_string()).map_err(invalid)?;
     let prompt = chat::prompt(&asked.messages, asked.declared()).map_err(invalid)?;
     let ids: Vec<usize> = tokenizer
         .encode(&prompt)
@@ -149,30 +220,62 @@ fn complete(
         created,
         model.to_string(),
         ids.len(),
-    );
+    )
+    .reporting_usage(asked.stream && asked.wants_usage());
+    Ok(Prepared {
+        ids,
+        ending,
+        completion,
+        stops: Stops::new(asked.stopping()),
+    })
+}
+
+fn generate(
+    prepared: Prepared,
+    tokenizer: &Tokenizer,
+    markers: &[(u32, String, Reading)],
+    generator: &inkling_core::Generator<'_>,
+    weights: &impl ModelWeights,
+    kept: &mut Kept<'_>,
+    stream: Option<&mut dyn FnMut(StreamEvent) -> ControlFlow<()>>,
+) -> Response {
     let mut reply = Reply {
         text: tokenizer.stream(),
         channels: Channels::new(markers.iter().cloned()),
-        completion,
-        stops: Stops::new(asked.stopping()),
+        completion: prepared.completion,
+        stops: prepared.stops,
         struck: false,
         failed: None,
+        cancelled: false,
+        stream,
     };
 
-    let generated = kept.turn(generator, weights, &ids, ending, |id| reply.push(id));
+    if reply.open().is_break() {
+        return Ok(Value::Null);
+    }
+    let generated = kept.turn(generator, weights, &prepared.ids, prepared.ending, |id| {
+        reply.push(id)
+    });
     reply.finish(generated.stop)
 }
 
-struct Reply<'a> {
+struct Reply<'a, 'stream> {
     text: inkling_core::Detokenizer<'a>,
     channels: Channels,
     completion: Completion,
     stops: Stops,
     struck: bool,
     failed: Option<String>,
+    cancelled: bool,
+    stream: Option<&'stream mut dyn FnMut(StreamEvent) -> ControlFlow<()>>,
 }
 
-impl Reply<'_> {
+impl Reply<'_, '_> {
+    fn open(&mut self) -> ControlFlow<()> {
+        let frame = self.completion.opening();
+        self.emit(Some(frame))
+    }
+
     fn push(&mut self, id: usize) -> ControlFlow<()> {
         let decoded = match self.text.push(id as u32) {
             Ok(decoded) => decoded,
@@ -183,14 +286,18 @@ impl Reply<'_> {
         };
         let routed = self.channels.route(id as u32, &decoded);
         let routed = self.cut(routed);
-        let _ = self.completion.push(routed);
-        match self.struck {
-            true => ControlFlow::Break(()),
-            false => ControlFlow::Continue(()),
+        let frame = self.completion.push(routed);
+        if self.emit(frame).is_break() || self.struck {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     }
 
     fn finish(mut self, stop: Stop) -> Response {
+        if self.cancelled {
+            return Ok(Value::Null);
+        }
         if let Some(message) = self.failed.take() {
             return Err(Error::Failed(message));
         }
@@ -198,11 +305,17 @@ impl Reply<'_> {
         let tail = self.text.finish();
         let routed = self.channels.finish(&tail);
         let routed = self.cut(routed);
-        let _ = self.completion.tail(routed);
+        let frame = self.completion.tail(routed);
+        if self.emit(frame).is_break() {
+            return Ok(Value::Null);
+        }
 
         let held = self.stops.finish();
         if !held.is_empty() {
-            let _ = self.completion.tail(Routed::Text(Channel::Content, held));
+            let frame = self.completion.tail(Routed::Text(Channel::Content, held));
+            if self.emit(frame).is_break() {
+                return Ok(Value::Null);
+            }
         }
 
         let finish = match (self.struck, stop, self.completion.called()) {
@@ -211,8 +324,28 @@ impl Reply<'_> {
             (false, Stop::EndOfSequence, false) => Finish::Stop,
             (false, Stop::Budget | Stop::Sink, _) => Finish::Length,
         };
+        let closing = self.completion.closing(finish);
+        if self.emit(Some(closing)).is_break() {
+            return Ok(Value::Null);
+        }
         serde_json::from_str(&self.completion.collected(finish))
             .map_err(|error| Error::Failed(error.to_string()))
+    }
+
+    fn emit(&mut self, frame: Option<String>) -> ControlFlow<()> {
+        let Some(stream) = &mut self.stream else {
+            return ControlFlow::Continue(());
+        };
+        let event = match frame {
+            Some(frame) => StreamEvent::Frame(frame),
+            None => StreamEvent::Pulse,
+        };
+        if stream(event).is_break() {
+            self.cancelled = true;
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
     }
 
     fn cut(&mut self, routed: Routed) -> Routed {

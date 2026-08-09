@@ -655,6 +655,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures-util",
  "inkling-cli",
  "serde",
  "serde_json",

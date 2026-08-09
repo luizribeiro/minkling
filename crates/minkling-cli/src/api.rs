@@ -3,11 +3,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -16,12 +18,19 @@ use std::future::ready;
 
 const LARGEST_BODY: usize = 1 << 20;
 
-pub type Completion<'a> = Pin<Box<dyn Future<Output = Result<Value, InferenceError>> + Send + 'a>>;
+pub type FrameStream = Pin<Box<dyn Stream<Item = Result<String, String>> + Send + 'static>>;
+pub type CompletionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Completion, InferenceError>> + Send + 'a>>;
+
+pub enum Completion {
+    Collected(Value),
+    Streaming(FrameStream),
+}
 
 pub trait Inference: Send + Sync + 'static {
     fn model(&self) -> Option<&str>;
 
-    fn complete(&self, request: Value) -> Completion<'_>;
+    fn complete(&self, request: Value) -> CompletionFuture<'_>;
 }
 
 #[cfg(test)]
@@ -33,7 +42,7 @@ impl Inference for Unavailable {
         None
     }
 
-    fn complete(&self, _request: Value) -> Completion<'_> {
+    fn complete(&self, _request: Value) -> CompletionFuture<'_> {
         Box::pin(ready(Err(InferenceError::unavailable(
             "the inference engine is not connected yet",
         ))))
@@ -156,8 +165,21 @@ async fn models(State(inference): State<Arc<dyn Inference>>) -> Json<Models> {
 async fn complete(
     State(inference): State<Arc<dyn Inference>>,
     Json(request): Json<Value>,
-) -> Result<Json<Value>, InferenceError> {
-    inference.complete(request).await.map(Json)
+) -> Result<Response, InferenceError> {
+    match inference.complete(request).await? {
+        Completion::Collected(completion) => Ok(Json(completion).into_response()),
+        Completion::Streaming(frames) => {
+            let frames = frames.map(|frame| frame.map_err(std::io::Error::other));
+            Ok((
+                [
+                    (header::CONTENT_TYPE, "text/event-stream"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                Body::from_stream(frames),
+            )
+                .into_response())
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -184,11 +206,21 @@ mod tests {
             Some("Inkling-Small-mxfp4")
         }
 
-        fn complete(&self, _request: Value) -> Completion<'_> {
-            Box::pin(ready(Ok(serde_json::json!({
-                "object": "chat.completion",
-                "choices": [{"message": {"role": "assistant", "content": "hello"}}],
-            }))))
+        fn complete(&self, request: Value) -> CompletionFuture<'_> {
+            let completion = match request["stream"].as_bool() {
+                Some(true) => Completion::Streaming(Box::pin(futures_util::stream::iter([
+                    Ok(
+                        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+                            .to_string(),
+                    ),
+                    Ok("data: [DONE]\n\n".to_string()),
+                ]))),
+                _ => Completion::Collected(serde_json::json!({
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "hello"}}],
+                })),
+            };
+            Box::pin(ready(Ok(completion)))
         }
     }
 
@@ -245,6 +277,33 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["object"], "chat.completion");
         assert_eq!(body["choices"][0]["message"]["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn a_streaming_completion_is_an_event_stream() {
+        let request = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": true,
+                })
+                .to_string(),
+            ))
+            .expect("the request should be valid");
+        let response = router(Arc::new(Fake))
+            .oneshot(request)
+            .await
+            .expect("the router should answer");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let body = to_bytes(response.into_body(), LARGEST_BODY)
+            .await
+            .expect("the stream should be readable");
+        let body = String::from_utf8(body.to_vec()).expect("the stream should be text");
+        assert!(body.starts_with("data: {"), "{body:?}");
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body:?}");
     }
 
     #[tokio::test]

@@ -56,17 +56,18 @@ largest budget a request may ask for.
 Then send an OpenAI-compatible request:
 
 ```sh
-curl -s http://127.0.0.1:8080/v1/chat/completions \
+curl -sN http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Hi!"}],"max_tokens":64}'
+  -d '{"messages":[{"role":"user","content":"Hi!"}],"max_tokens":64,"stream":true}'
 ```
 
 The host listens on loopback by default, limits request bodies to 1 MiB, and
 queues at most 16 requests for its single model-owning inference worker. It
 also exposes `GET /healthz` and `GET /v1/models`.
 
-This first host milestone returns collected completions. It explicitly rejects
-`"stream": true`; streaming needs cancellation and backpressure at the worker
-boundary and will be migrated separately. Continuous batching, streaming, and
-speculative generation remain available in the quarantined `inklingrs` CLI and
-are documented in [`slop/README.md`](slop/README.md).
+Both collected and streaming completions are supported. A stream buffers at
+most eight chunks between the model and the socket; a disconnected client or a
+full buffer cancels its generation and releases the worker for the next
+request. Continuous batching and speculative generation remain available in
+the quarantined `inklingrs` CLI and are documented in
+[`slop/README.md`](slop/README.md).
