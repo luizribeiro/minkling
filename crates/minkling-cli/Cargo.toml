@@ -13,4 +13,6 @@ name = "minkling"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
 clap.workspace = true
+tokio.workspace = true
