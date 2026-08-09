@@ -1,5 +1,8 @@
 [workspace]
 resolver = "3"
+# TODO(slop-boundary): Replace this glob with an explicit member list. As
+# written, a new directory under `slop/crates` becomes a trusted workspace
+# package automatically and can omit `[lints] workspace = true`.
 members = [ "slop/crates/*" ]
 
 [workspace.package]
@@ -93,12 +96,28 @@ tiny_http = { version = "0.12", default-features = false }
 # Legacy crates opt into these from their own manifests. `deny` permits a
 # narrow, visible `#[allow]` around the Metal implementation's existing unsafe
 # modules; new unsafe code is rejected everywhere else.
+# TODO(slop-unsafe): Replace the module-wide allowances with reviewed wrappers
+# or item-level allowances carrying safety reasons. A module allowance also
+# permits newly generated unsafe code anywhere in that module.
 [workspace.lints.rust]
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"
 disallowed_types = "deny"
+# TODO(slop-errors): Enable these after fallible runtime paths return errors and
+# fixture/test-only exceptions have been isolated. They remain comments so this
+# commit records the intended boundary without changing legacy behavior.
+# allow_attributes_without_reason = "deny"
+# dbg_macro = "deny"
+# expect_used = "deny"
+# panic = "deny"
+# print_stderr = "deny"
+# print_stdout = "deny"
+# todo = "deny"
+# undocumented_unsafe_blocks = "deny"
+# unimplemented = "deny"
+# unwrap_used = "deny"
 
 # The CPU ops are scalar loops, and a test that drives the whole 42-layer stack
 # runs tens of gigabytes through them. Unoptimised that is half an hour; this

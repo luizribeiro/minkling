@@ -10,3 +10,7 @@ check:
 # Run the legacy suite without accidentally activating checkpoint tests.
 test: check
     env -u INKLINGRS_CHECKPOINT cargo test --workspace --locked
+
+# TODO(slop-features): Add `--all-features` to the Clippy and test commands
+# after reviewing the legacy feature-only paths; feature-gated code can
+# otherwise evade both checks.

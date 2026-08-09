@@ -1,6 +1,13 @@
 # This is a deny-by-default snapshot of the resolved legacy graph. Cargo.lock
 # remains the authority on versions; this list makes a new crate name an
 # explicit policy change. Workspace packages are reviewed in this repository.
+#
+# TODO(slop-boundary): Set `allow-workspace = false` and explicitly allow each
+# reviewed local package after replacing Cargo's workspace glob. The current
+# combination automatically trusts a newly generated crate under `slop/crates`.
+# TODO(slop-dependencies): Use versioned PackageSpecs with reasons. A name-only,
+# graph-wide allowlist also lets slop promote an already-allowed transitive
+# crate to a direct dependency without adding a new name here.
 [bans]
 allow-workspace = true
 allow = [
@@ -40,6 +47,8 @@ allow = [
   "ident_case",
   "itertools",
   "itoa",
+  # TODO(slop-syscalls): Hide this behind a reviewed platform wrapper; direct
+  # libc access can bypass the standard-library capability policy.
   "libc",
   "linux-raw-sys",
   "log",
@@ -88,6 +97,8 @@ allow = [
   "tempfile",
   "thiserror",
   "thiserror-impl",
+  # TODO(slop-network): Move HTTP ownership to `minkling-cli`, then remove this
+  # listener capability from the quarantined crates.
   "tiny_http",
   "tokenizers",
   "unicode-ident",
@@ -103,6 +114,8 @@ allow = [
   "zerocopy-derive",
   "zmij",
 ]
+# TODO(slop-dependencies): Change this to `deny` after removing the legacy
+# `syn` 2.x/3.x split.
 multiple-versions = "warn"
 wildcards = "deny"
 
@@ -116,6 +129,15 @@ unused = "allow"
 # Build scripts execute during compilation. Every current script is named so a
 # newly introduced one fails review even if its crate was already in the graph.
 [bans.build]
+# TODO(slop-build): Deny packaged executables and interpreted files after the
+# local Cargo source cache is no longer polluted by in-place build artifacts.
+# Also set `include-workspace` and `include-dependencies` to true after reviewing
+# the resulting baseline; otherwise newly trusted local compile-time code and
+# helpers used by build scripts are not scanned.
+# executables = "deny"
+# interpreted = "deny"
+# include-workspace = true
+# include-dependencies = true
 executables = "allow"
 interpreted = "allow"
 allow-build-scripts = [
@@ -148,3 +170,19 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
+
+# TODO(slop-supply-chain): Add reviewed `[licenses]` and `[advisories]` sections,
+# then include `licenses advisories` in the justfile and Nix hook. The advisory
+# database must be pinned as a Nix input because `--frozen` deliberately does
+# not fetch it; the license allowlist needs a one-time review of the current
+# graph. Until then this file controls provenance, not vulnerability or license
+# acceptance.
+#
+# [advisories]
+# yanked = "deny"
+# unmaintained = "workspace"
+#
+# [licenses]
+# include-dev = true
+# confidence-threshold = 0.95
+# allow = [] # Populate with the licenses accepted during the baseline review.

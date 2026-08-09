@@ -10,9 +10,91 @@ disallowed-methods = [
   { path = "std::mem::forget", reason = "quarantined code must run destructors normally" },
   { path = "std::process::abort", reason = "quarantined code must return errors to its caller" },
   { path = "std::process::exit", reason = "quarantined code must return errors to its caller" },
+
+  # TODO(slop-filesystem): Route checkpoint/config reads through a reviewed
+  # capability and move mutating fixture setup into a dedicated test harness.
+  # Existing runtime code reads models directly, while checkpoint and benchmark
+  # tests currently write, remove, and chmod files.
+  # { path = "std::fs::File::create", reason = "quarantined code must not create files" },
+  # { path = "std::fs::File::create_new", reason = "quarantined code must not create files" },
+  # { path = "std::fs::File::open", reason = "model access must cross a reviewed boundary" },
+  # { path = "std::fs::canonicalize", reason = "filesystem access must cross a reviewed boundary" },
+  # { path = "std::fs::copy", reason = "quarantined code must not copy files" },
+  # { path = "std::fs::create_dir", reason = "quarantined code must not create directories" },
+  # { path = "std::fs::create_dir_all", reason = "quarantined code must not create directories" },
+  # { path = "std::fs::hard_link", reason = "quarantined code must not create filesystem links" },
+  # { path = "std::fs::metadata", reason = "filesystem access must cross a reviewed boundary" },
+  # { path = "std::fs::read", reason = "model access must cross a reviewed boundary" },
+  # { path = "std::fs::read_dir", reason = "model access must cross a reviewed boundary" },
+  # { path = "std::fs::read_to_string", reason = "model access must cross a reviewed boundary" },
+  # { path = "std::fs::remove_file", reason = "quarantined code must not remove files" },
+  # { path = "std::fs::set_permissions", reason = "quarantined code must not change permissions" },
+  # { path = "std::fs::write", reason = "quarantined code must not write files" },
+  # { path = "std::os::unix::fs::symlink", reason = "quarantined code must not create filesystem links" },
+
+  # TODO(slop-environment): Pass the small set of approved values into slop
+  # explicitly. The old CLI owns argument parsing and tests read checkpoint and
+  # numerics variables; direct access also permits generated code to inspect
+  # unrelated secrets.
+  # { path = "std::env::args", reason = "argument parsing belongs to the reviewed host" },
+  # { path = "std::env::args_os", reason = "argument parsing belongs to the reviewed host" },
+  # { path = "std::env::var", reason = "environment access must cross a reviewed boundary" },
+  # { path = "std::env::var_os", reason = "environment access must cross a reviewed boundary" },
+  # { path = "std::env::vars", reason = "quarantined code must not enumerate the environment" },
+  # { path = "std::env::vars_os", reason = "quarantined code must not enumerate the environment" },
+
+  # TODO(slop-process-state): Keep terminal input and panic-hook mutation in the
+  # reviewed host. Pair stdout/stderr ownership with the deferred Clippy lints
+  # in the workspace manifest.
+  # { path = "std::io::stdin", reason = "terminal input belongs to the reviewed host" },
+  # { path = "std::panic::set_hook", reason = "quarantined code must not replace process hooks" },
+  # { path = "std::panic::take_hook", reason = "quarantined code must not replace process hooks" },
+
+  # TODO(slop-threads): Keep scheduling in a reviewed host. Dependencies may
+  # manage their own workers, but slop should not start unbounded background
+  # work directly.
+  # { path = "std::thread::spawn", reason = "thread creation belongs to the reviewed host" },
+  # { path = "std::thread::Builder::spawn", reason = "thread creation belongs to the reviewed host" },
+  # { path = "std::thread::Scope::spawn", reason = "thread creation belongs to the reviewed host" },
+
+  # TODO(slop-lifetimes): Enable after checking the model's intentional static
+  # allocations; leaking memory must not become a generated lifetime shortcut.
+  # { path = "std::boxed::Box::leak", reason = "quarantined code must release owned allocations" },
 ]
 
 disallowed-types = [
   { path = "std::net::TcpListener", reason = "the legacy server owns the only approved listener" },
   { path = "std::net::UdpSocket", reason = "quarantined code has no UDP role" },
+
+  # TODO(slop-processes): Fixtures, benchmarks, and integration tests currently
+  # launch `ps` or workspace binaries. Move those harnesses outside slop before
+  # preventing runtime code from launching arbitrary programs.
+  # { path = "std::process::Command", reason = "process creation belongs to the reviewed host" },
+
+  # TODO(slop-network): The serve integration test connects over TCP today.
+  # Move it to a reviewed harness, then prohibit both outbound Internet access
+  # and unreviewed local IPC from slop.
+  # { path = "std::net::TcpStream", reason = "network access belongs to the reviewed host" },
+  # { path = "std::os::unix::net::UnixDatagram", reason = "local IPC belongs to the reviewed host" },
+  # { path = "std::os::unix::net::UnixListener", reason = "local IPC belongs to the reviewed host" },
+  # { path = "std::os::unix::net::UnixStream", reason = "local IPC belongs to the reviewed host" },
+
+  # TODO(slop-filesystem): Ban these types with the filesystem methods above
+  # once the model loader and fixtures use reviewed capabilities.
+  # { path = "std::fs::File", reason = "filesystem access must cross a reviewed boundary" },
+  # { path = "std::fs::OpenOptions", reason = "quarantined code must not open writable files" },
+
+  # TODO(slop-lifetimes): Pair with `Box::leak` after intentional uses are
+  # reviewed; this type can suppress destructor execution.
+  # { path = "std::mem::ManuallyDrop", reason = "quarantined code must run destructors normally" },
 ]
+
+# TODO(slop-syscalls): `libc` can bypass every std policy above. Reduce its use
+# to reviewed wrappers for `sysconf` and anonymous mappings, then remove it from
+# slop-visible dependencies. A list of forbidden libc symbols would never be a
+# complete sandbox.
+#
+# TODO(slop-runtime): Static lints cannot prevent infinite loops, unbounded
+# allocation, or capability use hidden inside an allowed dependency. The
+# reviewed host still needs time, memory, concurrency, and request-size limits;
+# hard isolation would require placing slop behind a process boundary.

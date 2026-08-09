@@ -60,6 +60,9 @@
                 cargo = rust;
                 clippy = rust;
               };
+              # TODO(slop-features): Enable after reviewing the legacy
+              # feature-only paths; otherwise feature-gated code can evade CI.
+              # settings.allFeatures = true;
               settings.denyWarnings = true;
             };
 
