@@ -1,0 +1,16 @@
+[package]
+name = "minkling-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "minkling"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true

@@ -3,7 +3,7 @@ resolver = "3"
 # TODO(slop-boundary): Replace this glob with an explicit member list. As
 # written, a new directory under `slop/crates` becomes a trusted workspace
 # package automatically and can omit `[lints] workspace = true`.
-members = [ "slop/crates/*" ]
+members = [ "crates/minkling-cli", "slop/crates/*" ]
 
 [workspace.package]
 edition = "2024"
@@ -16,6 +16,12 @@ inkling-core = { path = "slop/crates/inkling-core", version = "=0.1.0" }
 inkling-metal = { path = "slop/crates/inkling-metal", version = "=0.1.0" }
 
 anyhow = "1"
+clap = { version = "4.5", default-features = false, features = [
+  "derive",
+  "help",
+  "std",
+  "usage",
+] }
 
 # `sysconf(_SC_PAGESIZE)`, and nothing else. Metal takes the bounds of a no-copy
 # wrap in pages and raises an Objective-C exception for bounds that are not — an
